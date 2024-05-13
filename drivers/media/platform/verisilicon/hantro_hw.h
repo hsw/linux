@@ -264,6 +264,14 @@ struct hantro_vp9_dec_hw_ctx {
 };
 
 /**
+ * struct hantro_jpeg_dec_hw_ctx
+ * @priv:	Quantization and Huffman table buffer for the hardware
+ */
+struct hantro_jpeg_dec_hw_ctx {
+	struct hantro_aux_buf priv;
+};
+
+/**
  * struct hantro_av1_dec_ctrls
  * @sequence:		AV1 Sequence
  * @tile_group_entry:	AV1 Tile Group entry
@@ -586,5 +594,9 @@ void hantro_vp9_dec_exit(struct hantro_ctx *ctx);
 void hantro_g2_check_idle(struct hantro_dev *vpu);
 void hantro_g2_reset(struct hantro_ctx *ctx);
 irqreturn_t hantro_g2_irq(int irq, void *dev_id);
+
+int hantro_g1_jpeg_dec_run(struct hantro_ctx *ctx);
+int hantro_jpeg_dec_init(struct hantro_ctx *ctx);
+void hantro_jpeg_dec_exit(struct hantro_ctx *ctx);
 
 #endif /* HANTRO_HW_H_ */

@@ -39,6 +39,7 @@ struct hantro_postproc_ops;
 #define HANTRO_HEVC_DECODER	BIT(19)
 #define HANTRO_VP9_DECODER	BIT(20)
 #define HANTRO_AV1_DECODER	BIT(21)
+#define HANTRO_JPEG_DECODER	BIT(22)
 #define HANTRO_DECODERS		0xffff0000
 
 /**
@@ -252,6 +253,7 @@ struct hantro_dev {
  * @hevc_dec:		HEVC-decoding context.
  * @vp9_dec:		VP9-decoding context.
  * @av1_dec:		AV1-decoding context.
+ * @jpeg_dec:		JPEG-decoding context.
  */
 struct hantro_ctx {
 	struct hantro_dev *dev;
@@ -283,6 +285,7 @@ struct hantro_ctx {
 		struct hantro_hevc_dec_hw_ctx hevc_dec;
 		struct hantro_vp9_dec_hw_ctx vp9_dec;
 		struct hantro_av1_dec_hw_ctx av1_dec;
+		struct hantro_jpeg_dec_hw_ctx jpeg_dec;
 	};
 };
 

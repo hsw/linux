@@ -80,8 +80,15 @@ static int pmu_set_power_domain(int pd, bool on)
 	 * We need to soft reset the cpu when we turn off the cpu power domain,
 	 * or else the active processors might be stalled when the individual
 	 * processor is powered down.
+	 *
+	 * Without a PMU there is nothing to power down. On the RK3026 the
+	 * core soft reset does not hold the core: the write restarts it at
+	 * the reset vector, so asserting it here (before the SRAM trampoline
+	 * exists, or for a core that just went offline) would let the core
+	 * run stale SRAM contents. Leave a stopped core in its WFI loop and
+	 * restart it in the "on" path below.
 	 */
-	if (!IS_ERR(rstc) && !on)
+	if (!IS_ERR(rstc) && !on && has_pmu)
 		reset_control_assert(rstc);
 
 	if (has_pmu) {
@@ -103,8 +110,18 @@ static int pmu_set_power_domain(int pd, bool on)
 		}
 	}
 
-	if (!IS_ERR(rstc) && on)
+	if (!IS_ERR(rstc) && on) {
+		/*
+		 * Without a PMU the reset write is what restarts the core
+		 * (RK3026: the core starts at the reset vector on the assert,
+		 * a plain deassert of a reset asserted earlier does nothing).
+		 * Assert right before the deassert, as the vendor kernel does;
+		 * the trampoline is in SRAM by now.
+		 */
+		if (!has_pmu)
+			reset_control_assert(rstc);
 		reset_control_deassert(rstc);
+	}
 
 	return 0;
 }

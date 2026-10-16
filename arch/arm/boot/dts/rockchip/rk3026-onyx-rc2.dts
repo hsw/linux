@@ -12,7 +12,9 @@
  *  - the eMMC (0x1021c000) and the NAND controller (0x10500000): the NFC pads
  *    are the eMMC data lines on this board. Both nodes are deleted;
  *  - the ACT8931 (i2c0 0x5b): its rails are described as fixed regulators at
- *    the voltages the chip holds, so nothing writes it;
+ *    the voltages the chip holds, so nothing writes it. i2c0 and i2c2 are
+ *    enabled without child nodes, so no driver binds to either PMIC and
+ *    only userspace reads through i2c-dev reach them;
  *  - the TPS65185 EPD PMIC and the EBC (panel), touch, fuel gauge, RTC,
  *    frontlight, Wi-Fi, audio;
  *  - cpufreq: the CPU stays at the rate the DDR init set.
@@ -181,6 +183,22 @@
 		output-high;
 		line-name = "power_hold";
 	};
+};
+
+/*
+ * The PMIC buses, enabled with no child nodes: ACT8931 at 0x5b, CW2015 at
+ * 0x62 and HYM8563 at 0x51 on i2c0; TPS65185 at 0x68 and the touch
+ * controller at 0x24 on i2c2. No driver binds; the board's register state
+ * is read from userspace before any regulator driver is described.
+ * The TPS65185 WAKEUP pin (GPIO3_C1) is left alone, so the chip stays as
+ * the loader left it.
+ */
+&i2c0 {
+	status = "okay";
+};
+
+&i2c2 {
+	status = "okay";
 };
 
 &pinctrl {

@@ -1,0 +1,233 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * ONYX BOOX Robinson Crusoe 2 (MC_Kepler_R2, pcb V1.73), RK3026, 512 MiB DDR3.
+ *
+ * First-light description. The board boots from the microSD slot through a
+ * loader that hands over like the stock RK3026 loader: r2 = ATAG list (core +
+ * cmdline, no ATAG_MEM), MMU and caches off, PLLs, PMIC and DDR as the DDR
+ * init left them, CPU1 held in reset, IMEM mapped at 0 (GRF_SOC_CON0 bit 12),
+ * power hold (GPIO1_A2) high. The DTB is appended to the zImage.
+ *
+ * Deliberately left out until each part is checked on the board:
+ *  - the eMMC (0x1021c000) and the NAND controller (0x10500000): the NFC pads
+ *    are the eMMC data lines on this board. Both nodes are deleted;
+ *  - the ACT8931 (i2c0 0x5b): its rails are described as fixed regulators at
+ *    the voltages the chip holds, so nothing writes it;
+ *  - the TPS65185 EPD PMIC and the EBC (panel), touch, fuel gauge, RTC,
+ *    frontlight, Wi-Fi, audio;
+ *  - cpufreq: the CPU stays at the rate the DDR init set.
+ */
+
+/dts-v1/;
+#include "rk3026.dtsi"
+#include <dt-bindings/input/input.h>
+
+/delete-node/ &emmc;
+/delete-node/ &nfc;
+
+/ {
+	model = "Onyx Boox Robinson Crusoe 2";
+	compatible = "onyx,rc2", "rockchip,rk3026";
+
+	aliases {
+		mmc0 = &sdmmc;
+	};
+
+	memory@60000000 {
+		device_type = "memory";
+		reg = <0x60000000 0x20000000>; /* 512 MiB */
+	};
+
+	/*
+	 * The top 1 MiB is the stock waveform window: the stock kernel keeps it
+	 * out of its RAM, the loader puts the waveform at its start and its own
+	 * text log at 0x7fff0000. The part in between is unused by the stock
+	 * kernel, so the ramoops buffer there can be read back after a reset
+	 * from either kernel.
+	 */
+	reserved-memory {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		waveform@7ff00000 {
+			reg = <0x7ff00000 0x40000>;
+			no-map;
+		};
+
+		ramoops@7ff40000 {
+			compatible = "ramoops";
+			reg = <0x7ff40000 0x80000>;
+			console-size = <0x40000>;
+			record-size = <0x20000>;
+		};
+
+		loader-log@7ffc0000 {
+			reg = <0x7ffc0000 0x40000>;
+			no-map;
+		};
+	};
+
+	cpus {
+		/* The loader sets the IMEM remap and holds CPU1 in reset. */
+		enable-method = "rockchip,rk3036-smp";
+	};
+
+	/*
+	 * ACT8931 rails, as fixed regulators at the selectors the chip holds
+	 * (VSET2 bank, read on this board): no driver talks to the PMIC.
+	 */
+	vcc_io: regulator-vcc-io {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc_io";		/* DCDC1 */
+		regulator-min-microvolt = <3400000>;
+		regulator-max-microvolt = <3400000>;
+		regulator-always-on;
+		regulator-boot-on;
+	};
+
+	vcc_ddr: regulator-vcc-ddr {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc_ddr";		/* DCDC2 */
+		regulator-min-microvolt = <1350000>;
+		regulator-max-microvolt = <1350000>;
+		regulator-always-on;
+		regulator-boot-on;
+	};
+
+	vdd_arm: regulator-vdd-arm {
+		compatible = "regulator-fixed";
+		regulator-name = "vdd_arm";		/* DCDC3 */
+		regulator-min-microvolt = <1400000>;
+		regulator-max-microvolt = <1400000>;
+		regulator-always-on;
+		regulator-boot-on;
+	};
+
+	vcc_tp: regulator-vcc-tp {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc_tp";		/* LDO1, touch */
+		regulator-min-microvolt = <3100000>;
+		regulator-max-microvolt = <3100000>;
+		regulator-always-on;
+		regulator-boot-on;
+	};
+
+	vcc_sd: regulator-vcc-sd {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc_sd";		/* LDO3, microSD */
+		regulator-min-microvolt = <3100000>;
+		regulator-max-microvolt = <3100000>;
+		regulator-always-on;
+		regulator-boot-on;
+	};
+
+	gpio-keys {
+		compatible = "gpio-keys";
+		pinctrl-names = "default";
+		pinctrl-0 = <&pwr_key &page_keys>;
+
+		key-power {
+			label = "Power";
+			gpios = <&gpio1 RK_PA4 GPIO_ACTIVE_LOW>;
+			linux,code = <KEY_POWER>;
+			wakeup-source;
+		};
+
+		key-pageup {
+			label = "Page Up";
+			gpios = <&gpio2 RK_PB5 GPIO_ACTIVE_LOW>;
+			linux,code = <KEY_PAGEUP>;
+			debounce-interval = <20>;
+			wakeup-source;
+		};
+
+		key-pagedown {
+			label = "Page Down";
+			gpios = <&gpio2 RK_PB6 GPIO_ACTIVE_LOW>;
+			linux,code = <KEY_PAGEDOWN>;
+			debounce-interval = <20>;
+			wakeup-source;
+		};
+
+		key-back {
+			label = "Back";
+			gpios = <&gpio2 RK_PC3 GPIO_ACTIVE_LOW>;
+			linux,code = <KEY_BACK>;
+			debounce-interval = <20>;
+			wakeup-source;
+		};
+	};
+
+	leds {
+		compatible = "gpio-leds";
+		pinctrl-names = "default";
+		pinctrl-0 = <&led_pin>;
+
+		led-0 {
+			label = "status";
+			gpios = <&gpio2 RK_PB7 GPIO_ACTIVE_HIGH>;
+			linux,default-trigger = "heartbeat";
+			panic-indicator;
+		};
+	};
+};
+
+&gpio1 {
+	/* Power hold: the loader drives it high; keep it so. */
+	power-hold-hog {
+		gpio-hog;
+		gpios = <RK_PA2 GPIO_ACTIVE_HIGH>;
+		output-high;
+		line-name = "power_hold";
+	};
+};
+
+&pinctrl {
+	keys {
+		pwr_key: pwr-key {
+			rockchip,pins = <1 RK_PA4 RK_FUNC_GPIO &pcfg_pull_default>;
+		};
+
+		page_keys: page-keys {
+			rockchip,pins = <2 RK_PB5 RK_FUNC_GPIO &pcfg_pull_default>,
+					<2 RK_PB6 RK_FUNC_GPIO &pcfg_pull_default>,
+					<2 RK_PC3 RK_FUNC_GPIO &pcfg_pull_default>;
+		};
+	};
+
+	leds {
+		led_pin: led-pin {
+			rockchip,pins = <2 RK_PB7 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+	};
+
+	sdmmc {
+		/* On eMMC boards the card detect is GPIO2_A3, not GPIO1_C1. */
+		sdmmc_cd_gpio: sdmmc-cd-gpio {
+			rockchip,pins = <2 RK_PA3 RK_FUNC_GPIO &pcfg_pull_default>;
+		};
+	};
+};
+
+&sdmmc {
+	bus-width = <4>;
+	cap-sd-highspeed;
+	max-frequency = <25000000>;
+	cd-gpios = <&gpio2 RK_PA3 GPIO_ACTIVE_LOW>;
+	disable-wp;
+	fifo-mode;
+	pinctrl-names = "default";
+	pinctrl-0 = <&sdmmc_clk &sdmmc_cmd &sdmmc_bus4 &sdmmc_cd_gpio>;
+	vmmc-supply = <&vcc_sd>;
+	status = "okay";
+};
+
+&usbphy {
+	status = "okay";
+};
+
+&usb_otg {
+	dr_mode = "peripheral";
+	status = "okay";
+};

@@ -21,12 +21,12 @@
  *    without child nodes. The one ACT8931 write the panel needs, LDO4 (the
  *    panel logic rail, off at power-on) on, comes from /init before the EBC
  *    driver is loaded;
- *  - touch, fuel gauge, RTC, frontlight, Wi-Fi, audio;
+ *  - fuel gauge, RTC, frontlight, Wi-Fi, audio;
  *  - cpufreq: the CPU stays at the rate the DDR init set.
  *
  * The panel: the EBC with the stock ED060 1448x1072 timings and the TPS65185
  * EPD PMIC on i2c2, whose high-voltage rails and VCOM the EBC driver switches
- * on only around refreshes.
+ * on only around refreshes. The touch controller shares i2c2 with it.
  */
 
 /dts-v1/;
@@ -249,7 +249,7 @@
 	status = "okay";
 };
 
-/* i2c2: the TPS65185 EPD PMIC; the touch controller (0x24) is not described. */
+/* i2c2: the TPS65185 EPD PMIC (0x68) and the touch controller (0x24). */
 &i2c2 {
 	status = "okay";
 
@@ -306,6 +306,24 @@
 				regulator-max-microvolt = <1660000>;
 			};
 		};
+	};
+
+	/*
+	 * Cypress TrueTouch Gen4. The controller reports X along the short
+	 * side of the panel; the stock driver swaps the axes and inverts
+	 * its Y, i.e. the controller's X before the swap.
+	 */
+	touchscreen@24 {
+		compatible = "cypress,cyttsp4";
+		reg = <0x24>;
+		interrupt-parent = <&gpio1>;
+		interrupts = <RK_PA0 IRQ_TYPE_LEVEL_LOW>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&tp_irq &tp_rst>;
+		reset-gpios = <&gpio0 RK_PD3 GPIO_ACTIVE_LOW>;
+		vdd-supply = <&vcc_tp>;
+		touchscreen-swapped-x-y;
+		touchscreen-inverted-x;
 	};
 };
 
@@ -400,6 +418,16 @@
 		tps65185_pins: tps65185-pins {
 			rockchip,pins = <3 RK_PC1 RK_FUNC_GPIO &pcfg_pull_default>,
 					<2 RK_PC0 RK_FUNC_GPIO &pcfg_pull_default>;
+		};
+	};
+
+	touchscreen {
+		tp_irq: tp-irq {
+			rockchip,pins = <1 RK_PA0 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+
+		tp_rst: tp-rst {
+			rockchip,pins = <0 RK_PD3 RK_FUNC_GPIO &pcfg_pull_none>;
 		};
 	};
 

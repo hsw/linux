@@ -17,12 +17,16 @@
  *  - the eMMC (0x1021c000) and the NAND controller (0x10500000): the NFC pads
  *    are the eMMC data lines on this board. Both nodes are deleted;
  *  - the ACT8931 (i2c0 0x5b): its rails are described as fixed regulators at
- *    the voltages the chip holds, so nothing writes it. i2c0 and i2c2 are
- *    enabled without child nodes, so no driver binds to either PMIC and
- *    only userspace reads through i2c-dev reach them;
- *  - the TPS65185 EPD PMIC and the EBC (panel), touch, fuel gauge, RTC,
- *    frontlight, Wi-Fi, audio;
+ *    the voltages the chip holds, so no driver writes it. i2c0 is enabled
+ *    without child nodes. The one ACT8931 write the panel needs, LDO4 (the
+ *    panel logic rail, off at power-on) on, comes from /init before the EBC
+ *    driver is loaded;
+ *  - touch, fuel gauge, RTC, frontlight, Wi-Fi, audio;
  *  - cpufreq: the CPU stays at the rate the DDR init set.
+ *
+ * The panel: the EBC with the stock ED060 1448x1072 timings and the TPS65185
+ * EPD PMIC on i2c2, whose high-voltage rails and VCOM the EBC driver switches
+ * on only around refreshes.
  */
 
 /dts-v1/;
@@ -73,6 +77,18 @@
 			reg = <0x7ffc0000 0x40000>;
 			no-map;
 		};
+
+		/*
+		 * EBC images (two 4 bpp frames of 776 128 B, adjacent), 10 MiB
+		 * as on the C67ML, right below the top MiB so it stays clear of
+		 * the waveform, ramoops and loader windows. U-Boot puts the FDT
+		 * and an initrd below 0x70000000.
+		 */
+		ebc_reserved: ebc@7f500000 {
+			compatible = "shared-dma-pool";
+			reg = <0x7f500000 0xa00000>;
+			no-map;
+		};
 	};
 
 	cpus {
@@ -116,6 +132,19 @@
 		regulator-name = "vcc_tp";		/* LDO1, touch */
 		regulator-min-microvolt = <3100000>;
 		regulator-max-microvolt = <3100000>;
+		regulator-always-on;
+		regulator-boot-on;
+	};
+
+	/*
+	 * The TPS65185's VIN, the battery / charger system rail; nothing
+	 * switches it. The voltage is nominal.
+	 */
+	vcc_sys: regulator-vcc-sys {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc_sys";
+		regulator-min-microvolt = <3700000>;
+		regulator-max-microvolt = <3700000>;
 		regulator-always-on;
 		regulator-boot-on;
 	};
@@ -185,6 +214,18 @@
 		timeout-ms = <0xffffffff>;
 	};
 
+	/*
+	 * The panel thermometer in the TPS65185, which selects the waveform
+	 * temperature range. No trips: nothing is cooled.
+	 */
+	thermal-zones {
+		epd-thermal {
+			polling-delay = <0>;
+			polling-delay-passive = <0>;
+			thermal-sensors = <&tps65185>;
+		};
+	};
+
 	leds {
 		compatible = "gpio-leds";
 		pinctrl-names = "default";
@@ -200,19 +241,108 @@
 };
 
 /*
- * The PMIC buses, enabled with no child nodes: ACT8931 at 0x5b, CW2015 at
- * 0x62 and HYM8563 at 0x51 on i2c0; TPS65185 at 0x68 and the touch
- * controller at 0x24 on i2c2. No driver binds; the board's register state
- * is read from userspace before any regulator driver is described.
- * The TPS65185 WAKEUP pin (GPIO3_C1) is left alone, so the chip stays as
- * the loader left it.
+ * i2c0 is enabled with no child nodes: ACT8931 at 0x5b, CW2015 at 0x62 and
+ * HYM8563 at 0x51. No driver binds there; userspace reads them through
+ * i2c-dev (and /init makes the one LDO4 write).
  */
 &i2c0 {
 	status = "okay";
 };
 
+/* i2c2: the TPS65185 EPD PMIC; the touch controller (0x24) is not described. */
 &i2c2 {
 	status = "okay";
+
+	/*
+	 * No PWRUP and no PWR_GOOD pin on this board: the driver powers the
+	 * rails through the ENABLE register and polls PG. WAKEUP is high from
+	 * the loader on (the chip answers on a cold boot); VCOM_CTRL is the
+	 * vcom regulator's enable. The values below are what the chip holds
+	 * (read on this board): VADJ 0x03 = 15 V, VCOM1 0xa6 / VCOM2 b0 = 0 =
+	 * 1.66 V in 10 mV steps, ENABLE 0x20 = V3P3 switch on. With min = max
+	 * equal to the held value the regulator core reads it back and writes
+	 * nothing.
+	 */
+	tps65185: pmic@68 {
+		compatible = "ti,tps65185";
+		reg = <0x68>;
+		vin-supply = <&vcc_sys>;
+		wakeup-gpios = <&gpio3 RK_PC1 GPIO_ACTIVE_HIGH>;
+		vcom-ctrl-gpios = <&gpio2 RK_PC0 GPIO_ACTIVE_HIGH>;
+		#thermal-sensor-cells = <0>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&tps65185_pins>;
+
+		regulators {
+			/*
+			 * The 3.3 V switch is on at idle under the stock
+			 * kernel too; always-on keeps the core from switching
+			 * it off as unused.
+			 */
+			v3p3: v3p3 {
+				regulator-name = "v3p3";
+				regulator-always-on;
+			};
+
+			vposneg: vposneg {
+				regulator-name = "vposneg";
+				regulator-min-microvolt = <15000000>;
+				regulator-max-microvolt = <15000000>;
+			};
+
+			/* Magnitude: the rail is -1.66 V. */
+			vcom: vcom {
+				regulator-name = "vcom";
+				regulator-min-microvolt = <1660000>;
+				regulator-max-microvolt = <1660000>;
+			};
+		};
+	};
+};
+
+/*
+ * ED060 1448x1072 panel, mounted at 270 degrees. Timings as the stock kernel
+ * programs them (source clock 40 MHz: frame 442 x 1082 clocks = 11.96 ms).
+ * dclk_ebc runs at four times the source clock, 160 MHz = CPLL 640 MHz / 4,
+ * the stock clock tree; CPLL is in slow mode when the loader hands over, so
+ * its rate is set here first. No dclk-parent: dclk_ebc is parented to CPLL
+ * by assigned-clock-parents, and the driver then only sets the rate it already
+ * has. Only the pads the board routes to the EBC: GPIO2_B2 (SDOE) and B4
+ * (SDCE2) are board GPIOs here, and GPIO2_C0 (EBC_VCOM) is the TPS65185
+ * VCOM_CTRL line.
+ */
+&ebc {
+	clocks = <&cru HCLK_EBC>, <&cru DCLK_EBC>, <&cru ACLK_LCDC1>,
+		 <&cru ACLK_EBC>;
+	clock-names = "hclk", "dclk", "aclk", "mclk";
+	assigned-clocks = <&cru PLL_CPLL>, <&cru DCLK_EBC>;
+	assigned-clock-parents = <0>, <&cru PLL_CPLL>;
+	assigned-clock-rates = <640000000>, <160000000>;
+	pinctrl-names = "default";
+	pinctrl-0 = <&ebc_pins_rc2>;
+	memory-region = <&ebc_reserved>;
+	/*
+	 * No v3p3-supply: the panel logic rail is the ACT8931's LDO4, which
+	 * /init switches on before the driver loads.
+	 */
+	epd-supply = <&vposneg>;
+	vcom-supply = <&vcom>;
+	rockchip,gdck-sta = <100>;
+	rockchip,lgonl = <281>;
+	rotation = <270>;
+	status = "okay";
+
+	panel-timing {
+		clock-frequency = <40000000>;
+		hactive = <1448>;
+		vactive = <1072>;
+		hsync-len = <17>;
+		hback-porch = <8>;
+		hfront-porch = <55>;
+		vsync-len = <2>;
+		vback-porch = <4>;
+		vfront-porch = <4>;
+	};
 };
 
 &pinctrl {
@@ -237,6 +367,30 @@
 	power {
 		pwr_hold: pwr-hold {
 			rockchip,pins = <1 RK_PA2 RK_FUNC_GPIO &pcfg_pull_default>;
+		};
+	};
+
+	ebc {
+		/*
+		 * SDCLK, SDLE, GDCLK (GPIO2_B0, B1, B3), GDOE, GDSP (C1, C2),
+		 * GDPWR1, GDPWR2 (D0, D1): the pads stock muxes to the EBC.
+		 */
+		ebc_pins_rc2: ebc-pins-rc2 {
+			rockchip,pins = <2 RK_PB0 2 &pcfg_pull_none>,
+					<2 RK_PB1 2 &pcfg_pull_none>,
+					<2 RK_PB3 2 &pcfg_pull_none>,
+					<2 RK_PC1 2 &pcfg_pull_none>,
+					<2 RK_PC2 2 &pcfg_pull_none>,
+					<2 RK_PD0 2 &pcfg_pull_none>,
+					<2 RK_PD1 2 &pcfg_pull_none>;
+		};
+	};
+
+	tps65185 {
+		/* WAKEUP (GPIO3_C1) and VCOM_CTRL (GPIO2_C0) as GPIOs. */
+		tps65185_pins: tps65185-pins {
+			rockchip,pins = <3 RK_PC1 RK_FUNC_GPIO &pcfg_pull_default>,
+					<2 RK_PC0 RK_FUNC_GPIO &pcfg_pull_default>;
 		};
 	};
 

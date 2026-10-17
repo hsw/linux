@@ -1,0 +1,54 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * ONYX BOOX Robinson Crusoe 2: system devices that need no PMIC driver.
+ *
+ * Included at the end of rk3026-onyx-rc2.dts. Wiring from the stock board
+ * file of this board (pcb V1.73).
+ *
+ * None of these nodes binds the ACT8931 (i2c0 0x5b) or writes it: the
+ * gauge and the RTC share its bus, and the charger state comes from the
+ * GRF, not from the PMIC's charger registers.
+ */
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/input.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/pinctrl/rockchip.h>
+
+/ {
+	/*
+	 * USB-only charging: there is no DC-detect pin, and the stock battery
+	 * driver takes "charger present" from the OTG controller's bvalid.
+	 * The same bit, read from GRF_SOC_STATUS0, says whether a cable
+	 * supplies VBUS (host or wall charger alike).
+	 */
+	usb_charger: usb-charger {
+		compatible = "gpio-charger";
+		charger-type = "usb-sdp";
+		gpios = <&usb_status 0 GPIO_ACTIVE_HIGH>;
+	};
+};
+
+&grf {
+	usb_status: usb-status {
+		compatible = "rockchip,rk3026-grf-usb-status";
+		gpio-controller;
+		#gpio-cells = <2>;
+		gpio-line-names = "otg-bvalid", "otg-linestate0",
+				  "otg-linestate1", "otg-iddig";
+	};
+};
+
+/*
+ * CW2015 fuel gauge. Its ALRT line (GPIO1_B1) is not used: the driver
+ * polls. With no battery profile here the driver keeps the profile the
+ * gauge holds (the stock firmware loaded it; it survives as long as the
+ * battery is connected).
+ */
+&i2c0 {
+	battery@62 {
+		compatible = "cellwise,cw2015";
+		reg = <0x62>;
+		power-supplies = <&usb_charger>;
+	};
+};

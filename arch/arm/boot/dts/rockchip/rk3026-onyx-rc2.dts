@@ -460,3 +460,5 @@
 	dr_mode = "peripheral";
 	status = "okay";
 };
+
+#include "rk3026-onyx-rc2-sys.dtsi"

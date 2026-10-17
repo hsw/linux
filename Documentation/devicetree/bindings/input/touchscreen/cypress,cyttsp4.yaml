@@ -1,0 +1,72 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/input/touchscreen/cypress,cyttsp4.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Cypress TrueTouch Gen4 (CYTTSP4) touchscreen controller
+
+maintainers:
+  - Sergei Khomenkov <shomenkow@gmail.com>
+
+description: |
+  Cypress TrueTouch Standard Product Generation 4 touchscreen controllers
+  (TMA4xx, TMA1036) on I2C. The controller answers on two consecutive I2C
+  addresses: the register address is 9 bits wide and its top bit selects
+  the second address, so reg is the even (lower) one.
+
+  The panel resolution, the number of contacts and the touch record layout
+  are read from the controller's system information registers. The
+  touchscreen-* properties give the orientation relative to the
+  controller's own axes.
+
+allOf:
+  - $ref: touchscreen.yaml#
+
+properties:
+  compatible:
+    const: cypress,cyttsp4
+
+  reg:
+    maxItems: 1
+
+  interrupts:
+    maxItems: 1
+
+  reset-gpios:
+    maxItems: 1
+    description: XRES line of the controller.
+
+  vdd-supply:
+    description: Supply of the controller.
+
+  wakeup-source: true
+
+required:
+  - compatible
+  - reg
+  - interrupts
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/gpio/gpio.h>
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    i2c {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        touchscreen@24 {
+            compatible = "cypress,cyttsp4";
+            reg = <0x24>;
+            interrupt-parent = <&gpio1>;
+            interrupts = <0 IRQ_TYPE_LEVEL_LOW>;
+            reset-gpios = <&gpio0 27 GPIO_ACTIVE_LOW>;
+            vdd-supply = <&vcc_tp>;
+            touchscreen-swapped-x-y;
+            touchscreen-inverted-x;
+        };
+    };
+...

@@ -79,3 +79,22 @@
 		};
 	};
 };
+
+/*
+ * Front light: PWM0 on GPIO0_D2, duty proportional to brightness, no
+ * enable GPIO. The stock driver runs it at 1 kHz (PWM_APB_PRE_DIV 1000,
+ * prescaler 2) with 256 linear steps; boot leaves it dark.
+ */
+/ {
+	backlight: backlight {
+		compatible = "pwm-backlight";
+		pwms = <&pwm0 0 1000000 0>;
+		brightness-levels = <0 255>;
+		num-interpolated-steps = <255>;
+		default-brightness-level = <0>;
+	};
+};
+
+&pwm0 {
+	status = "okay";
+};

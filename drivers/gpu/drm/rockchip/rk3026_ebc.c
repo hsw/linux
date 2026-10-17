@@ -582,11 +582,13 @@ static void ebc_set_dsp_ctrl(struct rk3026_ebc *ebc, u32 mode)
  * readback, not against what was just written.
  *
  * Both hold absolute physical addresses, biased by the window origin at two
- * pixels per byte over a fixed 1024-pixel row stride.
+ * pixels per byte. The row stride is the panel width: the images are packed
+ * at width / 2 bytes per line (rk3026_ebc_blit_xrgb8888()), and WIN_VIR, from
+ * which the controller takes its line step, is the width as well.
  */
 static void ebc_set_image_addr(struct rk3026_ebc *ebc, u32 x, u32 y)
 {
-	u32 off = (x + y * EBC_ROW_STRIDE) / 2;
+	u32 off = (x + y * ebc->width) / 2;
 	dma_addr_t m0 = swap_mst ? ebc->next_phys : ebc->prev_phys;
 	dma_addr_t m1 = swap_mst ? ebc->prev_phys : ebc->next_phys;
 

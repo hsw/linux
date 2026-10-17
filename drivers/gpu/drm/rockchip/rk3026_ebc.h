@@ -310,9 +310,20 @@ struct rk3026_ebc {
 	 * by the refresh thread alone: on before a waveform is driven, off once
 	 * the queue has stayed empty for rails_off_ms, and off at CRTC disable.
 	 * @rails_lock serialises the thread against ebc_crtc_atomic_disable().
+	 *
+	 * @epd_on and @vcom_on say which of the two this driver holds enabled,
+	 * so every regulator_enable() is matched by exactly one
+	 * regulator_disable(): a disable that fails leaves its flag set, and the
+	 * next attempt (idle tick, CRTC disable, shutdown) retries only what is
+	 * still on. @rails_on is "either is on", for the thread's lockless
+	 * timeout. All three under @rails_lock.
 	 */
 	struct mutex		rails_lock;
 	bool			rails_on;
+	bool			epd_on;
+	bool			vcom_on;
+	/* @v3p3_supply enabled by ebc_crtc_atomic_enable(). */
+	bool			v3p3_on;
 	/*
 	 * The CRTC is enabled, so a dequeued update may drive the panel.
 	 * Written under @queue_lock; the thread samples it in the same

@@ -912,44 +912,76 @@ static void ebc_recover_panel(struct rk3026_ebc *ebc, int temp)
  * last because its amplifier needs the positive boost in regulation, and
  * first on the way down.
  */
+static int ebc_rails_off(struct rk3026_ebc *ebc);
+
 static int ebc_rails_on(struct rk3026_ebc *ebc)
 {
 	int ret;
 
 	lockdep_assert_held(&ebc->rails_lock);
-	if (ebc->rails_on)
-		return 0;
-
-	ret = regulator_enable(ebc->epd_supply);
-	if (ret) {
-		dev_err_ratelimited(ebc->dev, "failed to enable EPD rails: %d\n", ret);
-		return ret;
-	}
-	if (ebc->vcom_supply) {
-		ret = regulator_enable(ebc->vcom_supply);
+	if (!ebc->epd_on) {
+		ret = regulator_enable(ebc->epd_supply);
 		if (ret) {
-			regulator_disable(ebc->epd_supply);
-			dev_err_ratelimited(ebc->dev, "failed to enable VCOM: %d\n", ret);
+			dev_err_ratelimited(ebc->dev, "failed to enable EPD rails: %d\n", ret);
 			return ret;
 		}
+		ebc->epd_on = true;
+		WRITE_ONCE(ebc->rails_on, true);
 	}
-	WRITE_ONCE(ebc->rails_on, true);
+	if (ebc->vcom_supply && !ebc->vcom_on) {
+		ret = regulator_enable(ebc->vcom_supply);
+		if (ret) {
+			dev_err_ratelimited(ebc->dev, "failed to enable VCOM: %d\n", ret);
+			/*
+			 * No waveform without VCOM: take the high-voltage rails
+			 * down again. If that fails too, @epd_on stays set and
+			 * the idle tick retries it.
+			 */
+			ebc_rails_off(ebc);
+			return ret;
+		}
+		ebc->vcom_on = true;
+	}
 	/* dev_dbg only: a console line would itself queue a refresh. */
 	dev_dbg(ebc->dev, "rails on\n");
 	return 0;
 }
 
-static void ebc_rails_off(struct rk3026_ebc *ebc)
+/*
+ * VCOM first, then the high-voltage rails. A regulator_disable() that fails
+ * has not dropped the consumer's enable count (the core returns before it
+ * does), so the supply is still ours: its flag stays set, @rails_on stays
+ * true, and the caller's next attempt disables exactly what is still on.
+ * The epd rail is not dropped while VCOM is still held: VCOM's own supply is
+ * that rail, so it would stay up regardless.
+ */
+static int ebc_rails_off(struct rk3026_ebc *ebc)
 {
-	lockdep_assert_held(&ebc->rails_lock);
-	if (!ebc->rails_on)
-		return;
+	int ret;
 
-	if (ebc->vcom_supply)
-		regulator_disable(ebc->vcom_supply);
-	regulator_disable(ebc->epd_supply);
+	lockdep_assert_held(&ebc->rails_lock);
+	if (ebc->vcom_on) {
+		ret = regulator_disable(ebc->vcom_supply);
+		if (ret)
+			goto err;
+		ebc->vcom_on = false;
+	}
+	if (ebc->epd_on) {
+		ret = regulator_disable(ebc->epd_supply);
+		if (ret)
+			goto err;
+		ebc->epd_on = false;
+	}
+	if (ebc->rails_on)
+		dev_dbg(ebc->dev, "rails off\n");
 	WRITE_ONCE(ebc->rails_on, false);
-	dev_dbg(ebc->dev, "rails off\n");
+	return 0;
+
+err:
+	dev_err_ratelimited(ebc->dev,
+			    "failed to switch the panel rails off (%d), will retry\n",
+			    ret);
+	return ret;
 }
 
 /* Drive one queued update onto the panel. Runs only on the refresh thread. */
@@ -1395,12 +1427,13 @@ static void ebc_crtc_atomic_enable(struct drm_crtc *crtc,
 	 * being in regulation (SLVSAQ8G: "Positive boost (DCDC1) must be in
 	 * regulation before VCOM can be enabled").
 	 */
-	if (ebc->v3p3_supply) {
+	if (ebc->v3p3_supply && !ebc->v3p3_on) {
 		ret = regulator_enable(ebc->v3p3_supply);
 		if (ret) {
 			dev_err(ebc->dev, "failed to enable v3p3: %d\n", ret);
 			return;
 		}
+		ebc->v3p3_on = true;
 	}
 
 	/*
@@ -1454,11 +1487,16 @@ static void ebc_crtc_atomic_disable(struct drm_crtc *crtc,
 	spin_unlock(&ebc->queue_lock);
 	rk3026_ebc_wait_idle(ebc);
 
+	/* A failure here is retried by the thread's idle tick. */
 	mutex_lock(&ebc->rails_lock);
 	ebc_rails_off(ebc);
 	mutex_unlock(&ebc->rails_lock);
-	if (ebc->v3p3_supply)
-		regulator_disable(ebc->v3p3_supply);
+	if (ebc->v3p3_on) {
+		if (regulator_disable(ebc->v3p3_supply))
+			dev_err(ebc->dev, "failed to disable v3p3\n");
+		else
+			ebc->v3p3_on = false;
+	}
 }
 
 static const struct drm_crtc_funcs ebc_crtc_funcs = {
@@ -2057,6 +2095,11 @@ static void ebc_shutdown(struct platform_device *pdev)
 	struct rk3026_ebc *ebc = platform_get_drvdata(pdev);
 
 	drm_atomic_helper_shutdown(&ebc->drm);
+
+	/* Last chance for a rails-off that failed at CRTC disable. */
+	mutex_lock(&ebc->rails_lock);
+	ebc_rails_off(ebc);
+	mutex_unlock(&ebc->rails_lock);
 }
 
 static const struct of_device_id ebc_of_match[] = {

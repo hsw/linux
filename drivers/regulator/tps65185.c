@@ -567,6 +567,12 @@ static int tps65185_probe(struct i2c_client *client)
 					     "failed to request power good irq\n");
 	}
 
+	/*
+	 * The end-of-conversion interrupt only with nINT wired: nobody else
+	 * reads INT1/INT2, so with it enabled and no handler the first
+	 * conversion latches nINT low for good. Without it a temperature read
+	 * waits out its timeout and then checks CONV_END in TMST1.
+	 */
 	if (client->irq) {
 		ret = devm_request_threaded_irq(&client->dev, client->irq,
 						NULL, tps65185_irq_thread,
@@ -575,12 +581,13 @@ static int tps65185_probe(struct i2c_client *client)
 		if (ret)
 			return dev_err_probe(&client->dev, ret,
 					     "failed to request irq\n");
-	}
 
-	ret = regmap_update_bits(data->regmap, TPS65185_REG_INT_EN2, BIT(0), BIT(0));
-	if (ret)
-		return dev_err_probe(&client->dev, ret,
-				     "failed to enable temp irq\n");
+		ret = regmap_update_bits(data->regmap, TPS65185_REG_INT_EN2,
+					 BIT(0), BIT(0));
+		if (ret)
+			return dev_err_probe(&client->dev, ret,
+					     "failed to enable temp irq\n");
+	}
 
 	config.driver_data = data;
 	config.dev = &client->dev;

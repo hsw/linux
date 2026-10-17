@@ -146,3 +146,41 @@
 		};
 	};
 };
+
+/*
+ * Wi-Fi + Bluetooth: an RTL8723BU module on the host-only USB controller,
+ * powered through GPIO1_A5, active low (stock: high = off at boot, low
+ * while Wi-Fi or Bluetooth is in use). The switch is left to userspace,
+ * as the stock bt_pwr / wifi on-off was: the module stays off until
+ * "enabled" is written to /sys/devices/platform/wifi-power/state, then
+ * enumerates on the host port (rtl8xxxu loads rtlwifi/rtl8723bu_nic.bin
+ * from the root file system at that point).
+ */
+/ {
+	vcc_wifi: regulator-vcc-wifi {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc_wifi";
+		regulator-min-microvolt = <3400000>;
+		regulator-max-microvolt = <3400000>;
+		gpio = <&gpio1 RK_PA5 GPIO_ACTIVE_LOW>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&wifi_pwr>;
+	};
+
+	wifi-power {
+		compatible = "regulator-output";
+		vout-supply = <&vcc_wifi>;
+	};
+};
+
+&pinctrl {
+	wifi {
+		wifi_pwr: wifi-pwr {
+			rockchip,pins = <1 RK_PA5 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+	};
+};
+
+&usb_host {
+	status = "okay";
+};

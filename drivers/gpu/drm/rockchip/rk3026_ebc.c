@@ -81,6 +81,17 @@
 #define EBC_FRAME_TIMEOUT_MIN_MS	5000
 /* Longest a client may block in MXCFB_WAIT_FOR_UPDATE_COMPLETE. */
 #define EBC_MARKER_TIMEOUT_MS	10000
+/*
+ * Longest rk3026_ebc_wait_idle() waits for the refresh thread. One refresh
+ * takes at most ~10 s even when a chunk times out: the sensor read and the
+ * rails coming up (~0.4 s), a repair RESET and the update itself (up to five
+ * 64-frame chunks at ~0.8 s), and one chunk that runs into its budget
+ * (EBC_FRAME_TIMEOUT_MIN_MS) and ends the refresh. Twice that covers the one
+ * update queued behind it (CRTC enable's own RESET). Past this the thread is
+ * stuck outside the EBC (an I2C transfer, say), and CRTC enable/disable and
+ * shutdown go on without it.
+ */
+#define EBC_IDLE_TIMEOUT_MS	20000
 
 /*
  * The panel's high-voltage rails and VCOM are on only around refreshes: the
@@ -810,6 +821,16 @@ static void ebc_program_regs(struct rk3026_ebc *ebc);
 static int ebc_rails_off(struct rk3026_ebc *ebc);
 
 /*
+ * Both rails are held, so a chunk may be kicked. Lockless: the rails only go
+ * down under the thread's feet when a CRTC disable gave up waiting for it.
+ */
+static bool ebc_rails_up(struct rk3026_ebc *ebc)
+{
+	return READ_ONCE(ebc->epd_on) &&
+	       (!ebc->vcom_supply || READ_ONCE(ebc->vcom_on));
+}
+
+/*
  * A chunk did not end within its budget: stop the controller before the
  * rails go down and before anything else is kicked.
  *
@@ -857,7 +878,8 @@ static void ebc_stop_scan(struct rk3026_ebc *ebc)
  *
  * Returns 0 only if every frame was driven, -ETIMEDOUT if a chunk did not
  * end in its budget: the controller is then stopped and the rails are down,
- * so the caller must not drive anything else for this update.
+ * so the caller must not drive anything else for this update. -EIO if the
+ * rails were found down before a chunk.
  *
  * @prev_unknown is set here and cleared in exactly ONE place -- the successful
  * exit below. That asymmetry is the whole design (docs/PENDING.md P62): a
@@ -886,6 +908,13 @@ static int ebc_drive(struct rk3026_ebc *ebc, const u8 *lut, u32 frames,
 		bool ok;
 
 		unsigned int budget = ebc_chunk_timeout_ms(ebc, n);
+
+		if (!ebc_rails_up(ebc)) {
+			dev_warn_ratelimited(ebc->dev,
+					     "rails down before chunk %u, waveform abandoned\n",
+					     chunk);
+			return -EIO;
+		}
 
 		/* DIAGNOSTIC: make the wait expire for real. See debug_timeout. */
 		if (debug_timeout) {
@@ -988,7 +1017,7 @@ static int ebc_rails_on(struct rk3026_ebc *ebc)
 			dev_err_ratelimited(ebc->dev, "failed to enable EPD rails: %d\n", ret);
 			return ret;
 		}
-		ebc->epd_on = true;
+		WRITE_ONCE(ebc->epd_on, true);
 		WRITE_ONCE(ebc->rails_on, true);
 		/* Off again after the delay even if nothing is driven. */
 		ebc_rails_rearm(ebc);
@@ -1005,7 +1034,7 @@ static int ebc_rails_on(struct rk3026_ebc *ebc)
 			ebc_rails_off(ebc);
 			return ret;
 		}
-		ebc->vcom_on = true;
+		WRITE_ONCE(ebc->vcom_on, true);
 	}
 	/* dev_dbg only: a console line would itself queue a refresh. */
 	dev_dbg(ebc->dev, "rails on\n");
@@ -1029,13 +1058,13 @@ static int ebc_rails_off(struct rk3026_ebc *ebc)
 		ret = regulator_disable(ebc->vcom_supply);
 		if (ret)
 			goto err;
-		ebc->vcom_on = false;
+		WRITE_ONCE(ebc->vcom_on, false);
 	}
 	if (ebc->epd_on) {
 		ret = regulator_disable(ebc->epd_supply);
 		if (ret)
 			goto err;
-		ebc->epd_on = false;
+		WRITE_ONCE(ebc->epd_on, false);
 	}
 	if (ebc->rails_on)
 		dev_dbg(ebc->dev, "rails off\n");
@@ -1158,7 +1187,7 @@ static void ebc_do_refresh(struct rk3026_ebc *ebc,
 	 * earlier -- fetching first would silently drive the requested mode's
 	 * frame count through the RESET LUT.
 	 */
-	/* A RESET that timed out took the rails down: nothing more this time. */
+	/* A RESET that failed took the rails down: nothing more this time. */
 	if (ebc->prev_unknown && ebc_recover_panel(ebc, temp)) {
 		mutex_unlock(&ebc->blit_lock);
 		return;
@@ -1292,6 +1321,46 @@ static int ebc_refresh_thread(void *data)
 	return 0;
 }
 
+/*
+ * Block until nothing is queued and no waveform is in flight.
+ *
+ * ⚠️ "Empty queue plus an uncontended @blit_lock" is NOT idle, and believing
+ * it was is docs/PENDING.md P39's second half: ebc_refresh_thread() bumps
+ * @queue_head under @queue_lock and only then calls ebc_do_refresh(), which is
+ * where @blit_lock is taken. In that window both tests pass while a full
+ * waveform is about to run -- so this returned immediately, the caller's blit
+ * landed in @next_virt, and the boot RESET drove the client's image instead of
+ * white. @refresh_busy closes the window because it is set in the same critical
+ * section that dequeues.
+ *
+ * Bounded by EBC_IDLE_TIMEOUT_MS so a thread stuck elsewhere cannot hang
+ * blank or shutdown; returns -ETIMEDOUT then.
+ */
+int rk3026_ebc_wait_idle(struct rk3026_ebc *ebc)
+{
+	unsigned long end = jiffies + msecs_to_jiffies(EBC_IDLE_TIMEOUT_MS);
+	bool idle;
+
+	for (;;) {
+		spin_lock(&ebc->queue_lock);
+		idle = ebc->queue_head == ebc->queue_tail && !ebc->refresh_busy;
+		spin_unlock(&ebc->queue_lock);
+		if (idle)
+			break;
+		if (time_after(jiffies, end)) {
+			/* @blit_lock may be the thread's: do not wait for it. */
+			dev_warn(ebc->dev, "refresh thread busy for %u ms, not waiting\n",
+				 EBC_IDLE_TIMEOUT_MS);
+			return -ETIMEDOUT;
+		}
+		msleep(20);
+	}
+
+	mutex_lock(&ebc->blit_lock);
+	mutex_unlock(&ebc->blit_lock);
+	return 0;
+}
+
 /**
  * rk3026_ebc_queue_update - hand a panel update to the refresh thread
  * @ebc: controller
@@ -1305,35 +1374,6 @@ static int ebc_refresh_thread(void *data)
  * the newest mode wins, which is what a burst of small damage rectangles
  * wants anyway.
  */
-/*
- * Block until nothing is queued and no waveform is in flight.
- *
- * ⚠️ "Empty queue plus an uncontended @blit_lock" is NOT idle, and believing
- * it was is docs/PENDING.md P39's second half: ebc_refresh_thread() bumps
- * @queue_head under @queue_lock and only then calls ebc_do_refresh(), which is
- * where @blit_lock is taken. In that window both tests pass while a full
- * waveform is about to run -- so this returned immediately, the caller's blit
- * landed in @next_virt, and the boot RESET drove the client's image instead of
- * white. @refresh_busy closes the window because it is set in the same critical
- * section that dequeues.
- */
-void rk3026_ebc_wait_idle(struct rk3026_ebc *ebc)
-{
-	bool idle;
-
-	for (;;) {
-		spin_lock(&ebc->queue_lock);
-		idle = ebc->queue_head == ebc->queue_tail && !ebc->refresh_busy;
-		spin_unlock(&ebc->queue_lock);
-		if (idle)
-			break;
-		msleep(20);
-	}
-
-	mutex_lock(&ebc->blit_lock);
-	mutex_unlock(&ebc->blit_lock);
-}
-
 void rk3026_ebc_queue_update(struct rk3026_ebc *ebc, const struct drm_rect *clip,
 			     u32 mode, int temp, bool temp_valid, u32 marker)
 {
@@ -1575,6 +1615,11 @@ static void ebc_crtc_atomic_disable(struct drm_crtc *crtc,
 	spin_lock(&ebc->queue_lock);
 	WRITE_ONCE(ebc->crtc_on, false);
 	spin_unlock(&ebc->queue_lock);
+	/*
+	 * If the thread does not come back, drop the rails under it anyway:
+	 * ebc_drive() checks them before every chunk and abandons the
+	 * waveform, leaving prev_unknown set.
+	 */
 	rk3026_ebc_wait_idle(ebc);
 
 	/* A failure here is retried by the thread's idle tick. */

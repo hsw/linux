@@ -266,6 +266,19 @@ config TOUCHSCREEN_CYTTSP_SPI
 	  To compile this driver as a module, choose M here: the
 	  module will be called cyttsp_spi.
 
+config TOUCHSCREEN_CYTTSP4
+	tristate "Cypress TrueTouch Gen4 touchscreen"
+	depends on I2C
+	help
+	  Say Y here if you have a Cypress TrueTouch(tm) Standard Product
+	  Generation 4 touchscreen controller (TMA4xx, TMA1036) connected
+	  over I2C.
+
+	  If unsure, say N.
+
+	  To compile this driver as a module, choose M here: the
+	  module will be called cyttsp4.
+
 config TOUCHSCREEN_CYTTSP5
 	tristate "Cypress TrueTouch Gen5 Touchscreen Driver"
 	depends on I2C

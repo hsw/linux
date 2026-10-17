@@ -80,6 +80,19 @@
 #define EBC_MARKER_TIMEOUT_MS	10000
 
 /*
+ * The panel's high-voltage rails and VCOM are on only around refreshes: the
+ * refresh thread switches them on before it drives a waveform and off once
+ * the queue has stayed empty this long. A short delay keeps a burst of
+ * updates (typing, a scrolling console) from cycling the PMIC per update;
+ * new work cancels the pending power-off. Stock powers off right after each
+ * update; leaving the rails and VCOM up between updates holds a DC bias on
+ * the panel.
+ */
+static unsigned int rails_off_ms = 200;
+module_param(rails_off_ms, uint, 0644);
+MODULE_PARM_DESC(rails_off_ms, "switch the panel rails off this long after the last refresh, in ms (default 200)");
+
+/*
  * Refresh mode used when nothing annotates the update.
  *
  * FULL, not PART. EBC_MODE_PART is a partial waveform: it under-saturates a
@@ -893,6 +906,52 @@ static void ebc_recover_panel(struct rk3026_ebc *ebc, int temp)
 		memset(ebc->prev_virt, 0xff, ebc->img_size);
 }
 
+/*
+ * Panel rails, refresh thread and CRTC disable only, under @rails_lock. The
+ * TPS65185 sequences its rails internally once "epd" is enabled; VCOM goes
+ * last because its amplifier needs the positive boost in regulation, and
+ * first on the way down.
+ */
+static int ebc_rails_on(struct rk3026_ebc *ebc)
+{
+	int ret;
+
+	lockdep_assert_held(&ebc->rails_lock);
+	if (ebc->rails_on)
+		return 0;
+
+	ret = regulator_enable(ebc->epd_supply);
+	if (ret) {
+		dev_err_ratelimited(ebc->dev, "failed to enable EPD rails: %d\n", ret);
+		return ret;
+	}
+	if (ebc->vcom_supply) {
+		ret = regulator_enable(ebc->vcom_supply);
+		if (ret) {
+			regulator_disable(ebc->epd_supply);
+			dev_err_ratelimited(ebc->dev, "failed to enable VCOM: %d\n", ret);
+			return ret;
+		}
+	}
+	WRITE_ONCE(ebc->rails_on, true);
+	/* dev_dbg only: a console line would itself queue a refresh. */
+	dev_dbg(ebc->dev, "rails on\n");
+	return 0;
+}
+
+static void ebc_rails_off(struct rk3026_ebc *ebc)
+{
+	lockdep_assert_held(&ebc->rails_lock);
+	if (!ebc->rails_on)
+		return;
+
+	if (ebc->vcom_supply)
+		regulator_disable(ebc->vcom_supply);
+	regulator_disable(ebc->epd_supply);
+	WRITE_ONCE(ebc->rails_on, false);
+	dev_dbg(ebc->dev, "rails off\n");
+}
+
 /* Drive one queued update onto the panel. Runs only on the refresh thread. */
 static void ebc_do_refresh(struct rk3026_ebc *ebc,
 			   const struct rk3026_ebc_update *upd)
@@ -900,6 +959,7 @@ static void ebc_do_refresh(struct rk3026_ebc *ebc,
 	u32 frames;
 	const u8 *lut;
 	int temp;
+	int ret;
 	u32 mode = upd->mode;
 
 	if (!ebc->waveform)
@@ -954,6 +1014,22 @@ static void ebc_do_refresh(struct rk3026_ebc *ebc,
 	    !ebc->prev_unknown) {
 		if (debug_scan)
 			dev_info(ebc->dev, "scan: skipped, image identical to prev\n");
+		mutex_unlock(&ebc->blit_lock);
+		return;
+	}
+
+	/*
+	 * Rails up before anything is driven, the repair below included. If they
+	 * do not come up nothing is driven and the glass is as it was, so
+	 * @prev_virt stays true -- except for a RESET, which is only queued when
+	 * the glass is not known (the boot clear) and so must leave the mark.
+	 */
+	mutex_lock(&ebc->rails_lock);
+	ret = ebc_rails_on(ebc);
+	mutex_unlock(&ebc->rails_lock);
+	if (ret) {
+		if (upd->mode == EBC_MODE_RESET)
+			ebc->prev_unknown = true;
 		mutex_unlock(&ebc->blit_lock);
 		return;
 	}
@@ -1022,18 +1098,41 @@ static bool ebc_queue_empty(struct rk3026_ebc *ebc)
 	return empty;
 }
 
+/*
+ * Idle power-off: the queue stayed empty for rails_off_ms. Only this thread
+ * drives the panel and it is here, so no waveform is in flight.
+ */
+static void ebc_idle_rails_off(struct rk3026_ebc *ebc)
+{
+	mutex_lock(&ebc->rails_lock);
+	if (ebc_queue_empty(ebc))
+		ebc_rails_off(ebc);
+	mutex_unlock(&ebc->rails_lock);
+}
+
 static int ebc_refresh_thread(void *data)
 {
 	struct rk3026_ebc *ebc = data;
 
 	while (!kthread_should_stop()) {
 		struct rk3026_ebc_update upd;
+		long timeout, left;
+		bool active;
 
-		wait_event_interruptible(ebc->update_wq,
-					 !ebc_queue_empty(ebc) ||
-					 kthread_should_stop());
+		/* With the rails up, wake after the idle delay to drop them. */
+		timeout = READ_ONCE(ebc->rails_on) ?
+			  msecs_to_jiffies(READ_ONCE(rails_off_ms)) :
+			  MAX_SCHEDULE_TIMEOUT;
+		left = wait_event_interruptible_timeout(ebc->update_wq,
+							!ebc_queue_empty(ebc) ||
+							kthread_should_stop(),
+							timeout);
 		if (kthread_should_stop())
 			break;
+		if (!left) {
+			ebc_idle_rails_off(ebc);
+			continue;
+		}
 
 		spin_lock(&ebc->queue_lock);
 		if (ebc->queue_head == ebc->queue_tail) {
@@ -1044,9 +1143,19 @@ static int ebc_refresh_thread(void *data)
 		ebc->queue_head++;
 		ebc->marker_active = upd.marker;
 		ebc->refresh_busy = true;
+		active = ebc->crtc_on;
 		spin_unlock(&ebc->queue_lock);
 
-		ebc_do_refresh(ebc, &upd);
+		/*
+		 * Nothing reaches the panel while the CRTC is off: the rails
+		 * stay down, @prev_virt is untouched, and a waiter on the
+		 * update's marker is released below.
+		 */
+		if (active)
+			ebc_do_refresh(ebc, &upd);
+		else
+			dev_dbg(ebc->dev, "CRTC off, update (mode %u) dropped\n",
+				upd.mode);
 
 		spin_lock(&ebc->queue_lock);
 		ebc->marker_active = 0;
@@ -1054,6 +1163,10 @@ static int ebc_refresh_thread(void *data)
 		spin_unlock(&ebc->queue_lock);
 		wake_up_all(&ebc->marker_wq);
 	}
+
+	mutex_lock(&ebc->rails_lock);
+	ebc_rails_off(ebc);
+	mutex_unlock(&ebc->rails_lock);
 	return 0;
 }
 
@@ -1290,19 +1403,15 @@ static void ebc_crtc_atomic_enable(struct drm_crtc *crtc,
 		}
 	}
 
-	ret = regulator_enable(ebc->epd_supply);
-	if (ret) {
-		dev_err(ebc->dev, "failed to enable EPD rails: %d\n", ret);
-		goto err_v3p3;
-	}
-
-	if (ebc->vcom_supply) {
-		ret = regulator_enable(ebc->vcom_supply);
-		if (ret) {
-			dev_err(ebc->dev, "failed to enable VCOM: %d\n", ret);
-			goto err_epd;
-		}
-	}
+	/*
+	 * The high-voltage rails and VCOM are not switched here: the refresh
+	 * thread brings them up for each waveform, the boot RESET below
+	 * included, and drops them once the queue has drained (rails_off_ms).
+	 * V3P3, the logic rail, stays with the CRTC.
+	 */
+	spin_lock(&ebc->queue_lock);
+	WRITE_ONCE(ebc->crtc_on, true);
+	spin_unlock(&ebc->queue_lock);
 
 	/*
 	 * Drive the panel to a known white before anything is composed on it.
@@ -1327,13 +1436,6 @@ static void ebc_crtc_atomic_enable(struct drm_crtc *crtc,
 	memset(ebc->next_virt, 0xff, ebc->img_size);
 	rk3026_ebc_queue_update(ebc, &clip, EBC_MODE_RESET, 0, false, 0);
 	rk3026_ebc_wait_idle(ebc);
-	return;
-
-err_epd:
-	regulator_disable(ebc->epd_supply);
-err_v3p3:
-	if (ebc->v3p3_supply)
-		regulator_disable(ebc->v3p3_supply);
 }
 
 static void ebc_crtc_atomic_disable(struct drm_crtc *crtc,
@@ -1341,12 +1443,20 @@ static void ebc_crtc_atomic_disable(struct drm_crtc *crtc,
 {
 	struct rk3026_ebc *ebc = drm_to_ebc(crtc->dev);
 
-	/* Let any waveform in flight finish before the rails drop. */
+	/*
+	 * No new waveform from here on: the thread drops what it dequeues
+	 * while the CRTC is off. Let the one in flight finish, then drop the
+	 * rails now rather than after the idle delay: VCOM first, then the
+	 * high-voltage rails, then logic.
+	 */
+	spin_lock(&ebc->queue_lock);
+	WRITE_ONCE(ebc->crtc_on, false);
+	spin_unlock(&ebc->queue_lock);
 	rk3026_ebc_wait_idle(ebc);
-	/* Reverse of atomic_enable: VCOM first, then the rails, then logic. */
-	if (ebc->vcom_supply)
-		regulator_disable(ebc->vcom_supply);
-	regulator_disable(ebc->epd_supply);
+
+	mutex_lock(&ebc->rails_lock);
+	ebc_rails_off(ebc);
+	mutex_unlock(&ebc->rails_lock);
 	if (ebc->v3p3_supply)
 		regulator_disable(ebc->v3p3_supply);
 }
@@ -1712,9 +1822,9 @@ static int ebc_probe(struct platform_device *pdev)
 
 	/*
 	 * Optional so a device tree predating these properties still probes, but a
-	 * board that omits them cannot image -- see the struct comment. Both are
-	 * enabled in ebc_crtc_atomic_enable() rather than here, so the panel is
-	 * only powered while the CRTC is on.
+	 * board that omits them cannot image -- see the struct comment. V3P3 is
+	 * enabled with the CRTC, VCOM by the refresh thread around each
+	 * waveform (ebc_rails_on()), never here.
 	 */
 	ebc->v3p3_supply = devm_regulator_get_optional(dev, "v3p3");
 	if (IS_ERR(ebc->v3p3_supply)) {
@@ -1738,6 +1848,9 @@ static int ebc_probe(struct platform_device *pdev)
 	init_waitqueue_head(&ebc->marker_wq);
 	spin_lock_init(&ebc->queue_lock);
 	ret = drmm_mutex_init(drm, &ebc->blit_lock);
+	if (ret)
+		return ret;
+	ret = drmm_mutex_init(drm, &ebc->rails_lock);
 	if (ret)
 		return ret;
 

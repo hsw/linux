@@ -173,7 +173,7 @@ static int cw_init(struct cw_battery *cw_bat)
 	if ((reg_val & CW2015_MASK_ATHD) != CW2015_ATHD(cw_bat->alert_level)) {
 		dev_dbg(cw_bat->dev, "Setting new alert level\n");
 		reg_val &= ~CW2015_MASK_ATHD;
-		reg_val |= ~CW2015_ATHD(cw_bat->alert_level);
+		reg_val |= CW2015_ATHD(cw_bat->alert_level);
 		ret = regmap_write(cw_bat->regmap, CW2015_REG_CONFIG, reg_val);
 		if (ret)
 			return ret;

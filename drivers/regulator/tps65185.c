@@ -203,6 +203,8 @@ static irqreturn_t pgood_handler(int irq, void *dev_id)
 	return IRQ_HANDLED;
 }
 
+static int tps65185_vposneg_disable(struct regulator_dev *rdev);
+
 static int tps65185_vposneg_enable(struct regulator_dev *rdev)
 {
 	struct tps65185_data *data = rdev_get_drvdata(rdev);
@@ -239,8 +241,15 @@ static int tps65185_vposneg_enable(struct regulator_dev *rdev)
 		} while (time_before(jiffies, timeout));
 	}
 	dev_dbg(data->dev, "turned on");
-	if (tps65185_pgood(data) != 1)
+	if (tps65185_pgood(data) != 1) {
+		/*
+		 * A failed enable is not counted, so no consumer will call
+		 * disable for it: put the chip back to STANDBY here rather
+		 * than leave whichever rails did come up running.
+		 */
+		tps65185_vposneg_disable(rdev);
 		return -ETIMEDOUT;
+	}
 
 	return 0;
 }

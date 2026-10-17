@@ -27,6 +27,10 @@
 #define TPS65185_REG_INT_EN2 6
 #define TPS65185_REG_INT1 7
 #define TPS65185_REG_INT2 8
+#define TPS65185_REG_UPSEQ0 9
+#define TPS65185_REG_UPSEQ1 0xa
+#define TPS65185_REG_DWNSEQ0 0xb
+#define TPS65185_REG_DWNSEQ1 0xc
 #define TPS65185_REG_TMST1 0xd
 #define TPS65185_REG_TMST2 0xe
 #define TPS65185_REG_PG 0xf
@@ -40,6 +44,10 @@
 #define TPS65185_ENABLE_ACTIVE BIT(7)
 #define TPS65185_ENABLE_STANDBY BIT(6)
 
+/* VADJ VSET[2:0]: 3 = 15.00 V ... 6 = 14.25 V, the other codes are invalid */
+#define TPS65185_VADJ_MIN 3
+#define TPS65185_VADJ_MAX 6
+
 #define PGOOD_TIMEOUT_MSECS 200
 
 struct tps65185_data {
@@ -52,6 +60,11 @@ struct tps65185_data {
 	struct completion pgood_completion;
 	int pgood_irq;
 	struct completion tmst_completion;
+	/* board values from DT, restored whenever the chip leaves SLEEP */
+	bool has_vadj, has_upseq, has_dwnseq;
+	u8 vadj;
+	u8 upseq[2];
+	u8 dwnseq[2];
 };
 
 static const struct hwmon_channel_info *tps65185_info[] = {
@@ -388,6 +401,78 @@ static irqreturn_t tps65185_irq_thread(int irq, void *dev_id)
 	return IRQ_NONE;
 }
 
+/*
+ * The chip loads its EEPROM defaults into VADJ and the sequencing registers
+ * every time WAKEUP goes from low to high, so board values given in DT have to
+ * be written again after each such transition. Today that is only probe; a PM
+ * path that drops WAKEUP must call this after the wake-up delay, too.
+ * Properties that are absent are left alone.
+ */
+static int tps65185_apply_board_config(struct tps65185_data *data)
+{
+	int ret;
+
+	if (data->has_vadj) {
+		ret = regmap_write(data->regmap, TPS65185_REG_VADJ, data->vadj);
+		if (ret)
+			return ret;
+	}
+
+	if (data->has_upseq) {
+		ret = regmap_write(data->regmap, TPS65185_REG_UPSEQ0, data->upseq[0]);
+		if (ret)
+			return ret;
+		ret = regmap_write(data->regmap, TPS65185_REG_UPSEQ1, data->upseq[1]);
+		if (ret)
+			return ret;
+	}
+
+	if (data->has_dwnseq) {
+		ret = regmap_write(data->regmap, TPS65185_REG_DWNSEQ0, data->dwnseq[0]);
+		if (ret)
+			return ret;
+		ret = regmap_write(data->regmap, TPS65185_REG_DWNSEQ1, data->dwnseq[1]);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
+static int tps65185_parse_board_config(struct device *dev,
+				       struct tps65185_data *data)
+{
+	u32 vadj;
+	int ret;
+
+	ret = device_property_read_u32(dev, "ti,vadj", &vadj);
+	if (!ret) {
+		if (vadj < TPS65185_VADJ_MIN || vadj > TPS65185_VADJ_MAX)
+			return dev_err_probe(dev, -EINVAL,
+					     "invalid ti,vadj %u\n", vadj);
+		data->vadj = vadj;
+		data->has_vadj = true;
+	} else if (ret != -EINVAL) {
+		return dev_err_probe(dev, ret, "failed to read ti,vadj\n");
+	}
+
+	ret = device_property_read_u8_array(dev, "ti,up-sequence",
+					    data->upseq, ARRAY_SIZE(data->upseq));
+	if (!ret)
+		data->has_upseq = true;
+	else if (ret != -EINVAL)
+		return dev_err_probe(dev, ret, "failed to read ti,up-sequence\n");
+
+	ret = device_property_read_u8_array(dev, "ti,down-sequence",
+					    data->dwnseq, ARRAY_SIZE(data->dwnseq));
+	if (!ret)
+		data->has_dwnseq = true;
+	else if (ret != -EINVAL)
+		return dev_err_probe(dev, ret, "failed to read ti,down-sequence\n");
+
+	return 0;
+}
+
 static int tps65185_probe(struct i2c_client *client)
 {
 	struct tps65185_data *data;
@@ -404,6 +489,10 @@ static int tps65185_probe(struct i2c_client *client)
 	if (IS_ERR(data->regmap))
 		return dev_err_probe(&client->dev, PTR_ERR(data->regmap),
 				     "failed to allocate regmap!\n");
+
+	ret = tps65185_parse_board_config(&client->dev, data);
+	if (ret)
+		return ret;
 
 	/*
 	 * Optional: not every board routes PGOOD to a GPIO. The C67ML brings it
@@ -450,6 +539,11 @@ static int tps65185_probe(struct i2c_client *client)
 	// TPS65185x PMIC for E Ink Vizplex Enabled Electronic Paper Display Chapter 7.6 Figure 2:
 	// "Minimum delay time between WAKEUP rising edge and IC ready to accept I2C transaction."
 	usleep_range(1800, 3000);
+
+	ret = tps65185_apply_board_config(data);
+	if (ret)
+		return dev_err_probe(&client->dev, ret,
+				     "failed to write the board configuration\n");
 
 	data->dev = &client->dev;
 	i2c_set_clientdata(client, data);

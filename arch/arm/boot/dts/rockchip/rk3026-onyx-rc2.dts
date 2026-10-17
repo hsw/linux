@@ -8,6 +8,11 @@
  * init left them, CPU1 held in reset, IMEM mapped at 0 (GRF_SOC_CON0 bit 12),
  * power hold (GPIO1_A2) high. The DTB is appended to the zImage.
  *
+ * Power-off drops the power hold: on battery the ACT8931 then switches every
+ * rail off, as the stock kernel's last power-off step does. With USB power
+ * present the board stays up and the kernel waits with the hold low, so
+ * unplugging the cable switches it off.
+ *
  * Deliberately left out until each part is checked on the board:
  *  - the eMMC (0x1021c000) and the NAND controller (0x10500000): the NFC pads
  *    are the eMMC data lines on this board. Both nodes are deleted;
@@ -161,6 +166,25 @@
 		};
 	};
 
+	/*
+	 * Power hold (ACT8931 PWRHLD): the loader drives it high, the driver
+	 * keeps it high from probe on and drives it low to power off. On
+	 * battery the PMIC then switches every rail off; the line is not
+	 * driven back high while they fall. USB power keeps the board up:
+	 * rather than give up after a few seconds and return into a system
+	 * whose devices are already shut down, wait with the line low (CPU0
+	 * spins with interrupts off, like a halt), so unplugging the cable
+	 * switches the board off.
+	 */
+	gpio-poweroff {
+		compatible = "gpio-poweroff";
+		gpios = <&gpio1 RK_PA2 GPIO_ACTIVE_LOW>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&pwr_hold>;
+		active-delay-ms = <3000>;
+		timeout-ms = <0xffffffff>;
+	};
+
 	leds {
 		compatible = "gpio-leds";
 		pinctrl-names = "default";
@@ -172,16 +196,6 @@
 			linux,default-trigger = "heartbeat";
 			panic-indicator;
 		};
-	};
-};
-
-&gpio1 {
-	/* Power hold: the loader drives it high; keep it so. */
-	power-hold-hog {
-		gpio-hog;
-		gpios = <RK_PA2 GPIO_ACTIVE_HIGH>;
-		output-high;
-		line-name = "power_hold";
 	};
 };
 
@@ -217,6 +231,12 @@
 	leds {
 		led_pin: led-pin {
 			rockchip,pins = <2 RK_PB7 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+	};
+
+	power {
+		pwr_hold: pwr-hold {
+			rockchip,pins = <1 RK_PA2 RK_FUNC_GPIO &pcfg_pull_default>;
 		};
 	};
 

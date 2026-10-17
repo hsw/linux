@@ -307,8 +307,9 @@ struct rk3026_ebc {
 
 	/*
 	 * Panel rails off when idle. @epd_supply and @vcom_supply are switched
-	 * by the refresh thread alone: on before a waveform is driven, off once
-	 * the queue has stayed empty for rails_off_ms, and off at CRTC disable.
+	 * by the refresh thread alone: on before a waveform is driven, off at
+	 * @rails_off_at (rails_off_ms after the last waveform ended, or after
+	 * they came up), and off at CRTC disable.
 	 * @rails_lock serialises the thread against ebc_crtc_atomic_disable().
 	 *
 	 * @epd_on and @vcom_on say which of the two this driver holds enabled,
@@ -324,6 +325,8 @@ struct rk3026_ebc {
 	bool			vcom_on;
 	/* @v3p3_supply enabled by ebc_crtc_atomic_enable(). */
 	bool			v3p3_on;
+	/* Rails-off deadline, in jiffies; only meaningful while @rails_on. */
+	unsigned long		rails_off_at;
 	/*
 	 * The CRTC is enabled, so a dequeued update may drive the panel.
 	 * Written under @queue_lock; the thread samples it in the same

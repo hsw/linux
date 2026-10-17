@@ -17,16 +17,20 @@
  *  - the eMMC (0x1021c000) and the NAND controller (0x10500000): the NFC pads
  *    are the eMMC data lines on this board. Both nodes are deleted;
  *  - the ACT8931 (i2c0 0x5b): its rails are described as fixed regulators at
- *    the voltages the chip holds, so no driver writes it. i2c0 is enabled
- *    without child nodes. The one ACT8931 write the panel needs, LDO4 (the
- *    panel logic rail, off at power-on) on, comes from /init before the EBC
+ *    the voltages the chip holds, so no driver writes it, and i2c0 has no
+ *    node at 0x5b. The one ACT8931 write the panel needs, LDO4 (the panel
+ *    logic rail, off at power-on) on, comes from /init before the EBC
  *    driver is loaded;
- *  - fuel gauge, RTC, frontlight, Wi-Fi, audio;
+ *  - audio, Bluetooth;
  *  - cpufreq: the CPU stays at the rate the DDR init set.
  *
  * The panel: the EBC with the stock ED060 1448x1072 timings and the TPS65185
  * EPD PMIC on i2c2, whose high-voltage rails and VCOM the EBC driver switches
  * on only around refreshes. The touch controller shares i2c2 with it.
+ *
+ * System devices (fuel gauge and charger presence, RTC, front light, cover
+ * switch, vibrator, Wi-Fi power and the USB host port) are described in
+ * rk3026-onyx-rc2-sys.dtsi, included at the end.
  */
 
 /dts-v1/;
@@ -241,9 +245,10 @@
 };
 
 /*
- * i2c0 is enabled with no child nodes: ACT8931 at 0x5b, CW2015 at 0x62 and
- * HYM8563 at 0x51. No driver binds there; userspace reads them through
- * i2c-dev (and /init makes the one LDO4 write).
+ * i2c0: ACT8931 at 0x5b, CW2015 at 0x62 and HYM8563 at 0x51. The gauge and
+ * the RTC are described in rk3026-onyx-rc2-sys.dtsi; the ACT8931 has no node,
+ * so no driver binds it (userspace reads it through i2c-dev, and /init makes
+ * the one LDO4 write).
  */
 &i2c0 {
 	status = "okay";

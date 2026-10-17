@@ -272,10 +272,16 @@ static int tps65185_vposneg_disable(struct regulator_dev *rdev)
 	struct tps65185_data *data = rdev_get_drvdata(rdev);
 	int ret;
 
+	/*
+	 * STANDBY with ACTIVE cleared in the same write, as the vendor driver
+	 * does (ENABLE = 0x6f): a read-modify-write of STANDBY alone would
+	 * write ACTIVE back if it still reads as set.
+	 */
 	if (data->pwrup_gpio)
 		ret = gpiod_set_value_cansleep(data->pwrup_gpio, 0);
 	else
 		ret = regmap_update_bits(data->regmap, TPS65185_REG_ENABLE,
+					 TPS65185_ENABLE_ACTIVE |
 					 TPS65185_ENABLE_STANDBY,
 					 TPS65185_ENABLE_STANDBY);
 

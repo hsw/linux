@@ -154,6 +154,18 @@ static const struct syscon_gpio_data rockchip_rk3328_gpio_mute = {
 	.set		= rockchip_gpio_set,
 };
 
+/*
+ * RK3026 GRF_SOC_STATUS0 (0x14c) bits 7-10: the OTG port's UTMI status,
+ * input only. Line 0 utmi_bvalid (VBUS above the B-session threshold),
+ * lines 1-2 utmi_linestate (DP, DM), line 3 utmi_iddig. There is no other
+ * VBUS signal on boards that charge from the OTG port only.
+ */
+static const struct syscon_gpio_data rockchip_rk3026_usb_status = {
+	.flags		= GPIO_SYSCON_FEAT_IN,
+	.bit_count	= 4,
+	.dat_bit_offset	= 0x014c * 8 + 7,
+};
+
 #define KEYSTONE_LOCK_BIT BIT(0)
 
 static int keystone_gpio_set(struct gpio_chip *chip, unsigned int offset,
@@ -195,6 +207,10 @@ static const struct of_device_id syscon_gpio_ids[] = {
 	{
 		.compatible	= "ti,keystone-dsp-gpio",
 		.data		= &keystone_dsp_gpio,
+	},
+	{
+		.compatible	= "rockchip,rk3026-grf-usb-status",
+		.data		= &rockchip_rk3026_usb_status,
 	},
 	{
 		.compatible	= "rockchip,rk3328-grf-gpio",

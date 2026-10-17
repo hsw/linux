@@ -354,7 +354,7 @@ static inline struct rk3026_ebc *drm_to_ebc(struct drm_device *drm)
 /* rk3026_ebc.c */
 void rk3026_ebc_blit_xrgb8888(struct rk3026_ebc *ebc, const void *src,
 			      unsigned int src_pitch, const struct drm_rect *clip);
-void rk3026_ebc_wait_idle(struct rk3026_ebc *ebc);
+int rk3026_ebc_wait_idle(struct rk3026_ebc *ebc);
 void rk3026_ebc_queue_update(struct rk3026_ebc *ebc, const struct drm_rect *clip,
 			     u32 mode, int temp, bool temp_valid, u32 marker);
 int rk3026_ebc_wait_marker(struct rk3026_ebc *ebc, u32 marker);

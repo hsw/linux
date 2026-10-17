@@ -41,6 +41,33 @@ properties:
 
   vin-supply: true
 
+  ti,vadj:
+    description:
+      VADJ VSET[2:0], the VPOS/VNEG level the chip starts with (3 = 15.00 V,
+      4 = 14.75 V, 5 = 14.50 V, 6 = 14.25 V). The chip loads VADJ and the
+      sequencing registers from its EEPROM whenever WAKEUP rises; the driver
+      writes the values given here after that. Absent properties are left as
+      the chip has them.
+    $ref: /schemas/types.yaml#/definitions/uint32
+    minimum: 3
+    maximum: 6
+
+  ti,up-sequence:
+    description:
+      Power-up sequence, the bytes for UPSEQ0 (strobe of each rail) and UPSEQ1
+      (delays between the strobes), as in the datasheet.
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    minItems: 2
+    maxItems: 2
+
+  ti,down-sequence:
+    description:
+      Power-down sequence, the bytes for DWNSEQ0 (strobe of each rail) and
+      DWNSEQ1 (delays between the strobes), as in the datasheet.
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    minItems: 2
+    maxItems: 2
+
   interrupts:
     maxItems: 1
 
@@ -79,6 +106,8 @@ examples:
             wakeup-gpios = <&gpio2 5 GPIO_ACTIVE_HIGH>;
             vin-supply = <&epdc_pmic_supply>;
             interrupts-extended = <&gpio2 0 IRQ_TYPE_LEVEL_LOW>;
+            ti,up-sequence = /bits/ 8 <0xe4 0x55>;
+            ti,down-sequence = /bits/ 8 <0x1e 0xe0>;
 
             regulators {
                 vcom {

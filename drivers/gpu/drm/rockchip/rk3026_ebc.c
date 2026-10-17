@@ -17,6 +17,7 @@
  */
 
 #include <linux/clk.h>
+#include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/firmware.h>
 #include <linux/interrupt.h>
@@ -31,6 +32,7 @@
 #include <linux/platform_device.h>
 #include <linux/regmap.h>
 #include <linux/regulator/consumer.h>
+#include <linux/reset.h>
 #include <linux/thermal.h>
 #include <linux/unaligned.h>
 
@@ -66,13 +68,14 @@
  * This replaces a deliberately absurd 60000 that was set while the dot clock was
  * still stuck at 12 MHz, so it could not read as a considered value.
  *
- * ⚠️ Do NOT tighten this toward the measured time. The timeout path `break`s out
- * of the frame loop, which abandons the waveform partway, and a panel left
- * mid-transition accumulates real ghosting and darkening that persists into
- * Android -- that is exactly what a 3000 ms budget did against a 3.1 s waveform
- * on 2026-08-02. A budget that is merely tight is not a benign mis-tuning on this
- * hardware, it is cumulative damage. Either keep the generous margin, or make the
- * timeout path finish the waveform instead of breaking.
+ * ⚠️ Do NOT tighten this toward the measured time. The timeout path abandons
+ * the waveform partway (it stops the controller, see ebc_stop_scan(), and drops
+ * the rails), and a panel left mid-transition accumulates real ghosting and
+ * darkening that persists into Android -- that is exactly what a 3000 ms
+ * budget did against a 3.1 s waveform on 2026-08-02. A budget that is merely
+ * tight is not a benign mis-tuning on this hardware, it is cumulative damage.
+ * The timeout exists for a controller that has stopped answering, nothing
+ * else.
  */
 #define EBC_FRAME_TIMEOUT_MARGIN	4
 #define EBC_FRAME_TIMEOUT_MIN_MS	5000
@@ -302,17 +305,19 @@ MODULE_PARM_DESC(win_vir, "override WIN_VIR's low half in pixels (0 = panel widt
  * about, and a repair nobody has seen run is a repair nobody has tested.
  *
  * Cuts the budget of the next N chunks to 1 ms, so wait_for_completion_timeout()
- * genuinely expires: same code path, same `break`, same fall-through into the
- * unconditional memcpy. Nothing is faked.
+ * genuinely expires: same code path, same controller stop and rails-off, same
+ * prev_unknown. Nothing is faked.
  *
  * 🔴 An abort leaves the panel MID-WAVEFORM, which is the cumulative ghosting
  * this driver otherwise works hard to avoid. Set it once, to a small number, to
  * take a verdict -- never leave it armed.
  *
- * ⚠️ Reading the result: the aborted scan's frame-end interrupt arrives while
- * the NEXT waveform is being set up, so it can complete that waveform's first
- * chunk early. A chunk that reports "ended in 0 ms" is that stale interrupt, not
- * a scan. Judge the recovery by its chunk durations, not by the word "ended".
+ * ⚠️ Reading the result: without a reset in the device tree the controller is
+ * only un-armed (ebc_stop_scan()), and the aborted scan's frame-end interrupt
+ * may still arrive while the NEXT waveform is being set up, completing that
+ * waveform's first chunk early. A chunk that reports "ended in 0 ms" is that
+ * stale interrupt, not a scan. Judge the recovery by its chunk durations, not
+ * by the word "ended".
  */
 static unsigned int debug_timeout;
 module_param(debug_timeout, uint, 0644);
@@ -801,6 +806,48 @@ void rk3026_ebc_blit_xrgb8888(struct rk3026_ebc *ebc, const void *src,
 	}
 }
 
+static void ebc_program_regs(struct rk3026_ebc *ebc);
+static int ebc_rails_off(struct rk3026_ebc *ebc);
+
+/*
+ * A chunk did not end within its budget: stop the controller before the
+ * rails go down and before anything else is kicked.
+ *
+ * With the block's resets described (SRST_EBC_AXI/AHB) it is reset and
+ * reprogrammed: that stops a scan in progress, drops a pending interrupt and
+ * clears the LUT SRAM, which the next kick writes again. Without them the
+ * best the documented registers offer is to un-arm it (docs: DSP_START b0 is
+ * the start bit, nothing is known to stop a running scan): start bit and
+ * VCOM_MODE cleared, the display-end interrupt masked and acknowledged. The
+ * interrupt handler is kept out meanwhile, since it shares @int_reg.
+ */
+static void ebc_stop_scan(struct rk3026_ebc *ebc)
+{
+	disable_irq(ebc->irq);
+
+	if (ebc->rst) {
+		reset_control_assert(ebc->rst);
+		usleep_range(10, 20);
+		reset_control_deassert(ebc->rst);
+		ebc->dsp_start = 0;
+		ebc->int_reg = 0;
+		ebc_program_regs(ebc);
+	} else {
+		ebc->dsp_start &= ~DSP_FRAME_START;
+		ebc_write(ebc, EBC_DSP_START, ebc->dsp_start);
+		ebc->dsp_ctrl &= ~DSP_VCOM_MODE;
+		ebc_write(ebc, EBC_DSP_CTRL, ebc->dsp_ctrl);
+		ebc->int_reg |= EBC_INT_DISPLAYEND_MASK | EBC_INT_FRAMEEND_CLEAR |
+				EBC_INT_DISPLAYEND_CLEAR | EBC_INT_FRAMEFLAG_CLEAR;
+		ebc_write(ebc, EBC_INT, ebc->int_reg);
+		ebc_config_done(ebc);
+	}
+
+	enable_irq(ebc->irq);
+	dev_warn(ebc->dev, "controller stopped (%s), rails off\n",
+		 ebc->rst ? "reset" : "un-armed");
+}
+
 /**
  * ebc_drive - run one whole waveform, and own the "is prev true?" flag
  * @ebc: controller
@@ -808,7 +855,9 @@ void rk3026_ebc_blit_xrgb8888(struct rk3026_ebc *ebc, const void *src,
  * @frames: frames in the waveform
  * @mode: EBC work mode, for the DSP_CTRL class
  *
- * Returns true only if every frame was driven.
+ * Returns 0 only if every frame was driven, -ETIMEDOUT if a chunk did not
+ * end in its budget: the controller is then stopped and the rails are down,
+ * so the caller must not drive anything else for this update.
  *
  * @prev_unknown is set here and cleared in exactly ONE place -- the successful
  * exit below. That asymmetry is the whole design (docs/PENDING.md P62): a
@@ -817,8 +866,8 @@ void rk3026_ebc_blit_xrgb8888(struct rk3026_ebc *ebc, const void *src,
  * anywhere. Do not "improve" this into a set of clears on the known failure
  * paths; the failure that matters is the path not yet written.
  */
-static bool ebc_drive(struct rk3026_ebc *ebc, const u8 *lut, u32 frames,
-		      u32 mode)
+static int ebc_drive(struct rk3026_ebc *ebc, const u8 *lut, u32 frames,
+		     u32 mode)
 {
 	u32 done = 0, chunk = 0;
 
@@ -856,7 +905,11 @@ static bool ebc_drive(struct rk3026_ebc *ebc, const u8 *lut, u32 frames,
 				 atomic_read(&dbg_irqs) - irqs, dbg_last_status);
 		if (!ok) {
 			dev_warn_ratelimited(ebc->dev, "frame timeout\n");
-			break;
+			ebc_stop_scan(ebc);
+			mutex_lock(&ebc->rails_lock);
+			ebc_rails_off(ebc);
+			mutex_unlock(&ebc->rails_lock);
+			return -ETIMEDOUT;
 		}
 		done += n;
 		chunk++;
@@ -870,11 +923,8 @@ static bool ebc_drive(struct rk3026_ebc *ebc, const u8 *lut, u32 frames,
 	/* The idle deadline runs from the end of the last waveform. */
 	ebc_rails_rearm(ebc);
 
-	if (done < frames)
-		return false;
-
 	ebc->prev_unknown = false;
-	return true;
+	return 0;
 }
 
 /**
@@ -897,10 +947,11 @@ static bool ebc_drive(struct rk3026_ebc *ebc, const u8 *lut, u32 frames,
  * ebc_crtc_atomic_enable() already makes when it memsets @next_virt to 0xff for
  * the boot clear.
  */
-static void ebc_recover_panel(struct rk3026_ebc *ebc, int temp)
+static int ebc_recover_panel(struct rk3026_ebc *ebc, int temp)
 {
 	const u8 *lut;
 	u32 frames;
+	int ret;
 
 	lut = rk3026_ebc_waveform_lut(ebc->waveform, EBC_MODE_RESET, temp,
 				      &frames);
@@ -908,14 +959,16 @@ static void ebc_recover_panel(struct rk3026_ebc *ebc, int temp)
 		dev_warn_ratelimited(ebc->dev,
 				     "panel state unknown and no RESET waveform at %d C\n",
 				     temp);
-		return;
+		return 0;
 	}
 
 	dev_warn(ebc->dev, "panel state unknown, clearing with %u RESET frames\n",
 		 frames);
 
-	if (ebc_drive(ebc, lut, frames, EBC_MODE_RESET))
+	ret = ebc_drive(ebc, lut, frames, EBC_MODE_RESET);
+	if (!ret)
 		memset(ebc->prev_virt, 0xff, ebc->img_size);
+	return ret;
 }
 
 /*
@@ -924,8 +977,6 @@ static void ebc_recover_panel(struct rk3026_ebc *ebc, int temp)
  * last because its amplifier needs the positive boost in regulation, and
  * first on the way down.
  */
-static int ebc_rails_off(struct rk3026_ebc *ebc);
-
 static int ebc_rails_on(struct rk3026_ebc *ebc)
 {
 	int ret;
@@ -1107,8 +1158,11 @@ static void ebc_do_refresh(struct rk3026_ebc *ebc,
 	 * earlier -- fetching first would silently drive the requested mode's
 	 * frame count through the RESET LUT.
 	 */
-	if (ebc->prev_unknown)
-		ebc_recover_panel(ebc, temp);
+	/* A RESET that timed out took the rails down: nothing more this time. */
+	if (ebc->prev_unknown && ebc_recover_panel(ebc, temp)) {
+		mutex_unlock(&ebc->blit_lock);
+		return;
+	}
 
 	/*
 	 * A direct mode has no LUT of its own; fall back to the update's own mode
@@ -1694,6 +1748,23 @@ static int ebc_setup_buffers(struct rk3026_ebc *ebc)
 	return 0;
 }
 
+/*
+ * The controller's register state outside a scan: timings, window, border,
+ * EPD_CTRL and the idle DSP_CTRL. At probe, and again after a block reset.
+ */
+static void ebc_program_regs(struct rk3026_ebc *ebc)
+{
+	ebc_set_timing(ebc);
+	ebc_set_window(ebc);
+	ebc_set_border(ebc);
+	ebc_set_epd_ctrl(ebc);
+
+	/* Idle DSP_CTRL: the full-refresh class value. */
+	ebc->dsp_ctrl = DSP_CTRL_FIXED | DSP_DISPLAY_MODE;
+	ebc_write(ebc, EBC_DSP_CTRL, ebc->dsp_ctrl);
+	ebc_config_done(ebc);
+}
+
 static int ebc_hw_init(struct rk3026_ebc *ebc)
 {
 	int ret;
@@ -1805,15 +1876,7 @@ static int ebc_hw_init(struct rk3026_ebc *ebc)
 		regmap_write(ebc->grf, GRF_EBC_SEL_REG,
 			     (GRF_EBC_SEL_MASK << 16) | GRF_EBC_SEL_MASK);
 
-	ebc_set_timing(ebc);
-	ebc_set_window(ebc);
-	ebc_set_border(ebc);
-	ebc_set_epd_ctrl(ebc);
-
-	/* Idle DSP_CTRL: the full-refresh class value. */
-	ebc->dsp_ctrl = DSP_CTRL_FIXED | DSP_DISPLAY_MODE;
-	ebc_write(ebc, EBC_DSP_CTRL, ebc->dsp_ctrl);
-	ebc_config_done(ebc);
+	ebc_program_regs(ebc);
 	return 0;
 
 err_mclk:
@@ -1948,6 +2011,11 @@ static int ebc_probe(struct platform_device *pdev)
 	ebc->dclk_parent = devm_clk_get_optional(dev, "dclk-parent");
 	if (IS_ERR(ebc->dclk_parent))
 		return dev_err_probe(dev, PTR_ERR(ebc->dclk_parent), "bad dclk-parent\n");
+
+	/* Used only to stop a controller that stopped answering. */
+	ebc->rst = devm_reset_control_array_get_optional_exclusive(dev);
+	if (IS_ERR(ebc->rst))
+		return dev_err_probe(dev, PTR_ERR(ebc->rst), "bad resets\n");
 
 	ebc->grf = syscon_regmap_lookup_by_phandle(dev->of_node, "rockchip,grf");
 	if (IS_ERR(ebc->grf)) {

@@ -235,6 +235,8 @@ struct rk3026_ebc {
 	struct clk		*mclk;
 	/* Asserted as dclk's parent after set_rate — see ebc_hw_init(). */
 	struct clk		*dclk_parent;
+	/* SRST_EBC_AXI/AHB, optional: ebc_stop_scan() after a chunk timeout. */
+	struct reset_control	*rst;
 	struct regulator	*epd_supply;
 	/*
 	 * VCOM (the panel's common electrode) and V3P3 (its logic supply). Both

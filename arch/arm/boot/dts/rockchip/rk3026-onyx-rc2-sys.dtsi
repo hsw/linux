@@ -98,3 +98,51 @@
 &pwm0 {
 	status = "okay";
 };
+
+/*
+ * Magnet (cover) sensor on GPIO1_B0, no pull; stock turns its falling
+ * edge into a power key press. Here it is a lid switch, so userspace sees
+ * the state on both edges. Polarity (magnet = low) to be checked.
+ * GPIO1_B0 doubles as SPI0_CLK for the panel's flash, which this
+ * description never reads.
+ *
+ * Vibrator on GPIO0_A2, active low (stock timed-gpio "vibrator").
+ */
+/ {
+	gpio-keys-lid {
+		compatible = "gpio-keys";
+		label = "Lid";
+		pinctrl-names = "default";
+		pinctrl-0 = <&lid_pin>;
+
+		switch-lid {
+			label = "Cover";
+			gpios = <&gpio1 RK_PB0 GPIO_ACTIVE_LOW>;
+			linux,input-type = <EV_SW>;
+			linux,code = <SW_LID>;
+			debounce-interval = <50>;
+			wakeup-source;
+		};
+	};
+
+	vibrator {
+		compatible = "gpio-vibrator";
+		enable-gpios = <&gpio0 RK_PA2 GPIO_ACTIVE_LOW>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&vibrator_pin>;
+	};
+};
+
+&pinctrl {
+	lid {
+		lid_pin: lid-pin {
+			rockchip,pins = <1 RK_PB0 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+	};
+
+	vibrator {
+		vibrator_pin: vibrator-pin {
+			rockchip,pins = <0 RK_PA2 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+	};
+};

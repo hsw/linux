@@ -262,6 +262,12 @@
 	 * 1.66 V in 10 mV steps, ENABLE 0x20 = V3P3 switch on. With min = max
 	 * equal to the held value the regulator core reads it back and writes
 	 * nothing.
+	 *
+	 * VADJ and the power sequence are reloaded from the chip's EEPROM on a
+	 * WAKEUP rising edge or a power loss, so the driver writes the stock
+	 * values at probe: VADJ 3 (15 V, the same value the vposneg constraint
+	 * names, so the two never disagree), UPSEQ0/1 0x39 / 0x11 (VDDH, VNEG,
+	 * VEE, VPOS), DWNSEQ0/1 0x00 / 0x00 (all rails off together).
 	 */
 	tps65185: pmic@68 {
 		compatible = "ti,tps65185";
@@ -272,6 +278,9 @@
 		#thermal-sensor-cells = <0>;
 		pinctrl-names = "default";
 		pinctrl-0 = <&tps65185_pins>;
+		ti,vadj = <3>;
+		ti,up-sequence = /bits/ 8 <0x39 0x11>;
+		ti,down-sequence = /bits/ 8 <0x00 0x00>;
 
 		regulators {
 			/*

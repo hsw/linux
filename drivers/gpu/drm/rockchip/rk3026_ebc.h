@@ -143,12 +143,6 @@
 #define GRF_IOMUX_GPIO2D	0xd4
 
 /*
- * Row stride used by the image-address adder: a hardcoded 1024 pixels at two
- * pixels per byte, independent of the panel width.
- */
-#define EBC_ROW_STRIDE		1024
-
-/*
  * Source-driver clock: 306 x 769 x 85 Hz = 20 MHz, which is the figure the
  * panel table carries and what DRM's mode->clock describes.
  *

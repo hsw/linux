@@ -52,3 +52,30 @@
 		power-supplies = <&usb_charger>;
 	};
 };
+
+/*
+ * HYM8563 RTC at i2c0 0x51; it keeps UTC. Its interrupt (GPIO1_B3, level
+ * low) is the stock wake source for alarms. The driver's probe clears the
+ * STOP bit, masks the alarm and timer interrupts and switches the
+ * 32.768 kHz CLKOUT off; the alarm registers are written only when an
+ * alarm is set.
+ */
+&i2c0 {
+	rtc@51 {
+		compatible = "haoyu,hym8563";
+		reg = <0x51>;
+		interrupt-parent = <&gpio1>;
+		interrupts = <RK_PB3 IRQ_TYPE_LEVEL_LOW>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&rtc_int>;
+		wakeup-source;
+	};
+};
+
+&pinctrl {
+	rtc {
+		rtc_int: rtc-int {
+			rockchip,pins = <1 RK_PB3 RK_FUNC_GPIO &pcfg_pull_default>;
+		};
+	};
+};

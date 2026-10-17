@@ -7018,6 +7018,7 @@ CYTTSP TOUCHSCREEN DRIVER
 M:	Linus Walleij <linusw@kernel.org>
 L:	linux-input@vger.kernel.org
 S:	Maintained
+F:	Documentation/devicetree/bindings/input/touchscreen/cypress,cyttsp4.yaml
 F:	drivers/input/touchscreen/cyttsp*
 
 D-LINK DIR-685 TOUCHKEYS DRIVER

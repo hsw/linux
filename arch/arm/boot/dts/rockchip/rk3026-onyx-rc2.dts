@@ -155,6 +155,20 @@
 		};
 	};
 
+	/*
+	 * ACT8931 power hold: low switches the board off on battery. With
+	 * USB power the board stays up.
+	 */
+	gpio-poweroff {
+		compatible = "gpio-poweroff";
+		gpios = <&gpio1 RK_PA2 GPIO_ACTIVE_LOW>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&pwr_hold>;
+		active-delay-ms = <3000>;
+		/* U32_MAX ms: keep the line low until the cable goes */
+		timeout-ms = <0xffffffff>;
+	};
+
 	leds {
 		compatible = "gpio-leds";
 		pinctrl-names = "default";
@@ -166,16 +180,6 @@
 			linux,default-trigger = "heartbeat";
 			panic-indicator;
 		};
-	};
-};
-
-&gpio1 {
-	/* Power hold: the loader drives it high; keep it so. */
-	power-hold-hog {
-		gpio-hog;
-		gpios = <RK_PA2 GPIO_ACTIVE_HIGH>;
-		output-high;
-		line-name = "power_hold";
 	};
 };
 
@@ -196,6 +200,13 @@
 	leds {
 		led_pin: led-pin {
 			rockchip,pins = <2 RK_PB7 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+	};
+
+	power {
+		/* GPIO function; the pull stays on, as at reset and on stock */
+		pwr_hold: pwr-hold {
+			rockchip,pins = <1 RK_PA2 RK_FUNC_GPIO &pcfg_pull_default>;
 		};
 	};
 

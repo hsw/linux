@@ -93,10 +93,15 @@ static struct rockchip_pll_rate_table rk3026_gpll_clks[] = {
  * cand/div matches, and sets CPLL to it. 80 MHz x 7 = 560 MHz, which is the
  * live CPLL rate. Binding CPLL to the GPLL table, as an earlier revision did,
  * would move it somewhere uncharacterised on the first EBC set_rate.
+ *
+ * 640 MHz is the rate the ONYX BOOX Robinson Crusoe 2 runs (refdiv 1, fbdiv
+ * 80, postdiv1 3, postdiv2 1, read back on that board): its EBC takes
+ * dclk_ebc = 640 / 4 = 160 MHz for a 40 MHz source-driver clock.
  */
 static struct rockchip_pll_rate_table rk3026_cpll_clks[] = {
 	RK3036_PLL_RATE(1064000000, 1, 133, 3, 1, 1, 0),
 	RK3036_PLL_RATE( 798000000, 1, 133, 4, 1, 1, 0),
+	RK3036_PLL_RATE( 640000000, 1,  80, 3, 1, 1, 0),
 	RK3036_PLL_RATE( 594000000, 1,  99, 4, 1, 1, 0),
 	RK3036_PLL_RATE( 560000000, 1,  70, 3, 1, 1, 0),
 	{ /* sentinel */ },

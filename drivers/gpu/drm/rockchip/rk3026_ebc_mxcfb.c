@@ -87,6 +87,15 @@ static int mxcfb_send_update(struct rk3026_ebc *ebc, struct fb_info *info,
 	bool temp_valid;
 	u32 mode;
 
+	/*
+	 * With the CRTC off the panel is not driven (blanked fbdev, shutdown):
+	 * refuse rather than queue a waveform that would not run. The refresh
+	 * thread drops anything dequeued while the CRTC is off as well; this is
+	 * the early answer to the client.
+	 */
+	if (!READ_ONCE(ebc->crtc_on))
+		return -EBUSY;
+
 	if (copy_from_user(&upd, (void __user *)arg, sizeof(upd)))
 		return -EFAULT;
 

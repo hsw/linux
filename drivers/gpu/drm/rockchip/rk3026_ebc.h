@@ -305,6 +305,21 @@ struct rk3026_ebc {
 	/* Serialises writers into @next_virt. */
 	struct mutex		blit_lock;
 
+	/*
+	 * Panel rails off when idle. @epd_supply and @vcom_supply are switched
+	 * by the refresh thread alone: on before a waveform is driven, off once
+	 * the queue has stayed empty for rails_off_ms, and off at CRTC disable.
+	 * @rails_lock serialises the thread against ebc_crtc_atomic_disable().
+	 */
+	struct mutex		rails_lock;
+	bool			rails_on;
+	/*
+	 * The CRTC is enabled, so a dequeued update may drive the panel.
+	 * Written under @queue_lock; the thread samples it in the same
+	 * critical section that dequeues.
+	 */
+	bool			crtc_on;
+
 	const struct firmware	*fw;
 	struct ebc_waveform	*waveform;
 

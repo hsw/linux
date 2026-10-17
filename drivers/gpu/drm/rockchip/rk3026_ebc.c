@@ -81,16 +81,25 @@
 
 /*
  * The panel's high-voltage rails and VCOM are on only around refreshes: the
- * refresh thread switches them on before it drives a waveform and off once
- * the queue has stayed empty this long. A short delay keeps a burst of
- * updates (typing, a scrolling console) from cycling the PMIC per update;
- * new work cancels the pending power-off. Stock powers off right after each
- * update; leaving the rails and VCOM up between updates holds a DC bias on
- * the panel.
+ * refresh thread switches them on before it drives a waveform and off this
+ * long after the last waveform ended (or after they came up, if none was
+ * driven). A short delay keeps a burst of updates (typing, a scrolling
+ * console) from cycling the PMIC per update. Only a driven waveform moves
+ * the deadline: an update that is skipped (identical image) or has no LUT
+ * does not, so a stream of no-op commits cannot keep the rails up. Stock
+ * powers off right after each update; leaving the rails and VCOM up between
+ * updates holds a DC bias on the panel.
  */
 static unsigned int rails_off_ms = 200;
 module_param(rails_off_ms, uint, 0644);
 MODULE_PARM_DESC(rails_off_ms, "switch the panel rails off this long after the last refresh, in ms (default 200)");
+
+/* Rails-off deadline: rails_off_ms from now. Under @rails_lock or on the thread. */
+static void ebc_rails_rearm(struct rk3026_ebc *ebc)
+{
+	WRITE_ONCE(ebc->rails_off_at,
+		   jiffies + msecs_to_jiffies(READ_ONCE(rails_off_ms)));
+}
 
 /*
  * Refresh mode used when nothing annotates the update.
@@ -858,6 +867,9 @@ static bool ebc_drive(struct rk3026_ebc *ebc, const u8 *lut, u32 frames,
 		dev_info(ebc->dev, "scan: %u of %u frames driven\n", done, frames);
 	}
 
+	/* The idle deadline runs from the end of the last waveform. */
+	ebc_rails_rearm(ebc);
+
 	if (done < frames)
 		return false;
 
@@ -927,6 +939,8 @@ static int ebc_rails_on(struct rk3026_ebc *ebc)
 		}
 		ebc->epd_on = true;
 		WRITE_ONCE(ebc->rails_on, true);
+		/* Off again after the delay even if nothing is driven. */
+		ebc_rails_rearm(ebc);
 	}
 	if (ebc->vcom_supply && !ebc->vcom_on) {
 		ret = regulator_enable(ebc->vcom_supply);
@@ -981,6 +995,9 @@ err:
 	dev_err_ratelimited(ebc->dev,
 			    "failed to switch the panel rails off (%d), will retry\n",
 			    ret);
+	/* Next attempt one delay from now (at least 100 ms), not in a tight loop. */
+	WRITE_ONCE(ebc->rails_off_at,
+		   jiffies + msecs_to_jiffies(max(READ_ONCE(rails_off_ms), 100U)));
 	return ret;
 }
 
@@ -1000,10 +1017,6 @@ static void ebc_do_refresh(struct rk3026_ebc *ebc,
 	/* DIAGNOSTIC: drive a different mode class with the same data and scan. */
 	if (force_mode >= 0 && force_mode <= EBC_MODE_MAX)
 		mode = force_mode;
-
-	temp = upd->temp_valid ? upd->temp : ebc_read_temp(ebc);
-	if (temp > EBC_TEMP_MAX)
-		temp = EBC_TEMP_FALLBACK;
 
 	/*
 	 * The target image must not move while the controller is scanning it,
@@ -1049,6 +1062,23 @@ static void ebc_do_refresh(struct rk3026_ebc *ebc,
 		mutex_unlock(&ebc->blit_lock);
 		return;
 	}
+
+	/*
+	 * The sensor read takes ~200 ms on RC2 (no nINT) and is only needed when
+	 * a waveform follows, so it comes after the skip. It is done without
+	 * @blit_lock so writers are not held off for it; a blit that lands
+	 * meanwhile only makes @next_virt newer, and that is what gets driven.
+	 * @prev_virt and @prev_unknown belong to this thread alone.
+	 */
+	if (upd->temp_valid) {
+		temp = upd->temp;
+	} else {
+		mutex_unlock(&ebc->blit_lock);
+		temp = ebc_read_temp(ebc);
+		mutex_lock(&ebc->blit_lock);
+	}
+	if (temp > EBC_TEMP_MAX)
+		temp = EBC_TEMP_FALLBACK;
 
 	/*
 	 * Rails up before anything is driven, the repair below included. If they
@@ -1131,14 +1161,15 @@ static bool ebc_queue_empty(struct rk3026_ebc *ebc)
 }
 
 /*
- * Idle power-off: the queue stayed empty for rails_off_ms. Only this thread
- * drives the panel and it is here, so no waveform is in flight.
+ * Idle power-off: rails_off_ms passed since the last waveform. Only this
+ * thread drives the panel and it is here, so no waveform is in flight. Queued
+ * work does not hold the rails up: an update that needs them brings them up
+ * again, and one that is skipped never needed them.
  */
 static void ebc_idle_rails_off(struct rk3026_ebc *ebc)
 {
 	mutex_lock(&ebc->rails_lock);
-	if (ebc_queue_empty(ebc))
-		ebc_rails_off(ebc);
+	ebc_rails_off(ebc);
 	mutex_unlock(&ebc->rails_lock);
 }
 
@@ -1148,23 +1179,28 @@ static int ebc_refresh_thread(void *data)
 
 	while (!kthread_should_stop()) {
 		struct rk3026_ebc_update upd;
-		long timeout, left;
+		long timeout = MAX_SCHEDULE_TIMEOUT;
 		bool active;
 
-		/* With the rails up, wake after the idle delay to drop them. */
-		timeout = READ_ONCE(ebc->rails_on) ?
-			  msecs_to_jiffies(READ_ONCE(rails_off_ms)) :
-			  MAX_SCHEDULE_TIMEOUT;
-		left = wait_event_interruptible_timeout(ebc->update_wq,
-							!ebc_queue_empty(ebc) ||
-							kthread_should_stop(),
-							timeout);
+		/*
+		 * With the rails up, drop them at the deadline. Checked on every
+		 * pass, not only when the wait times out: a steady stream of
+		 * skipped updates keeps the queue busy and must not keep the
+		 * rails up.
+		 */
+		if (READ_ONCE(ebc->rails_on)) {
+			timeout = (long)(READ_ONCE(ebc->rails_off_at) - jiffies);
+			if (timeout <= 0) {
+				ebc_idle_rails_off(ebc);
+				continue;
+			}
+		}
+		wait_event_interruptible_timeout(ebc->update_wq,
+						 !ebc_queue_empty(ebc) ||
+						 kthread_should_stop(),
+						 timeout);
 		if (kthread_should_stop())
 			break;
-		if (!left) {
-			ebc_idle_rails_off(ebc);
-			continue;
-		}
 
 		spin_lock(&ebc->queue_lock);
 		if (ebc->queue_head == ebc->queue_tail) {

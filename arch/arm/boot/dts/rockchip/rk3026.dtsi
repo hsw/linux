@@ -735,6 +735,9 @@
 		clocks = <&cru HCLK_EBC>, <&cru DCLK_EBC>, <&cru ACLK_LCDC1>,
 			 <&cru ACLK_EBC>, <&cru PLL_GPLL>;
 		clock-names = "hclk", "dclk", "aclk", "mclk", "dclk-parent";
+		/* SOFTRST_CON7 b11 / b12; the driver resets only a wedged scan. */
+		resets = <&cru SRST_EBC_AXI>, <&cru SRST_EBC_AHB>;
+		reset-names = "axi", "ahb";
 		pinctrl-names = "default";
 		pinctrl-0 = <&ebc_pins>;
 		rockchip,grf = <&grf>;

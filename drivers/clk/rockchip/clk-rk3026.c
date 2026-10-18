@@ -723,6 +723,13 @@ static const char *const rk3026_critical_clocks[] __initconst = {
  * CRU+0x100 (GLB_SRST_FST) is a real register -- the vendor kernel's own
  * dump_regs names it -- but nothing in any binary we hold ever writes it, and
  * 0xfdb9 appears in none of them either. Use the sequence that is proven.
+ *
+ * Both global resets also reset the GPIO banks, so on a board whose PMIC
+ * power hold is a SoC GPIO a reboot without external power turns the board
+ * off. The core reset in arch/arm/mach-rockchip/rk3026-restart.c runs ahead
+ * of this handler and does not return; this one is reached only when that
+ * one is not there (no restart SRAM section in the device tree, or its setup
+ * failed), where a reset that may power the board off still beats a halt.
  */
 static void __iomem *rk3026_cru_base;
 

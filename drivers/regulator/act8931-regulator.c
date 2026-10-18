@@ -38,11 +38,13 @@
 #include <linux/devm-helpers.h>
 #include <linux/i2c.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/power_supply.h>
 #include <linux/regmap.h>
 #include <linux/regulator/driver.h>
 #include <linux/seq_file.h>
+#include <linux/uaccess.h>
 #include <linux/workqueue.h>
 
 #define ACT8931_SYS0		0x00
@@ -159,6 +161,8 @@ struct act8931 {
 	struct regulator_desc desc[ACT8931_NUM_RAILS];
 	struct power_supply *charger;
 	struct delayed_work poll;
+	struct mutex dbg_lock;	/* dbg_result */
+	char dbg_result[48];
 	unsigned int last_status;
 	unsigned int last_state;
 };
@@ -875,6 +879,73 @@ static int act8931_rails_show(struct seq_file *s, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(act8931_rails);
 
+/*
+ * debugfs act8931-reg, for bring-up: write "REG" to read a register or
+ * "REG VAL" (hex) to write one through the write rules; reading the file
+ * returns the result of the last command. A write is logged.
+ */
+static ssize_t act8931_reg_dbg_write(struct file *file,
+				     const char __user *ubuf, size_t len,
+				     loff_t *ppos)
+{
+	struct act8931 *chip = file->private_data;
+	unsigned int reg, val;
+	char buf[32];
+	int n, ret;
+
+	if (len >= sizeof(buf))
+		return -EINVAL;
+	if (copy_from_user(buf, ubuf, len))
+		return -EFAULT;
+	buf[len] = '\0';
+
+	n = sscanf(buf, "%x %x", &reg, &val);
+	if (n < 1)
+		return -EINVAL;
+
+	mutex_lock(&chip->dbg_lock);
+	if (n == 1) {
+		ret = regmap_read(chip->regmap, reg, &val);
+		if (ret)
+			snprintf(chip->dbg_result, sizeof(chip->dbg_result),
+				 "0x%02x: read error %d\n", reg, ret);
+		else
+			snprintf(chip->dbg_result, sizeof(chip->dbg_result),
+				 "0x%02x = 0x%02x\n", reg, val);
+	} else {
+		ret = regmap_write(chip->regmap, reg, val);
+		snprintf(chip->dbg_result, sizeof(chip->dbg_result),
+			 "0x%02x <- 0x%02x: %s %d\n", reg, val,
+			 ret ? "error" : "ok", ret);
+		dev_info(chip->dev, "debugfs write 0x%02x <- 0x%02x: %d\n",
+			 reg, val, ret);
+	}
+	mutex_unlock(&chip->dbg_lock);
+
+	return ret ? ret : len;
+}
+
+static ssize_t act8931_reg_dbg_read(struct file *file, char __user *ubuf,
+				    size_t len, loff_t *ppos)
+{
+	struct act8931 *chip = file->private_data;
+	ssize_t ret;
+
+	mutex_lock(&chip->dbg_lock);
+	ret = simple_read_from_buffer(ubuf, len, ppos, chip->dbg_result,
+				      strlen(chip->dbg_result));
+	mutex_unlock(&chip->dbg_lock);
+	return ret;
+}
+
+static const struct file_operations act8931_reg_dbg_fops = {
+	.owner	= THIS_MODULE,
+	.open	= simple_open,
+	.read	= act8931_reg_dbg_read,
+	.write	= act8931_reg_dbg_write,
+	.llseek	= default_llseek,
+};
+
 static void act8931_debugfs_remove(void *dentry)
 {
 	debugfs_remove(dentry);
@@ -957,9 +1028,16 @@ static int act8931_probe(struct i2c_client *client)
 	queue_delayed_work(system_freezable_power_efficient_wq, &chip->poll,
 			   msecs_to_jiffies(ACT8931_POLL_MS));
 
+	ret = devm_add_action_or_reset(dev, act8931_debugfs_remove,
+				       debugfs_create_file("act8931", 0444, NULL, chip,
+							   &act8931_rails_fops));
+	if (ret)
+		return ret;
+
+	mutex_init(&chip->dbg_lock);
 	return devm_add_action_or_reset(dev, act8931_debugfs_remove,
-					debugfs_create_file("act8931", 0444, NULL, chip,
-							    &act8931_rails_fops));
+					debugfs_create_file("act8931-reg", 0600, NULL, chip,
+							    &act8931_reg_dbg_fops));
 }
 
 static const struct of_device_id act8931_of_match[] = {

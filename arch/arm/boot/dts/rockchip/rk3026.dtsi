@@ -183,6 +183,16 @@
 			compatible = "rockchip,rk3066-smp-sram";
 			reg = <0x00 0x10>;
 		};
+
+		/*
+		 * The restart handler's last steps run here, with the PLLs
+		 * in slow mode and DDR out of use (mach-rockchip
+		 * rk3026-restart.c).
+		 */
+		restart-sram@1000 {
+			compatible = "rockchip,rk3026-restart-sram";
+			reg = <0x1000 0x100>;
+		};
 	};
 
 	scu@1013c000 {

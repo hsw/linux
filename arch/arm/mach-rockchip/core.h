@@ -11,4 +11,5 @@ extern unsigned long rockchip_boot_fn;
 
 extern char rk3026_restart_sram[];
 extern char rk3026_restart_sram_cru[];
+extern char rk3026_restart_sram_grf[];
 extern char rk3026_restart_sram_end[];

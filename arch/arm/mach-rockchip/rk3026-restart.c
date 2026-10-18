@@ -8,11 +8,17 @@
  * them, and with no external power the PMIC switches every rail off: a
  * reboot on battery turns the board off.
  *
- * The vendor kernel resets the cores only (rk30_arch_reset, soft_reset):
- * every PLL to slow mode, then the MCORE, CORE0, CORE1 and L2C resets in
- * SOFTRST_CON0. The GPIO banks, the GRF, the internal SRAM and the DDR
- * controller keep their state, and CPU0 restarts in the BootROM, which
- * loads the loader as on a cold start. Do the same.
+ * The vendor kernel resets the cores instead (rk30_arch_reset,
+ * soft_reset): every PLL to slow mode, the clock selects back to their
+ * reset values and every clock gate open, then a pulse of the module
+ * resets with the buses idle, and last the MCORE, CORE0, CORE1 and L2C
+ * resets in SOFTRST_CON0. The GPIO banks, the GRF, the internal SRAM and
+ * the DDR controller keep their state, and CPU0 restarts in the BootROM,
+ * which loads the loader as on a cold start. Do the same, with the
+ * module resets limited to the bus masters: the SD controller in
+ * particular has no reset of its own in the BootROM or the loader, and
+ * one left in the middle of a transfer, or with a clock tree the next
+ * stage does not expect, keeps the next kernel from finding the card.
  *
  * With the PLLs in slow mode DDR cannot be used, so the last steps run
  * from the internal SRAM. They are entered through soft_restart(), which
@@ -50,6 +56,7 @@ static void __iomem *rk3026_restart_code;
 static void __iomem *rk3026_restart_cru;
 static phys_addr_t rk3026_restart_code_phys;
 static u32 rk3026_restart_cru_phys;
+static u32 rk3026_restart_grf_phys;
 static struct regmap *rk3026_restart_grf;
 static void __iomem *rk3026_restart_otg;
 static struct clk *rk3026_restart_otg_clk;
@@ -95,6 +102,7 @@ static int rk3026_restart(struct sys_off_data *data)
 {
 	size_t size = rk3026_restart_sram_end - rk3026_restart_sram;
 	size_t cru = rk3026_restart_sram_cru - rk3026_restart_sram;
+	size_t grf = rk3026_restart_sram_grf - rk3026_restart_sram;
 
 	rk3026_restart_usb_disconnect();
 	rk3026_restart_stop_wdt();
@@ -105,6 +113,7 @@ static int rk3026_restart(struct sys_off_data *data)
 
 	memcpy_toio(rk3026_restart_code, rk3026_restart_sram, size);
 	writel(rk3026_restart_cru_phys, rk3026_restart_code + cru);
+	writel(rk3026_restart_grf_phys, rk3026_restart_code + grf);
 	/* the routine is fetched with the MMU off: the copy must be in SRAM */
 	wmb();
 
@@ -181,6 +190,15 @@ static int __init rk3026_restart_init(void)
 	rk3026_restart_cru = ioremap(res.start, resource_size(&res));
 	if (!rk3026_restart_cru)
 		return -ENOMEM;
+
+	np = of_find_compatible_node(NULL, NULL, "rockchip,rk3026-grf");
+	if (!np)
+		return -ENODEV;
+	ret = of_address_to_resource(np, 0, &res);
+	of_node_put(np);
+	if (ret)
+		return ret;
+	rk3026_restart_grf_phys = res.start;
 
 	rk3026_restart_grf = syscon_regmap_lookup_by_compatible("rockchip,rk3026-grf");
 	if (IS_ERR(rk3026_restart_grf))

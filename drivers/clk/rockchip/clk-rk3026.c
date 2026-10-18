@@ -129,6 +129,10 @@ static struct rockchip_pll_rate_table rk3026_cpll_clks[] = {
  * so no transition ever leaves the bus faster than the highest entry allows.
  * The top entry is 600 MHz, so /4 = 150 MHz -- the rate this board has run at
  * since first light.
+ *
+ * rk3026_clk_init() moves aclk_cpu_src onto GPLL, as the vendor kernel runs
+ * it, and APLL changes then leave the bus alone. The divider is the same /4,
+ * so these writes stay correct with either parent: 192 MHz on a 768 MHz GPLL.
  */
 #define RK3026_ACLK_CPU_DIV_SAFE	3
 
@@ -170,8 +174,9 @@ static struct rockchip_pll_rate_table rk3026_cpll_clks[] = {
 /*
  * 600 MHz is what our U-Boot leaves APLL at (APLL_CON0/CON1 = 0x304b/0x1441,
  * clk_summary apll/armclk 600000000), and its dividers reproduce the state this
- * board has run in since first light: aclk_cpu 150, aclk_core 300, pclk_dbg 100.
- * 504 divides down from the same dividers: 126 / 252 / 84 MHz.
+ * board has run in since first light: aclk_core 300, pclk_dbg 100 (and
+ * aclk_cpu 150 while it was on APLL). 504 divides down from the same
+ * dividers: 252 / 84 MHz.
  *
  * 🔴 912 MHz IS NOT HERE, AND MUST NOT BE ADDED WITHOUT A CARD AND A RESET PIN.
  * It kills this board. Measured 2026-08-09 by walking the transition one CRU
@@ -798,6 +803,88 @@ static void __init rk3026_clk_power_up_plls(void __iomem *reg_base)
 	}
 }
 
+/*
+ * The vendor's dividers below GPLL, for the 768 MHz GPLL that rk3026.dtsi
+ * asks for. Values from CLKSEL_CON0-34 read back under the vendor kernel
+ * (GPLL 768): aclk/hclk/pclk_cpu 192/96/48, aclk/hclk/pclk_peri 192/96/48,
+ * aclk_lcdc1_src and hclk_disp_pre 256, sclk_sdmmc 48, sclk_sdio 24,
+ * sclk_emmc 192, sclk_spi 48, uart*_src 12, dclk_lcdc* 3, aclk_vdpu/vepu 384,
+ * aclk_gpu 128.
+ *
+ * The bootloader leaves GPLL at 132 MHz with the peripheral bus at /1, and
+ * the GPLL rate is only raised when this provider is registered and its
+ * assigned-clock-rates are applied. A PLL rate change does not touch the
+ * dividers below it, so every divider that can sit on GPLL is written here
+ * first: below 768 MHz they only run slower, at 768 MHz nothing ends up
+ * faster than under the vendor kernel. Only divider fields are written,
+ * except for the muxes of the bus sources the vendor runs from GPLL
+ * (aclk_cpu, aclk_peri and the display sources in CLKSEL_CON30/31), so a
+ * clock that sits on CPLL stays there. The I2S source is left alone: the
+ * vendor runs it at GPLL/1.
+ *
+ * Before registration on purpose: the clock framework caches a composite's
+ * parent from the register when the branch is registered, so a later raw
+ * write would leave the cached parent wrong and turn a following
+ * clk_set_parent() to that same parent into a no-op.
+ *
+ * CLKSEL_CON1 goes first, while aclk_cpu still runs from APLL, so hclk_cpu
+ * and pclk_cpu never exceed half and a quarter of it; CLKSEL_CON0 moves
+ * aclk_cpu onto GPLL last. CLKSEL_CON30's low byte is not identified in any
+ * binary we hold, so only its mux and divider are masked.
+ *
+ * dclk_ebc runs at CPLL/4 = 160 MHz under the vendor kernel, and the EBC
+ * driver moves it there when it probes. Until then it can sit on GPLL,
+ * where /4 would be 192 MHz, so it gets /5: 153.6 MHz on GPLL, 128 MHz on
+ * CPLL. CLKSEL_CON23 is not hiword-masked, see dclk_ebc above.
+ */
+struct rk3026_clksel_init {
+	u8 con;
+	u16 mask;
+	u16 val;
+};
+
+static const struct rk3026_clksel_init rk3026_gpll_dividers[] __initconst = {
+	{  1, 0x7300, 0x3100 },	/* hclk_cpu /2, pclk_cpu /4 */
+	{ 10, 0xb31f, 0x2103 },	/* aclk_peri GPLL /4, hclk_peri /2, pclk_peri /4 */
+	{ 11, 0x003f, 0x000f },	/* sclk_sdmmc /16 */
+	{ 12, 0x3f3f, 0x031f },	/* sclk_emmc /4, sclk_sdio /32 */
+	{ 13, 0x007f, 0x003f },	/* uart0_src /64 */
+	{ 14, 0x007f, 0x003f },	/* uart1_src /64 */
+	{ 15, 0x007f, 0x003f },	/* uart2_src /64 */
+	{ 25, 0x007f, 0x000f },	/* sclk_spi /16 */
+	{ 27, 0xff00, 0xff00 },	/* dclk_lcdc0 /256 */
+	{ 28, 0xff00, 0xff00 },	/* dclk_lcdc1 /256 */
+	{ 30, 0x9f00, 0x8200 },	/* hclk_disp_pre GPLL /3 */
+	{ 31, 0xffff, 0x8282 },	/* aclk_lcdc1_src, aclk_lcdc0_src GPLL /3 */
+	{ 32, 0x1f1f, 0x0101 },	/* aclk_vdpu /2, aclk_vepu /2 */
+	{ 34, 0x001f, 0x0005 },	/* aclk_gpu /6 */
+	{  0, 0x3f00, 0x2300 },	/* aclk_cpu GPLL /4 */
+};
+
+#define RK3026_GATE_GPLL_CPU		BIT(1)
+#define RK3026_DIV_DCLK_EBC_MASK	GENMASK(15, 8)
+#define RK3026_DIV_DCLK_EBC		(4 << 8)
+
+static void __init rk3026_clk_set_gpll_dividers(void __iomem *reg_base)
+{
+	const struct rk3026_clksel_init *sel;
+	void __iomem *con23 = reg_base + RK2928_CLKSEL_CON(23);
+	int i;
+
+	/* gpll_cpu, which aclk_cpu moves onto last: open whatever left it */
+	writel_relaxed(HIWORD_UPDATE(0, RK3026_GATE_GPLL_CPU, 0),
+		       reg_base + RK2928_CLKGATE_CON(0));
+
+	for (i = 0; i < ARRAY_SIZE(rk3026_gpll_dividers); i++) {
+		sel = &rk3026_gpll_dividers[i];
+		writel_relaxed(HIWORD_UPDATE(sel->val, sel->mask, 0),
+			       reg_base + RK2928_CLKSEL_CON(sel->con));
+	}
+
+	writel_relaxed((readl_relaxed(con23) & ~RK3026_DIV_DCLK_EBC_MASK) |
+		       RK3026_DIV_DCLK_EBC, con23);
+}
+
 static void __init rk3026_clk_init(struct device_node *np)
 {
 	struct rockchip_clk_provider *ctx;
@@ -819,61 +906,7 @@ static void __init rk3026_clk_init(struct device_node *np)
 	writel_relaxed(HIWORD_UPDATE(0, 0x1, 15),
 		       reg_base + RK2928_CLKSEL_CON(12));
 
-	/*
-	 * Park both LCDC AXI sources on GPLL at /1. CLKSEL_CON(31) holds
-	 * aclk_lcdc0_src (bit7 mux, bits[6:0] div) and aclk_lcdc1_src (bit15 mux,
-	 * bits[12:8] div); the reset value 0x0001 selects CPLL for both, and CPLL
-	 * sits in slow mode at 24 MHz because nothing ever sets a rate on it. The
-	 * EBC borrows this path for its AXI fetch, so it ran at 24 MHz against the
-	 * vendor's 256.
-	 *
-	 * Measured on hardware 2026-08-04, unit 1: with the panel showing fbpoke
-	 * vsplit, writing 0xffff8080 here took the artifact from stripes that
-	 * SLANT -- drifting sideways down the panel, i.e. a per-line phase error
-	 * accumulating line over line -- to stripes that are straight and evenly
-	 * spaced. Photographed before and after, same pattern, same mode, only this
-	 * register changed. It does NOT make content appear; a vsplit still shows
-	 * no vertical edge, so this is one fault of at least two (docs/PENDING.md
-	 * P15).
-	 *
-	 * ⚠️ Before registration on purpose. CCF caches a composite's parent from
-	 * whatever the register says when the branch is registered, so correcting
-	 * this afterwards would leave the cached parent wrong and make a later
-	 * clk_set_parent() to that same parent a no-op -- exactly the trap that hid
-	 * the dclk_ebc/CON23 defect, where clk_set_rate() returned success at
-	 * 12 MHz. See the CLKSEL_CON(23) comment above.
-	 *
-	 * ⚠️ GPLL is 132 MHz here, not the vendor's 768, so this yields 132 MHz and
-	 * not the vendor's 256. Raising GPLL, or taking CPLL out of slow mode to
-	 * 560, is a separate change and must pin this divider in the SAME commit --
-	 * at /1 a 560 MHz CPLL would put 560 MHz on an AXI bus.
-	 */
-	writel_relaxed(HIWORD_UPDATE(0x8080, 0xffff, 0),
-		       reg_base + RK2928_CLKSEL_CON(31));
-
-	/*
-	 * Park the display AHB source on GPLL at /1, for the same reason and
-	 * with the same before-registration timing as CON31 above.
-	 *
-	 * CLKSEL_CON30 holds hclk_disp_pre: bit 15 mux (0=CPLL, 1=GPLL),
-	 * bits[12:8] divider. Nothing in this port had ever written it, so it
-	 * held the loader's value -- CPLL, which is in slow mode at 24 MHz,
-	 * divided by 4 = 6 MHz -- and hclk_ebc inherited that. It is the EBC's
-	 * AHB slave clock and it was the dclk ceiling: at 6 MHz the panel
-	 * renders garbage above ~16.5 MHz dclk, and at 132 MHz it renders
-	 * cleanly at 66 (measured on glass, 2026-08-06, one variable).
-	 *
-	 * ⚠️ Only bits 15 and [12:8] are masked, deliberately. CON31's write
-	 * above masks all 16 bits because both of its fields are ours; CON30's
-	 * low byte is NOT identified in any binary we hold, and clearing an
-	 * unknown field is not a thing to do blind.
-	 *
-	 * ⚠️ GPLL is 132 MHz here against the vendor's 768, so this yields 132
-	 * and not the vendor's 256. That is enough for dclk 66; the vendor's
-	 * dclk 80 needs CPLL at 560, which is a separate change.
-	 */
-	writel_relaxed(HIWORD_UPDATE(0x8000, 0x9f00, 0),
-		       reg_base + RK2928_CLKSEL_CON(30));
+	rk3026_clk_set_gpll_dividers(reg_base);
 
 	clk_nr_clks = rockchip_clk_find_max_clk_id(rk3026_clk_branches,
 						    ARRAY_SIZE(rk3026_clk_branches)) + 1;

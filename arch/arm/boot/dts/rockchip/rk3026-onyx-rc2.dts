@@ -444,7 +444,16 @@
 	};
 };
 
+/*
+ * The SD clock as the vendor kernel runs it: GPLL 768 MHz / 16 = 48 MHz, so
+ * the controller's divider gives 24 MHz on the card for 25 MHz and 400 kHz
+ * for identification. Pinned to GPLL so it never follows CPLL, which the EBC
+ * driver reprograms.
+ */
 &sdmmc {
+	assigned-clocks = <&cru SCLK_SDMMC>;
+	assigned-clock-parents = <&cru PLL_GPLL>;
+	assigned-clock-rates = <48000000>;
 	bus-width = <4>;
 	cap-sd-highspeed;
 	max-frequency = <25000000>;

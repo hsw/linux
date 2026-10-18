@@ -187,11 +187,11 @@
 		/*
 		 * The restart handler's last steps run here, with the PLLs
 		 * in slow mode and DDR out of use (mach-rockchip
-		 * rk3026-restart.c).
+		 * rk3026-restart.c): the routine and its register tables.
 		 */
 		restart-sram@1000 {
 			compatible = "rockchip,rk3026-restart-sram";
-			reg = <0x1000 0x100>;
+			reg = <0x1000 0x200>;
 		};
 	};
 

@@ -5,10 +5,11 @@
  * Included at the end of rk3026-onyx-rc2.dts. Wiring from the stock board
  * file of this board (pcb V1.73).
  *
- * The ACT8931 (i2c0 0x5b) is described for read-back only: its driver
- * never writes the PMIC, and no node uses its outputs (the rails stay the
- * fixed regulators of the board file). The gauge and the RTC share its bus,
- * and the gauge's charger state comes from the GRF, not from the PMIC.
+ * The ACT8931 (i2c0 0x5b) is described at the voltages it holds; its
+ * driver writes it only within compiled-in limits (see the pmic@5b node),
+ * and no node uses its outputs (the rails stay the fixed regulators of the
+ * board file). The gauge and the RTC share its bus, and the gauge's
+ * charger state comes from the GRF, not from the PMIC.
  */
 
 #include <dt-bindings/gpio/gpio.h>
@@ -74,14 +75,20 @@
 };
 
 /*
- * ACT8931 PMU at i2c0 0x5b, read back only (driver act8931-regulator, a
- * module loaded by hand). VSEL (GPIO0_A3) is high, as the stock kernel
- * leaves it, so VSET2 sets the DCDC outputs. The voltages are the ones the
- * PMU holds on this board (stock regdump, DS Table 6 decode); the driver
- * compares them with the registers and warns on a difference, and hands no
- * constraint to the regulator core. Nothing here may become always-on,
- * boot-on, a suspend state or a supply of another node: LDO4 is the panel
- * logic rail that /init switches on, DCDC2 the DDR rail.
+ * ACT8931 PMU at i2c0 0x5b (driver act8931-regulator, a module loaded by
+ * hand). VSEL (GPIO0_A3) is high, as the stock kernel leaves it, so VSET2
+ * sets the DCDC outputs. The voltages are the ones the PMU holds on this
+ * board (stock regdump, DS Table 6 decode): minimum = maximum, so nothing
+ * moves an output. The driver caps every voltage write at the stock
+ * selector itself, whatever this node says.
+ *
+ * Only two outputs get ops: DCDC3 (CPU) can be set, pinned here at its
+ * current 1.40 V; LDO4 (panel logic) can be switched, and stays
+ * always-on until the EBC driver takes it as its v3p3-supply: without a
+ * consumer the regulator core would switch it off as unused. /init
+ * switches it on before the EBC module loads. Every other output is
+ * read back only. No suspend state, no supply of another node: DCDC2 is
+ * the DDR rail.
  */
 &i2c0 {
 	pmic@5b {
@@ -123,6 +130,8 @@
 			LDO_REG4 {	/* panel logic, 0x37 */
 				regulator-min-microvolt = <3100000>;
 				regulator-max-microvolt = <3100000>;
+				regulator-always-on;
+				regulator-boot-on;
 			};
 		};
 	};

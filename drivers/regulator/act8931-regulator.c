@@ -42,6 +42,8 @@
 #include <linux/regulator/of_regulator.h>
 #include <linux/workqueue.h>
 
+#include "act8931-rc2-guard.h"	/* LOCAL: RC2 stock limits */
+
 #define ACT8931_SYS0		0x00
 #define ACT8931_SYS1		0x01
 #define ACT8931_DCDC1_VSET1	0x20
@@ -436,7 +438,7 @@ static int act8931_reg_write(void *context, unsigned int reg, unsigned int val)
 {
 	struct act8931 *chip = context;
 	const char *why = NULL;
-	unsigned int keep = 0, cur;
+	unsigned int keep = 0, guard_keep, cur;
 	bool vset;
 	int id, ret;
 
@@ -451,6 +453,12 @@ static int act8931_reg_write(void *context, unsigned int reg, unsigned int val)
 		why = "above the output's maximum";
 	else
 		keep = act8931_reserved(reg, vset);
+
+	/* LOCAL (RC2 stack): the compiled-in stock limits on top */
+	if (!why) {
+		why = act8931_rc2_guard(reg, val, &guard_keep);
+		keep |= guard_keep;
+	}
 
 	if (keep) {
 		ret = act8931_reg_read(chip, reg, &cur);

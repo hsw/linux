@@ -88,6 +88,23 @@
 
 #define ACT8931_POLL_MS		5000
 
+/*
+ * Soft-start: 400 us for the DC/DC converters, 140 us typical for an LDO
+ * at 2.9 V (datasheet); no figure is given for a VSET step. The longer
+ * one bounds both an enable and a voltage raise.
+ */
+#define ACT8931_SOFTSTART_US	400
+
+/*
+ * Voltage caps: the selectors the board's vendor kernel runs the outputs
+ * at (ONYX BOOX Robinson Crusoe 2). DCDC1 0x3b is the vendor's raised
+ * VCCIO while its Wi-Fi/BT module is powered; 0x3a otherwise.
+ */
+#define ACT8931_CAP_DCDC1	0x3b
+#define ACT8931_CAP_DCDC2	0x1b
+#define ACT8931_CAP_DCDC3	0x1c
+#define ACT8931_CAP_LDO		0x37
+
 enum {
 	ACT8931_ID_DCDC1,
 	ACT8931_ID_DCDC2,
@@ -105,23 +122,32 @@ struct act8931_rail {
 	unsigned int vset1;	/* DCDC only: the VSEL-low register */
 	unsigned int vset;	/* LDO: the one VSET; DCDC: VSET2 */
 	unsigned int ctrl;
+	unsigned int cap;	/* highest selector a write may set */
+	bool switchable;	/* may get enable/disable ops */
 };
 
 static const struct act8931_rail act8931_rails[ACT8931_NUM_RAILS] = {
 	[ACT8931_ID_DCDC1] = { "act8931-dcdc1", "DCDC_REG1", ACT8931_DCDC1_VSET1,
-			       ACT8931_DCDC1_VSET2, ACT8931_DCDC1_CTRL },
+			       ACT8931_DCDC1_VSET2, ACT8931_DCDC1_CTRL,
+			       ACT8931_CAP_DCDC1 },
 	[ACT8931_ID_DCDC2] = { "act8931-dcdc2", "DCDC_REG2", ACT8931_DCDC2_VSET1,
-			       ACT8931_DCDC2_VSET2, ACT8931_DCDC2_CTRL },
+			       ACT8931_DCDC2_VSET2, ACT8931_DCDC2_CTRL,
+			       ACT8931_CAP_DCDC2 },
 	[ACT8931_ID_DCDC3] = { "act8931-dcdc3", "DCDC_REG3", ACT8931_DCDC3_VSET1,
-			       ACT8931_DCDC3_VSET2, ACT8931_DCDC3_CTRL },
+			       ACT8931_DCDC3_VSET2, ACT8931_DCDC3_CTRL,
+			       ACT8931_CAP_DCDC3 },
 	[ACT8931_ID_LDO1] = { "act8931-ldo1", "LDO_REG1", 0,
-			      ACT8931_LDO1_VSET, ACT8931_LDO1_CTRL },
+			      ACT8931_LDO1_VSET, ACT8931_LDO1_CTRL,
+			      ACT8931_CAP_LDO },
 	[ACT8931_ID_LDO2] = { "act8931-ldo2", "LDO_REG2", 0,
-			      ACT8931_LDO2_VSET, ACT8931_LDO2_CTRL },
+			      ACT8931_LDO2_VSET, ACT8931_LDO2_CTRL,
+			      ACT8931_CAP_LDO },
 	[ACT8931_ID_LDO3] = { "act8931-ldo3", "LDO_REG3", 0,
-			      ACT8931_LDO3_VSET, ACT8931_LDO3_CTRL },
+			      ACT8931_LDO3_VSET, ACT8931_LDO3_CTRL,
+			      ACT8931_CAP_LDO },
 	[ACT8931_ID_LDO4] = { "act8931-ldo4", "LDO_REG4", 0,
-			      ACT8931_LDO4_VSET, ACT8931_LDO4_CTRL },
+			      ACT8931_LDO4_VSET, ACT8931_LDO4_CTRL,
+			      ACT8931_CAP_LDO, true },
 };
 
 struct act8931 {
@@ -165,10 +191,87 @@ static int act8931_is_enabled(struct regulator_dev *rdev)
 	return act8931_ctrl_enabled(ctrl);
 }
 
+/*
+ * Enable: a rising edge of ON, written as ON 0 then ON 1 from the value
+ * read back. Nothing is written when the output is on already: the
+ * regulator core enables an always-on output at registration without
+ * asking first, and a 0 written to a live ON bit would switch it off.
+ *
+ * An output whose ON reads 1 without power good is never toggled: it may
+ * still be ramping up, so it gets the soft-start time; without power good
+ * after that it is overloaded or failing, and the falling edge of a
+ * toggle would cut it while its load may still run from it. That is an
+ * error, and the output is left as it is.
+ */
+static int act8931_enable(struct regulator_dev *rdev)
+{
+	struct act8931 *chip = rdev_get_drvdata(rdev);
+	struct regmap *map = rdev_get_regmap(rdev);
+	unsigned int reg = rdev->desc->enable_reg;
+	unsigned int ctrl;
+	int ret;
+
+	ret = regmap_read(map, reg, &ctrl);
+	if (ret)
+		return ret;
+	if (act8931_ctrl_enabled(ctrl))
+		return 0;
+	if (ctrl & ACT8931_CTRL_ON) {
+		fsleep(ACT8931_SOFTSTART_US);
+		ret = regmap_read(map, reg, &ctrl);
+		if (ret)
+			return ret;
+		if (act8931_ctrl_enabled(ctrl))
+			return 0;
+		if (ctrl & ACT8931_CTRL_ON) {
+			dev_err(chip->dev,
+				"%s: ON without power good (CTRL 0x%02x): not toggled\n",
+				rdev->desc->name, ctrl);
+			return -EIO;
+		}
+	}
+
+	ret = regmap_write(map, reg, ctrl & ~ACT8931_CTRL_ON);
+	if (ret)
+		return ret;
+	return regmap_write(map, reg, ctrl | ACT8931_CTRL_ON);
+}
+
+/*
+ * Disable: a falling edge, ON 1 then ON 0. An output whose ON reads 0
+ * had a falling edge last and is off; nothing is written then.
+ */
+static int act8931_disable(struct regulator_dev *rdev)
+{
+	struct regmap *map = rdev_get_regmap(rdev);
+	unsigned int reg = rdev->desc->enable_reg;
+	unsigned int ctrl;
+	int ret;
+
+	ret = regmap_read(map, reg, &ctrl);
+	if (ret)
+		return ret;
+	if (!(ctrl & ACT8931_CTRL_ON))
+		return 0;
+
+	ret = regmap_write(map, reg, ctrl | ACT8931_CTRL_ON);
+	if (ret)
+		return ret;
+	return regmap_write(map, reg, ctrl & ~ACT8931_CTRL_ON);
+}
+
 static const struct regulator_ops act8931_ro_ops = {
 	.list_voltage		= regulator_list_voltage_linear_range,
 	.get_voltage_sel	= regulator_get_voltage_sel_regmap,
 	.is_enabled		= act8931_is_enabled,
+};
+
+static const struct regulator_ops act8931_switch_ops = {
+	.list_voltage		= regulator_list_voltage_linear_range,
+	.get_voltage_sel	= regulator_get_voltage_sel_regmap,
+	.is_enabled		= act8931_is_enabled,
+	.enable			= act8931_enable,
+	.disable		= act8931_disable,
 };
 
 static bool act8931_readable_reg(struct device *dev, unsigned int reg)
@@ -224,16 +327,6 @@ struct act8931_wrule {
 #define ACT8931_APCH_CFG_TOTTIMO GENMASK(5, 4)
 #define ACT8931_APCH_CFG_PRETIMO GENMASK(3, 2)
 #define ACT8931_APCH_CFG_OVPSET	GENMASK(1, 0)
-
-/*
- * Voltage caps: the selectors the board's vendor kernel runs the outputs
- * at (ONYX BOOX Robinson Crusoe 2). DCDC1 0x3b is the vendor's raised
- * VCCIO while its Wi-Fi/BT module is powered; 0x3a otherwise.
- */
-#define ACT8931_CAP_DCDC1	0x3b
-#define ACT8931_CAP_DCDC2	0x1b
-#define ACT8931_CAP_DCDC3	0x1c
-#define ACT8931_CAP_LDO		0x37
 
 #define ACT8931_VSET_RULE(_reg, _cap)					\
 	{ .reg = (_reg), .keep = ACT8931_VSET_RESERVED,			\
@@ -441,17 +534,22 @@ static unsigned int act8931_live_sel(struct act8931 *chip,
 	return vset & ACT8931_VSEL_MASK;
 }
 
-static void act8931_report_rail(struct act8931 *chip, struct device_node *regs,
-				const struct act8931_rail *rail)
+/*
+ * Logs an output's registers and compares its selector with the board's.
+ * Returns the selector in effect, or a negative error; *board is the
+ * board's selector or a negative error.
+ */
+static int act8931_report_rail(struct act8931 *chip, struct device_node *regs,
+			       const struct act8931_rail *rail, int *board)
 {
 	unsigned int vset1, vset, ctrl, sel;
-	int board;
 	int ret;
 
+	*board = regs ? act8931_board_sel(chip, regs, rail) : -ENOENT;
 	ret = act8931_read_rail(chip, rail, &vset1, &vset, &ctrl);
 	if (ret) {
 		dev_warn(chip->dev, "%s: read failed: %d\n", rail->of_name, ret);
-		return;
+		return ret;
 	}
 	sel = act8931_live_sel(chip, rail, vset1, vset);
 
@@ -470,15 +568,54 @@ static void act8931_report_rail(struct act8931 *chip, struct device_node *regs,
 			 !!(ctrl & ACT8931_CTRL_ON), !!(ctrl & ACT8931_CTRL_OK),
 			 act8931_ctrl_enabled(ctrl) ? "on" : "off");
 
-	board = regs ? act8931_board_sel(chip, regs, rail) : -ENOENT;
-	if (board >= 0 && board != sel)
+	if (*board >= 0 && *board != sel)
 		dev_warn(chip->dev,
 			 "%s: selector 0x%02x (%u uV) differs from the board's 0x%02x (%u uV); left as it is\n",
-			 rail->of_name, sel, act8931_sel_to_uv(sel), board,
-			 act8931_sel_to_uv(board));
+			 rail->of_name, sel, act8931_sel_to_uv(sel), *board,
+			 act8931_sel_to_uv(*board));
+	return sel;
 }
 
-static int act8931_register_rail(struct act8931 *chip, int id)
+/*
+ * An output gets enable/disable ops only when the board describes it as
+ * always-on: until a consumer holds it, the regulator core would switch
+ * an output with a disable op off as unused 30 s after boot. And only
+ * when it runs at the board's voltage, within the cap: an enable switches
+ * on whatever voltage is set.
+ */
+static bool act8931_may_switch(struct act8931 *chip, struct device_node *regs,
+			       const struct act8931_rail *rail, int sel,
+			       int board)
+{
+	struct device_node *np;
+	bool always_on;
+
+	if (!rail->switchable || !regs)
+		return false;
+
+	np = of_get_child_by_name(regs, rail->of_name);
+	always_on = of_property_read_bool(np, "regulator-always-on");
+	of_node_put(np);
+	if (!always_on) {
+		dev_info(chip->dev, "%s: not always-on on this board: no switching\n",
+			 rail->of_name);
+		return false;
+	}
+	if (sel < 0 || board < 0) {
+		dev_warn(chip->dev, "%s: no selector or no board voltage: no switching\n",
+			 rail->of_name);
+		return false;
+	}
+	if (sel != board || sel > rail->cap) {
+		dev_warn(chip->dev, "%s: selector 0x%02x is not the board's 0x%02x (cap 0x%02x): no switching\n",
+			 rail->of_name, sel, board, rail->cap);
+		return false;
+	}
+	return true;
+}
+
+static int act8931_register_rail(struct act8931 *chip, int id,
+				 struct device_node *regs, int sel, int board)
 {
 	const struct act8931_rail *rail = &act8931_rails[id];
 	struct regulator_desc *desc = &chip->desc[id];
@@ -497,9 +634,22 @@ static int act8931_register_rail(struct act8931 *chip, int id)
 			 rail->vset1 : rail->vset;
 	desc->vsel_mask = ACT8931_VSEL_MASK;
 	desc->enable_reg = rail->ctrl;
-	/* no of_match, no supply_name: no DT constraints, no consumers */
 
-	/* no init_data and no of_node: the core gets empty constraints */
+	/*
+	 * A read-only output is registered without of_match, init_data or
+	 * of_node: the core gets empty constraints and, with no enable op,
+	 * treats it as always on. An output with ops takes its constraints
+	 * from its device tree node.
+	 */
+	if (act8931_may_switch(chip, regs, rail, sel, board)) {
+		desc->ops = &act8931_switch_ops;
+		desc->enable_time = ACT8931_SOFTSTART_US;
+	}
+	if (desc->ops != &act8931_ro_ops) {
+		desc->of_match = rail->of_name;
+		desc->regulators_node = "regulators";
+	}
+
 	config.dev = chip->dev;
 	config.regmap = chip->regmap;
 	config.driver_data = chip;
@@ -668,7 +818,7 @@ static int act8931_probe(struct i2c_client *client)
 	struct device_node *regs;
 	struct act8931 *chip;
 	unsigned int sys0, sys1, cfg, intr, status, state;
-	int i, ret;
+	int i, ret, sel, board;
 
 	if (!i2c_check_functionality(client->adapter,
 				     I2C_FUNC_SMBUS_READ_BYTE_DATA))
@@ -704,8 +854,8 @@ static int act8931_probe(struct i2c_client *client)
 
 	regs = of_get_child_by_name(dev->of_node, "regulators");
 	for (i = 0; i < ACT8931_NUM_RAILS; i++) {
-		act8931_report_rail(chip, regs, &act8931_rails[i]);
-		ret = act8931_register_rail(chip, i);
+		sel = act8931_report_rail(chip, regs, &act8931_rails[i], &board);
+		ret = act8931_register_rail(chip, i, regs, sel, board);
 		if (ret)
 			dev_warn(dev, "%s: not registered: %d\n",
 				 act8931_rails[i].of_name, ret);

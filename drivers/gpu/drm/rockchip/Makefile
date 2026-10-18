@@ -24,5 +24,6 @@ obj-$(CONFIG_DRM_ROCKCHIP) += rockchipdrm.o
 
 rk3026-ebc-y := rk3026_ebc.o rk3026_ebc_waveform.o
 rk3026-ebc-$(CONFIG_DRM_RK3026_EBC_MXCFB) += rk3026_ebc_mxcfb.o
+rk3026-ebc-$(CONFIG_DEBUG_FS) += rk3026_ebc_debugfs.o
 
 obj-$(CONFIG_DRM_RK3026_EBC) += rk3026-ebc.o

@@ -21,8 +21,13 @@
 #define RK3026_IDLE_REQ			0x1e00
 /* their acknowledges (bits 17-20) and idle states (bits 23-26) */
 #define RK3026_IDLE_ACK_HI		0x079e
-/* polls of SOC_STATUS0: tens of milliseconds at 24 MHz */
-#define RK3026_IDLE_POLLS		0x10000
+/*
+ * Polls of SOC_STATUS0 per wait. Each poll is an APB read of the GRF with
+ * pclk_cpu at 1-2 MHz and uncached fetches from the SRAM, several
+ * microseconds, so a wait that never sees its acknowledge ends after
+ * tens of milliseconds, with the DDR still refreshed from 24 MHz.
+ */
+#define RK3026_IDLE_POLLS		0x1000
 /* a few milliseconds at 24 MHz */
 #define RK3026_DELAY			0x4000
 

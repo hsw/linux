@@ -124,6 +124,7 @@ struct act8931_rail {
 	unsigned int ctrl;
 	unsigned int cap;	/* highest selector a write may set */
 	bool switchable;	/* may get enable/disable ops */
+	bool settable;		/* may get set_voltage ops (DCDC: VSET2) */
 };
 
 static const struct act8931_rail act8931_rails[ACT8931_NUM_RAILS] = {
@@ -135,7 +136,7 @@ static const struct act8931_rail act8931_rails[ACT8931_NUM_RAILS] = {
 			       ACT8931_CAP_DCDC2 },
 	[ACT8931_ID_DCDC3] = { "act8931-dcdc3", "DCDC_REG3", ACT8931_DCDC3_VSET1,
 			       ACT8931_DCDC3_VSET2, ACT8931_DCDC3_CTRL,
-			       ACT8931_CAP_DCDC3 },
+			       ACT8931_CAP_DCDC3, false, true },
 	[ACT8931_ID_LDO1] = { "act8931-ldo1", "LDO_REG1", 0,
 			      ACT8931_LDO1_VSET, ACT8931_LDO1_CTRL,
 			      ACT8931_CAP_LDO },
@@ -260,9 +261,42 @@ static int act8931_disable(struct regulator_dev *rdev)
 	return regmap_write(map, reg, ctrl & ~ACT8931_CTRL_ON);
 }
 
+/*
+ * The selector is checked against the cap here and again in the write
+ * rules; regulator_set_voltage_sel_regmap() keeps the reserved bits.
+ */
+static int act8931_set_voltage_sel(struct regulator_dev *rdev,
+				   unsigned int sel)
+{
+	if (sel > act8931_rails[rdev_get_id(rdev)].cap)
+		return -EPERM;
+	return regulator_set_voltage_sel_regmap(rdev, sel);
+}
+
+/*
+ * The datasheet gives no slew rate for a VSET change; a raise is given
+ * the soft-start time, a drop needs no wait before the load may rely on
+ * it.
+ */
+static int act8931_set_voltage_time_sel(struct regulator_dev *rdev,
+					unsigned int old_sel,
+					unsigned int new_sel)
+{
+	return new_sel > old_sel ? ACT8931_SOFTSTART_US : 0;
+}
+
 static const struct regulator_ops act8931_ro_ops = {
 	.list_voltage		= regulator_list_voltage_linear_range,
 	.get_voltage_sel	= regulator_get_voltage_sel_regmap,
+	.is_enabled		= act8931_is_enabled,
+};
+
+static const struct regulator_ops act8931_set_ops = {
+	.list_voltage		= regulator_list_voltage_linear_range,
+	.map_voltage		= regulator_map_voltage_linear_range,
+	.get_voltage_sel	= regulator_get_voltage_sel_regmap,
+	.set_voltage_sel	= act8931_set_voltage_sel,
+	.set_voltage_time_sel	= act8931_set_voltage_time_sel,
 	.is_enabled		= act8931_is_enabled,
 };
 
@@ -614,6 +648,39 @@ static bool act8931_may_switch(struct act8931 *chip, struct device_node *regs,
 	return true;
 }
 
+/*
+ * An output gets set_voltage ops only when the voltage it runs at lies in
+ * its node's range, within the cap: with minimum = maximum the regulator
+ * core would otherwise write the node's voltage at registration. Only
+ * VSET2 is set, so only with VSEL high.
+ */
+static bool act8931_may_set(struct act8931 *chip, struct device_node *regs,
+			    const struct act8931_rail *rail, int sel)
+{
+	struct device_node *np;
+	u32 min_uv = 0, max_uv = 0;
+	unsigned int uv;
+	bool range;
+
+	if (!rail->settable || !chip->vsel_high || !regs || sel < 0)
+		return false;
+
+	np = of_get_child_by_name(regs, rail->of_name);
+	if (!np)
+		return false;
+	range = !of_property_read_u32(np, "regulator-min-microvolt", &min_uv) &&
+		!of_property_read_u32(np, "regulator-max-microvolt", &max_uv);
+	of_node_put(np);
+
+	uv = act8931_sel_to_uv(sel);
+	if (!range || uv < min_uv || uv > max_uv || sel > rail->cap) {
+		dev_warn(chip->dev, "%s: selector 0x%02x (%u uV) is outside the board's range or the cap 0x%02x: no voltage setting\n",
+			 rail->of_name, sel, uv, rail->cap);
+		return false;
+	}
+	return true;
+}
+
 static int act8931_register_rail(struct act8931 *chip, int id,
 				 struct device_node *regs, int sel, int board)
 {
@@ -644,6 +711,8 @@ static int act8931_register_rail(struct act8931 *chip, int id,
 	if (act8931_may_switch(chip, regs, rail, sel, board)) {
 		desc->ops = &act8931_switch_ops;
 		desc->enable_time = ACT8931_SOFTSTART_US;
+	} else if (act8931_may_set(chip, regs, rail, sel)) {
+		desc->ops = &act8931_set_ops;
 	}
 	if (desc->ops != &act8931_ro_ops) {
 		desc->of_match = rail->of_name;

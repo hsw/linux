@@ -259,6 +259,19 @@
 		rockchip,grf = <&grf>;
 		#clock-cells = <1>;
 		#reset-cells = <1>;
+		/*
+		 * GPLL and the bus clocks as the vendor kernel runs them. The
+		 * clock driver sets the dividers below GPLL before it registers,
+		 * so raising GPLL lands every bus on these rates.
+		 */
+		assigned-clocks = <&cru PLL_GPLL>,
+				  <&cru ACLK_CPU>, <&cru HCLK_CPU>, <&cru PCLK_CPU>,
+				  <&cru ACLK_PERI>, <&cru HCLK_PERI>, <&cru PCLK_PERI>,
+				  <&cru HCLK_DISP_PRE>, <&cru ACLK_LCDC1_SRC>;
+		assigned-clock-rates = <768000000>,
+				       <192000000>, <96000000>, <48000000>,
+				       <192000000>, <96000000>, <48000000>,
+				       <256000000>, <256000000>;
 	};
 
 	grf: syscon@20008000 {

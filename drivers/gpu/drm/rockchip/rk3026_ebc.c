@@ -56,6 +56,9 @@
 
 #include "rk3026_ebc.h"
 
+#define CREATE_TRACE_POINTS
+#include "rk3026_ebc_trace.h"
+
 #define DRIVER_NAME		"rk3026-ebc"
 #define EBC_WAVEFORM_FW		"rockchip/rk3026-c67ml.rkf"
 /*
@@ -897,6 +900,11 @@ static int ebc_drive(struct rk3026_ebc *ebc, const u8 *lut, u32 frames,
 	ktime_t start = ktime_get();
 	int ret = 0;
 
+	/* A repair is the first waveform of an update that has repaired set. */
+	trace_rk3026_ebc_scan_start(mode, lut_mode, last->temp, frames,
+				    last->marker,
+				    last->repaired && !last->scans);
+
 	ebc->prev_unknown = true;
 	last->scans++;
 	last->lut_mode = lut_mode;
@@ -969,6 +977,7 @@ static int ebc_drive(struct rk3026_ebc *ebc, const u8 *lut, u32 frames,
 out:
 	last->driven = done;
 	last->scan_ms = ktime_ms_delta(ktime_get(), start);
+	trace_rk3026_ebc_scan_end(mode, frames, done, last->scan_ms, ret);
 	return ret;
 }
 
@@ -1027,6 +1036,7 @@ static int ebc_recover_panel(struct rk3026_ebc *ebc, int temp,
  */
 static int ebc_rails_on(struct rk3026_ebc *ebc)
 {
+	bool changed = false;
 	int ret;
 
 	lockdep_assert_held(&ebc->rails_lock);
@@ -1034,8 +1044,10 @@ static int ebc_rails_on(struct rk3026_ebc *ebc)
 		ret = regulator_enable(ebc->epd_supply);
 		if (ret) {
 			dev_err_ratelimited(ebc->dev, "failed to enable EPD rails: %d\n", ret);
+			trace_rk3026_ebc_rails(true, ebc->epd_on, ebc->vcom_on, ret);
 			return ret;
 		}
+		changed = true;
 		WRITE_ONCE(ebc->epd_on, true);
 		WRITE_ONCE(ebc->rails_on, true);
 		/* Off again after the delay even if nothing is driven. */
@@ -1045,6 +1057,7 @@ static int ebc_rails_on(struct rk3026_ebc *ebc)
 		ret = regulator_enable(ebc->vcom_supply);
 		if (ret) {
 			dev_err_ratelimited(ebc->dev, "failed to enable VCOM: %d\n", ret);
+			trace_rk3026_ebc_rails(true, ebc->epd_on, ebc->vcom_on, ret);
 			/*
 			 * No waveform without VCOM: take the high-voltage rails
 			 * down again. If that fails too, @epd_on stays set and
@@ -1054,9 +1067,12 @@ static int ebc_rails_on(struct rk3026_ebc *ebc)
 			return ret;
 		}
 		WRITE_ONCE(ebc->vcom_on, true);
+		changed = true;
 	}
 	/* dev_dbg only: a console line would itself queue a refresh. */
 	dev_dbg(ebc->dev, "rails on\n");
+	if (changed)
+		trace_rk3026_ebc_rails(true, ebc->epd_on, ebc->vcom_on, 0);
 	return 0;
 }
 
@@ -1085,12 +1101,15 @@ static int ebc_rails_off(struct rk3026_ebc *ebc)
 			goto err;
 		WRITE_ONCE(ebc->epd_on, false);
 	}
-	if (ebc->rails_on)
+	if (ebc->rails_on) {
 		dev_dbg(ebc->dev, "rails off\n");
+		trace_rk3026_ebc_rails(false, ebc->epd_on, ebc->vcom_on, 0);
+	}
 	WRITE_ONCE(ebc->rails_on, false);
 	return 0;
 
 err:
+	trace_rk3026_ebc_rails(false, ebc->epd_on, ebc->vcom_on, ret);
 	dev_err_ratelimited(ebc->dev,
 			    "failed to switch the panel rails off (%d), will retry\n",
 			    ret);
@@ -1111,6 +1130,19 @@ static void ebc_publish(struct rk3026_ebc *ebc, struct rk3026_ebc_last *last,
 	struct rk3026_ebc_stats *st = &ebc->stats;
 
 	last->ms = ktime_ms_delta(ktime_get(), start);
+
+	switch (last->outcome) {
+	case EBC_OUTCOME_SKIPPED:
+	case EBC_OUTCOME_CRTC_OFF:
+	case EBC_OUTCOME_NO_WAVEFORM:
+	case EBC_OUTCOME_NO_RAILS:
+	case EBC_OUTCOME_NO_LUT:
+		trace_rk3026_ebc_skip(last->asked_mode, last->marker,
+				      last->outcome);
+		break;
+	default:
+		break;
+	}
 
 	spin_lock(&ebc->queue_lock);
 	ebc->last = *last;
@@ -1488,6 +1520,9 @@ void rk3026_ebc_queue_update(struct rk3026_ebc *ebc, const struct drm_rect *clip
 		upd->source = source;
 		ebc->queue_tail++;
 	}
+	trace_rk3026_ebc_update_queue(source, mode, clip, marker, temp,
+				      temp_valid, used >= EBC_UPDATE_QUEUE_LEN,
+				      ebc->queue_tail - ebc->queue_head);
 
 	spin_unlock(&ebc->queue_lock);
 	wake_up(&ebc->update_wq);

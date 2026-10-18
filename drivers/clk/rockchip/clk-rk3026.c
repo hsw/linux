@@ -13,6 +13,7 @@
 #include <linux/clk-provider.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
+#include <linux/moduleparam.h>
 #include <linux/notifier.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
@@ -231,6 +232,30 @@ static const struct rockchip_cpuclk_reg_data rk3026_cpuclk_data = {
 	.div_core_mask[0]  = 0x1f,
 	.num_cores      = 1,
 	.mux_core_alt   = 1,
+	.mux_core_main  = 0,
+	.mux_core_shift = 7,
+	.mux_core_mask  = 0x1,
+};
+
+/*
+ * clk_rk3026.armclk_slow=1 on the command line switches armclk without the
+ * alternate parent: the "alternate" mux value is APLL itself, so the core
+ * stays on APLL and rides it through the PLL's slow mode (24 MHz) while it
+ * relocks, as the vendor kernel switches it; the pre_muxs dividers suit every
+ * rate of the table for that. The default parks the core on gpll_armclk
+ * instead and muxes it back onto the relocked APLL. A test aid: it tells the
+ * two paths apart on hardware.
+ */
+static bool armclk_slow;
+module_param(armclk_slow, bool, 0444);
+MODULE_PARM_DESC(armclk_slow, "switch armclk through APLL slow mode, without the GPLL alternate parent");
+
+static const struct rockchip_cpuclk_reg_data rk3026_cpuclk_slow_data = {
+	.core_reg[0]    = RK2928_CLKSEL_CON(0),
+	.div_core_shift[0] = 0,
+	.div_core_mask[0]  = 0x1f,
+	.num_cores      = 1,
+	.mux_core_alt   = 0,
 	.mux_core_main  = 0,
 	.mux_core_shift = 7,
 	.mux_core_mask  = 0x1,
@@ -953,10 +978,13 @@ static void __init rk3026_clk_init(struct device_node *np)
 	rockchip_clk_protect_critical(rk3026_critical_clocks,
 				      ARRAY_SIZE(rk3026_critical_clocks));
 
+	if (armclk_slow)
+		pr_info("%s: armclk switches through APLL slow mode\n", __func__);
 	rockchip_clk_register_armclk(ctx, ARMCLK, "armclk",
 			mux_armclk_p, ARRAY_SIZE(mux_armclk_p),
-			&rk3026_cpuclk_data, rk3026_cpuclk_rates,
-			ARRAY_SIZE(rk3026_cpuclk_rates));
+			armclk_slow ? &rk3026_cpuclk_slow_data :
+				      &rk3026_cpuclk_data,
+			rk3026_cpuclk_rates, ARRAY_SIZE(rk3026_cpuclk_rates));
 
 	rockchip_register_softrst(np, 9, reg_base + RK2928_SOFTRST_CON(0),
 				  ROCKCHIP_SOFTRST_HIWORD_MASK);

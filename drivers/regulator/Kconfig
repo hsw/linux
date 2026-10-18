@@ -107,15 +107,16 @@ config REGULATOR_ACT8865
 	  regulator via I2C bus.
 
 config REGULATOR_ACT8931
-	tristate "Active-semi ACT8931 read-only regulator and charger state"
+	tristate "Active-semi ACT8931 regulators and charger state"
 	depends on I2C
 	depends on POWER_SUPPLY
 	select REGMAP
 	help
 	  This driver reports the outputs and the charger state of an
-	  Active-semi ACT8931 PMU and never writes to it: every output keeps
-	  the setting the boot firmware left. It is meant for boards that
-	  describe the outputs as fixed regulators and want to read them back.
+	  Active-semi ACT8931 PMU. Every register write it makes is checked
+	  against compiled-in limits first: no output voltage above the
+	  board vendor's value, no relaxed battery protection, no reserved or
+	  undocumented register.
 
 config REGULATOR_ACT8945A
 	tristate "Active-semi ACT8945A voltage regulator"

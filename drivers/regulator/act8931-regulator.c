@@ -1,27 +1,35 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Active-semi ACT8931 PMU: read-only regulator and charger state.
+ * Active-semi ACT8931 PMU: regulators and charger state.
  *
- * The driver reports what the PMU holds and never writes it. Every output
- * keeps the setting the boot firmware left; consumers on such a board use
- * fixed regulators, so nothing depends on this driver.
+ * Every register write passes one compiled-in rule per register before it
+ * reaches the bus, whatever asked for it (a regulator op, the regulator
+ * core, debugfs). The rules only keep the PMU from damaging what it feeds;
+ * they do not keep a board running:
+ *  - only the registers of the datasheet map are written; the undocumented
+ *    and reserved addresses (0x02, 0x03, 0x0b, 0x70, the suspend set-points
+ *    of the ACT8865 family) and the read-only APCH state are refused;
+ *  - bits the datasheet calls reserved must keep the value read back from
+ *    the PMU just before the write;
+ *  - no output voltage selector, VSET1 or VSET2, may go above the value
+ *    the board's vendor firmware runs it at (the caps below); any lower
+ *    value is allowed;
+ *  - the battery protections may not be relaxed: the system voltage
+ *    threshold stays at or above 3.0 V, the charge safety timers at or
+ *    below 80 min and 5 h (never off), the input over-voltage threshold
+ *    at 6.6 V.
+ * The caps are not taken from the device tree, so a wrong tree cannot
+ * raise them.
  *
- * Writes cannot happen by construction:
- *  - the regmap has no bus: its read callback is the one SMBus byte read,
- *    its write callback refuses without touching the bus, and
- *    writeable_reg() rejects every register before that callback is reached;
- *  - the regulator ops are list_voltage, get_voltage_sel and is_enabled
- *    only (enabled = ON and power-good both set: the ON bit is
- *    edge-triggered), and the regulators are registered without DT
- *    constraints, so the regulator core has no operation it could call
- *    to change an output (with no enable op it treats every output as
- *    always on and never disables it as unused);
- *  - the charger is reported from status reads; there are no PM ops, no
- *    shutdown hook and no power-off handler.
+ * The ON bit of an output is edge-triggered: the output follows the last
+ * 0->1 or 1->0 edge written to it, so ON alone is not the output state.
+ * An output counts as enabled when ON and OK (power good) are both set.
  *
  * APCH 0x78 bits 7:4 are interrupt status bits that clear on read. The
- * register is marked precious, so regmap debugfs leaves it alone, and only
- * act8931_charger_read() reads it.
+ * register is marked precious, so regmap debugfs leaves it alone, and the
+ * write rules never read it. act8931_charger_read() does, at probe, every
+ * 5 s and on every read of a charger property, and each of these reads
+ * clears the bits.
  */
 
 #include <linux/bitfield.h>
@@ -118,6 +126,7 @@ static const struct act8931_rail act8931_rails[ACT8931_NUM_RAILS] = {
 
 struct act8931 {
 	struct device *dev;
+	struct i2c_client *client;
 	struct regmap *regmap;
 	bool vsel_high;
 	struct regulator_desc desc[ACT8931_NUM_RAILS];
@@ -188,9 +197,96 @@ static bool act8931_readable_reg(struct device *dev, unsigned int reg)
 	}
 }
 
+/*
+ * Write rules. @keep: bits that must equal the register's current value
+ * (reserved bits). @lim: fields whose masked value must lie in
+ * [min, max]; an entry with a zero mask is unused. Bits the datasheet
+ * calls read-only (OK, nSYSSTAT, the APCH status data) are ignored by
+ * the PMU on a write and are not checked.
+ */
+struct act8931_limit {
+	u8 mask;
+	u8 min;
+	u8 max;
+};
+
+struct act8931_wrule {
+	u8 reg;
+	u8 keep;
+	struct act8931_limit lim[3];
+};
+
+#define ACT8931_VSET_RESERVED	GENMASK(7, 6)
+#define ACT8931_SYS0_SYSLEV	GENMASK(3, 0)
+#define ACT8931_SYS1_RESERVED	(GENMASK(7, 6) | BIT(4))
+#define ACT8931_DCDC3_CTRL_RESERVED BIT(6)
+#define ACT8931_APCH_CFG_RESERVED BIT(6)
+#define ACT8931_APCH_CFG_TOTTIMO GENMASK(5, 4)
+#define ACT8931_APCH_CFG_PRETIMO GENMASK(3, 2)
+#define ACT8931_APCH_CFG_OVPSET	GENMASK(1, 0)
+
+/*
+ * Voltage caps: the selectors the board's vendor kernel runs the outputs
+ * at (ONYX BOOX Robinson Crusoe 2). DCDC1 0x3b is the vendor's raised
+ * VCCIO while its Wi-Fi/BT module is powered; 0x3a otherwise.
+ */
+#define ACT8931_CAP_DCDC1	0x3b
+#define ACT8931_CAP_DCDC2	0x1b
+#define ACT8931_CAP_DCDC3	0x1c
+#define ACT8931_CAP_LDO		0x37
+
+#define ACT8931_VSET_RULE(_reg, _cap)					\
+	{ .reg = (_reg), .keep = ACT8931_VSET_RESERVED,			\
+	  .lim = { { ACT8931_VSEL_MASK, 0, (_cap) } } }
+#define ACT8931_FREE_RULE(_reg)	{ .reg = (_reg) }
+
+static const struct act8931_wrule act8931_wrules[] = {
+	/* SYSLEV: 2.3 V + 100 mV per step; not below 3.0 V */
+	{ .reg = ACT8931_SYS0,
+	  .lim = { { ACT8931_SYS0_SYSLEV, 0x7, 0xf } } },
+	{ .reg = ACT8931_SYS1, .keep = ACT8931_SYS1_RESERVED },
+	ACT8931_VSET_RULE(ACT8931_DCDC1_VSET1, ACT8931_CAP_DCDC1),
+	ACT8931_VSET_RULE(ACT8931_DCDC1_VSET2, ACT8931_CAP_DCDC1),
+	ACT8931_FREE_RULE(ACT8931_DCDC1_CTRL),
+	ACT8931_VSET_RULE(ACT8931_DCDC2_VSET1, ACT8931_CAP_DCDC2),
+	ACT8931_VSET_RULE(ACT8931_DCDC2_VSET2, ACT8931_CAP_DCDC2),
+	ACT8931_FREE_RULE(ACT8931_DCDC2_CTRL),
+	ACT8931_VSET_RULE(ACT8931_DCDC3_VSET1, ACT8931_CAP_DCDC3),
+	ACT8931_VSET_RULE(ACT8931_DCDC3_VSET2, ACT8931_CAP_DCDC3),
+	{ .reg = ACT8931_DCDC3_CTRL, .keep = ACT8931_DCDC3_CTRL_RESERVED },
+	ACT8931_VSET_RULE(ACT8931_LDO1_VSET, ACT8931_CAP_LDO),
+	ACT8931_FREE_RULE(ACT8931_LDO1_CTRL),
+	ACT8931_VSET_RULE(ACT8931_LDO2_VSET, ACT8931_CAP_LDO),
+	ACT8931_FREE_RULE(ACT8931_LDO2_CTRL),
+	ACT8931_VSET_RULE(ACT8931_LDO3_VSET, ACT8931_CAP_LDO),
+	ACT8931_FREE_RULE(ACT8931_LDO3_CTRL),
+	ACT8931_VSET_RULE(ACT8931_LDO4_VSET, ACT8931_CAP_LDO),
+	ACT8931_FREE_RULE(ACT8931_LDO4_CTRL),
+	/*
+	 * Charge safety timers no longer than 80 min precondition and 5 h
+	 * total (code 3 = no time-out), input OVP at 6.6 V; SUSCHG is free.
+	 */
+	{ .reg = ACT8931_APCH_CFG, .keep = ACT8931_APCH_CFG_RESERVED,
+	  .lim = { { ACT8931_APCH_CFG_TOTTIMO, 0, FIELD_PREP_CONST(ACT8931_APCH_CFG_TOTTIMO, 2) },
+		   { ACT8931_APCH_CFG_PRETIMO, 0, FIELD_PREP_CONST(ACT8931_APCH_CFG_PRETIMO, 2) },
+		   { ACT8931_APCH_CFG_OVPSET, 0, 0 } } },
+	ACT8931_FREE_RULE(ACT8931_APCH_STATUS),
+	ACT8931_FREE_RULE(ACT8931_APCH_INTR),
+};
+
+static const struct act8931_wrule *act8931_find_wrule(unsigned int reg)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(act8931_wrules); i++)
+		if (act8931_wrules[i].reg == reg)
+			return &act8931_wrules[i];
+	return NULL;
+}
+
 static bool act8931_writeable_reg(struct device *dev, unsigned int reg)
 {
-	return false;
+	return act8931_find_wrule(reg);
 }
 
 static bool act8931_precious_reg(struct device *dev, unsigned int reg)
@@ -205,10 +301,10 @@ static bool act8931_volatile_reg(struct device *dev, unsigned int reg)
 
 static int act8931_reg_read(void *context, unsigned int reg, unsigned int *val)
 {
-	struct i2c_client *client = context;
+	struct act8931 *chip = context;
 	int ret;
 
-	ret = i2c_smbus_read_byte_data(client, reg);
+	ret = i2c_smbus_read_byte_data(chip->client, reg);
 	if (ret < 0)
 		return ret;
 
@@ -216,14 +312,46 @@ static int act8931_reg_read(void *context, unsigned int reg, unsigned int *val)
 	return 0;
 }
 
+/* The one path to the bus for a write: the rule of the register first */
 static int act8931_reg_write(void *context, unsigned int reg, unsigned int val)
 {
-	struct i2c_client *client = context;
+	struct act8931 *chip = context;
+	const struct act8931_wrule *rule = act8931_find_wrule(reg);
+	const char *why = NULL;
+	int i, cur;
 
-	dev_WARN_ONCE(&client->dev, 1,
-		      "write of 0x%02x to 0x%02x refused: the driver is read-only\n",
-		      val, reg);
-	return -EPERM;
+	if (!rule) {
+		why = "not a writable register";
+	} else if (val > 0xff) {
+		why = "not a byte";
+	} else {
+		for (i = 0; i < ARRAY_SIZE(rule->lim); i++) {
+			const struct act8931_limit *lim = &rule->lim[i];
+
+			if (lim->mask && ((val & lim->mask) < lim->min ||
+					  (val & lim->mask) > lim->max)) {
+				why = "outside the limit";
+				break;
+			}
+		}
+	}
+
+	if (!why && rule->keep) {
+		cur = i2c_smbus_read_byte_data(chip->client, reg);
+		if (cur < 0)
+			return cur;
+		if ((cur ^ val) & rule->keep)
+			why = "changes reserved bits";
+	}
+
+	if (why) {
+		dev_err_ratelimited(chip->dev,
+				    "write of 0x%02x to 0x%02x refused: %s\n",
+				    val, reg, why);
+		return -EPERM;
+	}
+
+	return i2c_smbus_write_byte_data(chip->client, reg, val);
 }
 
 static const struct regmap_config act8931_regmap_config = {
@@ -550,11 +678,12 @@ static int act8931_probe(struct i2c_client *client)
 	if (!chip)
 		return -ENOMEM;
 	chip->dev = dev;
+	chip->client = client;
 	chip->vsel_high = of_property_read_bool(dev->of_node,
 						"active-semi,vsel-high");
 	i2c_set_clientdata(client, chip);
 
-	chip->regmap = devm_regmap_init(dev, NULL, client,
+	chip->regmap = devm_regmap_init(dev, NULL, chip,
 					&act8931_regmap_config);
 	if (IS_ERR(chip->regmap))
 		return dev_err_probe(dev, PTR_ERR(chip->regmap),
@@ -570,7 +699,7 @@ static int act8931_probe(struct i2c_client *client)
 	if (ret)
 		return dev_err_probe(dev, ret, "no answer at 0x%02x\n",
 				     client->addr);
-	dev_info(dev, "read-only: SYS 0x%02x 0x%02x, APCH_CFG 0x%02x, APCH_INTR 0x%02x\n",
+	dev_info(dev, "SYS 0x%02x 0x%02x, APCH_CFG 0x%02x, APCH_INTR 0x%02x\n",
 		 sys0, sys1, cfg, intr);
 
 	regs = of_get_child_by_name(dev->of_node, "regulators");
@@ -636,6 +765,6 @@ static struct i2c_driver act8931_driver = {
 };
 module_i2c_driver(act8931_driver);
 
-MODULE_DESCRIPTION("Active-semi ACT8931 read-only regulator and charger state");
+MODULE_DESCRIPTION("Active-semi ACT8931 regulators and charger state");
 MODULE_AUTHOR("Sergei Khomenkov <shomenkow@gmail.com>");
 MODULE_LICENSE("GPL");

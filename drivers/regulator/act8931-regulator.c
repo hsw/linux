@@ -29,17 +29,21 @@
 #include <linux/bitfield.h>
 #include <linux/bitops.h>
 #include <linux/bits.h>
+#include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/devm-helpers.h>
 #include <linux/i2c.h>
 #include <linux/linear_range.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/power_supply.h>
 #include <linux/regmap.h>
 #include <linux/regulator/driver.h>
 #include <linux/regulator/machine.h>
 #include <linux/regulator/of_regulator.h>
+#include <linux/seq_file.h>
+#include <linux/uaccess.h>
 #include <linux/workqueue.h>
 
 #include "act8931-rc2-guard.h"	/* LOCAL: RC2 stock limits */
@@ -167,6 +171,9 @@ struct act8931 {
 	struct delayed_work poll;
 	unsigned int last_status;
 	unsigned int last_state;
+	/* LOCAL (RC2 stack): debugfs act8931-reg */
+	struct mutex dbg_lock;
+	char dbg_result[40];
 };
 
 /* ACT8931 output voltage table: three linear ranges of the 6-bit selector */
@@ -772,6 +779,145 @@ static int act8931_charger_init(struct act8931 *chip)
 	return 0;
 }
 
+/*
+ * LOCAL (RC2 stack), bring-up debugfs files, the interface of the RC2
+ * book tools (rc2-dvfs-sweep, rc2-cpufreq-test.sh, the checklists):
+ *  - act8931 (0444): every output's VSET registers, live selector and
+ *    voltage, CTRL with ON, OK and enabled (ON && OK), then the charger
+ *    status;
+ *  - act8931-reg (0600): write "REG" (hex) to read a register, "REG VAL"
+ *    to write one through the regmap, so through every write rule of the
+ *    driver and the RC2 stock limits; reading the file returns the result
+ *    of the last command. A write is logged.
+ */
+static int act8931_rails_show(struct seq_file *s, void *unused)
+{
+	struct act8931 *chip = s->private;
+	unsigned int vset1, vset, ctrl, sel, uv, status, state;
+	int i;
+
+	seq_printf(s, "VSEL %s\n", chip->vsel_high ? "high" : "low");
+	seq_puts(s, "rail       vset1 vset  sel   uV       ctrl ON OK enabled\n");
+	for (i = 0; i < ACT8931_NUM_RAILS; i++) {
+		const struct act8931_rail *rail = &act8931_rails[i];
+
+		vset1 = 0;
+		if ((rail->vset1 &&
+		     regmap_read(chip->regmap, rail->vset1, &vset1)) ||
+		    regmap_read(chip->regmap, rail->vset, &vset) ||
+		    regmap_read(chip->regmap, rail->ctrl, &ctrl)) {
+			seq_printf(s, "%-10s read error\n", rail->of_name);
+			continue;
+		}
+		sel = (rail->vset1 && !chip->vsel_high ? vset1 : vset) &
+		      ACT8931_VSEL_MASK;
+		linear_range_get_value_array(act8931_voltage_ranges,
+					     ARRAY_SIZE(act8931_voltage_ranges),
+					     sel, &uv);
+		if (rail->vset1)
+			seq_printf(s, "%-10s 0x%02x  ", rail->of_name, vset1);
+		else
+			seq_printf(s, "%-10s -     ", rail->of_name);
+		seq_printf(s, "0x%02x  0x%02x  %-8u 0x%02x %d  %d  %d\n", vset,
+			   sel, uv, ctrl, !!(ctrl & ACT8931_CTRL_ON),
+			   !!(ctrl & ACT8931_CTRL_OK),
+			   act8931_ctrl_enabled(ctrl));
+	}
+	if (!act8931_charger_read(chip, &status, &state))
+		seq_printf(s, "charger: status 0x%02x (INDAT %d CHGDAT %d), state 0x%02x (CSTATE %lu)\n",
+			   status, !!(status & ACT8931_STATUS_INDAT),
+			   !!(status & ACT8931_STATUS_CHGDAT), state,
+			   FIELD_GET(ACT8931_STATE_CSTATE, state));
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(act8931_rails);
+
+static ssize_t act8931_reg_dbg_write(struct file *file,
+				     const char __user *ubuf, size_t len,
+				     loff_t *ppos)
+{
+	struct act8931 *chip = file->private_data;
+	unsigned int reg, val;
+	char buf[32];
+	int n, ret;
+
+	if (len >= sizeof(buf))
+		return -EINVAL;
+	if (copy_from_user(buf, ubuf, len))
+		return -EFAULT;
+	buf[len] = '\0';
+
+	n = sscanf(buf, "%x %x", &reg, &val);
+	if (n < 1)
+		return -EINVAL;
+
+	mutex_lock(&chip->dbg_lock);
+	if (n == 1) {
+		ret = regmap_read(chip->regmap, reg, &val);
+		if (ret)
+			snprintf(chip->dbg_result, sizeof(chip->dbg_result),
+				 "0x%02x: read error %d\n", reg, ret);
+		else
+			snprintf(chip->dbg_result, sizeof(chip->dbg_result),
+				 "0x%02x = 0x%02x\n", reg, val);
+	} else {
+		ret = regmap_write(chip->regmap, reg, val);
+		snprintf(chip->dbg_result, sizeof(chip->dbg_result),
+			 "0x%02x <- 0x%02x: %s %d\n", reg, val,
+			 ret ? "error" : "ok", ret);
+		dev_info(chip->dev, "debugfs write 0x%02x <- 0x%02x: %d\n",
+			 reg, val, ret);
+	}
+	mutex_unlock(&chip->dbg_lock);
+
+	return ret ? ret : len;
+}
+
+static ssize_t act8931_reg_dbg_read(struct file *file, char __user *ubuf,
+				    size_t len, loff_t *ppos)
+{
+	struct act8931 *chip = file->private_data;
+	ssize_t ret;
+
+	mutex_lock(&chip->dbg_lock);
+	ret = simple_read_from_buffer(ubuf, len, ppos, chip->dbg_result,
+				      strlen(chip->dbg_result));
+	mutex_unlock(&chip->dbg_lock);
+	return ret;
+}
+
+static const struct file_operations act8931_reg_dbg_fops = {
+	.owner	= THIS_MODULE,
+	.open	= simple_open,
+	.read	= act8931_reg_dbg_read,
+	.write	= act8931_reg_dbg_write,
+	.llseek	= default_llseek,
+};
+
+static void act8931_debugfs_remove(void *dentry)
+{
+	debugfs_remove(dentry);
+}
+
+static int act8931_debugfs_init(struct act8931 *chip)
+{
+	int ret;
+
+	ret = devm_mutex_init(chip->dev, &chip->dbg_lock);
+	if (ret)
+		return ret;
+	ret = devm_add_action_or_reset(chip->dev, act8931_debugfs_remove,
+				       debugfs_create_file("act8931", 0444,
+							   NULL, chip,
+							   &act8931_rails_fops));
+	if (ret)
+		return ret;
+	return devm_add_action_or_reset(chip->dev, act8931_debugfs_remove,
+					debugfs_create_file("act8931-reg",
+							    0600, NULL, chip,
+							    &act8931_reg_dbg_fops));
+}
+
 static int act8931_probe(struct i2c_client *client)
 {
 	struct device *dev = &client->dev;
@@ -832,7 +978,7 @@ static int act8931_probe(struct i2c_client *client)
 		if (ret)
 			return ret;
 	}
-	return 0;
+	return act8931_debugfs_init(chip);	/* LOCAL */
 }
 
 static const struct of_device_id act8931_of_match[] = {

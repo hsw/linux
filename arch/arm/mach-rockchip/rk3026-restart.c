@@ -14,11 +14,13 @@
  * resets with the buses idle, and last the MCORE, CORE0, CORE1 and L2C
  * resets in SOFTRST_CON0. The GPIO banks, the GRF, the internal SRAM and
  * the DDR controller keep their state, and CPU0 restarts in the BootROM,
- * which loads the loader as on a cold start. Do the same, with the
- * module resets limited to the bus masters: the SD controller in
- * particular has no reset of its own in the BootROM or the loader, and
- * one left in the middle of a transfer, or with a clock tree the next
- * stage does not expect, keeps the next kernel from finding the card.
+ * which loads the loader as on a cold start. Do the same, with the PLLs
+ * also powered up (the vendor never powers a PLL down, the clock
+ * framework does) and the module resets limited to the bus masters: the
+ * SD controller in particular has no reset of its own in the BootROM or
+ * the loader, and one left in the middle of a transfer, or with a clock
+ * tree the next stage does not expect, keeps the next kernel from
+ * finding the card.
  *
  * With the PLLs in slow mode DDR cannot be used, so the last steps run
  * from the internal SRAM. They are entered through soft_restart(), which

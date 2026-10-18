@@ -9,6 +9,7 @@
  */
 #include <linux/linkage.h>
 
+#define RK3026_CRU_PLL_CON(x)		((x) * 4)
 #define RK3026_CRU_MODE_CON		0x40
 #define RK3026_CRU_CLKSEL_CON(x)	(0x44 + (x) * 4)
 #define RK3026_CRU_CLKGATE_CON(x)	(0xd0 + (x) * 4)
@@ -60,10 +61,14 @@ rk3026_restart_sram:
 	bne	1b
 
 	/*
-	 * The clock selects of the CPU and peripheral buses and of the SD,
-	 * SDIO and eMMC clocks back to their reset values, then every clock
-	 * gate open: what a cold start hands the BootROM, and the clocks the
-	 * module resets below need to take effect.
+	 * Every PLL powered (PLLCON1 PWRDOWN clear; the clock framework
+	 * powers a PLL down when its last consumer goes, and a powered-down
+	 * PLL passes no clock in slow mode either), the clock selects of the
+	 * CPU and peripheral buses and of the SD, SDIO and eMMC clocks back
+	 * to their reset values, then every clock gate open: what a cold
+	 * start hands the BootROM, and the clocks the module resets below
+	 * need to take effect. The PLLs are in slow mode already, so powering
+	 * one up changes no rate.
 	 */
 	adr	r5, .Lwrites
 	adr	r6, .Lwrites_end
@@ -145,6 +150,10 @@ rk3026_restart_sram:
 	.align	2
 	/* { CRU offset, value } */
 .Lwrites:
+	.word	RK3026_CRU_PLL_CON(1), 0x20000000	/* APLL powered */
+	.word	RK3026_CRU_PLL_CON(5), 0x20000000	/* DPLL powered */
+	.word	RK3026_CRU_PLL_CON(9), 0x20000000	/* CPLL powered */
+	.word	RK3026_CRU_PLL_CON(13), 0x20000000	/* GPLL powered */
 	.word	RK3026_CRU_CLKSEL_CON(0), 0xffff0200	/* core, aclk_cpu */
 	.word	RK3026_CRU_CLKSEL_CON(1), 0xffff3113	/* hclk/pclk_cpu */
 	.word	RK3026_CRU_CLKSEL_CON(10), 0xffff2100	/* peripheral bus */

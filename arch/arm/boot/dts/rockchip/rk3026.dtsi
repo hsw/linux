@@ -619,6 +619,8 @@
 		clocks = <&cru HCLK_SDMMC>, <&cru SCLK_SDMMC>;
 		clock-names = "biu", "ciu";
 		fifo-depth = <0x100>;
+		resets = <&cru SRST_MMC0>;
+		reset-names = "reset";
 		pinctrl-names = "default";
 		pinctrl-0 = <&sdmmc_clk &sdmmc_cmd &sdmmc_cd &sdmmc_bus4>;
 		status = "disabled";
@@ -631,6 +633,8 @@
 		clocks = <&cru HCLK_SDIO>, <&cru SCLK_SDIO>;
 		clock-names = "biu", "ciu";
 		fifo-depth = <0x100>;
+		resets = <&cru SRST_SDIO>;
+		reset-names = "reset";
 		pinctrl-names = "default";
 		pinctrl-0 = <&sdio_clk &sdio_cmd &sdio_bus4>;
 		status = "disabled";
@@ -643,6 +647,8 @@
 		clocks = <&cru HCLK_EMMC>, <&cru SCLK_EMMC>;
 		clock-names = "biu", "ciu";
 		fifo-depth = <0x100>;
+		resets = <&cru SRST_EMMC>;
+		reset-names = "reset";
 		pinctrl-names = "default";
 		pinctrl-0 = <&emmc_clk &emmc_cmd &emmc_bus8>;
 		status = "disabled";

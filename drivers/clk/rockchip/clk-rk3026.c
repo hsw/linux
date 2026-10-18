@@ -12,6 +12,7 @@
 
 #include <linux/clk-provider.h>
 #include <linux/io.h>
+#include <linux/iopoll.h>
 #include <linux/notifier.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
@@ -21,6 +22,11 @@
 #include "clk.h"
 
 #define RK3026_GRF_SOC_STATUS0	0x14c
+
+#define RK3026_PLLCON1_LOCK	BIT(10)
+#define RK3026_PLLCON1_PWRDOWN	BIT(13)
+#define RK3026_PLL_MODE_MASK	0x3
+#define RK3026_PLL_MODE_NORM	0x1
 
 enum rk3026_plls {
 	apll, dpll, cpll, gpll,
@@ -745,6 +751,53 @@ static struct notifier_block rk3026_restart_handler = {
 	.priority = 128,
 };
 
+/*
+ * Power up any PLL the previous stage left powered down.
+ *
+ * rockchip_rk3036_pll_disable() sets PLLCON1 PWRDOWN when the last
+ * consumer of a PLL goes, and leaves its mode mux where it is. On the
+ * ONYX BOOX Robinson Crusoe 2 only the EBC uses CPLL, so unloading the
+ * EBC driver powers it down. Neither the core reset restart, the BootROM
+ * nor the loader touch CPLL's power-down bit, so the next kernel can find
+ * CPLL in slow mode (put there by the restart) and powered down. The
+ * clock framework then takes "cpll" for xin24m passed through, but a
+ * powered-down PLL in slow mode does not pass xin24m on the RK3026: the
+ * SD controller, moved onto "cpll" for its 400 kHz, got no clock. The
+ * vendor kernel never sets this bit (its PLL off is slow mode plus
+ * bypass), and every stage before Linux expects all four PLLs powered,
+ * as they are after a cold start.
+ *
+ * Do it before the PLLs are registered, so the clock framework reads the
+ * state it will keep. A PLL that is also in normal mode feeds its
+ * consumers from here on, so wait for it to lock.
+ */
+static void __init rk3026_clk_power_up_plls(void __iomem *reg_base)
+{
+	static const char *const names[] = { "apll", "dpll", "cpll", "gpll" };
+	void __iomem *con1;
+	u32 mode, val;
+	int i;
+
+	mode = readl_relaxed(reg_base + RK2928_MODE_CON);
+	for (i = 0; i < ARRAY_SIZE(names); i++) {
+		con1 = reg_base + RK2928_PLL_CON(4 * i + 1);
+		if (!(readl_relaxed(con1) & RK3026_PLLCON1_PWRDOWN))
+			continue;
+
+		pr_info("%s: %s was powered down, powering it up\n",
+			__func__, names[i]);
+		writel_relaxed(HIWORD_UPDATE(0, RK3026_PLLCON1_PWRDOWN, 0), con1);
+
+		if (((mode >> (4 * i)) & RK3026_PLL_MODE_MASK) !=
+		    RK3026_PLL_MODE_NORM)
+			continue;
+		if (readl_relaxed_poll_timeout_atomic(con1, val,
+						      val & RK3026_PLLCON1_LOCK,
+						      1, 10000))
+			pr_warn("%s: %s did not lock\n", __func__, names[i]);
+	}
+}
+
 static void __init rk3026_clk_init(struct device_node *np)
 {
 	struct rockchip_clk_provider *ctx;
@@ -756,6 +809,8 @@ static void __init rk3026_clk_init(struct device_node *np)
 		pr_err("%s: could not map cru region\n", __func__);
 		return;
 	}
+
+	rk3026_clk_power_up_plls(reg_base);
 
 	/*
 	 * Make uart_pll_clk a child of gpll, as all other sources are

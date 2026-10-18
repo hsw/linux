@@ -16,6 +16,8 @@
 
 #define RK3026_GRF_SOC_CON2		0x148
 #define RK3026_GRF_SOC_STATUS0		0x14c
+#define RK3026_GRF_OS_REG6		0x1e0
+#define RK3026_GRF_OS_REG7		0x1e4
 
 /* idle requests of the PERI, GPU, VIDEO and VIO buses: SOC_CON2 bits 9-12 */
 #define RK3026_IDLE_REQ			0x1e00
@@ -28,6 +30,14 @@
  * tens of milliseconds, with the DDR still refreshed from 24 MHz.
  */
 #define RK3026_IDLE_POLLS		0x1000
+/*
+ * The polls left when each wait ended go to the low half of OS_REG6
+ * (acknowledge) and OS_REG7 (release), 0 meaning it timed out, under this
+ * tag in the high half. Nothing else uses these two scratch registers and
+ * the GRF keeps them through the core reset, so the next boot can read
+ * how the buses took the idle request.
+ */
+#define RK3026_IDLE_TRACE		0x1d1e
 /* a few milliseconds at 24 MHz */
 #define RK3026_DELAY			0x4000
 
@@ -70,6 +80,8 @@ rk3026_restart_sram:
 	dsb
 	movw	r7, #0
 	movt	r7, #RK3026_IDLE_ACK_HI
+	movw	r8, #0
+	movt	r8, #RK3026_IDLE_TRACE
 	mov	r3, #RK3026_IDLE_POLLS
 3:	ldr	r2, [r4, #RK3026_GRF_SOC_STATUS0]
 	and	r2, r2, r7
@@ -78,7 +90,9 @@ rk3026_restart_sram:
 	subs	r3, r3, #1
 	bne	3b
 	/* no acknowledge in time: reset the masters all the same */
-4:	adr	r5, .Lresets
+4:	orr	r2, r3, r8
+	str	r2, [r4, #RK3026_GRF_OS_REG6]
+	adr	r5, .Lresets
 	adr	r6, .Lresets_end
 5:	ldmia	r5!, {r2, r3}
 	orr	r3, r3, r3, lsl #16
@@ -119,7 +133,9 @@ rk3026_restart_sram:
 	 * GRF, the SRAM and the DDR controller keep their state, and CPU0
 	 * restarts at address 0 in the BootROM.
 	 */
-9:	movw	r2, #0xffff
+9:	orr	r2, r3, r8
+	str	r2, [r4, #RK3026_GRF_OS_REG7]
+	movw	r2, #0xffff
 	movt	r2, #0x801c
 	str	r2, [r1, #RK3026_CRU_SOFTRST_CON(0)]
 	dsb

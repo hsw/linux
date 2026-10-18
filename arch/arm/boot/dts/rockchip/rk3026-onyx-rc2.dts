@@ -16,10 +16,11 @@
  * Deliberately left out until each part is checked on the board:
  *  - the eMMC (0x1021c000) and the NAND controller (0x10500000): the NFC pads
  *    are the eMMC data lines on this board. Both nodes are deleted;
- *  - the ACT8931 (i2c0 0x5b): its rails are described as fixed regulators at
- *    the voltages the chip holds, so no driver writes it, and i2c0 has no
- *    node at 0x5b. The one ACT8931 write the panel needs, LDO4 (the panel
- *    logic rail, off at power-on) on, comes from /init before the EBC
+ *  - control of the ACT8931 (i2c0 0x5b): its rails are described as fixed
+ *    regulators at the voltages the chip holds, and its node in
+ *    rk3026-onyx-rc2-sys.dtsi is for a read-only driver, so nothing in the
+ *    kernel writes it. The one ACT8931 write the panel needs, LDO4 (the
+ *    panel logic rail, off at power-on) on, comes from /init before the EBC
  *    driver is loaded;
  *  - audio, Bluetooth;
  *  - cpufreq: the CPU stays at the rate the DDR init set.
@@ -102,7 +103,7 @@
 
 	/*
 	 * ACT8931 rails, as fixed regulators at the selectors the chip holds
-	 * (VSET2 bank, read on this board): no driver talks to the PMIC.
+	 * (VSET2 bank, read on this board): no driver controls the PMIC.
 	 */
 	vcc_io: regulator-vcc-io {
 		compatible = "regulator-fixed";
@@ -245,10 +246,9 @@
 };
 
 /*
- * i2c0: ACT8931 at 0x5b, CW2015 at 0x62 and HYM8563 at 0x51. The gauge and
- * the RTC are described in rk3026-onyx-rc2-sys.dtsi; the ACT8931 has no node,
- * so no driver binds it (userspace reads it through i2c-dev, and /init makes
- * the one LDO4 write).
+ * i2c0: ACT8931 at 0x5b, CW2015 at 0x62 and HYM8563 at 0x51, all described
+ * in rk3026-onyx-rc2-sys.dtsi. The ACT8931's driver only reads it; /init
+ * makes the one LDO4 write through i2c-dev before that driver can be loaded.
  */
 &i2c0 {
 	status = "okay";

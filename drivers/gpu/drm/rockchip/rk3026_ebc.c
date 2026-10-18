@@ -875,6 +875,8 @@ static void ebc_stop_scan(struct rk3026_ebc *ebc)
  * @lut: packed LUT for @mode, @frames frames of EBC_LUT_FRAME_BYTES
  * @frames: frames in the waveform
  * @mode: EBC work mode, for the DSP_CTRL class
+ * @lut_mode: the mode @lut belongs to, for the record
+ * @last: the update's record: waveform, frames driven, time, outcome
  *
  * Returns 0 only if every frame was driven, -ETIMEDOUT if a chunk did not
  * end in its budget: the controller is then stopped and the rails are down,
@@ -889,11 +891,16 @@ static void ebc_stop_scan(struct rk3026_ebc *ebc)
  * paths; the failure that matters is the path not yet written.
  */
 static int ebc_drive(struct rk3026_ebc *ebc, const u8 *lut, u32 frames,
-		     u32 mode)
+		     u32 mode, u32 lut_mode, struct rk3026_ebc_last *last)
 {
 	u32 done = 0, chunk = 0;
+	ktime_t start = ktime_get();
+	int ret = 0;
 
 	ebc->prev_unknown = true;
+	last->scans++;
+	last->lut_mode = lut_mode;
+	last->frames = frames;
 
 	ebc_set_dsp_ctrl(ebc, mode);
 	ebc_set_image_addr(ebc, 0, 0);
@@ -913,7 +920,9 @@ static int ebc_drive(struct rk3026_ebc *ebc, const u8 *lut, u32 frames,
 			dev_warn_ratelimited(ebc->dev,
 					     "rails down before chunk %u, waveform abandoned\n",
 					     chunk);
-			return -EIO;
+			last->outcome = EBC_OUTCOME_ABANDONED;
+			ret = -EIO;
+			goto out;
 		}
 
 		/* DIAGNOSTIC: make the wait expire for real. See debug_timeout. */
@@ -938,7 +947,10 @@ static int ebc_drive(struct rk3026_ebc *ebc, const u8 *lut, u32 frames,
 			mutex_lock(&ebc->rails_lock);
 			ebc_rails_off(ebc);
 			mutex_unlock(&ebc->rails_lock);
-			return -ETIMEDOUT;
+			last->timeouts++;
+			last->outcome = EBC_OUTCOME_TIMEOUT;
+			ret = -ETIMEDOUT;
+			goto out;
 		}
 		done += n;
 		chunk++;
@@ -953,13 +965,18 @@ static int ebc_drive(struct rk3026_ebc *ebc, const u8 *lut, u32 frames,
 	ebc_rails_rearm(ebc);
 
 	ebc->prev_unknown = false;
-	return 0;
+	last->outcome = EBC_OUTCOME_DRIVEN;
+out:
+	last->driven = done;
+	last->scan_ms = ktime_ms_delta(ktime_get(), start);
+	return ret;
 }
 
 /**
  * ebc_recover_panel - drive the glass back to a state @prev_virt can describe
  * @ebc: controller
  * @temp: panel temperature, already clamped
+ * @last: the update's record
  *
  * A RESET waveform reads NEITHER image. rkf_expand_reset() fills every one of a
  * frame's 16 words -- the index is the new grey -- with the same phase *
@@ -976,7 +993,8 @@ static int ebc_drive(struct rk3026_ebc *ebc, const u8 *lut, u32 frames,
  * ebc_crtc_atomic_enable() already makes when it memsets @next_virt to 0xff for
  * the boot clear.
  */
-static int ebc_recover_panel(struct rk3026_ebc *ebc, int temp)
+static int ebc_recover_panel(struct rk3026_ebc *ebc, int temp,
+			     struct rk3026_ebc_last *last)
 {
 	const u8 *lut;
 	u32 frames;
@@ -994,7 +1012,8 @@ static int ebc_recover_panel(struct rk3026_ebc *ebc, int temp)
 	dev_warn(ebc->dev, "panel state unknown, clearing with %u RESET frames\n",
 		 frames);
 
-	ret = ebc_drive(ebc, lut, frames, EBC_MODE_RESET);
+	last->repaired = true;
+	ret = ebc_drive(ebc, lut, frames, EBC_MODE_RESET, EBC_MODE_RESET, last);
 	if (!ret)
 		memset(ebc->prev_virt, 0xff, ebc->img_size);
 	return ret;
@@ -1081,22 +1100,67 @@ err:
 	return ret;
 }
 
+/*
+ * Publish the record of a finished update, and count it. Called with
+ * @blit_lock held when the update took it, so a debugfs "panel" snapshot
+ * (taken under @blit_lock) never shows an image the counters do not cover.
+ */
+static void ebc_publish(struct rk3026_ebc *ebc, struct rk3026_ebc_last *last,
+			ktime_t start)
+{
+	struct rk3026_ebc_stats *st = &ebc->stats;
+
+	last->ms = ktime_ms_delta(ktime_get(), start);
+
+	spin_lock(&ebc->queue_lock);
+	ebc->last = *last;
+	if (last->scans)
+		ebc->last_driven = *last;
+	st->done++;
+	st->scans += last->scans;
+	st->timeouts += last->timeouts;
+	switch (last->outcome) {
+	case EBC_OUTCOME_SKIPPED:
+		st->skips++;
+		break;
+	case EBC_OUTCOME_CRTC_OFF:
+	case EBC_OUTCOME_NO_WAVEFORM:
+	case EBC_OUTCOME_NO_RAILS:
+	case EBC_OUTCOME_NO_LUT:
+		st->dropped++;
+		break;
+	case EBC_OUTCOME_ABANDONED:
+		st->abandoned++;
+		break;
+	default:
+		break;
+	}
+	spin_unlock(&ebc->queue_lock);
+}
+
 /* Drive one queued update onto the panel. Runs only on the refresh thread. */
 static void ebc_do_refresh(struct rk3026_ebc *ebc,
-			   const struct rk3026_ebc_update *upd)
+			   const struct rk3026_ebc_update *upd,
+			   struct rk3026_ebc_last *last)
 {
+	ktime_t start = ktime_get();
 	u32 frames;
 	const u8 *lut;
 	int temp;
 	int ret;
 	u32 mode = upd->mode;
+	u32 lut_mode;
 
-	if (!ebc->waveform)
+	if (!ebc->waveform) {
+		last->outcome = EBC_OUTCOME_NO_WAVEFORM;
+		ebc_publish(ebc, last, start);
 		return;
+	}
 
 	/* DIAGNOSTIC: drive a different mode class with the same data and scan. */
 	if (force_mode >= 0 && force_mode <= EBC_MODE_MAX)
 		mode = force_mode;
+	last->mode = mode;
 
 	/*
 	 * The target image must not move while the controller is scanning it,
@@ -1139,8 +1203,8 @@ static void ebc_do_refresh(struct rk3026_ebc *ebc,
 	    !ebc->prev_unknown) {
 		if (debug_scan)
 			dev_info(ebc->dev, "scan: skipped, image identical to prev\n");
-		mutex_unlock(&ebc->blit_lock);
-		return;
+		last->outcome = EBC_OUTCOME_SKIPPED;
+		goto out;
 	}
 
 	/*
@@ -1159,6 +1223,8 @@ static void ebc_do_refresh(struct rk3026_ebc *ebc,
 	}
 	if (temp > EBC_TEMP_MAX)
 		temp = EBC_TEMP_FALLBACK;
+	last->temp = temp;
+	last->temp_read = true;
 
 	/*
 	 * Rails up before anything is driven, the repair below included. If they
@@ -1172,8 +1238,8 @@ static void ebc_do_refresh(struct rk3026_ebc *ebc,
 	if (ret) {
 		if (upd->mode == EBC_MODE_RESET)
 			ebc->prev_unknown = true;
-		mutex_unlock(&ebc->blit_lock);
-		return;
+		last->outcome = EBC_OUTCOME_NO_RAILS;
+		goto out;
 	}
 
 	/*
@@ -1188,24 +1254,25 @@ static void ebc_do_refresh(struct rk3026_ebc *ebc,
 	 * frame count through the RESET LUT.
 	 */
 	/* A RESET that failed took the rails down: nothing more this time. */
-	if (ebc->prev_unknown && ebc_recover_panel(ebc, temp)) {
-		mutex_unlock(&ebc->blit_lock);
-		return;
-	}
+	if (ebc->prev_unknown && ebc_recover_panel(ebc, temp, last))
+		goto out;
 
 	/*
 	 * A direct mode has no LUT of its own; fall back to the update's own mode
 	 * for the scan data so the DSP_CTRL class is the only thing that changed.
 	 */
+	lut_mode = mode;
 	lut = rk3026_ebc_waveform_lut(ebc->waveform, mode, temp, &frames);
-	if (!lut && mode != upd->mode)
+	if (!lut && mode != upd->mode) {
+		lut_mode = upd->mode;
 		lut = rk3026_ebc_waveform_lut(ebc->waveform, upd->mode, temp, &frames);
+	}
 	if (!lut) {
 		if (debug_scan)
 			dev_info(ebc->dev, "scan: no LUT for mode %u at %d C\n",
 				 mode, temp);
-		mutex_unlock(&ebc->blit_lock);
-		return;
+		last->outcome = EBC_OUTCOME_NO_LUT;
+		goto out;
 	}
 
 	if (debug_scan) {
@@ -1216,7 +1283,7 @@ static void ebc_do_refresh(struct rk3026_ebc *ebc,
 		ebc_report_env(ebc);
 	}
 
-	ebc_drive(ebc, lut, frames, mode);
+	ebc_drive(ebc, lut, frames, mode, lut_mode, last);
 
 	if (debug_scan)
 		debug_scan--;
@@ -1230,6 +1297,8 @@ static void ebc_do_refresh(struct rk3026_ebc *ebc,
 	 * next draw acts on it.
 	 */
 	memcpy(ebc->prev_virt, ebc->next_virt, ebc->img_size);
+out:
+	ebc_publish(ebc, last, start);
 	mutex_unlock(&ebc->blit_lock);
 }
 
@@ -1262,6 +1331,7 @@ static int ebc_refresh_thread(void *data)
 
 	while (!kthread_should_stop()) {
 		struct rk3026_ebc_update upd;
+		struct rk3026_ebc_last last;
 		long timeout = MAX_SCHEDULE_TIMEOUT;
 		bool active;
 
@@ -1302,11 +1372,21 @@ static int ebc_refresh_thread(void *data)
 		 * stay down, @prev_virt is untouched, and a waiter on the
 		 * update's marker is released below.
 		 */
-		if (active)
-			ebc_do_refresh(ebc, &upd);
-		else
+		memset(&last, 0, sizeof(last));
+		last.clip = upd.clip;
+		last.asked_mode = upd.mode;
+		last.mode = upd.mode;
+		last.lut_mode = upd.mode;
+		last.marker = upd.marker;
+		last.source = upd.source;
+		if (active) {
+			ebc_do_refresh(ebc, &upd, &last);
+		} else {
 			dev_dbg(ebc->dev, "CRTC off, update (mode %u) dropped\n",
 				upd.mode);
+			last.outcome = EBC_OUTCOME_CRTC_OFF;
+			ebc_publish(ebc, &last, ktime_get());
+		}
 
 		spin_lock(&ebc->queue_lock);
 		ebc->marker_active = 0;
@@ -1369,21 +1449,25 @@ int rk3026_ebc_wait_idle(struct rk3026_ebc *ebc)
  * @temp: caller-supplied panel temperature, in degrees Celsius
  * @temp_valid: whether @temp should be used instead of the sensor
  * @marker: caller-owned completion tag, or 0 for fire-and-forget
+ * @source: who queued it, for debugfs and the trace
  *
  * A full queue is coalesced into its newest entry: the clips are merged and
  * the newest mode wins, which is what a burst of small damage rectangles
  * wants anyway.
  */
 void rk3026_ebc_queue_update(struct rk3026_ebc *ebc, const struct drm_rect *clip,
-			     u32 mode, int temp, bool temp_valid, u32 marker)
+			     u32 mode, int temp, bool temp_valid, u32 marker,
+			     enum rk3026_ebc_source source)
 {
 	struct rk3026_ebc_update *upd;
 	unsigned int used;
 
 	spin_lock(&ebc->queue_lock);
 
+	ebc->stats.updates++;
 	used = ebc->queue_tail - ebc->queue_head;
 	if (used >= EBC_UPDATE_QUEUE_LEN) {
+		ebc->stats.coalesced++;
 		upd = &ebc->queue[(ebc->queue_tail - 1) % EBC_UPDATE_QUEUE_LEN];
 		upd->clip.x1 = min(upd->clip.x1, clip->x1);
 		upd->clip.y1 = min(upd->clip.y1, clip->y1);
@@ -1393,6 +1477,7 @@ void rk3026_ebc_queue_update(struct rk3026_ebc *ebc, const struct drm_rect *clip
 		upd->marker = marker;
 		upd->temp = temp;
 		upd->temp_valid = temp_valid;
+		upd->source = source;
 	} else {
 		upd = &ebc->queue[ebc->queue_tail % EBC_UPDATE_QUEUE_LEN];
 		upd->clip = *clip;
@@ -1400,6 +1485,7 @@ void rk3026_ebc_queue_update(struct rk3026_ebc *ebc, const struct drm_rect *clip
 		upd->marker = marker;
 		upd->temp = temp;
 		upd->temp_valid = temp_valid;
+		upd->source = source;
 		ebc->queue_tail++;
 	}
 
@@ -1523,7 +1609,8 @@ static void ebc_plane_atomic_update(struct drm_plane *plane,
 					 new_state->fb->pitches[0], &clip);
 		mutex_unlock(&ebc->blit_lock);
 
-		rk3026_ebc_queue_update(ebc, &clip, EBC_MODE_DEFAULT, 0, false, 0);
+		rk3026_ebc_queue_update(ebc, &clip, EBC_MODE_DEFAULT, 0, false, 0,
+					EBC_SOURCE_PLANE);
 	}
 
 	drm_dev_exit(idx);
@@ -1597,7 +1684,8 @@ static void ebc_crtc_atomic_enable(struct drm_crtc *crtc,
 	 * is time the RESET takes regardless; it only moves who blocks for it.
 	 */
 	memset(ebc->next_virt, 0xff, ebc->img_size);
-	rk3026_ebc_queue_update(ebc, &clip, EBC_MODE_RESET, 0, false, 0);
+	rk3026_ebc_queue_update(ebc, &clip, EBC_MODE_RESET, 0, false, 0,
+				EBC_SOURCE_ENABLE);
 	rk3026_ebc_wait_idle(ebc);
 }
 
@@ -1950,6 +2038,11 @@ static void ebc_stop_thread(void *data)
 	kthread_stop(ebc->refresh_thread);
 }
 
+static void ebc_debugfs_fini(void *data)
+{
+	rk3026_ebc_debugfs_fini(data);
+}
+
 static void ebc_release_fw(void *data)
 {
 	release_firmware(data);
@@ -2171,6 +2264,11 @@ static int ebc_probe(struct platform_device *pdev)
 	if (IS_ERR(ebc->refresh_thread))
 		return PTR_ERR(ebc->refresh_thread);
 	ret = devm_add_action_or_reset(dev, ebc_stop_thread, ebc);
+	if (ret)
+		return ret;
+
+	rk3026_ebc_debugfs_init(ebc);
+	ret = devm_add_action_or_reset(dev, ebc_debugfs_fini, ebc);
 	if (ret)
 		return ret;
 

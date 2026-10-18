@@ -123,7 +123,7 @@ static int mxcfb_send_update(struct rk3026_ebc *ebc, struct fb_info *info,
 	mutex_unlock(&ebc->blit_lock);
 
 	rk3026_ebc_queue_update(ebc, &clip, mode, upd.temp, temp_valid,
-				upd.update_marker);
+				upd.update_marker, EBC_SOURCE_MXCFB);
 	return 0;
 }
 

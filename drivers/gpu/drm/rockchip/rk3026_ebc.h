@@ -202,11 +202,32 @@
 #define EBC_TEMP_FALLBACK	25
 
 struct clk;
+struct dentry;
 struct fb_info;
 struct fb_ops;
 struct firmware;
 struct regmap;
 struct thermal_zone_device;
+
+/* Who queued an update: debugfs "state" and the update_queue tracepoint. */
+enum rk3026_ebc_source {
+	EBC_SOURCE_PLANE,	/* a plane update: fbcon or a KMS client */
+	EBC_SOURCE_MXCFB,	/* MXCFB_SEND_UPDATE */
+	EBC_SOURCE_ENABLE,	/* the RESET of a CRTC enable */
+};
+
+/* What became of one dequeued update. */
+enum rk3026_ebc_outcome {
+	EBC_OUTCOME_NONE,	/* nothing dequeued yet */
+	EBC_OUTCOME_DRIVEN,	/* every frame of its waveform driven */
+	EBC_OUTCOME_SKIPPED,	/* image identical to prev: nothing driven */
+	EBC_OUTCOME_CRTC_OFF,	/* dropped: the CRTC is off */
+	EBC_OUTCOME_NO_WAVEFORM, /* dropped: no waveform loaded */
+	EBC_OUTCOME_NO_RAILS,	/* dropped: the rails did not come up */
+	EBC_OUTCOME_NO_LUT,	/* dropped: no LUT for the mode and temperature */
+	EBC_OUTCOME_TIMEOUT,	/* a chunk timed out (repair or update) */
+	EBC_OUTCOME_ABANDONED,	/* the rails were down before a chunk */
+};
 
 /* One queued panel update. */
 struct rk3026_ebc_update {
@@ -215,6 +236,42 @@ struct rk3026_ebc_update {
 	u32		marker;
 	int		temp;
 	bool		temp_valid;
+	u8		source;
+};
+
+/*
+ * The record of one dequeued update, for debugfs. Filled by the refresh
+ * thread and published under @queue_lock.
+ */
+struct rk3026_ebc_last {
+	struct drm_rect	clip;
+	u32		asked_mode;	/* the update's own mode */
+	u32		mode;		/* the DSP_CTRL class driven (force_mode) */
+	u32		lut_mode;	/* the mode whose LUT was driven */
+	u32		marker;
+	int		temp;		/* clamped; valid if @temp_read */
+	bool		temp_read;
+	bool		repaired;	/* a RESET repair ran before it */
+	u8		source;		/* enum rk3026_ebc_source */
+	u8		outcome;	/* enum rk3026_ebc_outcome */
+	u32		frames;		/* frames in its (last) waveform */
+	u32		driven;		/* of those, driven */
+	u32		scans;		/* waveforms started, repair included */
+	u32		timeouts;
+	u32		ms;		/* dequeue to done */
+	u32		scan_ms;	/* the last waveform */
+};
+
+/* Counters since probe, under @queue_lock. */
+struct rk3026_ebc_stats {
+	u64		updates;	/* rk3026_ebc_queue_update() calls */
+	u64		coalesced;	/* of those, merged into a full queue */
+	u64		done;		/* updates dequeued and finished */
+	u64		scans;		/* waveforms started, repairs included */
+	u64		skips;		/* identical image, nothing driven */
+	u64		dropped;	/* CRTC off, no waveform, rails or LUT */
+	u64		timeouts;	/* chunk timeouts */
+	u64		abandoned;	/* rails found down before a chunk */
 };
 
 #define EBC_UPDATE_QUEUE_LEN	8
@@ -344,6 +401,12 @@ struct rk3026_ebc {
 	const struct fb_ops	*orig_fbops;
 	atomic_t		fb_users;
 	bool			mxcfb_active;
+
+	/* debugfs: the last update, the last driven one, the counters. */
+	struct rk3026_ebc_last	last;
+	struct rk3026_ebc_last	last_driven;
+	struct rk3026_ebc_stats	stats;
+	struct dentry		*debugfs;
 };
 
 static inline struct rk3026_ebc *drm_to_ebc(struct drm_device *drm)
@@ -356,7 +419,8 @@ void rk3026_ebc_blit_xrgb8888(struct rk3026_ebc *ebc, const void *src,
 			      unsigned int src_pitch, const struct drm_rect *clip);
 int rk3026_ebc_wait_idle(struct rk3026_ebc *ebc);
 void rk3026_ebc_queue_update(struct rk3026_ebc *ebc, const struct drm_rect *clip,
-			     u32 mode, int temp, bool temp_valid, u32 marker);
+			     u32 mode, int temp, bool temp_valid, u32 marker,
+			     enum rk3026_ebc_source source);
 int rk3026_ebc_wait_marker(struct rk3026_ebc *ebc, u32 marker);
 
 /* rk3026_ebc_waveform.c */
@@ -364,6 +428,15 @@ struct ebc_waveform *rk3026_ebc_waveform_parse(struct device *dev,
 					       const u8 *buf, size_t len);
 const u8 *rk3026_ebc_waveform_lut(struct ebc_waveform *wf, u32 mode, int temp,
 				  u32 *frames);
+
+/* rk3026_ebc_debugfs.c */
+#if IS_ENABLED(CONFIG_DEBUG_FS)
+void rk3026_ebc_debugfs_init(struct rk3026_ebc *ebc);
+void rk3026_ebc_debugfs_fini(struct rk3026_ebc *ebc);
+#else
+static inline void rk3026_ebc_debugfs_init(struct rk3026_ebc *ebc) { }
+static inline void rk3026_ebc_debugfs_fini(struct rk3026_ebc *ebc) { }
+#endif
 
 /* rk3026_ebc_mxcfb.c */
 #if IS_ENABLED(CONFIG_DRM_RK3026_EBC_MXCFB)

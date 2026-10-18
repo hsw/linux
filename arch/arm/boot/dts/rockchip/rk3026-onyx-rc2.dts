@@ -23,11 +23,13 @@
  *    panel logic rail, off at power-on) on, comes from /init before the EBC
  *    driver is loaded;
  *  - audio, Bluetooth;
- *  - cpufreq: the CPU stays at the rate the DDR init set.
  *
  * The panel: the EBC with the stock ED060 1448x1072 timings and the TPS65185
  * EPD PMIC on i2c2, whose high-voltage rails and VCOM the EBC driver switches
  * on only around refreshes. The touch controller shares i2c2 with it.
+ *
+ * cpufreq scales the frequency only: the CPUs have no cpu-supply, so the
+ * OPP voltage below is the rail the board holds and nothing moves it.
  *
  * System devices (fuel gauge and charger presence, RTC, front light, cover
  * switch, vibrator, Wi-Fi power and the USB host port) are described in
@@ -99,6 +101,73 @@
 	cpus {
 		/* The loader sets the IMEM remap and holds CPU1 in reset. */
 		enable-method = "rockchip,rk3036-smp";
+	};
+
+	/*
+	 * Frequency only, at the 1.40 V vdd_arm holds (ACT8931 DCDC3 selector
+	 * 0x1c, the vendor firmware's value and the SoC's absolute maximum):
+	 * no cpu-supply, so opp-microvolt only describes the rail. 600 MHz is
+	 * the rate the loader leaves. 912 MHz is the vendor firmware's single
+	 * operating point; 960 and 1008 MHz are above anything it runs and
+	 * are boost points, off until /sys/devices/system/cpu/cpufreq/boost
+	 * is set.
+	 */
+	cpu_opp_table: opp-table-cpu {
+		compatible = "operating-points-v2";
+		opp-shared;
+
+		opp-216000000 {
+			opp-hz = /bits/ 64 <216000000>;
+			opp-microvolt = <1400000>;
+		};
+
+		opp-312000000 {
+			opp-hz = /bits/ 64 <312000000>;
+			opp-microvolt = <1400000>;
+		};
+
+		opp-408000000 {
+			opp-hz = /bits/ 64 <408000000>;
+			opp-microvolt = <1400000>;
+		};
+
+		opp-504000000 {
+			opp-hz = /bits/ 64 <504000000>;
+			opp-microvolt = <1400000>;
+		};
+
+		opp-600000000 {
+			opp-hz = /bits/ 64 <600000000>;
+			opp-microvolt = <1400000>;
+			opp-suspend;
+		};
+
+		opp-696000000 {
+			opp-hz = /bits/ 64 <696000000>;
+			opp-microvolt = <1400000>;
+		};
+
+		opp-816000000 {
+			opp-hz = /bits/ 64 <816000000>;
+			opp-microvolt = <1400000>;
+		};
+
+		opp-912000000 {
+			opp-hz = /bits/ 64 <912000000>;
+			opp-microvolt = <1400000>;
+		};
+
+		opp-960000000 {
+			opp-hz = /bits/ 64 <960000000>;
+			opp-microvolt = <1400000>;
+			turbo-mode;
+		};
+
+		opp-1008000000 {
+			opp-hz = /bits/ 64 <1008000000>;
+			opp-microvolt = <1400000>;
+			turbo-mode;
+		};
 	};
 
 	/*
@@ -250,6 +319,14 @@
  * in rk3026-onyx-rc2-sys.dtsi. The ACT8931's driver only reads it; /init
  * makes the one LDO4 write through i2c-dev before that driver can be loaded.
  */
+&cpu0 {
+	operating-points-v2 = <&cpu_opp_table>;
+};
+
+&cpu1 {
+	operating-points-v2 = <&cpu_opp_table>;
+};
+
 &i2c0 {
 	status = "okay";
 };

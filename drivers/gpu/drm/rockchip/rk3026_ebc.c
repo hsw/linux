@@ -1230,9 +1230,23 @@ static void ebc_do_refresh(struct rk3026_ebc *ebc,
 	 * glass the one thrown away, and the panel is unreachable from userspace.
 	 * It does not weaken the skip -- a successful refresh clears the flag, so
 	 * P29's case (fbcon redrawing one image forever) still skips.
+	 *
+	 * ⚠️ An MXCFB_SEND_UPDATE in a full-class mode is exempt too (the
+	 * update's own mode, as for RESET; full class = what ebc_dsp_ctrl_mode()
+	 * gives DISPLAY_MODE alone: FULL, i.e. GC16 or AUTO with UPDATE_MODE_FULL
+	 * and REAGLD, OED_PART for REAGL, RESET, BLOCK, FULL_DITHER). Neither
+	 * reason for the skip applies to it: it is queued once, by a client, not
+	 * by every fbdev commit or cursor blink. A GC16 full on identical content
+	 * is the ghost-clearing flash the client asks for, and it also repairs
+	 * the full whose pixels an earlier, weaker scan already drew: every send
+	 * blits into the one target image when it is queued, so a partial queued
+	 * before it draws its pixels and leaves prev == next for the full. Plane
+	 * updates and partial-class mxcfb sends still skip.
 	 */
 	if (!ebc_report_image(ebc) && upd->mode != EBC_MODE_RESET &&
-	    !ebc->prev_unknown) {
+	    !ebc->prev_unknown &&
+	    !(upd->source == EBC_SOURCE_MXCFB &&
+	      ebc_dsp_ctrl_mode(upd->mode) == DSP_DISPLAY_MODE)) {
 		if (debug_scan)
 			dev_info(ebc->dev, "scan: skipped, image identical to prev\n");
 		last->outcome = EBC_OUTCOME_SKIPPED;

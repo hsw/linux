@@ -29,7 +29,9 @@
  * register is marked precious, so regmap debugfs leaves it alone, and the
  * write rules never read it. act8931_charger_read() does, at probe, every
  * 5 s and on every read of a charger property, and each of these reads
- * clears the bits.
+ * clears the bits. While the debugfs file act8931-charger-hold holds 1,
+ * it reads nothing, so a test can arm the charger interrupts (0x78 and
+ * 0x79 through act8931-reg) without the driver disarming them again.
  */
 
 #include <linux/bitfield.h>
@@ -37,6 +39,7 @@
 #include <linux/debugfs.h>
 #include <linux/devm-helpers.h>
 #include <linux/i2c.h>
+#include <linux/kstrtox.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
@@ -162,6 +165,8 @@ struct act8931 {
 	struct power_supply *charger;
 	struct delayed_work poll;
 	struct mutex dbg_lock;	/* dbg_result */
+	struct mutex charger_lock;	/* charger_held, the APCH 0x78 reads */
+	bool charger_held;
 	char dbg_result[48];
 	unsigned int last_status;
 	unsigned int last_state;
@@ -733,16 +738,24 @@ static int act8931_register_rail(struct act8931 *chip, int id,
 	return 0;
 }
 
-/* The one reader of APCH 0x78 (bits 7:4 clear on read) */
+/*
+ * The one reader of APCH 0x78 (bits 7:4 clear on read). -EAGAIN while the
+ * reads are held; a read that has started finishes before a hold returns.
+ */
 static int act8931_charger_read(struct act8931 *chip, unsigned int *status,
 				unsigned int *state)
 {
-	int ret;
+	int ret = -EAGAIN;
 
-	ret = regmap_read(chip->regmap, ACT8931_APCH_STATUS, status);
-	if (ret)
-		return ret;
-	return regmap_read(chip->regmap, ACT8931_APCH_STATE, state);
+	mutex_lock(&chip->charger_lock);
+	if (!chip->charger_held) {
+		ret = regmap_read(chip->regmap, ACT8931_APCH_STATUS, status);
+		if (!ret)
+			ret = regmap_read(chip->regmap, ACT8931_APCH_STATE,
+					  state);
+	}
+	mutex_unlock(&chip->charger_lock);
+	return ret;
 }
 
 static int act8931_charger_status(unsigned int status, unsigned int state)
@@ -946,6 +959,51 @@ static const struct file_operations act8931_reg_dbg_fops = {
 	.llseek	= default_llseek,
 };
 
+/*
+ * debugfs act8931-charger-hold: 1 stops the charger's own APCH 0x78 reads
+ * (the poll, the charger properties, the act8931 file), 0 resumes them.
+ */
+static ssize_t act8931_hold_dbg_write(struct file *file,
+				      const char __user *ubuf, size_t len,
+				      loff_t *ppos)
+{
+	struct act8931 *chip = file->private_data;
+	bool hold;
+	int ret;
+
+	ret = kstrtobool_from_user(ubuf, len, &hold);
+	if (ret)
+		return ret;
+
+	mutex_lock(&chip->charger_lock);
+	chip->charger_held = hold;
+	mutex_unlock(&chip->charger_lock);
+	dev_info(chip->dev, "charger status reads %s\n",
+		 hold ? "held" : "resumed");
+	return len;
+}
+
+static ssize_t act8931_hold_dbg_read(struct file *file, char __user *ubuf,
+				     size_t len, loff_t *ppos)
+{
+	struct act8931 *chip = file->private_data;
+	char buf[2];
+
+	mutex_lock(&chip->charger_lock);
+	buf[0] = chip->charger_held ? '1' : '0';
+	mutex_unlock(&chip->charger_lock);
+	buf[1] = '\n';
+	return simple_read_from_buffer(ubuf, len, ppos, buf, sizeof(buf));
+}
+
+static const struct file_operations act8931_hold_dbg_fops = {
+	.owner	= THIS_MODULE,
+	.open	= simple_open,
+	.read	= act8931_hold_dbg_read,
+	.write	= act8931_hold_dbg_write,
+	.llseek	= default_llseek,
+};
+
 static void act8931_debugfs_remove(void *dentry)
 {
 	debugfs_remove(dentry);
@@ -968,6 +1026,7 @@ static int act8931_probe(struct i2c_client *client)
 	if (!chip)
 		return -ENOMEM;
 	chip->dev = dev;
+	mutex_init(&chip->charger_lock);
 	chip->client = client;
 	chip->vsel_high = of_property_read_bool(dev->of_node,
 						"active-semi,vsel-high");
@@ -1035,9 +1094,16 @@ static int act8931_probe(struct i2c_client *client)
 		return ret;
 
 	mutex_init(&chip->dbg_lock);
+	ret = devm_add_action_or_reset(dev, act8931_debugfs_remove,
+				       debugfs_create_file("act8931-reg", 0600, NULL, chip,
+							   &act8931_reg_dbg_fops));
+	if (ret)
+		return ret;
+
 	return devm_add_action_or_reset(dev, act8931_debugfs_remove,
-					debugfs_create_file("act8931-reg", 0600, NULL, chip,
-							    &act8931_reg_dbg_fops));
+					debugfs_create_file("act8931-charger-hold", 0600,
+							    NULL, chip,
+							    &act8931_hold_dbg_fops));
 }
 
 static const struct of_device_id act8931_of_match[] = {

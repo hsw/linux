@@ -82,19 +82,19 @@
  */
 #define EBC_FRAME_TIMEOUT_MARGIN	4
 #define EBC_FRAME_TIMEOUT_MIN_MS	5000
-/* Longest a client may block in MXCFB_WAIT_FOR_UPDATE_COMPLETE. */
-#define EBC_MARKER_TIMEOUT_MS	10000
 /*
- * Longest rk3026_ebc_wait_idle() waits for the refresh thread. One refresh
- * takes at most ~10 s even when a chunk times out: the sensor read and the
- * rails coming up (~0.4 s), a repair RESET and the update itself (up to five
- * 64-frame chunks at ~0.8 s), and one chunk that runs into its budget
- * (EBC_FRAME_TIMEOUT_MIN_MS) and ends the refresh. Twice that covers the one
- * update queued behind it (CRTC enable's own RESET). Past this the thread is
- * stuck outside the EBC (an I2C transfer, say), and CRTC enable/disable and
- * shutdown go on without it.
+ * A part's work besides its waveforms: the sensor read (~0.4 s at worst),
+ * the rails coming up (~0.2 s), the snapshot copy.
  */
-#define EBC_IDLE_TIMEOUT_MS	20000
+#define EBC_PART_SETUP_MS	1000
+/*
+ * The parts a wait on one update can sit behind, its own included: the one
+ * in flight, then what was sent before a pending RESET, the RESET, and what
+ * was sent after it (rk3026_ebc_pending_take()). A later send adds no part
+ * ahead of these: a RESET sent behind a pending one absorbs the set between
+ * them.
+ */
+#define EBC_WAIT_PARTS		4
 
 /*
  * The panel's high-voltage rails and VCOM are on only around refreshes: the
@@ -204,6 +204,35 @@ static unsigned int ebc_chunk_timeout_ms(struct rk3026_ebc *ebc, u32 frames)
 	u64 ms = div_u64(us * frames * EBC_FRAME_TIMEOUT_MARGIN, USEC_PER_MSEC);
 
 	return max_t(u64, ms, EBC_FRAME_TIMEOUT_MIN_MS);
+}
+
+/*
+ * The longest one part takes while the refresh thread works: the setup
+ * (EBC_PART_SETUP_MS), then at most two waveforms, a repair RESET and the
+ * part's own, of at most EBC_WAVEFORM_MAX_FRAMES frames each. A chunk ends
+ * within its budget (ebc_chunk_timeout_ms()) or ends the part, so every
+ * chunk counts at its budget. Derived from the timings like the budget: at
+ * a lower dot clock a part takes longer.
+ */
+static unsigned int ebc_part_max_ms(struct rk3026_ebc *ebc)
+{
+	u32 chunks = 2 * DIV_ROUND_UP(EBC_WAVEFORM_MAX_FRAMES,
+				      EBC_LUT_MAX_FRAMES);
+
+	return EBC_PART_SETUP_MS +
+	       chunks * ebc_chunk_timeout_ms(ebc, EBC_LUT_MAX_FRAMES);
+}
+
+/*
+ * Longest a wait on one update blocks (rk3026_ebc_wait_seq():
+ * MXCFB_WAIT_FOR_UPDATE_COMPLETE, CRTC enable and disable): EBC_WAIT_PARTS
+ * parts at their longest, 164 s with every chunk budget at its 5 s floor.
+ * Past this the thread is stuck outside the EBC (an I2C transfer, say), and
+ * the waiter goes on without it.
+ */
+static unsigned int rk3026_ebc_wait_timeout_ms(struct rk3026_ebc *ebc)
+{
+	return EBC_WAIT_PARTS * ebc_part_max_ms(ebc);
 }
 
 /*
@@ -879,7 +908,7 @@ static int ebc_drive(struct rk3026_ebc *ebc, const u8 *lut, u32 frames,
 
 	/* A repair is the first waveform of an update that has repaired set. */
 	trace_rk3026_ebc_scan_start(mode, lut_mode, last->temp, frames,
-				    last->marker,
+				    last->marker, last->merged,
 				    last->repaired && !last->scans);
 
 	WRITE_ONCE(ebc->shadows.prev_unknown, true);
@@ -976,10 +1005,13 @@ out:
  * that is now true.
  *
  * White is the state a RESET lands on -- the same assumption
- * ebc_crtc_atomic_enable() already makes when it memsets @next_shadow to 0xff
- * for the boot clear. Both prev images follow: @prev_virt for the scan, and
- * @shadows.prev, in a short @image_lock section, for debugfs and the next
- * snapshot.
+ * rk3026_ebc_add_update() makes when it fills @next_shadow with 0xff for a
+ * RESET. @prev_virt follows here, for the part's scan; @shadows.prev follows
+ * in rk3026_ebc_scan_finish() (EBC_REPAIR_DONE), whatever the part's outcome.
+ *
+ * Returns 0 if the RESET ran to completion (@last->repaired set) or there is
+ * no RESET waveform at @temp (@last->repaired clear: nothing was driven), or
+ * ebc_drive()'s error: the rails are down and the part must not be driven.
  */
 static int ebc_recover_panel(struct rk3026_ebc *ebc, int temp,
 			     struct rk3026_ebc_last *last)
@@ -1101,7 +1133,7 @@ err:
 }
 
 /*
- * Publish the record of a finished update, and count it. Called under
+ * Publish the record of a finished part, and count it. Called under
  * @image_lock, in the section of rk3026_ebc_scan_finish(), so a debugfs
  * "panel" snapshot (taken under @image_lock) never shows an image the
  * counters do not cover.
@@ -1111,6 +1143,7 @@ static void ebc_publish(struct rk3026_ebc *ebc, struct rk3026_ebc_last *last,
 {
 	struct rk3026_ebc_stats *st = &ebc->stats;
 
+	lockdep_assert_held(&ebc->image_lock);
 	last->ms = ktime_ms_delta(ktime_get(), start);
 
 	switch (last->outcome) {
@@ -1126,7 +1159,6 @@ static void ebc_publish(struct rk3026_ebc *ebc, struct rk3026_ebc_last *last,
 		break;
 	}
 
-	spin_lock(&ebc->queue_lock);
 	ebc->last = *last;
 	if (last->scans)
 		ebc->last_driven = *last;
@@ -1149,46 +1181,29 @@ static void ebc_publish(struct rk3026_ebc *ebc, struct rk3026_ebc_last *last,
 	default:
 		break;
 	}
-	spin_unlock(&ebc->queue_lock);
 }
 
 /*
- * The part one scan drives, from the update the thread dequeued.
- *
- * Until the senders queue into @pending, each update passes through it alone:
- * it is added and taken at once, so @pending is empty again afterwards but
- * for the carry of a scan that could not drive, and the carry and RESET rules
- * are those of rk3026_ebc_pending_take(). The queue keeps its order.
- */
-static void ebc_take_part(struct rk3026_ebc *ebc,
-			  const struct rk3026_ebc_update *upd,
-			  struct rk3026_ebc_set *part)
-{
-	u32 seq;
-
-	lockdep_assert_held(&ebc->image_lock);
-	rk3026_ebc_pending_add(&ebc->pending, upd, &seq);
-	rk3026_ebc_pending_take(&ebc->pending, part);
-}
-
-/*
- * Drive one queued update onto the panel. Runs only on the refresh thread.
+ * Take the next part and drive it onto the panel, if anything is pending.
+ * Runs only on the refresh thread.
  *
  * Three steps, so that no sender waits for a waveform:
  *
- *  1. under @image_lock: the update becomes a part, and its snapshot is built
- *     into @shadows.scan from @shadows.prev and @next_shadow. Senders may
- *     blit into @next_shadow as soon as the lock is dropped: the snapshot is
- *     what this scan drives, and their updates are queued behind this one.
+ *  1. under @image_lock: the part is taken (rk3026_ebc_pending_take(): what
+ *     was sent before a RESET, then the RESET alone, then what was sent
+ *     after it), and its snapshot is built into @shadows.scan from
+ *     @shadows.prev and the target (@next_shadow, or @pre_shadow for what
+ *     was sent before a pending RESET). Senders may blit into @next_shadow
+ *     and add to @pending as soon as the lock is dropped: the snapshot is
+ *     what this scan drives, and their updates go to the next part.
  *  2. without it: the sensor, the rails, the snapshot into @next_virt, a
  *     repair if the glass is not known, the waveform;
  *  3. under @image_lock again: rk3026_ebc_scan_finish() says what the glass
- *     shows now, and the record is published with it. @prev_virt follows
- *     once the lock is dropped.
+ *     shows now and moves @pending.done_seq over the part, and the record is
+ *     published with it. The waiters on the part's updates are woken then,
+ *     whatever the outcome, and @prev_virt follows.
  */
-static void ebc_do_refresh(struct rk3026_ebc *ebc,
-			   const struct rk3026_ebc_update *upd,
-			   struct rk3026_ebc_last *last, bool active)
+static void ebc_do_refresh(struct rk3026_ebc *ebc, struct rk3026_ebc_last *last)
 {
 	enum rk3026_ebc_repair repair_result = EBC_REPAIR_NONE;
 	struct rk3026_ebc_shadows *sh = &ebc->shadows;
@@ -1196,20 +1211,43 @@ static void ebc_do_refresh(struct rk3026_ebc *ebc,
 	struct rk3026_ebc_set part;
 	bool repair_due, identical, prev_changed;
 	u32 frames, mode, scan_mode, lut_mode;
-	const u8 *lut;
+	const u8 *lut, *target;
 	int temp;
 	int ret;
 
 	mutex_lock(&ebc->image_lock);
-	ebc_take_part(ebc, upd, &part);
+	if (!rk3026_ebc_pending_take(&ebc->pending, &part)) {
+		mutex_unlock(&ebc->image_lock);
+		return;
+	}
+
+	/*
+	 * Taken while @pre_split, the part is the @pending.pre a RESET was sent
+	 * behind (it goes first): it is drawn from the image its updates were
+	 * sent into, and that image is the spare again.
+	 */
+	target = ebc->next_shadow;
+	if (ebc->pre_split) {
+		target = ebc->pre_shadow;
+		ebc->pre_split = false;
+	}
+
+	memset(last, 0, sizeof(*last));
 	last->clip = part.box;
+	last->asked_mode = part.mode;
+	last->mode = part.mode;
+	last->lut_mode = part.mode;
+	last->marker = part.marker;
+	last->merged = part.merged;
+	last->source = part.source;
 
 	/*
 	 * Nothing reaches the panel while the CRTC is off: the rails stay
-	 * down, the prev images are untouched, and a waiter on the update's
-	 * marker is released by the caller.
+	 * down and the prev images are untouched. The part is dropped, not
+	 * carried (the RESET of the next CRTC enable clears the glass), and
+	 * the waits on its updates end like any other part's.
 	 */
-	if (!active) {
+	if (!ebc->crtc_on) {
 		dev_dbg(ebc->dev, "CRTC off, part (mode %u) dropped\n",
 			part.mode);
 		last->outcome = EBC_OUTCOME_CRTC_OFF;
@@ -1231,7 +1269,7 @@ static void ebc_do_refresh(struct rk3026_ebc *ebc,
 	scan_mode = rk3026_ebc_scan_mode(&part, repair_due);
 
 	/* An A2 scan over a grey of the glass comes back as DU. */
-	identical = !rk3026_ebc_build_snapshot(sh, ebc->next_shadow, &part.box,
+	identical = !rk3026_ebc_build_snapshot(sh, target, &part.box,
 					       &scan_mode);
 	if (debug_scan)
 		ebc_report_image(ebc);
@@ -1283,11 +1321,10 @@ static void ebc_do_refresh(struct rk3026_ebc *ebc,
 	 * REAGLD, OED_PART for REAGL, RESET, BLOCK, FULL_DITHER). Neither
 	 * reason for the skip applies to it: it is queued once, by a client, not
 	 * by every fbdev commit or cursor blink. A GC16 full on identical content
-	 * is the ghost-clearing flash the client asks for, and it also repairs
-	 * the full whose pixels an earlier, weaker scan already drew: every send
-	 * blits into the one target image when it is queued, so a partial queued
-	 * before it draws its pixels and leaves prev == next for the full. Plane
-	 * updates and partial-class mxcfb sends still skip.
+	 * is the ghost-clearing flash the client asks for, and a full sent
+	 * after a scan that already drew the same pixels would otherwise be
+	 * skipped as identical. Plane updates and partial-class mxcfb sends
+	 * still skip.
 	 */
 	if (rk3026_ebc_should_skip(&part, sh->prev_unknown, identical)) {
 		if (debug_scan)
@@ -1375,7 +1412,7 @@ static void ebc_do_refresh(struct rk3026_ebc *ebc,
 	if (debug_scan) {
 		dev_info(ebc->dev,
 			 "scan: mode %u (part asked %u) temp %d C, %u frames, clip %d,%d-%d,%d\n",
-			 mode, upd->mode, temp, frames, part.box.x1, part.box.y1,
+			 mode, part.mode, temp, frames, part.box.x1, part.box.y1,
 			 part.box.x2, part.box.y2);
 		ebc_report_env(ebc);
 	}
@@ -1404,19 +1441,16 @@ finish:
 	ebc_publish(ebc, last, start);
 	mutex_unlock(&ebc->image_lock);
 
+	/*
+	 * @pending.done_seq moved over the part on every outcome -- driven,
+	 * skipped, dropped with the CRTC off, carried without rails -- so
+	 * every wait on one of its updates ends here.
+	 */
+	wake_up_all(&ebc->marker_wq);
+
 	/* Only this thread writes either prev image, so this needs no lock. */
 	if (prev_changed)
 		memcpy(ebc->prev_virt, sh->prev, ebc->img_size);
-}
-
-static bool ebc_queue_empty(struct rk3026_ebc *ebc)
-{
-	bool empty;
-
-	spin_lock(&ebc->queue_lock);
-	empty = ebc->queue_head == ebc->queue_tail;
-	spin_unlock(&ebc->queue_lock);
-	return empty;
 }
 
 /*
@@ -1437,15 +1471,13 @@ static int ebc_refresh_thread(void *data)
 	struct rk3026_ebc *ebc = data;
 
 	while (!kthread_should_stop()) {
-		struct rk3026_ebc_update upd;
 		struct rk3026_ebc_last last;
 		long timeout = MAX_SCHEDULE_TIMEOUT;
-		bool active;
 
 		/*
 		 * With the rails up, drop them at the deadline. Checked on every
 		 * pass, not only when the wait times out: a steady stream of
-		 * skipped updates keeps the queue busy and must not keep the
+		 * skipped updates keeps the thread busy and must not keep the
 		 * rails up.
 		 */
 		if (READ_ONCE(ebc->rails_on)) {
@@ -1455,40 +1487,18 @@ static int ebc_refresh_thread(void *data)
 				continue;
 			}
 		}
+		/*
+		 * The wait cannot take @image_lock; the thread asks between
+		 * parts, where rk3026_ebc_work_pending() means a part to take.
+		 */
 		wait_event_interruptible_timeout(ebc->update_wq,
-						 !ebc_queue_empty(ebc) ||
+						 rk3026_ebc_work_pending(&ebc->pending) ||
 						 kthread_should_stop(),
 						 timeout);
 		if (kthread_should_stop())
 			break;
 
-		spin_lock(&ebc->queue_lock);
-		if (ebc->queue_head == ebc->queue_tail) {
-			spin_unlock(&ebc->queue_lock);
-			continue;
-		}
-		upd = ebc->queue[ebc->queue_head % EBC_UPDATE_QUEUE_LEN];
-		ebc->queue_head++;
-		ebc->marker_active = upd.marker;
-		ebc->refresh_busy = true;
-		active = ebc->crtc_on;
-		spin_unlock(&ebc->queue_lock);
-
-		memset(&last, 0, sizeof(last));
-		last.clip = upd.clip;
-		last.asked_mode = upd.mode;
-		last.mode = upd.mode;
-		last.lut_mode = upd.mode;
-		last.marker = upd.marker;
-		last.source = upd.source;
-		ebc_do_refresh(ebc, &upd, &last, active);
-
-		/* The waiter on the update's marker is released here. */
-		spin_lock(&ebc->queue_lock);
-		ebc->marker_active = 0;
-		ebc->refresh_busy = false;
-		spin_unlock(&ebc->queue_lock);
-		wake_up_all(&ebc->marker_wq);
+		ebc_do_refresh(ebc, &last);
 	}
 
 	mutex_lock(&ebc->rails_lock);
@@ -1497,152 +1507,144 @@ static int ebc_refresh_thread(void *data)
 	return 0;
 }
 
-/*
- * Block until nothing is queued and no waveform is in flight.
+/**
+ * rk3026_ebc_wait_seq - block until a sent update has finished
+ * @ebc: controller
+ * @seq: the seq rk3026_ebc_add_update() gave the update
+ * @timeout_ms: the longest wait
+ * @interruptible: a signal ends the wait
  *
- * Idle is an empty queue AND !@refresh_busy, both read in one @queue_lock
- * section. @refresh_busy is set in the section that dequeues and cleared only
- * after ebc_do_refresh() has returned -- waveform, rk3026_ebc_scan_finish()
- * and the copy into @prev_virt included -- so no state between a dequeue and
- * the end of its update reads as idle.
+ * The update has finished once @pending.done_seq reached @seq, whatever
+ * became of its part: driven, skipped, dropped with the CRTC off, or carried
+ * into a later scan. Every part taken before it has finished too, and the
+ * seqs cover each part from its take to rk3026_ebc_scan_finish(), waveform
+ * included: @done_seq moves only in the @image_lock section after the scan.
  *
- * ⚠️ An empty queue alone is NOT idle, and believing it was is
- * docs/PENDING.md P39's second half: ebc_refresh_thread() bumps @queue_head
- * under @queue_lock and only then calls ebc_do_refresh(). In that window the
- * queue reads empty while a full waveform is about to run -- so this returned
- * immediately, the caller's blit landed in the target image, and the boot
- * RESET drove the client's image instead of white. Nor is @image_lock a
+ * ⚠️ Nothing pending is NOT finished: the thread takes a part out of
+ * @pending before it drives it, and in that window nothing is pending while a
+ * full waveform is about to run -- so a wait on that returned at once and the
+ * first blit of a boot raced the boot RESET. Nor is @image_lock a
  * substitute: the thread does not hold it across a waveform.
  *
- * Bounded by EBC_IDLE_TIMEOUT_MS so a thread stuck elsewhere cannot hang
- * blank or shutdown; returns -ETIMEDOUT then.
+ * Returns 0, -ETIMEDOUT after @timeout_ms, or -ERESTARTSYS if @interruptible
+ * and a signal arrived.
  */
-int rk3026_ebc_wait_idle(struct rk3026_ebc *ebc)
+static int rk3026_ebc_wait_seq(struct rk3026_ebc *ebc, u32 seq,
+			       unsigned int timeout_ms, bool interruptible)
 {
-	unsigned long end = jiffies + msecs_to_jiffies(EBC_IDLE_TIMEOUT_MS);
-	bool idle;
-
-	for (;;) {
-		spin_lock(&ebc->queue_lock);
-		idle = ebc->queue_head == ebc->queue_tail && !ebc->refresh_busy;
-		spin_unlock(&ebc->queue_lock);
-		if (idle)
-			break;
-		if (time_after(jiffies, end)) {
-			dev_warn(ebc->dev, "refresh thread busy for %u ms, not waiting\n",
-				 EBC_IDLE_TIMEOUT_MS);
-			return -ETIMEDOUT;
-		}
-		msleep(20);
-	}
-	return 0;
-}
-
-/**
- * rk3026_ebc_queue_update - hand a panel update to the refresh thread
- * @ebc: controller
- * @clip: damaged region: the scan drives the whole panel, but moves only
- *	  the pixels inside it (rk3026_ebc_build_snapshot())
- * @mode: EBC work mode
- * @temp: caller-supplied panel temperature, in degrees Celsius
- * @temp_valid: whether @temp should be used instead of the sensor
- * @marker: caller-owned completion tag, or 0 for fire-and-forget
- * @source: who queued it, for debugfs and the trace
- *
- * Called under @image_lock, in the section that wrote the update's pixels
- * into @next_shadow.
- *
- * A RESET ends white everywhere whatever the images hold, so it fills
- * @next_shadow white: the target follows the glass, and pixels sent before
- * it are not drawn again by a later box that covers them.
- *
- * A full queue is coalesced into its newest entry: the clips are merged and
- * the newest mode wins, which is what a burst of small damage rectangles
- * wants anyway.
- */
-void rk3026_ebc_queue_update(struct rk3026_ebc *ebc, const struct drm_rect *clip,
-			     u32 mode, int temp, bool temp_valid, u32 marker,
-			     enum rk3026_ebc_source source)
-{
-	struct rk3026_ebc_update *upd;
-	unsigned int used;
-
-	lockdep_assert_held(&ebc->image_lock);
-
-	if (mode == EBC_MODE_RESET)
-		memset(ebc->next_shadow, 0xff, ebc->img_size);
-	spin_lock(&ebc->queue_lock);
-
-	ebc->stats.updates++;
-	used = ebc->queue_tail - ebc->queue_head;
-	if (used >= EBC_UPDATE_QUEUE_LEN) {
-		ebc->stats.coalesced++;
-		upd = &ebc->queue[(ebc->queue_tail - 1) % EBC_UPDATE_QUEUE_LEN];
-		upd->clip.x1 = min(upd->clip.x1, clip->x1);
-		upd->clip.y1 = min(upd->clip.y1, clip->y1);
-		upd->clip.x2 = max(upd->clip.x2, clip->x2);
-		upd->clip.y2 = max(upd->clip.y2, clip->y2);
-		upd->mode = mode;
-		upd->marker = marker;
-		upd->temp = temp;
-		upd->temp_valid = temp_valid;
-		upd->source = source;
-	} else {
-		upd = &ebc->queue[ebc->queue_tail % EBC_UPDATE_QUEUE_LEN];
-		upd->clip = *clip;
-		upd->mode = mode;
-		upd->marker = marker;
-		upd->temp = temp;
-		upd->temp_valid = temp_valid;
-		upd->source = source;
-		ebc->queue_tail++;
-	}
-	trace_rk3026_ebc_update_queue(source, mode, clip, marker, temp,
-				      temp_valid, used >= EBC_UPDATE_QUEUE_LEN,
-				      ebc->queue_tail - ebc->queue_head);
-
-	spin_unlock(&ebc->queue_lock);
-	wake_up(&ebc->update_wq);
-}
-
-static bool ebc_marker_pending(struct rk3026_ebc *ebc, u32 marker)
-{
-	bool pending = false;
-	unsigned int i;
-
-	spin_lock(&ebc->queue_lock);
-	if (ebc->marker_active == marker) {
-		pending = true;
-	} else {
-		for (i = ebc->queue_head; i != ebc->queue_tail; i++) {
-			if (ebc->queue[i % EBC_UPDATE_QUEUE_LEN].marker == marker) {
-				pending = true;
-				break;
-			}
-		}
-	}
-	spin_unlock(&ebc->queue_lock);
-	return pending;
-}
-
-/**
- * rk3026_ebc_wait_marker - block until a queued update has been driven out
- * @ebc: controller
- * @marker: value returned by rk3026_ebc_queue_update()
- */
-int rk3026_ebc_wait_marker(struct rk3026_ebc *ebc, u32 marker)
-{
+	const struct rk3026_ebc_pending *p = &ebc->pending;
+	unsigned long timeout = msecs_to_jiffies(timeout_ms);
 	long ret;
 
-	if (!marker)
-		return 0;
-
-	ret = wait_event_interruptible_timeout(ebc->marker_wq,
-					       !ebc_marker_pending(ebc, marker),
-					       msecs_to_jiffies(EBC_MARKER_TIMEOUT_MS));
+	if (interruptible)
+		ret = wait_event_interruptible_timeout(ebc->marker_wq,
+						       rk3026_ebc_seq_finished(p, seq),
+						       timeout);
+	else
+		ret = wait_event_timeout(ebc->marker_wq,
+					 rk3026_ebc_seq_finished(p, seq),
+					 timeout);
 	if (ret < 0)
 		return ret;
 	return ret ? 0 : -ETIMEDOUT;
+}
+
+/*
+ * For CRTC enable and disable: bounded, so a thread stuck elsewhere cannot
+ * hang blank or shutdown.
+ */
+static void ebc_wait_finished(struct rk3026_ebc *ebc, u32 seq)
+{
+	unsigned int ms = rk3026_ebc_wait_timeout_ms(ebc);
+
+	if (rk3026_ebc_wait_seq(ebc, seq, ms, false))
+		dev_warn(ebc->dev, "refresh thread busy for %u ms, not waiting\n",
+			 ms);
+}
+
+/**
+ * rk3026_ebc_add_update - hand a panel update to the refresh thread
+ * @ebc: controller
+ * @upd: the update. Its clip is the damaged region: the scan drives the
+ *	 whole panel, but moves only the pixels inside it
+ *	 (rk3026_ebc_build_snapshot()). Its marker, if not 0, is recorded with
+ *	 the update's seq for rk3026_ebc_wait_marker().
+ *
+ * Called under @image_lock, in the section that wrote the update's pixels
+ * into @next_shadow, so no snapshot sees the pixels without their update.
+ *
+ * The update joins the pending set the next scan takes
+ * (rk3026_ebc_pending_add()): one bounding box and the strongest mode of
+ * everything sent since the last take, behind a pending RESET if there is
+ * one. Nothing is overwritten and nothing overflows.
+ *
+ * A RESET ends white everywhere whatever the images hold, so it fills
+ * @next_shadow white: the target follows the glass, and pixels sent before
+ * it are not drawn again by a later box that covers them. The updates
+ * still pending in front of the RESET keep their pixels all the same:
+ * @next_shadow and @pre_shadow swap before the fill, and @pending.pre is
+ * drawn from @pre_shadow (rk3026_ebc_do_refresh()). Otherwise its part
+ * would lay white over the glass in its box, or be skipped as identical
+ * on a white glass, and its updates would finish without being drawn. A
+ * second RESET finds the split made: @pending.pre is still the part
+ * before the first.
+ *
+ * Returns the update's seq, for rk3026_ebc_wait_seq().
+ */
+u32 rk3026_ebc_add_update(struct rk3026_ebc *ebc,
+			  const struct rk3026_ebc_update *upd)
+{
+	bool merged;
+	u32 seq;
+
+	lockdep_assert_held(&ebc->image_lock);
+
+	if (upd->mode == EBC_MODE_RESET) {
+		if (ebc->pending.pre.merged && !ebc->pre_split) {
+			swap(ebc->next_shadow, ebc->pre_shadow);
+			ebc->pre_split = true;
+		}
+		memset(ebc->next_shadow, 0xff, ebc->img_size);
+	}
+	merged = rk3026_ebc_pending_add(&ebc->pending, upd, &seq);
+	rk3026_ebc_marker_seq_record(&ebc->markers, upd->marker, seq);
+	ebc->stats.updates++;
+	if (merged)
+		ebc->stats.coalesced++;
+	trace_rk3026_ebc_update_queue(upd->source, upd->mode, &upd->clip,
+				      upd->marker, upd->temp, upd->temp_valid,
+				      merged,
+				      rk3026_ebc_pending_parts(&ebc->pending));
+
+	wake_up(&ebc->update_wq);
+	return seq;
+}
+
+/**
+ * rk3026_ebc_wait_marker - block until a sent update has been driven out
+ * @ebc: controller
+ * @marker: the marker the update was sent with
+ *
+ * Waits for the newest update sent with @marker, until the part that took
+ * it has finished, whatever became of it: driven, skipped, dropped with the
+ * CRTC off, or carried into a later scan because the rails did not come up.
+ * The marker is resolved to its seq once, here. Marker 0, a marker never
+ * sent, and one overwritten by EBC_MARKER_RING_LEN newer markers return at
+ * once.
+ */
+int rk3026_ebc_wait_marker(struct rk3026_ebc *ebc, u32 marker)
+{
+	bool known;
+	u32 seq;
+
+	mutex_lock(&ebc->image_lock);
+	known = rk3026_ebc_marker_seq_lookup(&ebc->markers, marker, &seq);
+	mutex_unlock(&ebc->image_lock);
+	if (!known)
+		return 0;
+
+	return rk3026_ebc_wait_seq(ebc, seq, rk3026_ebc_wait_timeout_ms(ebc),
+				   true);
 }
 
 /* --- DRM --- */
@@ -1689,15 +1691,18 @@ static int ebc_plane_atomic_check(struct drm_plane *plane,
 static bool rk3026_ebc_plane_update(struct rk3026_ebc *ebc, const void *src,
 				    unsigned int src_pitch)
 {
-	struct drm_rect clip = DRM_RECT_INIT(0, 0, ebc->width, ebc->height);
+	struct rk3026_ebc_update upd = {
+		.clip	= DRM_RECT_INIT(0, 0, ebc->width, ebc->height),
+		.mode	= EBC_MODE_DEFAULT,
+		.source	= EBC_SOURCE_PLANE,
+	};
 	bool queue;
 
 	mutex_lock(&ebc->image_lock);
 	queue = !ebc->mxcfb_active;
 	if (queue) {
-		rk3026_ebc_blit_xrgb8888(ebc, src, src_pitch, &clip);
-		rk3026_ebc_queue_update(ebc, &clip, EBC_MODE_DEFAULT, 0, false,
-					0, EBC_SOURCE_PLANE);
+		rk3026_ebc_blit_xrgb8888(ebc, src, src_pitch, &upd.clip);
+		rk3026_ebc_add_update(ebc, &upd);
 	}
 	mutex_unlock(&ebc->image_lock);
 	return queue;
@@ -1763,7 +1768,12 @@ static void ebc_crtc_atomic_enable(struct drm_crtc *crtc,
 				   struct drm_atomic_state *state)
 {
 	struct rk3026_ebc *ebc = drm_to_ebc(crtc->dev);
-	struct drm_rect clip = DRM_RECT_INIT(0, 0, ebc->width, ebc->height);
+	struct rk3026_ebc_update upd = {
+		.clip	= DRM_RECT_INIT(0, 0, ebc->width, ebc->height),
+		.mode	= EBC_MODE_RESET,
+		.source	= EBC_SOURCE_ENABLE,
+	};
+	u32 seq;
 	int ret;
 
 	/*
@@ -1786,12 +1796,12 @@ static void ebc_crtc_atomic_enable(struct drm_crtc *crtc,
 	/*
 	 * The high-voltage rails and VCOM are not switched here: the refresh
 	 * thread brings them up for each waveform, the boot RESET below
-	 * included, and drops them once the queue has drained (rails_off_ms).
+	 * included, and drops them once nothing is pending (rails_off_ms).
 	 * V3P3, the logic rail, stays with the CRTC.
 	 *
 	 * Drive the panel to a known white before anything is composed on it.
 	 *
-	 * ⚠️ The RESET's white fill of @next_shadow (rk3026_ebc_queue_update())
+	 * ⚠️ The RESET's white fill of @next_shadow (rk3026_ebc_add_update())
 	 * MUST NOT race a client blit into the same buffer: the enabling commit
 	 * also carries the first plane update, and the default commit_tail runs
 	 * the planes FIRST, so the blit landed and was then overwritten white
@@ -1803,44 +1813,45 @@ static void ebc_crtc_atomic_enable(struct drm_crtc *crtc,
 	 *    tail), so the CRTC enables before the planes commit;
 	 *  - @crtc_on, the white fill and the RESET are one @image_lock section,
 	 *    so a sender that sees the CRTC on blits after the fill and queues
-	 *    behind the RESET;
+	 *    behind the RESET; the RESET also drops a carry left from before
+	 *    the blank;
 	 *  - the RESET is then driven to completion here, so by the time the plane
 	 *    blits, prev is white and the client's own update is the next thing
-	 *    the thread sees.
+	 *    the thread sees. The wait is for the RESET's own seq, so sends made
+	 *    meanwhile do not extend it.
 	 *
 	 * Waiting costs the enabling commit one full RESET (~8 s at 12 MHz), which
 	 * is time the RESET takes regardless; it only moves who blocks for it.
 	 */
 	mutex_lock(&ebc->image_lock);
-	spin_lock(&ebc->queue_lock);
-	WRITE_ONCE(ebc->crtc_on, true);
-	spin_unlock(&ebc->queue_lock);
-	rk3026_ebc_queue_update(ebc, &clip, EBC_MODE_RESET, 0, false, 0,
-				EBC_SOURCE_ENABLE);
+	ebc->crtc_on = true;
+	seq = rk3026_ebc_add_update(ebc, &upd);
 	mutex_unlock(&ebc->image_lock);
-	rk3026_ebc_wait_idle(ebc);
+	ebc_wait_finished(ebc, seq);
 }
 
 static void ebc_crtc_atomic_disable(struct drm_crtc *crtc,
 				    struct drm_atomic_state *state)
 {
 	struct rk3026_ebc *ebc = drm_to_ebc(crtc->dev);
+	u32 seq;
 
 	/*
-	 * No new waveform from here on: the thread drops what it dequeues
-	 * while the CRTC is off. Let the one in flight finish, then drop the
-	 * rails now rather than after the idle delay: VCOM first, then the
-	 * high-voltage rails, then logic.
+	 * No new waveform from here on: the thread drops what it takes while
+	 * the CRTC is off, and mxcfb sends are refused. Let the part in flight
+	 * and those pending finish, then drop the rails now rather than after
+	 * the idle delay: VCOM first, then the high-voltage rails, then logic.
 	 */
-	spin_lock(&ebc->queue_lock);
-	WRITE_ONCE(ebc->crtc_on, false);
-	spin_unlock(&ebc->queue_lock);
+	mutex_lock(&ebc->image_lock);
+	ebc->crtc_on = false;
+	seq = ebc->pending.queued_seq;
+	mutex_unlock(&ebc->image_lock);
 	/*
 	 * If the thread does not come back, drop the rails under it anyway:
 	 * ebc_drive() checks them before every chunk and abandons the
 	 * waveform, leaving prev_unknown set.
 	 */
-	rk3026_ebc_wait_idle(ebc);
+	ebc_wait_finished(ebc, seq);
 
 	/* A failure here is retried by the thread's idle tick. */
 	mutex_lock(&ebc->rails_lock);
@@ -2036,6 +2047,9 @@ static int ebc_setup_buffers(struct rk3026_ebc *ebc)
 	memset(ebc->prev_virt, 0xff, pool);
 
 	ret = ebc_alloc_shadow(ebc, &ebc->next_shadow);
+	if (ret)
+		return ret;
+	ret = ebc_alloc_shadow(ebc, &ebc->pre_shadow);
 	if (ret)
 		return ret;
 	ret = ebc_alloc_shadow(ebc, &ebc->shadows.prev);
@@ -2284,7 +2298,6 @@ static int ebc_probe(struct platform_device *pdev)
 	init_completion(&ebc->frame_done);
 	init_waitqueue_head(&ebc->update_wq);
 	init_waitqueue_head(&ebc->marker_wq);
-	spin_lock_init(&ebc->queue_lock);
 	ret = drmm_mutex_init(drm, &ebc->image_lock);
 	if (ret)
 		return ret;

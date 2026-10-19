@@ -159,13 +159,17 @@ static void ebc_show_last(struct seq_file *m, const char *p,
 
 /*
  * "state": one "key value" line per item, values decimal or a word. The
- * record and the counters are copied under @queue_lock, where the refresh
- * thread publishes them, so they agree with each other; this never takes
- * @image_lock and so never waits for a snapshot.
+ * record and the counters are copied under @image_lock, where the refresh
+ * thread publishes them, so they agree with each other; this waits at most
+ * for one snapshot to be built, never for a waveform.
  *
- * last_* is the last update the refresh thread finished, whatever became of
- * it; scan_* the last one that started a waveform. Clips are x1 y1 x2 y2,
- * x2/y2 exclusive. Modes are the EBC work modes (EBC_MODE_*). Times in ms.
+ * last_* is the last part the refresh thread finished, whatever became of
+ * it; scan_* the last one that started a waveform. A part is the updates
+ * one scan took: its clip is their bounding box, its marker and source the
+ * newest update's. queued counts the parts still to take (at most three:
+ * before a RESET, the RESET, after it); busy is 1 while a part is pending or
+ * in flight (a send not finished yet). Clips are x1 y1 x2 y2, x2/y2
+ * exclusive. Modes are the EBC work modes (EBC_MODE_*). Times in ms.
  */
 static int rk3026_ebc_state_show(struct seq_file *m, void *unused)
 {
@@ -175,14 +179,14 @@ static int rk3026_ebc_state_show(struct seq_file *m, void *unused)
 	unsigned int queued;
 	bool busy, crtc_on;
 
-	spin_lock(&ebc->queue_lock);
+	mutex_lock(&ebc->image_lock);
 	last = ebc->last;
 	scan = ebc->last_driven;
 	st = ebc->stats;
-	queued = ebc->queue_tail - ebc->queue_head;
-	busy = ebc->refresh_busy;
+	queued = rk3026_ebc_pending_parts(&ebc->pending);
+	busy = rk3026_ebc_work_pending(&ebc->pending);
 	crtc_on = ebc->crtc_on;
-	spin_unlock(&ebc->queue_lock);
+	mutex_unlock(&ebc->image_lock);
 
 	seq_puts(m, "version 1\n");
 	seq_printf(m, "width %u\n", ebc->width);

@@ -8,6 +8,7 @@
  * structs below, and rk3026_ebc_kunit.c tests them as they are.
  */
 
+#include <linux/compiler.h>
 #include <linux/export.h>
 #include <linux/minmax.h>
 #include <linux/string.h>
@@ -132,6 +133,7 @@ static void ebc_set_add(struct rk3026_ebc_set *set,
 		set->temp_valid = true;
 	}
 	set->seq = seq;
+	set->marker = upd->marker;
 	set->source = upd->source;
 	set->merged++;
 }
@@ -157,7 +159,9 @@ bool rk3026_ebc_pending_add(struct rk3026_ebc_pending *p,
 	struct rk3026_ebc_set *set;
 	bool merged;
 
-	*seq = ++p->queued_seq;
+	/* Read without the lock by the refresh thread's wait. */
+	*seq = p->queued_seq + 1;
+	WRITE_ONCE(p->queued_seq, *seq);
 
 	if (upd->mode == EBC_MODE_RESET) {
 		set = &p->reset;
@@ -385,7 +389,8 @@ bool rk3026_ebc_scan_finish(struct rk3026_ebc_shadows *sh,
 	bool reset = part->mode == EBC_MODE_RESET;
 	struct drm_rect panel;
 
-	p->done_seq = part->seq;
+	/* Read without the lock by the waits on it. */
+	WRITE_ONCE(p->done_seq, part->seq);
 
 	if (repair == EBC_REPAIR_FAILED && !reset) {
 		sh->prev_unknown = true;

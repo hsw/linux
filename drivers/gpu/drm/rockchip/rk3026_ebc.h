@@ -55,6 +55,8 @@
 #define EBC_LUT_BASE		0x1000
 #define EBC_LUT_FRAME_BYTES	0x40
 #define EBC_LUT_MAX_FRAMES	0x40
+/* A waveform's frame count is one byte of its container segment. */
+#define EBC_WAVEFORM_MAX_FRAMES	255
 
 /* EBC_DSP_START. */
 #define DSP_FRAME_START		BIT(0)
@@ -209,16 +211,16 @@ struct firmware;
 struct regmap;
 struct thermal_zone_device;
 
-/* Who queued an update: debugfs "state" and the update_queue tracepoint. */
+/* Who sent an update: debugfs "state" and the update_queue tracepoint. */
 enum rk3026_ebc_source {
 	EBC_SOURCE_PLANE,	/* a plane update: fbcon or a KMS client */
 	EBC_SOURCE_MXCFB,	/* MXCFB_SEND_UPDATE */
 	EBC_SOURCE_ENABLE,	/* the RESET of a CRTC enable */
 };
 
-/* What became of one dequeued update. */
+/* What became of one part (the updates one scan takes). */
 enum rk3026_ebc_outcome {
-	EBC_OUTCOME_NONE,	/* nothing dequeued yet */
+	EBC_OUTCOME_NONE,	/* nothing taken yet */
 	EBC_OUTCOME_DRIVEN,	/* every frame of its waveform driven */
 	EBC_OUTCOME_SKIPPED,	/* image identical to prev: nothing driven */
 	EBC_OUTCOME_CRTC_OFF,	/* dropped: the CRTC is off */
@@ -236,26 +238,31 @@ enum rk3026_ebc_repair {
 	EBC_REPAIR_FAILED,	/* cut short: the part was not driven */
 };
 
-/* One queued panel update. */
+/*
+ * One update as a sender hands it over (rk3026_ebc_add_update()): its region,
+ * EBC work mode, MXCFB_WAIT_FOR_UPDATE_COMPLETE marker (0: none), the panel
+ * temperature it brings (@temp, if @temp_valid) and who sent it.
+ */
 struct rk3026_ebc_update {
 	struct drm_rect	clip;
 	u32		mode;
 	u32		marker;
 	int		temp;
 	bool		temp_valid;
-	u8		source;
+	u8		source;		/* enum rk3026_ebc_source */
 };
 
 /*
- * The record of one dequeued update, for debugfs. Filled by the refresh
- * thread and published under @queue_lock.
+ * The record of one part, for debugfs. Filled by the refresh thread and
+ * published under @image_lock.
  */
 struct rk3026_ebc_last {
 	struct drm_rect	clip;
-	u32		asked_mode;	/* the update's own mode */
+	u32		asked_mode;	/* the part's own mode */
 	u32		mode;		/* the DSP_CTRL class driven (force_mode) */
 	u32		lut_mode;	/* the mode whose LUT was driven */
-	u32		marker;
+	u32		marker;		/* the newest update's */
+	u32		merged;		/* updates in the part */
 	int		temp;		/* clamped; valid if @temp_read */
 	bool		temp_read;
 	bool		repaired;	/* a RESET repair ran before it */
@@ -265,23 +272,27 @@ struct rk3026_ebc_last {
 	u32		driven;		/* of those, driven */
 	u32		scans;		/* waveforms started, repair included */
 	u32		timeouts;
-	u32		ms;		/* dequeue to done */
+	u32		ms;		/* take to done */
 	u32		scan_ms;	/* the last waveform */
 };
 
-/* Counters since probe, under @queue_lock. */
+/*
+ * Counters since probe, under @image_lock. @skips, @dropped and @done count
+ * parts; @updates less @coalesced is the parts made, @done plus those
+ * pending, except where a RESET absorbed a pending set behind another RESET
+ * (rk3026_ebc_pending_add()): that set's first update made a part that is
+ * gone.
+ */
 struct rk3026_ebc_stats {
-	u64		updates;	/* rk3026_ebc_queue_update() calls */
-	u64		coalesced;	/* of those, merged into a full queue */
-	u64		done;		/* updates dequeued and finished */
+	u64		updates;	/* rk3026_ebc_add_update() calls */
+	u64		coalesced;	/* of those, merged into a pending set */
+	u64		done;		/* parts taken and finished */
 	u64		scans;		/* waveforms started, repairs included */
 	u64		skips;		/* identical image, nothing driven */
 	u64		dropped;	/* CRTC off, no waveform, rails or LUT */
 	u64		timeouts;	/* chunk timeouts */
 	u64		abandoned;	/* rails found down before a chunk */
 };
-
-#define EBC_UPDATE_QUEUE_LEN	8
 
 /*
  * Refresh bookkeeping as plain data, for the pure helpers in rk3026_ebc_core.c.
@@ -298,6 +309,7 @@ struct rk3026_ebc_set {
 	struct drm_rect	box;
 	u32		mode;
 	u32		seq;		/* the newest update's */
+	u32		marker;		/* the newest update's, or 0 */
 	u32		merged;		/* updates in the set */
 	int		temp;		/* the newest valid one */
 	bool		temp_valid;
@@ -310,10 +322,10 @@ struct rk3026_ebc_set {
  * Everything queued and not yet taken, in seq order: @pre, then the RESET
  * barrier @reset, then @post. An update joins @post while a RESET is pending
  * and @pre otherwise, so the RESET's scan comes after every update queued
- * before it and before every one queued after it. The images are not split
- * that finely: a scan draws the target image as it is when its part is
- * taken, so where the boxes overlap @pre also draws pixels sent after the
- * RESET. The RESET whitens them and the scan of @post draws them again.
+ * before it and before every one queued after it. The target image is split
+ * the same way: a RESET sent behind @pre leaves @pre the image its updates
+ * were sent into, and what is sent after the RESET is blitted on white
+ * (rk3026_ebc_add_update()).
  *
  * @carry is what a scan took but could not drive (no rails, LUT or waveform,
  * or a failed repair). It is merged into the next @pre that is taken and is
@@ -322,7 +334,10 @@ struct rk3026_ebc_set {
  * its @merged is 1 (a carry counts no updates).
  *
  * @queued_seq is the seq of the newest update and @done_seq that of the newest
- * finished one; both wrap and compare with rk3026_ebc_seq_done().
+ * finished one; both wrap and compare with rk3026_ebc_seq_done(). Parts are
+ * taken in seq order and finished one at a time, so once the part taken
+ * last has finished, @done_seq equals @queued_seq exactly when nothing is
+ * pending. A carry has no seq of its own.
  */
 struct rk3026_ebc_pending {
 	struct rk3026_ebc_set	pre;
@@ -369,6 +384,32 @@ static inline bool rk3026_ebc_seq_done(u32 done_seq, u32 seq)
 static inline bool rk3026_ebc_pending_empty(const struct rk3026_ebc_pending *p)
 {
 	return !p->pre.merged && !p->reset.merged;
+}
+
+/*
+ * A part is pending or in flight, read without the lock. Parts are taken in
+ * seq order and @done_seq moves only when one finishes, so from the take of
+ * a part to its finish @done_seq is behind @queued_seq; between parts the two
+ * differ exactly when a part is pending (!rk3026_ebc_pending_empty()). A
+ * carry has no seq: on its own it wakes nothing.
+ */
+static inline bool rk3026_ebc_work_pending(const struct rk3026_ebc_pending *p)
+{
+	return READ_ONCE(p->queued_seq) != READ_ONCE(p->done_seq);
+}
+
+/* The update queued with @seq has finished. Read without the lock. */
+static inline bool rk3026_ebc_seq_finished(const struct rk3026_ebc_pending *p,
+					   u32 seq)
+{
+	return rk3026_ebc_seq_done(READ_ONCE(p->done_seq), seq);
+}
+
+/* The parts still to take: @pre, the RESET, @post. */
+static inline unsigned int
+rk3026_ebc_pending_parts(const struct rk3026_ebc_pending *p)
+{
+	return !!p->pre.merged + !!p->reset.merged + !!p->post.merged;
 }
 
 struct rk3026_ebc {
@@ -420,11 +461,15 @@ struct rk3026_ebc {
 	size_t			img_size;
 
 	/*
-	 * The CPU-side images, all cached, and what senders and the refresh
-	 * thread share, under @image_lock.
+	 * The CPU-side images, all cached, the pending updates and the
+	 * refresh bookkeeping: what senders, the refresh thread and debugfs
+	 * share, under @image_lock.
 	 *
 	 * @next_shadow is the target every sender blits into, white again when
-	 * a RESET is sent (the RESET ends white everywhere). @shadows.prev is
+	 * a RESET is sent (the RESET ends white everywhere). While @pre_split,
+	 * @pre_shadow is the target as a RESET found it with @pending.pre still
+	 * pending, and that part is drawn from it; otherwise it is a spare
+	 * (rk3026_ebc_add_update()). @shadows.prev is
 	 * what the glass shows and @shadows.scan the snapshot a scan drives
 	 * (rk3026_ebc_build_snapshot()). The refresh thread alone writes those
 	 * two, under @image_lock, and swaps them after a scan
@@ -441,23 +486,29 @@ struct rk3026_ebc {
 	 * waveform, and rk3026_ebc_scan_finish() records the part's outcome
 	 * under @image_lock, never clearing what ebc_drive() left set.
 	 *
-	 * @pending holds the carry of a scan that could not drive its part.
-	 * Until the senders queue into it, each dequeued update passes through
-	 * it alone (ebc_take_part()).
+	 * @pending holds every update sent and not yet taken (a sender blits
+	 * and adds its update in one section, so no snapshot sees pixels
+	 * without their update), and the carry of a scan that could not
+	 * drive its part. @markers maps the senders' markers to the seq of
+	 * their updates for MXCFB_WAIT_FOR_UPDATE_COMPLETE. @pending.queued_seq
+	 * and @pending.done_seq are also read without the lock, by the waits
+	 * on them.
 	 *
 	 * @prev_virt and @next_virt, the write-combined images the controller
 	 * scans, are written by the thread alone, outside @image_lock, and
 	 * never read by the CPU.
 	 *
-	 * Lock order: @image_lock, then @queue_lock. @image_lock is never held
-	 * across a waveform, the sensor read or a write into @prev_virt or
-	 * @next_virt, so a sender waits at most for one snapshot to be built;
-	 * @rails_lock is never taken under it.
+	 * @image_lock is never held across a waveform, the sensor read or a
+	 * write into @prev_virt or @next_virt, so a sender waits at most for
+	 * one snapshot to be built; @rails_lock is never taken under it.
 	 */
 	struct mutex		image_lock;
 	u8			*next_shadow;
+	u8			*pre_shadow;
+	bool			pre_split;
 	struct rk3026_ebc_shadows shadows;
 	struct rk3026_ebc_pending pending;
+	struct rk3026_ebc_marker_ring markers;
 
 	/* Write-only registers the controller does not read back. */
 	u32			dsp_start;
@@ -466,25 +517,13 @@ struct rk3026_ebc {
 
 	struct completion	frame_done;
 
-	/* Refresh thread and its update queue. */
+	/*
+	 * Refresh thread. A send wakes @update_wq; every finished part
+	 * (@pending.done_seq moved, whatever the outcome) wakes @marker_wq.
+	 */
 	struct task_struct	*refresh_thread;
 	wait_queue_head_t	update_wq;
 	wait_queue_head_t	marker_wq;
-	spinlock_t		queue_lock;
-	struct rk3026_ebc_update queue[EBC_UPDATE_QUEUE_LEN];
-	unsigned int		queue_head;
-	unsigned int		queue_tail;
-	u32			marker_active;
-	/*
-	 * An update that has been dequeued but not yet driven out. The queue
-	 * indices alone do not describe idleness: the thread bumps @queue_head
-	 * under @queue_lock and only then enters ebc_do_refresh(), so between
-	 * the two the queue reads empty while nothing is driven yet -- which is
-	 * exactly how rk3026_ebc_wait_idle() returned early and let the first
-	 * blit of a boot race the boot RESET (PENDING.md P39). Set from the
-	 * dequeue to the end of the update's bookkeeping, @prev_virt included.
-	 */
-	bool			refresh_busy;
 
 	/*
 	 * Panel rails off when idle. @epd_supply and @vcom_supply are switched
@@ -509,9 +548,9 @@ struct rk3026_ebc {
 	/* Rails-off deadline, in jiffies; only meaningful while @rails_on. */
 	unsigned long		rails_off_at;
 	/*
-	 * The CRTC is enabled, so a dequeued update may drive the panel.
-	 * Written under @queue_lock; the thread samples it in the same
-	 * critical section that dequeues.
+	 * The CRTC is enabled, so a part may drive the panel. Under
+	 * @image_lock: the thread samples it in the section that takes a
+	 * part, and a sender checks it in the section that adds its update.
 	 */
 	bool			crtc_on;
 
@@ -525,7 +564,10 @@ struct rk3026_ebc {
 	/* Written under @image_lock; debugfs reads it without. */
 	bool			mxcfb_active;
 
-	/* debugfs: the last update, the last driven one, the counters. */
+	/*
+	 * debugfs: the last part, the last driven one, the counters. Under
+	 * @image_lock.
+	 */
 	struct rk3026_ebc_last	last;
 	struct rk3026_ebc_last	last_driven;
 	struct rk3026_ebc_stats	stats;
@@ -540,10 +582,8 @@ static inline struct rk3026_ebc *drm_to_ebc(struct drm_device *drm)
 /* rk3026_ebc.c */
 void rk3026_ebc_blit_xrgb8888(struct rk3026_ebc *ebc, const void *src,
 			      unsigned int src_pitch, const struct drm_rect *clip);
-int rk3026_ebc_wait_idle(struct rk3026_ebc *ebc);
-void rk3026_ebc_queue_update(struct rk3026_ebc *ebc, const struct drm_rect *clip,
-			     u32 mode, int temp, bool temp_valid, u32 marker,
-			     enum rk3026_ebc_source source);
+u32 rk3026_ebc_add_update(struct rk3026_ebc *ebc,
+			  const struct rk3026_ebc_update *upd);
 int rk3026_ebc_wait_marker(struct rk3026_ebc *ebc, u32 marker);
 
 /* rk3026_ebc_core.c */

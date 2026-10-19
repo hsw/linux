@@ -38,9 +38,9 @@
 #define RKF_ROOT		(RKF_NNODE - 1)
 
 /* Largest LUT the SRAM window can be fed: 255 frames of 0x40 bytes. */
-#define RKF_LUT_MAX		(255 * EBC_LUT_FRAME_BYTES)
+#define RKF_LUT_MAX		(EBC_WAVEFORM_MAX_FRAMES * EBC_LUT_FRAME_BYTES)
 /* Largest raw segment we decode: mode 7 emits frames << 3. */
-#define RKF_RAW_MAX		(255 * 8)
+#define RKF_RAW_MAX		(EBC_WAVEFORM_MAX_FRAMES * 8)
 
 /* Container LUT modes, as selected by epd_lut_data_get(). */
 #define RKF_LUT_RESET		1

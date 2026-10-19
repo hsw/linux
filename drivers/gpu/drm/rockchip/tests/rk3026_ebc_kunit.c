@@ -195,6 +195,7 @@ static void ebc_test_pending_empty(struct kunit *test)
 
 	memset(&part, 0x5a, sizeof(part));
 	KUNIT_EXPECT_TRUE(test, rk3026_ebc_pending_empty(&p));
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_work_pending(&p));
 	KUNIT_EXPECT_FALSE(test, rk3026_ebc_pending_take(&p, &part));
 	KUNIT_EXPECT_EQ(test, part.merged, 0);
 	KUNIT_EXPECT_EQ(test, part.seq, 0);
@@ -221,6 +222,8 @@ static void ebc_test_pending_add(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, rk3026_ebc_pending_add(&p, &b, &seq));
 	KUNIT_EXPECT_EQ(test, seq, 2);
 	KUNIT_EXPECT_FALSE(test, rk3026_ebc_pending_empty(&p));
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_work_pending(&p));
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_pending_parts(&p), 1);
 
 	KUNIT_ASSERT_TRUE(test, rk3026_ebc_pending_take(&p, &part));
 	KUNIT_EXPECT_EQ(test, part.box.x1, 2);
@@ -234,8 +237,11 @@ static void ebc_test_pending_add(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, part.temp_valid);
 	KUNIT_EXPECT_EQ(test, part.temp, 20);
 	KUNIT_EXPECT_EQ(test, part.source, EBC_SOURCE_PLANE);
+	/* The newest update's marker, even when it had none. */
+	KUNIT_EXPECT_EQ(test, part.marker, 0);
 	KUNIT_EXPECT_FALSE(test, part.has_mxcfb_full);
 	KUNIT_EXPECT_TRUE(test, rk3026_ebc_pending_empty(&p));
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_pending_parts(&p), 0);
 	KUNIT_EXPECT_FALSE(test, rk3026_ebc_pending_take(&p, &part));
 }
 
@@ -611,7 +617,7 @@ static struct t_ctx *t_ctx_alloc(struct kunit *test)
 /* The update queued with @seq has finished: what the driver's wait tests. */
 static bool t_done(const struct t_ctx *c, u32 seq)
 {
-	return rk3026_ebc_seq_done(c->p.done_seq, seq);
+	return rk3026_ebc_seq_finished(&c->p, seq);
 }
 
 static void t_finish(struct t_ctx *c, const struct rk3026_ebc_set *part,
@@ -632,6 +638,7 @@ static void ebc_test_seq_barrier(struct kunit *test)
 	s3 = t_add_marked(&c->p, &c->ring, &r, EBC_MODE_PART, 3);
 	t_add_marked(&c->p, &c->ring, &r, EBC_MODE_FULL, 4);
 	KUNIT_EXPECT_EQ(test, c->p.post.merged, 2);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_pending_parts(&c->p), 3);
 	/* The ring maps each marker to its update's seq. */
 	KUNIT_ASSERT_TRUE(test, rk3026_ebc_marker_seq_lookup(&c->ring, 2, &seq));
 	KUNIT_EXPECT_EQ(test, seq, s2);
@@ -640,6 +647,7 @@ static void ebc_test_seq_barrier(struct kunit *test)
 	KUNIT_ASSERT_TRUE(test, rk3026_ebc_pending_take(&c->p, &part));
 	KUNIT_EXPECT_EQ(test, part.mode, EBC_MODE_PART);
 	KUNIT_EXPECT_EQ(test, part.merged, 1);
+	KUNIT_EXPECT_EQ(test, part.marker, 1);
 	t_finish(c, &part, EBC_OUTCOME_DRIVEN);
 	KUNIT_EXPECT_TRUE(test, t_done(c, s1));
 	KUNIT_EXPECT_FALSE(test, t_done(c, s2));
@@ -663,6 +671,7 @@ static void ebc_test_seq_barrier(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, part.mode, EBC_MODE_FULL);
 	KUNIT_EXPECT_EQ(test, part.merged, 3);
 	KUNIT_EXPECT_EQ(test, part.seq, c->p.queued_seq);
+	KUNIT_EXPECT_EQ(test, part.marker, 5);
 	t_finish(c, &part, EBC_OUTCOME_DRIVEN);
 	KUNIT_EXPECT_TRUE(test, t_done(c, s3));
 	KUNIT_EXPECT_TRUE(test, t_done(c, s5));
@@ -715,6 +724,60 @@ static void ebc_test_seq_merged_markers(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, t_done(c, seq[3]));
 }
 
+/*
+ * What the driver asks locklessly between parts: work pending
+ * (rk3026_ebc_work_pending(), the thread's wake) must agree with
+ * rk3026_ebc_pending_empty() on every outcome, a carry included, or the
+ * thread would sleep on work or spin on a carry.
+ */
+static void t_expect_between_parts(struct kunit *test,
+				   const struct rk3026_ebc_pending *p)
+{
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_work_pending(p),
+			!rk3026_ebc_pending_empty(p));
+}
+
+static void ebc_test_seq_between_parts(struct kunit *test)
+{
+	static const enum rk3026_ebc_outcome outcomes[] = {
+		EBC_OUTCOME_DRIVEN, EBC_OUTCOME_SKIPPED, EBC_OUTCOME_CRTC_OFF,
+		EBC_OUTCOME_NO_RAILS, EBC_OUTCOME_NO_LUT,
+		EBC_OUTCOME_NO_WAVEFORM, EBC_OUTCOME_TIMEOUT,
+		EBC_OUTCOME_ABANDONED,
+	};
+	struct drm_rect r = DRM_RECT_INIT(2, 2, 4, 2);
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(outcomes); i++) {
+		struct t_ctx *c = t_ctx_alloc(test);
+		struct rk3026_ebc_set part;
+		unsigned int parts = 0;
+		u32 before, last;
+
+		t_expect_between_parts(test, &c->p);
+		t_add_marked(&c->p, &c->ring, &r, EBC_MODE_A2, 1);
+		t_add_marked(&c->p, &c->ring, &t_panel, EBC_MODE_RESET, 2);
+		last = t_add_marked(&c->p, &c->ring, &r, EBC_MODE_PART, 3);
+		t_expect_between_parts(test, &c->p);
+
+		while (rk3026_ebc_pending_take(&c->p, &part)) {
+			before = c->p.done_seq;
+			/* in flight: still work, so not idle */
+			KUNIT_EXPECT_TRUE(test, rk3026_ebc_work_pending(&c->p));
+			rk3026_ebc_scan_finish(&c->sh, &c->p, &part,
+					       outcomes[i], EBC_REPAIR_NONE);
+			/* done_seq advanced, whatever the outcome */
+			KUNIT_EXPECT_EQ(test, c->p.done_seq, part.seq);
+			KUNIT_EXPECT_GT(test, (s32)(c->p.done_seq - before), 0);
+			t_expect_between_parts(test, &c->p);
+			parts++;
+		}
+		KUNIT_EXPECT_EQ(test, parts, 3);
+		KUNIT_EXPECT_EQ(test, c->p.done_seq, c->p.queued_seq);
+		KUNIT_EXPECT_TRUE(test, t_done(c, last));
+	}
+}
+
 /* A RESET sent while a part is in flight waits behind it, then post. */
 static void ebc_test_seq_reset_in_flight(struct kunit *test)
 {
@@ -728,9 +791,12 @@ static void ebc_test_seq_reset_in_flight(struct kunit *test)
 	s2 = t_add(&c->p, &t_panel, EBC_MODE_RESET, EBC_SOURCE_MXCFB);
 	s3 = t_add(&c->p, &r, EBC_MODE_PART, EBC_SOURCE_MXCFB);
 	KUNIT_EXPECT_EQ(test, c->p.pre.merged, 0);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_pending_parts(&c->p), 2);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_work_pending(&c->p));
 
 	t_finish(c, &part, EBC_OUTCOME_DRIVEN);
 	KUNIT_EXPECT_EQ(test, c->p.done_seq, s1);
+	t_expect_between_parts(test, &c->p);
 
 	KUNIT_ASSERT_TRUE(test, rk3026_ebc_pending_take(&c->p, &part));
 	KUNIT_EXPECT_EQ(test, part.mode, EBC_MODE_RESET);
@@ -742,7 +808,7 @@ static void ebc_test_seq_reset_in_flight(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, part.mode, EBC_MODE_PART);
 	t_finish(c, &part, EBC_OUTCOME_DRIVEN);
 	KUNIT_EXPECT_TRUE(test, t_done(c, s3));
-	KUNIT_EXPECT_FALSE(test, rk3026_ebc_pending_take(&c->p, &part));
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_work_pending(&c->p));
 }
 
 static void ebc_test_finish_driven(struct kunit *test)
@@ -828,6 +894,7 @@ static void ebc_test_finish_repair_failed(struct kunit *test)
 		KUNIT_EXPECT_TRUE(test, c->sh.prev_unknown);
 		KUNIT_EXPECT_TRUE(test, t_done(c, seq));
 		KUNIT_EXPECT_TRUE(test, drm_rect_equals(&c->p.carry.box, &r));
+		KUNIT_EXPECT_FALSE(test, rk3026_ebc_work_pending(&c->p));
 
 		/* The next part draws it, in its mode, still a full send. */
 		t_add(&c->p, &s, EBC_MODE_A2, EBC_SOURCE_MXCFB);
@@ -869,6 +936,7 @@ static void ebc_test_finish_carry(struct kunit *test)
 		KUNIT_EXPECT_PTR_EQ(test, c->sh.prev, c->prev);
 		KUNIT_EXPECT_TRUE(test, t_done(c, seq));
 		KUNIT_EXPECT_TRUE(test, rk3026_ebc_pending_empty(&c->p));
+		KUNIT_EXPECT_FALSE(test, rk3026_ebc_work_pending(&c->p));
 		KUNIT_EXPECT_FALSE(test, rk3026_ebc_pending_take(&c->p, &part));
 
 		/* The next update's scan draws the carried box, as strongly. */
@@ -1116,6 +1184,7 @@ static void ebc_test_seq_wrap(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, c->p.done_seq, 0);
 	KUNIT_EXPECT_TRUE(test, t_done(c, s2));
 	KUNIT_EXPECT_FALSE(test, t_done(c, s3));
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_work_pending(&c->p));
 
 	KUNIT_EXPECT_TRUE(test, rk3026_ebc_seq_done(0, U32_MAX));
 	KUNIT_EXPECT_FALSE(test, rk3026_ebc_seq_done(U32_MAX, 0));
@@ -1190,6 +1259,7 @@ static struct kunit_case rk3026_ebc_core_test_cases[] = {
 	KUNIT_CASE(ebc_test_seq_barrier),
 	KUNIT_CASE(ebc_test_seq_reset_pending_twice),
 	KUNIT_CASE(ebc_test_seq_merged_markers),
+	KUNIT_CASE(ebc_test_seq_between_parts),
 	KUNIT_CASE(ebc_test_seq_reset_in_flight),
 	KUNIT_CASE(ebc_test_finish_driven),
 	KUNIT_CASE(ebc_test_finish_entered),

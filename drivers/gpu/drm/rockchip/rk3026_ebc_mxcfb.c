@@ -82,36 +82,46 @@ static u32 mxcfb_to_ebc_mode(u32 waveform_mode, u32 update_mode)
 static int mxcfb_send_update(struct rk3026_ebc *ebc, struct fb_info *info,
 			     unsigned long arg)
 {
-	struct mxcfb_update_data upd;
+	struct rk3026_ebc_update upd;
+	struct mxcfb_update_data req;
 	struct drm_rect clip;
-	bool temp_valid;
-	u32 mode;
+
+	if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
+		return -EFAULT;
+
+	clip.x1 = min_t(u32, req.update_region.left, ebc->width);
+	clip.y1 = min_t(u32, req.update_region.top, ebc->height);
+	clip.x2 = min_t(u32, clip.x1 + req.update_region.width, ebc->width);
+	clip.y2 = min_t(u32, clip.y1 + req.update_region.height, ebc->height);
+	if (clip.x1 >= clip.x2 || clip.y1 >= clip.y2)
+		return -EINVAL;
+
+	upd = (struct rk3026_ebc_update) {
+		.clip		= clip,
+		.mode		= mxcfb_to_ebc_mode(req.waveform_mode,
+						    req.update_mode),
+		.marker		= req.update_marker,
+		.temp		= req.temp,
+		.temp_valid	= req.temp != MXCFB_TEMP_USE_AMBIENT &&
+				  req.temp > -128 && req.temp < 128,
+		.source		= EBC_SOURCE_MXCFB,
+	};
+
+	/* One section: no snapshot sees these pixels without their update. */
+	mutex_lock(&ebc->image_lock);
 
 	/*
 	 * With the CRTC off the panel is not driven (blanked fbdev, shutdown):
 	 * refuse rather than queue a waveform that would not run. The refresh
-	 * thread drops anything dequeued while the CRTC is off as well; this is
-	 * the early answer to the client.
+	 * thread drops anything it takes while the CRTC is off as well; this
+	 * is the early answer to the client. Checked in the section that adds
+	 * the update, so a send either sees the CRTC on and goes behind the
+	 * RESET of its enable, or is refused.
 	 */
-	if (!READ_ONCE(ebc->crtc_on))
+	if (!ebc->crtc_on) {
+		mutex_unlock(&ebc->image_lock);
 		return -EBUSY;
-
-	if (copy_from_user(&upd, (void __user *)arg, sizeof(upd)))
-		return -EFAULT;
-
-	clip.x1 = min_t(u32, upd.update_region.left, ebc->width);
-	clip.y1 = min_t(u32, upd.update_region.top, ebc->height);
-	clip.x2 = min_t(u32, clip.x1 + upd.update_region.width, ebc->width);
-	clip.y2 = min_t(u32, clip.y1 + upd.update_region.height, ebc->height);
-	if (clip.x1 >= clip.x2 || clip.y1 >= clip.y2)
-		return -EINVAL;
-
-	mode = mxcfb_to_ebc_mode(upd.waveform_mode, upd.update_mode);
-	temp_valid = upd.temp != MXCFB_TEMP_USE_AMBIENT &&
-		     upd.temp > -128 && upd.temp < 128;
-
-	/* One section: no snapshot sees these pixels without their update. */
-	mutex_lock(&ebc->image_lock);
+	}
 
 	/*
 	 * From here on this client owns the pixels: it writes them through the
@@ -122,16 +132,23 @@ static int mxcfb_send_update(struct rk3026_ebc *ebc, struct fb_info *info,
 	 */
 	WRITE_ONCE(ebc->mxcfb_active, true);
 
-	/* A RESET discards the pixels: rk3026_ebc_queue_update() whitens them. */
-	if (mode != EBC_MODE_RESET)
+	/* A RESET discards the pixels: rk3026_ebc_add_update() whitens them. */
+	if (upd.mode != EBC_MODE_RESET)
 		rk3026_ebc_blit_xrgb8888(ebc, info->screen_buffer,
 					 info->fix.line_length, &clip);
-	rk3026_ebc_queue_update(ebc, &clip, mode, upd.temp, temp_valid,
-				upd.update_marker, EBC_SOURCE_MXCFB);
+	rk3026_ebc_add_update(ebc, &upd);
 	mutex_unlock(&ebc->image_lock);
 	return 0;
 }
 
+/*
+ * The fbdev core calls fb_ioctl under lock_fb_info(), so a client blocked
+ * here (up to rk3026_ebc_wait_timeout_ms() when the refresh thread is stuck)
+ * holds the fb_info lock: a send, FBIOPAN_DISPLAY or FBIOBLANK from another
+ * thread of the same or another process waits for it. So a send waits for
+ * no waveform only as long as a single thread both sends and waits, as
+ * e-reader clients do.
+ */
 static int mxcfb_wait_for_update(struct rk3026_ebc *ebc, unsigned long arg)
 {
 	u32 marker;

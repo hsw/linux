@@ -310,12 +310,30 @@ static int act8931_disable(struct regulator_dev *rdev)
  * The datasheet gives no slew rate for a VSET change; a raise is given
  * the soft-start time, a drop needs no wait before the load may rely on
  * it.
+ *
+ * LOCAL (RC2 stack): a raise waits at least the step at the node's
+ * regulator-ramp-delay as well. The core uses this callback instead of
+ * the ramp delay whenever a driver has one, so without this the DT
+ * value would be ignored; the RC2 board states a conservative ramp for
+ * DCDC3 as the CPU supply.
  */
 static int act8931_set_voltage_time_sel(struct regulator_dev *rdev,
 					unsigned int old_sel,
 					unsigned int new_sel)
 {
-	return new_sel > old_sel ? ACT8931_SOFTSTART_US : 0;
+	unsigned int ramp = rdev->constraints ? rdev->constraints->ramp_delay : 0;
+	int old_uv, new_uv, us = ACT8931_SOFTSTART_US;
+
+	if (new_sel <= old_sel)
+		return 0;
+	if (ramp) {
+		old_uv = regulator_list_voltage_linear_range(rdev, old_sel);
+		new_uv = regulator_list_voltage_linear_range(rdev, new_sel);
+		if (old_uv < 0 || new_uv < 0)
+			return us;
+		us = max(us, (int)DIV_ROUND_UP(new_uv - old_uv, ramp));
+	}
+	return us;
 }
 
 /*

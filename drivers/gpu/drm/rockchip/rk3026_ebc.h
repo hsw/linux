@@ -49,8 +49,8 @@
 
 /*
  * Waveform LUT SRAM, mapped inside the same window at +0x1000: 0x40 frames of
- * 0x40 bytes. Each frame is 16 words indexed by the new grey level, 2 bits per
- * old grey level. A waveform longer than 0x40 frames is sent in chunks.
+ * 0x40 bytes. Each frame is 16 words indexed by the old grey level, 2 bits per
+ * new grey level. A waveform longer than 0x40 frames is sent in chunks.
  */
 #define EBC_LUT_BASE		0x1000
 #define EBC_LUT_FRAME_BYTES	0x40
@@ -229,6 +229,13 @@ enum rk3026_ebc_outcome {
 	EBC_OUTCOME_ABANDONED,	/* the rails were down before a chunk */
 };
 
+/* The repair RESET a scan runs before its part when the glass is not known. */
+enum rk3026_ebc_repair {
+	EBC_REPAIR_NONE,	/* none ran: not due, or no RESET waveform */
+	EBC_REPAIR_DONE,	/* every frame driven: the glass is white */
+	EBC_REPAIR_FAILED,	/* cut short: the part was not driven */
+};
+
 /* One queued panel update. */
 struct rk3026_ebc_update {
 	struct drm_rect	clip;
@@ -275,6 +282,94 @@ struct rk3026_ebc_stats {
 };
 
 #define EBC_UPDATE_QUEUE_LEN	8
+
+/*
+ * Refresh bookkeeping as plain data, for the pure helpers in rk3026_ebc_core.c.
+ * None of it knows about the device; the driver embeds it and holds the lock.
+ */
+
+/*
+ * Updates merged into one scan: the bounding box of their clips, the
+ * strongest of their modes (rk3026_ebc_mode_rank()), the newest seq. Empty
+ * while @merged is 0. Taken out of a struct rk3026_ebc_pending it is the part
+ * one scan drives; a part whose @mode is EBC_MODE_RESET is a RESET alone.
+ */
+struct rk3026_ebc_set {
+	struct drm_rect	box;
+	u32		mode;
+	u32		seq;		/* the newest update's */
+	u32		merged;		/* updates in the set */
+	int		temp;		/* the newest valid one */
+	bool		temp_valid;
+	/* an MXCFB_SEND_UPDATE in a full-class mode: never skipped */
+	bool		has_mxcfb_full;
+	u8		source;		/* the newest update's */
+};
+
+/*
+ * Everything queued and not yet taken, in seq order: @pre, then the RESET
+ * barrier @reset, then @post. An update joins @post while a RESET is pending
+ * and @pre otherwise, so the RESET's scan comes after every update queued
+ * before it and before every one queued after it. The images are not split
+ * that finely: a scan draws the target image as it is when its part is
+ * taken, so where the boxes overlap @pre also draws pixels sent after the
+ * RESET. The RESET whitens them and the scan of @post draws them again.
+ *
+ * @carry is what a scan took but could not drive (no rails, LUT or waveform,
+ * or a failed repair). It is merged into the next @pre that is taken and is
+ * not work on its own, so a failing rail cannot spin the thread. A RESET
+ * sent drops it: that RESET whitens the glass it would draw. Present while
+ * its @merged is 1 (a carry counts no updates).
+ *
+ * @queued_seq is the seq of the newest update and @done_seq that of the newest
+ * finished one; both wrap and compare with rk3026_ebc_seq_done().
+ */
+struct rk3026_ebc_pending {
+	struct rk3026_ebc_set	pre;
+	struct rk3026_ebc_set	reset;
+	struct rk3026_ebc_set	post;
+	struct rk3026_ebc_set	carry;
+	u32			queued_seq;
+	u32			done_seq;
+};
+
+/*
+ * The CPU-side images, packed 4bpp like the scanned ones (@pitch bytes per
+ * line, @height lines): what the glass shows, and the snapshot a scan drives.
+ * @prev_unknown says @prev is not evidence (a waveform did not end).
+ */
+struct rk3026_ebc_shadows {
+	u8		*prev;
+	u8		*scan;
+	u32		pitch;
+	u32		height;
+	bool		prev_unknown;
+};
+
+/*
+ * MXCFB_WAIT_FOR_UPDATE_COMPLETE markers of the newest updates, and the seq
+ * each was queued with. Marker 0 is never recorded, so an empty slot never
+ * matches.
+ */
+#define EBC_MARKER_RING_LEN	32
+
+struct rk3026_ebc_marker_ring {
+	u32		marker[EBC_MARKER_RING_LEN];
+	u32		seq[EBC_MARKER_RING_LEN];
+	unsigned int	next;		/* the slot written next, unwrapped */
+};
+
+/* The update queued with @seq has finished once @done_seq reached it. */
+static inline bool rk3026_ebc_seq_done(u32 done_seq, u32 seq)
+{
+	return (s32)(done_seq - seq) >= 0;
+}
+
+/* Nothing for the refresh thread to take; a carry alone is not work. */
+static inline bool rk3026_ebc_pending_empty(const struct rk3026_ebc_pending *p)
+{
+	return !p->pre.merged && !p->reset.merged;
+}
 
 struct rk3026_ebc {
 	struct drm_device	drm;
@@ -422,6 +517,31 @@ void rk3026_ebc_queue_update(struct rk3026_ebc *ebc, const struct drm_rect *clip
 			     u32 mode, int temp, bool temp_valid, u32 marker,
 			     enum rk3026_ebc_source source);
 int rk3026_ebc_wait_marker(struct rk3026_ebc *ebc, u32 marker);
+
+/* rk3026_ebc_core.c */
+u32 rk3026_ebc_dsp_ctrl_mode(u32 mode);
+bool rk3026_ebc_pending_add(struct rk3026_ebc_pending *p,
+			    const struct rk3026_ebc_update *upd, u32 *seq);
+bool rk3026_ebc_pending_take(struct rk3026_ebc_pending *p,
+			     struct rk3026_ebc_set *part);
+bool rk3026_ebc_build_snapshot(const struct rk3026_ebc_shadows *sh,
+			       const u8 *next, const struct drm_rect *box,
+			       u32 *mode);
+bool rk3026_ebc_should_skip(const struct rk3026_ebc_set *part,
+			    bool prev_unknown, bool identical);
+u32 rk3026_ebc_scan_mode(const struct rk3026_ebc_set *part, bool repaired);
+bool rk3026_ebc_scan_finish(struct rk3026_ebc_shadows *sh,
+			    struct rk3026_ebc_pending *p,
+			    const struct rk3026_ebc_set *part,
+			    enum rk3026_ebc_outcome outcome,
+			    enum rk3026_ebc_repair repair);
+void rk3026_ebc_marker_seq_record(struct rk3026_ebc_marker_ring *ring,
+				  u32 marker, u32 seq);
+bool rk3026_ebc_marker_seq_lookup(const struct rk3026_ebc_marker_ring *ring,
+				  u32 marker, u32 *seq);
+#if IS_ENABLED(CONFIG_KUNIT)
+unsigned int rk3026_ebc_mode_rank(u32 mode);
+#endif
 
 /* rk3026_ebc_waveform.c */
 struct ebc_waveform *rk3026_ebc_waveform_parse(struct device *dev,

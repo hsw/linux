@@ -629,6 +629,9 @@ static inline void rk3026_ebc_debugfs_fini(struct rk3026_ebc *ebc) { }
 /* rk3026_ebc_mxcfb.c */
 #if IS_ENABLED(CONFIG_DRM_RK3026_EBC_MXCFB)
 void rk3026_ebc_mxcfb_install(struct rk3026_ebc *ebc, struct fb_info *info);
+#if IS_ENABLED(CONFIG_KUNIT)
+u32 rk3026_ebc_mxcfb_to_ebc_mode(u32 waveform_mode, u32 update_mode);
+#endif
 #else
 static inline void rk3026_ebc_mxcfb_install(struct rk3026_ebc *ebc,
 					    struct fb_info *info) { }

@@ -23,6 +23,8 @@
 #include <drm/drm_print.h>
 #include <drm/drm_rect.h>
 
+#include <kunit/visibility.h>
+
 #include "rk3026_ebc.h"
 #include "rk3026_ebc_mxcfb.h"
 
@@ -32,31 +34,42 @@
  * The rkf container this panel ships carries five LUT families: reset,
  * gray16, "mode 6", gray2 and grayA2. The EBC work modes below select them
  * through the controller's own dispatch, which also decides whether the
- * refresh is full-class or partial-class.
+ * refresh is full-class or partial-class. The work mode (EBC_MODE_*) by
+ * update_mode:
  *
- *   INIT    -> EBC_MODE_RESET       reset LUT, full class
- *   DU      -> EBC_MODE_BLACK_WHITE gray2 LUT, partial class
- *   A2      -> EBC_MODE_A2          grayA2 LUT, partial class
- *   GC16    -> EBC_MODE_FULL/PART   gray16 LUT, by update_mode
- *   GL16    -> EBC_MODE_PART        gray16 LUT, partial class
- *   REAGL   -> EBC_MODE_OED_PART    "mode 6" LUT, full class
- *   REAGLD  -> EBC_MODE_FULL        gray16 LUT, full class
- *   GC4     -> EBC_MODE_PART        gray16 LUT; the panel has no 4-level LUT
- *   AUTO    -> EBC_MODE_FULL/PART   gray16 LUT, by update_mode
+ *   waveform   PARTIAL       FULL
+ *   INIT       RESET         RESET         reset LUT, full class
+ *   DU         BLACK_WHITE   BLACK_WHITE   gray2 LUT, partial class
+ *   A2         A2            A2            grayA2 LUT, partial class
+ *   GC16       PART          FULL          gray16 LUT
+ *   GL16       PART          OED_PART      gray16 LUT / "mode 6" LUT
+ *   REAGL      PART          FULL          gray16 LUT
+ *   REAGLD     FULL          FULL          gray16 LUT, full class
+ *   GC4        PART          PART          gray16 LUT; no 4-level LUT
+ *   AUTO       PART          FULL          gray16 LUT
+ *   (other)    PART          FULL          gray16 LUT
+ *
+ * The "mode 6" family is the container's 16-level no-flash table: it drives
+ * like gray16 except white to white, which is what i.MX calls GL16, so a
+ * GL16 full update gets it. EBC_MODE_OED_PART is a full-class work mode
+ * (every pixel driven, unchanged ones too), so a GL16 partial update stays
+ * on the gray16 partial path, which drives only the pixels that change.
+ * REAGL is i.MX's ghost-reducing 16-level mode; this panel has no table for
+ * it, so it takes the gray16 family by update_mode, like GC16.
  *
  * GC4 and REAGLD have no distinct waveform on this panel and are folded into
- * the gray16 family; GL16 likewise, the container has no separate 16-level
- * "no-flash" table. REAGL is mapped onto the container's mode-6 family, which
- * is the only other 16-level table present - that pairing is this driver's
- * choice, not something the vendor code states.
+ * the gray16 family.
  *
  * AUTO is deliberately not routed to EBC_MODE_AUTO: that work mode is one of
  * the controller's direct modes, driven line by line with no LUT upload and
  * with DISPLAY_MODE clear, which is a different data path entirely. Treating
  * AUTO as GC16 keeps every update on the LUT path.
  */
-static u32 mxcfb_to_ebc_mode(u32 waveform_mode, u32 update_mode)
+VISIBLE_IF_KUNIT u32 rk3026_ebc_mxcfb_to_ebc_mode(u32 waveform_mode,
+						  u32 update_mode)
 {
+	bool full = update_mode == MXCFB_UPDATE_MODE_FULL;
+
 	switch (waveform_mode) {
 	case MXCFB_WAVEFORM_MODE_INIT:
 		return EBC_MODE_RESET;
@@ -64,20 +77,20 @@ static u32 mxcfb_to_ebc_mode(u32 waveform_mode, u32 update_mode)
 		return EBC_MODE_BLACK_WHITE;
 	case MXCFB_WAVEFORM_MODE_A2:
 		return EBC_MODE_A2;
-	case MXCFB_WAVEFORM_MODE_REAGL:
-		return EBC_MODE_OED_PART;
+	case MXCFB_WAVEFORM_MODE_GL16:
+		return full ? EBC_MODE_OED_PART : EBC_MODE_PART;
 	case MXCFB_WAVEFORM_MODE_REAGLD:
 		return EBC_MODE_FULL;
-	case MXCFB_WAVEFORM_MODE_GL16:
 	case MXCFB_WAVEFORM_MODE_GC4:
 		return EBC_MODE_PART;
 	case MXCFB_WAVEFORM_MODE_GC16:
+	case MXCFB_WAVEFORM_MODE_REAGL:
 	case MXCFB_WAVEFORM_MODE_AUTO:
 	default:
-		return update_mode == MXCFB_UPDATE_MODE_FULL ?
-			EBC_MODE_FULL : EBC_MODE_PART;
+		return full ? EBC_MODE_FULL : EBC_MODE_PART;
 	}
 }
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_mxcfb_to_ebc_mode);
 
 static int mxcfb_send_update(struct rk3026_ebc *ebc, struct fb_info *info,
 			     unsigned long arg)
@@ -98,8 +111,8 @@ static int mxcfb_send_update(struct rk3026_ebc *ebc, struct fb_info *info,
 
 	upd = (struct rk3026_ebc_update) {
 		.clip		= clip,
-		.mode		= mxcfb_to_ebc_mode(req.waveform_mode,
-						    req.update_mode),
+		.mode		= rk3026_ebc_mxcfb_to_ebc_mode(req.waveform_mode,
+							       req.update_mode),
 		.marker		= req.update_marker,
 		.temp		= req.temp,
 		.temp_valid	= req.temp != MXCFB_TEMP_USE_AMBIENT &&

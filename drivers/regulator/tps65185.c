@@ -49,6 +49,11 @@
 #define TPS65185_VADJ_MAX 6
 
 #define PGOOD_TIMEOUT_MSECS 200
+/* end of a temperature conversion: TMST1 poll step and cap */
+#define TMST_POLL_US 1000
+#define TMST_TIMEOUT_US 200000
+/* vendor: TMST_VALUE read right after CONV_END can still be 0 degrees C */
+#define TMST_SETTLE_US 10000
 
 struct tps65185_data {
 	struct device *dev;
@@ -77,18 +82,34 @@ static int tps65185_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
 			       u32 attr, int channel, long *temp)
 {
 	struct tps65185_data *data = dev_get_drvdata(dev);
+	struct i2c_client *client = to_i2c_client(data->dev);
 	unsigned int val;
 	int ret;
 
 	reinit_completion(&data->tmst_completion);
 	/* start acquisition */
-	regmap_update_bits(data->regmap, TPS65185_REG_TMST1,
-			   TPS65185_READ_THERM, TPS65185_READ_THERM);
-	wait_for_completion_timeout(&data->tmst_completion,
-				    msecs_to_jiffies(PGOOD_TIMEOUT_MSECS));
-	ret = regmap_read(data->regmap, TPS65185_REG_TMST1, &val);
-	if (!(val & TPS65185_CONV_END))
-		return -ETIMEDOUT;
+	ret = regmap_update_bits(data->regmap, TPS65185_REG_TMST1,
+				 TPS65185_READ_THERM, TPS65185_READ_THERM);
+	if (ret)
+		return ret;
+
+	if (client->irq)
+		wait_for_completion_timeout(&data->tmst_completion,
+					    msecs_to_jiffies(PGOOD_TIMEOUT_MSECS));
+
+	/*
+	 * Without nINT nothing completes a wait, so poll TMST1 until the
+	 * conversion has ended and READ_THERM has cleared, as the vendor
+	 * driver does. After the interrupt this returns on the first read.
+	 */
+	ret = regmap_read_poll_timeout(data->regmap, TPS65185_REG_TMST1, val,
+				       (val & TPS65185_CONV_END) &&
+				       !(val & TPS65185_READ_THERM),
+				       TMST_POLL_US, TMST_TIMEOUT_US);
+	if (ret)
+		return ret;
+
+	fsleep(TMST_SETTLE_US);
 
 	ret = regmap_read(data->regmap, TPS65185_REG_TMST_VALUE, &val);
 	if (ret)
@@ -571,7 +592,7 @@ static int tps65185_probe(struct i2c_client *client)
 	 * The end-of-conversion interrupt only with nINT wired: nobody else
 	 * reads INT1/INT2, so with it enabled and no handler the first
 	 * conversion latches nINT low for good. Without it a temperature read
-	 * waits out its timeout and then checks CONV_END in TMST1.
+	 * polls CONV_END in TMST1.
 	 */
 	if (client->irq) {
 		ret = devm_request_threaded_irq(&client->dev, client->irq,

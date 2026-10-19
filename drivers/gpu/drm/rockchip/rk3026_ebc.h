@@ -419,6 +419,46 @@ struct rk3026_ebc {
 	dma_addr_t		next_phys;
 	size_t			img_size;
 
+	/*
+	 * The CPU-side images, all cached, and what senders and the refresh
+	 * thread share, under @image_lock.
+	 *
+	 * @next_shadow is the target every sender blits into, white again when
+	 * a RESET is sent (the RESET ends white everywhere). @shadows.prev is
+	 * what the glass shows and @shadows.scan the snapshot a scan drives
+	 * (rk3026_ebc_build_snapshot()). The refresh thread alone writes those
+	 * two, under @image_lock, and swaps them after a scan
+	 * (rk3026_ebc_scan_finish()); being their only writer, it reads them
+	 * without the lock.
+	 *
+	 * @shadows.prev_unknown: @shadows.prev does not describe the glass.
+	 * Set when a waveform starts, cleared ONLY when every frame has been
+	 * driven, so a timeout, an error path or a path nobody has written yet
+	 * all leave it set by construction. ⚠️ Do not turn this into a list of
+	 * clears on the known abort paths: the one that matters is the path not
+	 * yet written. Read at the next draw, which then clears the panel first.
+	 * Written by the refresh thread alone: ebc_drive() owns it during a
+	 * waveform, and rk3026_ebc_scan_finish() records the part's outcome
+	 * under @image_lock, never clearing what ebc_drive() left set.
+	 *
+	 * @pending holds the carry of a scan that could not drive its part.
+	 * Until the senders queue into it, each dequeued update passes through
+	 * it alone (ebc_take_part()).
+	 *
+	 * @prev_virt and @next_virt, the write-combined images the controller
+	 * scans, are written by the thread alone, outside @image_lock, and
+	 * never read by the CPU.
+	 *
+	 * Lock order: @image_lock, then @queue_lock. @image_lock is never held
+	 * across a waveform, the sensor read or a write into @prev_virt or
+	 * @next_virt, so a sender waits at most for one snapshot to be built;
+	 * @rails_lock is never taken under it.
+	 */
+	struct mutex		image_lock;
+	u8			*next_shadow;
+	struct rk3026_ebc_shadows shadows;
+	struct rk3026_ebc_pending pending;
+
 	/* Write-only registers the controller does not read back. */
 	u32			dsp_start;
 	u32			dsp_ctrl;
@@ -439,25 +479,12 @@ struct rk3026_ebc {
 	 * An update that has been dequeued but not yet driven out. The queue
 	 * indices alone do not describe idleness: the thread bumps @queue_head
 	 * under @queue_lock and only then enters ebc_do_refresh(), so between
-	 * the two the queue reads empty while @blit_lock is still free --
-	 * which is exactly how rk3026_ebc_wait_idle() returned early and let
-	 * the first blit of a boot race the boot RESET (PENDING.md P39).
+	 * the two the queue reads empty while nothing is driven yet -- which is
+	 * exactly how rk3026_ebc_wait_idle() returned early and let the first
+	 * blit of a boot race the boot RESET (PENDING.md P39). Set from the
+	 * dequeue to the end of the update's bookkeeping, @prev_virt included.
 	 */
 	bool			refresh_busy;
-
-	/*
-	 * @prev_virt does not describe the glass.
-	 *
-	 * Set when a waveform starts, cleared ONLY when every frame has been
-	 * driven, so a timeout, an error path or a path nobody has written yet
-	 * all leave it set by construction. ⚠️ Do not turn this into a list of
-	 * clears on the known abort paths: the one that matters is the path not
-	 * yet written. Read at the next draw, which then clears the panel first.
-	 */
-	bool			prev_unknown;
-
-	/* Serialises writers into @next_virt. */
-	struct mutex		blit_lock;
 
 	/*
 	 * Panel rails off when idle. @epd_supply and @vcom_supply are switched
@@ -495,6 +522,7 @@ struct rk3026_ebc {
 	struct fb_ops		*fbops;
 	const struct fb_ops	*orig_fbops;
 	atomic_t		fb_users;
+	/* Written under @image_lock; debugfs reads it without. */
 	bool			mxcfb_active;
 
 	/* debugfs: the last update, the last driven one, the counters. */

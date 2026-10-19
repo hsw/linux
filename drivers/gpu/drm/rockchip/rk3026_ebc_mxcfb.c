@@ -110,20 +110,25 @@ static int mxcfb_send_update(struct rk3026_ebc *ebc, struct fb_info *info,
 	temp_valid = upd.temp != MXCFB_TEMP_USE_AMBIENT &&
 		     upd.temp > -128 && upd.temp < 128;
 
+	/* One section: no snapshot sees these pixels without their update. */
+	mutex_lock(&ebc->image_lock);
+
 	/*
 	 * From here on this client owns the pixels: it writes them through the
 	 * mmap and tells us when they are ready, so the deferred-IO path must
-	 * not refresh the same region again with the default waveform.
+	 * not refresh the same region again with the default waveform. Set in
+	 * this section, where the plane update checks it
+	 * (rk3026_ebc_plane_update()).
 	 */
-	ebc->mxcfb_active = true;
+	WRITE_ONCE(ebc->mxcfb_active, true);
 
-	mutex_lock(&ebc->blit_lock);
-	rk3026_ebc_blit_xrgb8888(ebc, info->screen_buffer,
-				 info->fix.line_length, &clip);
-	mutex_unlock(&ebc->blit_lock);
-
+	/* A RESET discards the pixels: rk3026_ebc_queue_update() whitens them. */
+	if (mode != EBC_MODE_RESET)
+		rk3026_ebc_blit_xrgb8888(ebc, info->screen_buffer,
+					 info->fix.line_length, &clip);
 	rk3026_ebc_queue_update(ebc, &clip, mode, upd.temp, temp_valid,
 				upd.update_marker, EBC_SOURCE_MXCFB);
+	mutex_unlock(&ebc->image_lock);
 	return 0;
 }
 
@@ -174,8 +179,11 @@ static int ebc_fb_release(struct fb_info *info, int user)
 	struct rk3026_ebc *ebc = drm_to_ebc(helper->dev);
 
 	/* Hand the panel back to fbcon once the last mxcfb client is gone. */
-	if (user && atomic_dec_and_test(&ebc->fb_users))
-		ebc->mxcfb_active = false;
+	if (user && atomic_dec_and_test(&ebc->fb_users)) {
+		mutex_lock(&ebc->image_lock);
+		WRITE_ONCE(ebc->mxcfb_active, false);
+		mutex_unlock(&ebc->image_lock);
+	}
 
 	if (ebc->orig_fbops->fb_release)
 		return ebc->orig_fbops->fb_release(info, user);

@@ -3,8 +3,9 @@
  * debugfs of the RK3026 EBC: what the driver believes is on the glass.
  *
  * <debugfs>/rk3026-ebc/
- *   panel   the on-panel image (@prev_virt), read-only binary
- *   target  the image the next scan drives (@next_virt), read-only binary
+ *   panel   the on-panel image (@shadows.prev), read-only binary
+ *   target  the target image the senders write (@next_shadow); a scan draws
+ *           the part of it its updates cover, read-only binary
  *   state   text, one "key value" line per item (rk3026_ebc_state_show())
  *
  * Both images are @img_size = width * height / 2 bytes: 4 bpp, two pixels per
@@ -13,16 +14,16 @@
  * the connector and does not apply here), 0 black and 15 white. That is the
  * layout rk3026_ebc_blit_xrgb8888() writes.
  *
- * An image is copied at open(), under @blit_lock. The refresh thread holds
- * that lock for a whole update, from the identical-image test to the copy of
- * next into prev, and every client blit into next takes it, so a snapshot is
- * never half of an update. (The white fill of a CRTC enable writes next
- * without it; the commit order keeps client blits away from it, a reader of
- * "target" is not.) Copying at open() instead of locking per read() matters
+ * Both are the cached shadows, copied at open() under @image_lock. Every
+ * write to them takes that lock: a sender blits into next and queues its
+ * update in one section, the white fill of a RESET is one section with the
+ * RESET, and the refresh thread changes prev only at the end of a scan,
+ * in the section that publishes the "state" record. So an image is never
+ * half of an update. Copying at open() instead of locking per read() matters
  * because a reader takes the file in chunks: a lock per read() would let an
  * update land between two of them. The cost is one image-sized buffer per
- * open file, and an open() that waits out a running waveform (seconds; a
- * signal interrupts the wait).
+ * open file; the lock is not held across a waveform, so an open() waits at
+ * most for one snapshot to be built.
  */
 
 #include <linux/debugfs.h>
@@ -49,14 +50,14 @@ static int ebc_image_open(struct inode *inode, struct file *file, bool target)
 	if (!snap)
 		return -ENOMEM;
 
-	ret = mutex_lock_interruptible(&ebc->blit_lock);
+	ret = mutex_lock_interruptible(&ebc->image_lock);
 	if (ret) {
 		kvfree(snap);
 		return ret;
 	}
-	memcpy(snap->data, target ? ebc->next_virt : ebc->prev_virt,
+	memcpy(snap->data, target ? ebc->next_shadow : ebc->shadows.prev,
 	       ebc->img_size);
-	mutex_unlock(&ebc->blit_lock);
+	mutex_unlock(&ebc->image_lock);
 
 	snap->len = ebc->img_size;
 	file->private_data = snap;
@@ -160,7 +161,7 @@ static void ebc_show_last(struct seq_file *m, const char *p,
  * "state": one "key value" line per item, values decimal or a word. The
  * record and the counters are copied under @queue_lock, where the refresh
  * thread publishes them, so they agree with each other; this never takes
- * @blit_lock and so answers during a waveform too.
+ * @image_lock and so never waits for a snapshot.
  *
  * last_* is the last update the refresh thread finished, whatever became of
  * it; scan_* the last one that started a waveform. Clips are x1 y1 x2 y2,
@@ -194,7 +195,7 @@ static int rk3026_ebc_state_show(struct seq_file *m, void *unused)
 	seq_printf(m, "epd_on %d\n", READ_ONCE(ebc->epd_on));
 	seq_printf(m, "vcom_on %d\n", READ_ONCE(ebc->vcom_on));
 	seq_printf(m, "v3p3_on %d\n", READ_ONCE(ebc->v3p3_on));
-	seq_printf(m, "prev_unknown %d\n", READ_ONCE(ebc->prev_unknown));
+	seq_printf(m, "prev_unknown %d\n", READ_ONCE(ebc->shadows.prev_unknown));
 	seq_printf(m, "busy %d\n", busy);
 	seq_printf(m, "queued %u\n", queued);
 	seq_printf(m, "updates %llu\n", st.updates);

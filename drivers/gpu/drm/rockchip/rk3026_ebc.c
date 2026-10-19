@@ -338,18 +338,14 @@ module_param(debug_timeout, uint, 0644);
 MODULE_PARM_DESC(debug_timeout, "force the next N chunks to time out (0 = off); provokes P62's abort");
 
 /*
- * Bytes of the target image that differ from what the panel is believed to
- * show, and the value the skip decision in ebc_do_refresh() is made on.
- *
- * This is computed on EVERY refresh, not just when logging: a waveform whose
- * old and new greys are equal everywhere drives the panel to where it already
- * is, which is pure wear. The cost is one pass over 388 KiB against a scan of
- * three seconds, so it does not need to be conditional and must not be -- when
- * it was inside `if (debug_scan)` the driver could not act on it at all.
+ * DIAGNOSTIC: the snapshot a scan drives against the image the panel is
+ * believed to show, from the cached shadows (debug_scan only). The skip
+ * decision does not depend on it: ebc_do_refresh() makes that one on every
+ * refresh, from what rk3026_ebc_build_snapshot() returns.
  */
-static size_t ebc_report_image(struct rk3026_ebc *ebc)
+static void ebc_report_image(struct rk3026_ebc *ebc)
 {
-	const u8 *p = ebc->prev_virt, *n = ebc->next_virt;
+	const u8 *p = ebc->shadows.prev, *n = ebc->shadows.scan;
 	size_t i, diff = 0, black = 0, white = 0;
 	u32 hn = 2166136261u, hp = 2166136261u;
 
@@ -372,12 +368,9 @@ static size_t ebc_report_image(struct rk3026_ebc *ebc)
 		hp = (hp ^ p[i]) * 16777619u;
 	}
 
-	if (debug_scan)
-		dev_info(ebc->dev,
-			 "scan: image %zu bytes, %zu differ from prev, next %zu x00 %zu xff, fp next %08x prev %08x\n",
-			 ebc->img_size, diff, black, white, hn, hp);
-
-	return diff;
+	dev_info(ebc->dev,
+		 "scan: image %zu bytes, %zu differ from prev, scan %zu x00 %zu xff, fp scan %08x prev %08x\n",
+		 ebc->img_size, diff, black, white, hn, hp);
 }
 
 /*
@@ -642,9 +635,9 @@ static void ebc_frame_kick(struct rk3026_ebc *ebc, const u8 *lut,
 	 * fetch it. Two distinct things need this and neither had it:
 	 *
 	 *  - the IMAGE, in prev_virt/next_virt, which are DMA_ATTR_WRITE_COMBINE
-	 *    (ebc_setup_buffers). Write-combining means the blit's stores sit in a
-	 *    merge buffer with no ordering against the EBC's AXI master reading
-	 *    the same memory.
+	 *    (ebc_setup_buffers). Write-combining means the thread's copies into
+	 *    them sit in a merge buffer with no ordering against the EBC's AXI
+	 *    master reading the same memory.
 	 *  - the LUT SRAM and the register group just above, written with
 	 *    writel_relaxed() throughout, which by definition orders nothing.
 	 *
@@ -766,6 +759,9 @@ static int ebc_read_temp(struct rk3026_ebc *ebc)
  *
  * The panel is 4bpp with two pixels per byte, low nibble first. The clip is
  * widened to an even pixel boundary so byte writes stay whole.
+ *
+ * Writes @next_shadow. Called under @image_lock, in the same section that
+ * queues the update, so no snapshot sees the pixels without their update.
  */
 void rk3026_ebc_blit_xrgb8888(struct rk3026_ebc *ebc, const void *src,
 			      unsigned int src_pitch, const struct drm_rect *clip)
@@ -776,12 +772,13 @@ void rk3026_ebc_blit_xrgb8888(struct rk3026_ebc *ebc, const void *src,
 	int y2 = min_t(int, clip->y2, (int)ebc->height);
 	int x, y;
 
+	lockdep_assert_held(&ebc->image_lock);
 	if (x1 >= x2 || y1 >= y2)
 		return;
 
 	for (y = y1; y < y2; y++) {
 		const u8 *s = (const u8 *)src + (size_t)y * src_pitch + x1 * 4;
-		u8 *d = (u8 *)ebc->next_virt + ((size_t)y * ebc->width + x1) / 2;
+		u8 *d = ebc->next_shadow + ((size_t)y * ebc->width + x1) / 2;
 
 		for (x = x1; x < x2; x += 2, s += 8, d++) {
 			u32 p0 = get_unaligned_le32(s);
@@ -864,12 +861,14 @@ static void ebc_stop_scan(struct rk3026_ebc *ebc)
  * so the caller must not drive anything else for this update. -EIO if the
  * rails were found down before a chunk.
  *
- * @prev_unknown is set here and cleared in exactly ONE place -- the successful
- * exit below. That asymmetry is the whole design (docs/PENDING.md P62): a
- * refresh that ends any other way, including one added later by someone who
- * never read this comment, leaves the flag set without having to be listed
- * anywhere. Do not "improve" this into a set of clears on the known failure
- * paths; the failure that matters is the path not yet written.
+ * @shadows.prev_unknown is set here and cleared in exactly ONE place of this
+ * function -- the successful exit below. rk3026_ebc_scan_finish() records the
+ * part's outcome afterwards and never clears what this left set.
+ * That asymmetry is the whole design: a refresh that ends any other way,
+ * including one added later by someone who never read this comment, leaves
+ * the flag set without having to be listed anywhere. Do not "improve" this
+ * into a set of clears on the known failure paths; the failure that matters
+ * is the path not yet written.
  */
 static int ebc_drive(struct rk3026_ebc *ebc, const u8 *lut, u32 frames,
 		     u32 mode, u32 lut_mode, struct rk3026_ebc_last *last)
@@ -883,7 +882,7 @@ static int ebc_drive(struct rk3026_ebc *ebc, const u8 *lut, u32 frames,
 				    last->marker,
 				    last->repaired && !last->scans);
 
-	ebc->prev_unknown = true;
+	WRITE_ONCE(ebc->shadows.prev_unknown, true);
 	last->scans++;
 	last->lut_mode = lut_mode;
 	last->frames = frames;
@@ -950,7 +949,7 @@ static int ebc_drive(struct rk3026_ebc *ebc, const u8 *lut, u32 frames,
 	/* The idle deadline runs from the end of the last waveform. */
 	ebc_rails_rearm(ebc);
 
-	ebc->prev_unknown = false;
+	WRITE_ONCE(ebc->shadows.prev_unknown, false);
 	last->outcome = EBC_OUTCOME_DRIVEN;
 out:
 	last->driven = done;
@@ -972,13 +971,15 @@ out:
  *
  * That is what makes this repair cheap and content-preserving. It needs no third
  * buffer and no MST reprogramming (WIN_MST0/1 are shadowed, so a per-pass swap
- * would land on the wrong pass anyway); @next_virt keeps the caller's image
+ * would land on the wrong pass anyway); @next_virt keeps the snapshot
  * untouched through the RESET and is drawn immediately afterwards from a @prev
  * that is now true.
  *
  * White is the state a RESET lands on -- the same assumption
- * ebc_crtc_atomic_enable() already makes when it memsets @next_virt to 0xff for
- * the boot clear.
+ * ebc_crtc_atomic_enable() already makes when it memsets @next_shadow to 0xff
+ * for the boot clear. Both prev images follow: @prev_virt for the scan, and
+ * @shadows.prev, in a short @image_lock section, for debugfs and the next
+ * snapshot.
  */
 static int ebc_recover_panel(struct rk3026_ebc *ebc, int temp,
 			     struct rk3026_ebc_last *last)
@@ -1001,9 +1002,11 @@ static int ebc_recover_panel(struct rk3026_ebc *ebc, int temp,
 
 	last->repaired = true;
 	ret = ebc_drive(ebc, lut, frames, EBC_MODE_RESET, EBC_MODE_RESET, last);
-	if (!ret)
-		memset(ebc->prev_virt, 0xff, ebc->img_size);
-	return ret;
+	if (ret)
+		return ret;
+
+	memset(ebc->prev_virt, 0xff, ebc->img_size);
+	return 0;
 }
 
 /*
@@ -1098,9 +1101,10 @@ err:
 }
 
 /*
- * Publish the record of a finished update, and count it. Called with
- * @blit_lock held when the update took it, so a debugfs "panel" snapshot
- * (taken under @blit_lock) never shows an image the counters do not cover.
+ * Publish the record of a finished update, and count it. Called under
+ * @image_lock, in the section of rk3026_ebc_scan_finish(), so a debugfs
+ * "panel" snapshot (taken under @image_lock) never shows an image the
+ * counters do not cover.
  */
 static void ebc_publish(struct rk3026_ebc *ebc, struct rk3026_ebc_last *last,
 			ktime_t start)
@@ -1148,35 +1152,95 @@ static void ebc_publish(struct rk3026_ebc *ebc, struct rk3026_ebc_last *last,
 	spin_unlock(&ebc->queue_lock);
 }
 
-/* Drive one queued update onto the panel. Runs only on the refresh thread. */
+/*
+ * The part one scan drives, from the update the thread dequeued.
+ *
+ * Until the senders queue into @pending, each update passes through it alone:
+ * it is added and taken at once, so @pending is empty again afterwards but
+ * for the carry of a scan that could not drive, and the carry and RESET rules
+ * are those of rk3026_ebc_pending_take(). The queue keeps its order.
+ */
+static void ebc_take_part(struct rk3026_ebc *ebc,
+			  const struct rk3026_ebc_update *upd,
+			  struct rk3026_ebc_set *part)
+{
+	u32 seq;
+
+	lockdep_assert_held(&ebc->image_lock);
+	rk3026_ebc_pending_add(&ebc->pending, upd, &seq);
+	rk3026_ebc_pending_take(&ebc->pending, part);
+}
+
+/*
+ * Drive one queued update onto the panel. Runs only on the refresh thread.
+ *
+ * Three steps, so that no sender waits for a waveform:
+ *
+ *  1. under @image_lock: the update becomes a part, and its snapshot is built
+ *     into @shadows.scan from @shadows.prev and @next_shadow. Senders may
+ *     blit into @next_shadow as soon as the lock is dropped: the snapshot is
+ *     what this scan drives, and their updates are queued behind this one.
+ *  2. without it: the sensor, the rails, the snapshot into @next_virt, a
+ *     repair if the glass is not known, the waveform;
+ *  3. under @image_lock again: rk3026_ebc_scan_finish() says what the glass
+ *     shows now, and the record is published with it. @prev_virt follows
+ *     once the lock is dropped.
+ */
 static void ebc_do_refresh(struct rk3026_ebc *ebc,
 			   const struct rk3026_ebc_update *upd,
-			   struct rk3026_ebc_last *last)
+			   struct rk3026_ebc_last *last, bool active)
 {
+	enum rk3026_ebc_repair repair_result = EBC_REPAIR_NONE;
+	struct rk3026_ebc_shadows *sh = &ebc->shadows;
 	ktime_t start = ktime_get();
-	u32 frames;
+	struct rk3026_ebc_set part;
+	bool repair_due, identical, prev_changed;
+	u32 frames, mode, scan_mode, lut_mode;
 	const u8 *lut;
 	int temp;
 	int ret;
-	u32 mode = upd->mode;
-	u32 lut_mode;
 
+	mutex_lock(&ebc->image_lock);
+	ebc_take_part(ebc, upd, &part);
+	last->clip = part.box;
+
+	/*
+	 * Nothing reaches the panel while the CRTC is off: the rails stay
+	 * down, the prev images are untouched, and a waiter on the update's
+	 * marker is released by the caller.
+	 */
+	if (!active) {
+		dev_dbg(ebc->dev, "CRTC off, part (mode %u) dropped\n",
+			part.mode);
+		last->outcome = EBC_OUTCOME_CRTC_OFF;
+		goto finish;
+	}
 	if (!ebc->waveform) {
 		last->outcome = EBC_OUTCOME_NO_WAVEFORM;
-		ebc_publish(ebc, last, start);
-		return;
+		goto finish;
 	}
 
+	/*
+	 * A glass that is not known is repaired with a RESET before the draw
+	 * (below), except before a RESET, which clears it anyway. After a
+	 * repair the glass is white outside the box too, while the snapshot
+	 * there holds the old greys, so the scan runs at least PART; the
+	 * snapshot is then not thresholded either.
+	 */
+	repair_due = sh->prev_unknown && part.mode != EBC_MODE_RESET;
+	scan_mode = rk3026_ebc_scan_mode(&part, repair_due);
+
+	/* An A2 scan over a grey of the glass comes back as DU. */
+	identical = !rk3026_ebc_build_snapshot(sh, ebc->next_shadow, &part.box,
+					       &scan_mode);
+	if (debug_scan)
+		ebc_report_image(ebc);
+
 	/* DIAGNOSTIC: drive a different mode class with the same data and scan. */
+	mode = scan_mode;
 	if (force_mode >= 0 && force_mode <= EBC_MODE_MAX)
 		mode = force_mode;
 	last->mode = mode;
-
-	/*
-	 * The target image must not move while the controller is scanning it,
-	 * so writers are held off for the whole waveform.
-	 */
-	mutex_lock(&ebc->blit_lock);
 
 	/*
 	 * Nothing changed? Then do not drive the panel.
@@ -1195,7 +1259,11 @@ static void ebc_do_refresh(struct rk3026_ebc *ebc,
 	 * Left alone it is also continuous wear -- fbcon's cursor blink drove a
 	 * 38-frame full waveform every ~1.1 s indefinitely (docs/PENDING.md P29).
 	 *
-	 * ⚠️ EBC_MODE_RESET is exempt, and the test is on the UPDATE's own mode,
+	 * The test is on the cached snapshot against the cached prev, never on
+	 * the write-combined images. rk3026_ebc_should_skip() holds the
+	 * exemptions:
+	 *
+	 * ⚠️ EBC_MODE_RESET is exempt, and the test is on the PART's own mode,
 	 * not the possibly-forced one. The boot-time clear legitimately has
 	 * prev == next == white: the controller indexes its LUT by (prev, next),
 	 * so the driver must MAKE the panel white rather than assume it is, and
@@ -1203,17 +1271,16 @@ static void ebc_do_refresh(struct rk3026_ebc *ebc,
 	 * Keying off `mode` instead would let force_mode disable the boot clear.
 	 *
 	 * ⚠️ DO NOT DROP the @prev_unknown exemption. The skip is a decision made
-	 * from @prev_virt, and the flag says @prev_virt is not evidence; without
-	 * the exemption an aborted waveform makes the draw that would repair the
+	 * from @shadows.prev, and the flag says it is not evidence; without the
+	 * exemption an aborted waveform makes the draw that would repair the
 	 * glass the one thrown away, and the panel is unreachable from userspace.
 	 * It does not weaken the skip -- a successful refresh clears the flag, so
 	 * P29's case (fbcon redrawing one image forever) still skips.
 	 *
-	 * ⚠️ An MXCFB_SEND_UPDATE in a full-class mode is exempt too (the
-	 * update's own mode, as for RESET; full class = what
-	 * rk3026_ebc_dsp_ctrl_mode() gives DISPLAY_MODE alone: FULL, i.e. GC16
-	 * or AUTO with UPDATE_MODE_FULL and REAGLD, OED_PART for REAGL, RESET,
-	 * BLOCK, FULL_DITHER). Neither
+	 * ⚠️ An MXCFB_SEND_UPDATE in a full-class mode is exempt too
+	 * (@has_mxcfb_full; full class = what rk3026_ebc_dsp_ctrl_mode() gives
+	 * DISPLAY_MODE alone: FULL, i.e. GC16 or AUTO with UPDATE_MODE_FULL and
+	 * REAGLD, OED_PART for REAGL, RESET, BLOCK, FULL_DITHER). Neither
 	 * reason for the skip applies to it: it is queued once, by a client, not
 	 * by every fbdev commit or cursor blink. A GC16 full on identical content
 	 * is the ghost-clearing flash the client asks for, and it also repairs
@@ -1222,30 +1289,23 @@ static void ebc_do_refresh(struct rk3026_ebc *ebc,
 	 * before it draws its pixels and leaves prev == next for the full. Plane
 	 * updates and partial-class mxcfb sends still skip.
 	 */
-	if (!ebc_report_image(ebc) && upd->mode != EBC_MODE_RESET &&
-	    !ebc->prev_unknown &&
-	    !(upd->source == EBC_SOURCE_MXCFB &&
-	      rk3026_ebc_dsp_ctrl_mode(upd->mode) == DSP_DISPLAY_MODE)) {
+	if (rk3026_ebc_should_skip(&part, sh->prev_unknown, identical)) {
 		if (debug_scan)
 			dev_info(ebc->dev, "scan: skipped, image identical to prev\n");
 		last->outcome = EBC_OUTCOME_SKIPPED;
-		goto out;
+		goto finish;
 	}
+	mutex_unlock(&ebc->image_lock);
 
 	/*
-	 * The sensor read takes ~200 ms on RC2 (no nINT) and is only needed when
-	 * a waveform follows, so it comes after the skip. It is done without
-	 * @blit_lock so writers are not held off for it; a blit that lands
-	 * meanwhile only makes @next_virt newer, and that is what gets driven.
-	 * @prev_virt and @prev_unknown belong to this thread alone.
+	 * The sensor read is only needed when a waveform follows, so it comes
+	 * after the skip, and it is done without @image_lock so that no sender
+	 * waits for it.
 	 */
-	if (upd->temp_valid) {
-		temp = upd->temp;
-	} else {
-		mutex_unlock(&ebc->blit_lock);
+	if (part.temp_valid)
+		temp = part.temp;
+	else
 		temp = ebc_read_temp(ebc);
-		mutex_lock(&ebc->blit_lock);
-	}
 	if (temp > EBC_TEMP_MAX)
 		temp = EBC_TEMP_FALLBACK;
 	last->temp = temp;
@@ -1253,24 +1313,26 @@ static void ebc_do_refresh(struct rk3026_ebc *ebc,
 
 	/*
 	 * Rails up before anything is driven, the repair below included. If they
-	 * do not come up nothing is driven and the glass is as it was, so
-	 * @prev_virt stays true -- except for a RESET, which is only queued when
-	 * the glass is not known (the boot clear) and so must leave the mark.
+	 * do not come up nothing is driven and the glass is as it was, so the
+	 * prev image stays true and the part is carried into the next scan --
+	 * except for a RESET, which is only queued when the glass is not known
+	 * (the boot clear) and so leaves the mark (rk3026_ebc_scan_finish()).
 	 */
 	mutex_lock(&ebc->rails_lock);
 	ret = ebc_rails_on(ebc);
 	mutex_unlock(&ebc->rails_lock);
 	if (ret) {
-		if (upd->mode == EBC_MODE_RESET)
-			ebc->prev_unknown = true;
 		last->outcome = EBC_OUTCOME_NO_RAILS;
-		goto out;
+		goto relock;
 	}
 
+	/* The controller reads the snapshot; nothing on the CPU reads it back. */
+	memcpy(ebc->next_virt, sh->scan, ebc->img_size);
+
 	/*
-	 * Repair before drawing, never instead of it: this returns with @prev_virt
-	 * describing the glass again, and @next_virt still holding the caller's
-	 * image, so the update below is driven from a true prev.
+	 * Repair before drawing, never instead of it: this returns with the prev
+	 * images describing the glass again, and @next_virt still holding the
+	 * snapshot, so the part below is driven from a true prev.
 	 *
 	 * ⚠️ It must run BEFORE the LUT is fetched. rk3026_ebc_waveform_lut()
 	 * decodes into one buffer inside the container and hands out a pointer to
@@ -1278,33 +1340,43 @@ static void ebc_do_refresh(struct rk3026_ebc *ebc,
 	 * earlier -- fetching first would silently drive the requested mode's
 	 * frame count through the RESET LUT.
 	 */
-	/* A RESET that failed took the rails down: nothing more this time. */
-	if (ebc->prev_unknown && ebc_recover_panel(ebc, temp, last))
-		goto out;
+	if (repair_due) {
+		/*
+		 * A RESET that failed took the rails down: nothing more this
+		 * time, and the part is carried (rk3026_ebc_scan_finish()).
+		 */
+		if (ebc_recover_panel(ebc, temp, last)) {
+			repair_result = EBC_REPAIR_FAILED;
+			goto relock;
+		}
+		if (last->repaired)
+			repair_result = EBC_REPAIR_DONE;
+	}
 
 	/*
-	 * A direct mode has no LUT of its own; fall back to the update's own mode
+	 * A direct mode has no LUT of its own; fall back to the part's own mode
 	 * for the scan data so the DSP_CTRL class is the only thing that changed.
 	 */
 	lut_mode = mode;
 	lut = rk3026_ebc_waveform_lut(ebc->waveform, mode, temp, &frames);
-	if (!lut && mode != upd->mode) {
-		lut_mode = upd->mode;
-		lut = rk3026_ebc_waveform_lut(ebc->waveform, upd->mode, temp, &frames);
+	if (!lut && mode != scan_mode) {
+		lut_mode = scan_mode;
+		lut = rk3026_ebc_waveform_lut(ebc->waveform, scan_mode, temp,
+					      &frames);
 	}
 	if (!lut) {
 		if (debug_scan)
 			dev_info(ebc->dev, "scan: no LUT for mode %u at %d C\n",
 				 mode, temp);
 		last->outcome = EBC_OUTCOME_NO_LUT;
-		goto out;
+		goto relock;
 	}
 
 	if (debug_scan) {
 		dev_info(ebc->dev,
-			 "scan: mode %u (update asked %u) temp %d C, %u frames, clip %d,%d-%d,%d\n",
-			 mode, upd->mode, temp, frames, upd->clip.x1, upd->clip.y1,
-			 upd->clip.x2, upd->clip.y2);
+			 "scan: mode %u (part asked %u) temp %d C, %u frames, clip %d,%d-%d,%d\n",
+			 mode, upd->mode, temp, frames, part.box.x1, part.box.y1,
+			 part.box.x2, part.box.y2);
 		ebc_report_env(ebc);
 	}
 
@@ -1313,18 +1385,28 @@ static void ebc_do_refresh(struct rk3026_ebc *ebc,
 	if (debug_scan)
 		debug_scan--;
 
+relock:
+	mutex_lock(&ebc->image_lock);
+finish:
 	/*
-	 * What was driven in is now what the panel shows.
+	 * What was driven in is now what the panel shows: once ebc_drive() was
+	 * entered for the part, the snapshot becomes prev whatever the outcome.
+	 * A repair RESET that failed never got that far: the part is carried
+	 * and prev stays, marked unknown.
 	 *
-	 * ⚠️ STAYS UNCONDITIONAL. Making it conditional on success looks like the
-	 * fix and is not: @prev_virt would then hold a still older image, equally
-	 * false and carrying no mark saying so. @prev_unknown is the mark, and the
-	 * next draw acts on it.
+	 * ⚠️ The swap STAYS UNCONDITIONAL once the waveform was entered. Keeping
+	 * the old prev after a timeout looks like the fix and is not: prev would
+	 * then hold a still older image, equally false and carrying no mark
+	 * saying so. @prev_unknown is the mark, and the next draw acts on it.
 	 */
-	memcpy(ebc->prev_virt, ebc->next_virt, ebc->img_size);
-out:
+	prev_changed = rk3026_ebc_scan_finish(sh, &ebc->pending, &part,
+					      last->outcome, repair_result);
 	ebc_publish(ebc, last, start);
-	mutex_unlock(&ebc->blit_lock);
+	mutex_unlock(&ebc->image_lock);
+
+	/* Only this thread writes either prev image, so this needs no lock. */
+	if (prev_changed)
+		memcpy(ebc->prev_virt, sh->prev, ebc->img_size);
 }
 
 static bool ebc_queue_empty(struct rk3026_ebc *ebc)
@@ -1392,11 +1474,6 @@ static int ebc_refresh_thread(void *data)
 		active = ebc->crtc_on;
 		spin_unlock(&ebc->queue_lock);
 
-		/*
-		 * Nothing reaches the panel while the CRTC is off: the rails
-		 * stay down, @prev_virt is untouched, and a waiter on the
-		 * update's marker is released below.
-		 */
 		memset(&last, 0, sizeof(last));
 		last.clip = upd.clip;
 		last.asked_mode = upd.mode;
@@ -1404,15 +1481,9 @@ static int ebc_refresh_thread(void *data)
 		last.lut_mode = upd.mode;
 		last.marker = upd.marker;
 		last.source = upd.source;
-		if (active) {
-			ebc_do_refresh(ebc, &upd, &last);
-		} else {
-			dev_dbg(ebc->dev, "CRTC off, update (mode %u) dropped\n",
-				upd.mode);
-			last.outcome = EBC_OUTCOME_CRTC_OFF;
-			ebc_publish(ebc, &last, ktime_get());
-		}
+		ebc_do_refresh(ebc, &upd, &last, active);
 
+		/* The waiter on the update's marker is released here. */
 		spin_lock(&ebc->queue_lock);
 		ebc->marker_active = 0;
 		ebc->refresh_busy = false;
@@ -1429,14 +1500,19 @@ static int ebc_refresh_thread(void *data)
 /*
  * Block until nothing is queued and no waveform is in flight.
  *
- * ⚠️ "Empty queue plus an uncontended @blit_lock" is NOT idle, and believing
- * it was is docs/PENDING.md P39's second half: ebc_refresh_thread() bumps
- * @queue_head under @queue_lock and only then calls ebc_do_refresh(), which is
- * where @blit_lock is taken. In that window both tests pass while a full
- * waveform is about to run -- so this returned immediately, the caller's blit
- * landed in @next_virt, and the boot RESET drove the client's image instead of
- * white. @refresh_busy closes the window because it is set in the same critical
- * section that dequeues.
+ * Idle is an empty queue AND !@refresh_busy, both read in one @queue_lock
+ * section. @refresh_busy is set in the section that dequeues and cleared only
+ * after ebc_do_refresh() has returned -- waveform, rk3026_ebc_scan_finish()
+ * and the copy into @prev_virt included -- so no state between a dequeue and
+ * the end of its update reads as idle.
+ *
+ * ⚠️ An empty queue alone is NOT idle, and believing it was is
+ * docs/PENDING.md P39's second half: ebc_refresh_thread() bumps @queue_head
+ * under @queue_lock and only then calls ebc_do_refresh(). In that window the
+ * queue reads empty while a full waveform is about to run -- so this returned
+ * immediately, the caller's blit landed in the target image, and the boot
+ * RESET drove the client's image instead of white. Nor is @image_lock a
+ * substitute: the thread does not hold it across a waveform.
  *
  * Bounded by EBC_IDLE_TIMEOUT_MS so a thread stuck elsewhere cannot hang
  * blank or shutdown; returns -ETIMEDOUT then.
@@ -1453,28 +1529,32 @@ int rk3026_ebc_wait_idle(struct rk3026_ebc *ebc)
 		if (idle)
 			break;
 		if (time_after(jiffies, end)) {
-			/* @blit_lock may be the thread's: do not wait for it. */
 			dev_warn(ebc->dev, "refresh thread busy for %u ms, not waiting\n",
 				 EBC_IDLE_TIMEOUT_MS);
 			return -ETIMEDOUT;
 		}
 		msleep(20);
 	}
-
-	mutex_lock(&ebc->blit_lock);
-	mutex_unlock(&ebc->blit_lock);
 	return 0;
 }
 
 /**
  * rk3026_ebc_queue_update - hand a panel update to the refresh thread
  * @ebc: controller
- * @clip: damaged region; recorded but the scan is always full-panel
+ * @clip: damaged region: the scan drives the whole panel, but moves only
+ *	  the pixels inside it (rk3026_ebc_build_snapshot())
  * @mode: EBC work mode
  * @temp: caller-supplied panel temperature, in degrees Celsius
  * @temp_valid: whether @temp should be used instead of the sensor
  * @marker: caller-owned completion tag, or 0 for fire-and-forget
  * @source: who queued it, for debugfs and the trace
+ *
+ * Called under @image_lock, in the section that wrote the update's pixels
+ * into @next_shadow.
+ *
+ * A RESET ends white everywhere whatever the images hold, so it fills
+ * @next_shadow white: the target follows the glass, and pixels sent before
+ * it are not drawn again by a later box that covers them.
  *
  * A full queue is coalesced into its newest entry: the clips are merged and
  * the newest mode wins, which is what a burst of small damage rectangles
@@ -1487,6 +1567,10 @@ void rk3026_ebc_queue_update(struct rk3026_ebc *ebc, const struct drm_rect *clip
 	struct rk3026_ebc_update *upd;
 	unsigned int used;
 
+	lockdep_assert_held(&ebc->image_lock);
+
+	if (mode == EBC_MODE_RESET)
+		memset(ebc->next_shadow, 0xff, ebc->img_size);
 	spin_lock(&ebc->queue_lock);
 
 	ebc->stats.updates++;
@@ -1589,6 +1673,36 @@ static int ebc_plane_atomic_check(struct drm_plane *plane,
 						   false, false);
 }
 
+/*
+ * A plane update: the whole framebuffer into @next_shadow and to the thread
+ * in the default mode, unless an mxcfb client drives the panel. Such a
+ * client annotates its own updates with a waveform mode, so its pixels are
+ * left alone rather than refreshed twice.
+ *
+ * @mxcfb_active is checked in the @image_lock section of the blit, where a
+ * send sets it. Checked before the lock, a plane update could take the lock
+ * after a send that claimed the panel, overwrite the send's pixels in
+ * @next_shadow and queue a refresh of the whole panel with it.
+ *
+ * Returns true if the update was queued.
+ */
+static bool rk3026_ebc_plane_update(struct rk3026_ebc *ebc, const void *src,
+				    unsigned int src_pitch)
+{
+	struct drm_rect clip = DRM_RECT_INIT(0, 0, ebc->width, ebc->height);
+	bool queue;
+
+	mutex_lock(&ebc->image_lock);
+	queue = !ebc->mxcfb_active;
+	if (queue) {
+		rk3026_ebc_blit_xrgb8888(ebc, src, src_pitch, &clip);
+		rk3026_ebc_queue_update(ebc, &clip, EBC_MODE_DEFAULT, 0, false,
+					0, EBC_SOURCE_PLANE);
+	}
+	mutex_unlock(&ebc->image_lock);
+	return queue;
+}
+
 static void ebc_plane_atomic_update(struct drm_plane *plane,
 				    struct drm_atomic_state *state)
 {
@@ -1599,7 +1713,6 @@ static void ebc_plane_atomic_update(struct drm_plane *plane,
 	struct drm_shadow_plane_state *shadow =
 		to_drm_shadow_plane_state(new_state);
 	struct rk3026_ebc *ebc = drm_to_ebc(plane->dev);
-	struct drm_rect clip = DRM_RECT_INIT(0, 0, ebc->width, ebc->height);
 	int idx;
 
 	/*
@@ -1627,19 +1740,8 @@ static void ebc_plane_atomic_update(struct drm_plane *plane,
 	if (!drm_dev_enter(plane->dev, &idx))
 		return;
 
-	/*
-	 * A mxcfb client drives its own updates and annotates them with a
-	 * waveform mode; leave its pixels alone rather than refreshing twice.
-	 */
-	if (!ebc->mxcfb_active) {
-		mutex_lock(&ebc->blit_lock);
-		rk3026_ebc_blit_xrgb8888(ebc, shadow->data[0].vaddr,
-					 new_state->fb->pitches[0], &clip);
-		mutex_unlock(&ebc->blit_lock);
-
-		rk3026_ebc_queue_update(ebc, &clip, EBC_MODE_DEFAULT, 0, false, 0,
-					EBC_SOURCE_PLANE);
-	}
+	rk3026_ebc_plane_update(ebc, shadow->data[0].vaddr,
+				new_state->fb->pitches[0]);
 
 	drm_dev_exit(idx);
 }
@@ -1686,34 +1788,36 @@ static void ebc_crtc_atomic_enable(struct drm_crtc *crtc,
 	 * thread brings them up for each waveform, the boot RESET below
 	 * included, and drops them once the queue has drained (rails_off_ms).
 	 * V3P3, the logic rail, stays with the CRTC.
-	 */
-	spin_lock(&ebc->queue_lock);
-	WRITE_ONCE(ebc->crtc_on, true);
-	spin_unlock(&ebc->queue_lock);
-
-	/*
+	 *
 	 * Drive the panel to a known white before anything is composed on it.
 	 *
-	 * ⚠️ This memset owns next_virt, so it MUST NOT race a client blit into
-	 * the same buffer -- that is docs/PENDING.md P39: the enabling commit also
-	 * carries the first plane update, and the default commit_tail runs the
-	 * planes FIRST, so the blit landed and was then overwritten white here.
-	 * The first draw of every boot was silently lost.
+	 * ⚠️ The RESET's white fill of @next_shadow (rk3026_ebc_queue_update())
+	 * MUST NOT race a client blit into the same buffer: the enabling commit
+	 * also carries the first plane update, and the default commit_tail runs
+	 * the planes FIRST, so the blit landed and was then overwritten white
+	 * here. The first draw of every boot was silently lost.
 	 *
-	 * Two halves, and both are needed:
+	 * Three parts, and all are needed:
 	 *
 	 *  - the commit order is reversed (ebc_mode_config_helper_funcs, the _rpm
 	 *    tail), so the CRTC enables before the planes commit;
+	 *  - @crtc_on, the white fill and the RESET are one @image_lock section,
+	 *    so a sender that sees the CRTC on blits after the fill and queues
+	 *    behind the RESET;
 	 *  - the RESET is then driven to completion here, so by the time the plane
-	 *    blits, prev is white, next is free, and the client's own update is the
-	 *    next thing the thread sees.
+	 *    blits, prev is white and the client's own update is the next thing
+	 *    the thread sees.
 	 *
 	 * Waiting costs the enabling commit one full RESET (~8 s at 12 MHz), which
 	 * is time the RESET takes regardless; it only moves who blocks for it.
 	 */
-	memset(ebc->next_virt, 0xff, ebc->img_size);
+	mutex_lock(&ebc->image_lock);
+	spin_lock(&ebc->queue_lock);
+	WRITE_ONCE(ebc->crtc_on, true);
+	spin_unlock(&ebc->queue_lock);
 	rk3026_ebc_queue_update(ebc, &clip, EBC_MODE_RESET, 0, false, 0,
 				EBC_SOURCE_ENABLE);
+	mutex_unlock(&ebc->image_lock);
 	rk3026_ebc_wait_idle(ebc);
 }
 
@@ -1813,8 +1917,8 @@ static const struct drm_mode_config_funcs ebc_mode_config_funcs = {
 
 /*
  * CRTC BEFORE PLANES. The default tail commits planes first, which on the
- * enabling commit means the client's blit lands in next_virt and is then
- * memset white by ebc_crtc_atomic_enable() (docs/PENDING.md P39).
+ * enabling commit means the client's blit lands in next_shadow and is then
+ * filled white by the RESET of ebc_crtc_atomic_enable().
  *
  * The _rpm tail differs from the default only in that order, and this driver
  * has no runtime-PM stake in it -- it is being used for the ordering alone.
@@ -1851,6 +1955,26 @@ static const struct drm_driver ebc_drm_driver = {
 };
 
 /* --- bring-up --- */
+
+static void ebc_kvfree(struct drm_device *drm, void *ptr)
+{
+	kvfree(ptr);
+}
+
+/*
+ * One cached image, white like the panel after power-up. kvmalloc: an image
+ * is more than kmalloc should be asked for (758 KiB, an order-8 allocation,
+ * on a 1448x1072 panel). Released with the drm device: debugfs and the
+ * mxcfb shim read the images through it.
+ */
+static int ebc_alloc_shadow(struct rk3026_ebc *ebc, u8 **img)
+{
+	*img = kvmalloc(ebc->img_size, GFP_KERNEL);
+	if (!*img)
+		return -ENOMEM;
+	memset(*img, 0xff, ebc->img_size);
+	return drmm_add_action_or_reset(&ebc->drm, ebc_kvfree, *img);
+}
 
 /*
  * ONE allocation, the two frames adjacent -- prev first, next at +img_size.
@@ -1889,8 +2013,12 @@ static const struct drm_driver ebc_drm_driver = {
 static int ebc_setup_buffers(struct rk3026_ebc *ebc)
 {
 	size_t pool;
+	int ret;
 
-	ebc->img_size = ebc->width * ebc->height / 2;
+	/* One size for every image, the scanned ones and the shadows alike. */
+	ebc->shadows.pitch = ebc->width / 2;
+	ebc->shadows.height = ebc->height;
+	ebc->img_size = (size_t)ebc->shadows.pitch * ebc->shadows.height;
 	pool = ebc->img_size * 2;
 
 	ebc->prev_virt = dmam_alloc_attrs(ebc->dev, pool, &ebc->prev_phys,
@@ -1906,7 +2034,14 @@ static int ebc_setup_buffers(struct rk3026_ebc *ebc)
 
 	/* The panel is assumed white after power-up. */
 	memset(ebc->prev_virt, 0xff, pool);
-	return 0;
+
+	ret = ebc_alloc_shadow(ebc, &ebc->next_shadow);
+	if (ret)
+		return ret;
+	ret = ebc_alloc_shadow(ebc, &ebc->shadows.prev);
+	if (ret)
+		return ret;
+	return ebc_alloc_shadow(ebc, &ebc->shadows.scan);
 }
 
 /*
@@ -2150,7 +2285,7 @@ static int ebc_probe(struct platform_device *pdev)
 	init_waitqueue_head(&ebc->update_wq);
 	init_waitqueue_head(&ebc->marker_wq);
 	spin_lock_init(&ebc->queue_lock);
-	ret = drmm_mutex_init(drm, &ebc->blit_lock);
+	ret = drmm_mutex_init(drm, &ebc->image_lock);
 	if (ret)
 		return ret;
 	ret = drmm_mutex_init(drm, &ebc->rails_lock);

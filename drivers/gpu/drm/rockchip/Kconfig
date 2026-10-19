@@ -197,9 +197,10 @@ config DRM_RK3026_EBC_KUNIT_TEST
 	help
 	  This builds unit tests for the RK3026 EBC refresh bookkeeping:
 	  how updates merge into one scan, the image each scan drives, the
-	  identical-image skip, the update markers and the mxcfb waveform
-	  map. This option is not useful for distributions or general
-	  kernels, but only for kernel developers working on the driver.
+	  identical-image skip, the update markers, the waveform container
+	  bounds and the mxcfb waveform map. This option is not useful for
+	  distributions or general kernels, but only for kernel developers
+	  working on the driver.
 
 	  For more information on KUnit and unit tests in general,
 	  please refer to the KUnit documentation in

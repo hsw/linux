@@ -23,10 +23,13 @@
 #include <linux/device.h>
 #include <linux/err.h>
 #include <linux/errno.h>
+#include <linux/export.h>
 #include <linux/kernel.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/unaligned.h>
+
+#include <kunit/visibility.h>
 
 #include "rk3026_ebc.h"
 
@@ -36,6 +39,8 @@
 #define RKF_NSYM		0x100
 #define RKF_NNODE		(2 * RKF_NSYM - 1)
 #define RKF_ROOT		(RKF_NNODE - 1)
+/* A segment's header: the frame count, three pad bytes. */
+#define RKF_SEG_HDR		4
 
 /* Largest LUT the SRAM window can be fed: 255 frames of 0x40 bytes. */
 #define RKF_LUT_MAX		(EBC_WAVEFORM_MAX_FRAMES * EBC_LUT_FRAME_BYTES)
@@ -153,25 +158,68 @@ static void rkf_build_tree(struct ebc_waveform *wf, const u32 *weights,
 	}
 }
 
-/* MSB-first walk from the root; a symbol is the index of the leaf reached. */
-static void rkf_decode(struct ebc_waveform *wf, u8 *dst, const u8 *src,
-		       size_t n)
+/**
+ * rk3026_ebc_rkf_decode - decode a Huffman bitstream of known symbol count
+ * @left: left child per node, -1 for a leaf
+ * @right: right child per node
+ * @root: index of the root node
+ * @dst: output, @dst_len bytes
+ * @dst_len: room in @dst
+ * @n: symbols to decode
+ * @src: bitstream
+ * @len: bytes of @src that may be read
+ *
+ * MSB-first walk from the root; a symbol is the index of the leaf reached.
+ * A segment carries no length of its own, so the walk is bounded by @len,
+ * the bytes left in the container after the segment start.
+ *
+ * Returns 0, or -EINVAL if @n does not fit @dst_len or @src runs out before
+ * @n symbols are decoded.
+ */
+VISIBLE_IF_KUNIT int rk3026_ebc_rkf_decode(const s16 *left, const s16 *right,
+					   int root, u8 *dst, size_t dst_len,
+					   size_t n, const u8 *src, size_t len)
 {
+	const u8 *end = src + len;
 	unsigned int bit = 0;
-	int node = RKF_ROOT;
+	int node = root;
+
+	if (n > dst_len)
+		return -EINVAL;
 
 	while (n) {
-		node = (*src & (0x80 >> bit)) ? wf->right[node] : wf->left[node];
+		if (src == end)
+			return -EINVAL;
+		node = (*src & (0x80 >> bit)) ? right[node] : left[node];
 		if (++bit == 8) {
 			bit = 0;
 			src++;
 		}
-		if (wf->left[node] == -1) {
+		if (left[node] == -1) {
 			*dst++ = node;
 			n--;
-			node = RKF_ROOT;
+			node = root;
 		}
 	}
+	return 0;
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_rkf_decode);
+
+/* Decode the bitstream of the segment at @seg, which follows its header. */
+static int rkf_decode(struct ebc_waveform *wf, u8 *dst, size_t dst_len,
+		      size_t n, const u8 *seg)
+{
+	const u8 *src = seg + RKF_SEG_HDR;
+	size_t len = wf->base + wf->size - src;
+	int ret;
+
+	ret = rk3026_ebc_rkf_decode(wf->left, wf->right, RKF_ROOT, dst,
+				    dst_len, n, src, len);
+	if (ret)
+		dev_err_ratelimited(wf->dev,
+				    "waveform segment at %#tx truncated or oversized\n",
+				    seg - wf->base);
+	return ret;
 }
 
 /*
@@ -211,7 +259,10 @@ static const struct rkf_mode_desc rkf_modes[] = {
 	[RKF_LUT_GRAYA2] = { 0x110, 0x3d0 },
 };
 
-/* Locate a segment; returns its base or NULL when the mode is absent. */
+/*
+ * Locate a segment. Returns its base, ERR_PTR(-ENOENT) when the mode is
+ * absent, or ERR_PTR(-EINVAL) when its header does not fit the container.
+ */
 static const u8 *rkf_segment(struct ebc_waveform *wf, u32 mode, int temp,
 			     u32 *frames)
 {
@@ -221,19 +272,25 @@ static const u8 *rkf_segment(struct ebc_waveform *wf, u32 mode, int temp,
 	int idx;
 
 	if (mode >= ARRAY_SIZE(rkf_modes) || !rkf_modes[mode].temp_off)
-		return NULL;
+		return ERR_PTR(-ENOENT);
 	d = &rkf_modes[mode];
 
 	idx = rkf_temp_bucket(wf->base + d->temp_off, temp);
 	off = rkf_u32(wf->base + d->offs_off + idx * 4);
 
 	/* A zero slot means the mode is not present in this container. */
-	if (off < RKF_PAYLOAD_OFF || off >= wf->size)
-		return NULL;
+	if (off < RKF_PAYLOAD_OFF)
+		return ERR_PTR(-ENOENT);
+	if (off > wf->size - RKF_SEG_HDR) {
+		dev_err_ratelimited(wf->dev,
+				    "waveform segment at %#x past the container end %#zx\n",
+				    off, wf->size);
+		return ERR_PTR(-EINVAL);
+	}
 
 	seg = wf->base + off;
 	*frames = seg[0];
-	return *frames ? seg : NULL;
+	return *frames ? seg : ERR_PTR(-ENOENT);
 }
 
 /*
@@ -303,25 +360,24 @@ static int rkf_load_direct(struct ebc_waveform *wf, u32 mode, int temp,
 {
 	const u8 *seg = rkf_segment(wf, mode, temp, frames);
 
-	if (!seg)
-		return -ENOENT;
-	if (*frames > RKF_LUT_MAX / EBC_LUT_FRAME_BYTES)
-		return -EINVAL;
+	if (IS_ERR(seg))
+		return PTR_ERR(seg);
 
-	rkf_decode(wf, wf->lut, seg + 4, *frames * EBC_LUT_FRAME_BYTES);
-	return 0;
+	return rkf_decode(wf, wf->lut, RKF_LUT_MAX,
+			  *frames * EBC_LUT_FRAME_BYTES, seg);
 }
 
 static int rkf_load_gray2(struct ebc_waveform *wf, int temp, u32 *frames)
 {
 	const u8 *seg = rkf_segment(wf, RKF_LUT_GRAY2, temp, frames);
+	int ret;
 
-	if (!seg)
-		return -ENOENT;
-	if (*frames > RKF_RAW_MAX / 8)
-		return -EINVAL;
+	if (IS_ERR(seg))
+		return PTR_ERR(seg);
 
-	rkf_decode(wf, wf->raw, seg + 4, *frames * 8);
+	ret = rkf_decode(wf, wf->raw, RKF_RAW_MAX, *frames * 8, seg);
+	if (ret)
+		return ret;
 	rkf_expand_gray2(wf->lut, wf->raw, *frames);
 	return 0;
 }
@@ -336,11 +392,12 @@ static int rkf_load_lut(struct ebc_waveform *wf, u32 mode, int temp,
 	switch (mode) {
 	case RKF_LUT_RESET:
 		seg = rkf_segment(wf, RKF_LUT_RESET, temp, frames);
-		if (!seg)
-			return -ENOENT;
-		if (*frames > RKF_LUT_MAX / EBC_LUT_FRAME_BYTES)
-			return -EINVAL;
-		rkf_decode(wf, wf->raw, seg + 4, (*frames + 3) >> 2);
+		if (IS_ERR(seg))
+			return PTR_ERR(seg);
+		ret = rkf_decode(wf, wf->raw, RKF_RAW_MAX, (*frames + 3) >> 2,
+				 seg);
+		if (ret)
+			return ret;
 		rkf_expand_reset(wf->lut, wf->raw, *frames);
 		return 0;
 
@@ -363,10 +420,15 @@ static int rkf_load_lut(struct ebc_waveform *wf, u32 mode, int temp,
 		ret = rkf_load_direct(wf, RKF_LUT_GRAY16, temp, frames);
 		if (ret)
 			return ret;
+		/* The overlay is optional; a damaged one is not. */
 		seg = rkf_segment(wf, RKF_LUT_GRAY2, temp, &n);
-		if (!seg || n > *frames || n > RKF_RAW_MAX / 8)
+		if (IS_ERR(seg))
+			return PTR_ERR(seg) == -ENOENT ? 0 : PTR_ERR(seg);
+		if (n > *frames)
 			return 0;
-		rkf_decode(wf, wf->raw, seg + 4, n * 8);
+		ret = rkf_decode(wf, wf->raw, RKF_RAW_MAX, n * 8, seg);
+		if (ret)
+			return ret;
 		rkf_overlay_gray2(wf->lut, wf->raw, n);
 		return 0;
 
@@ -432,6 +494,7 @@ const u8 *rk3026_ebc_waveform_lut(struct ebc_waveform *wf, u32 mode, int temp,
 	*frames = wf->frames;
 	return wf->lut;
 }
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_waveform_lut);
 
 /**
  * rk3026_ebc_waveform_parse - validate a container and build its Huffman tree
@@ -454,22 +517,31 @@ struct ebc_waveform *rk3026_ebc_waveform_parse(struct device *dev,
 	u32 crc;
 	int i;
 
-	if (len < RKF_PAYLOAD_OFF + 4)
+	if (len < RKF_PAYLOAD_OFF + 4) {
+		dev_err(dev, "waveform truncated: %zu bytes\n", len);
 		return ERR_PTR(-EINVAL);
+	}
 
 	size = rkf_u32(buf);
-	if (size > RKF_MAX_SIZE || size + 4 > len || size <= RKF_PAYLOAD_OFF)
+	if (size > RKF_MAX_SIZE || size + 4 > len || size <= RKF_PAYLOAD_OFF) {
+		dev_err(dev, "waveform size %#zx out of range for %zu bytes\n",
+			size, len);
 		return ERR_PTR(-EINVAL);
+	}
 
-	if (memcmp(buf + 8, "rkf:v", 5))
+	if (memcmp(buf + 8, "rkf:v", 5)) {
+		dev_err(dev, "waveform is not an rkf container\n");
 		return ERR_PTR(-EINVAL);
+	}
 
-	if (!memcmp(buf + 0x1c, "Einks", 5))
+	if (!memcmp(buf + 0x1c, "Einks", 5)) {
 		key = key_einks;
-	else if (!memcmp(buf + 0x1c, "OED", 3))
+	} else if (!memcmp(buf + 0x1c, "OED", 3)) {
 		key = key_oed;
-	else
+	} else {
+		dev_err(dev, "unknown waveform vendor tag %5ph\n", buf + 0x1c);
 		return ERR_PTR(-EINVAL);
+	}
 
 	wf = devm_kzalloc(dev, sizeof(*wf), GFP_KERNEL);
 	if (!wf)
@@ -527,3 +599,4 @@ struct ebc_waveform *rk3026_ebc_waveform_parse(struct device *dev,
 		 buf + 8, buf + 0x2c, size);
 	return wf;
 }
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_waveform_parse);

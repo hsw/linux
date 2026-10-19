@@ -2426,9 +2426,6 @@ static int ebc_probe(struct platform_device *pdev)
 	ebc->irq = platform_get_irq(pdev, 0);
 	if (ebc->irq < 0)
 		return ebc->irq;
-	ret = devm_request_irq(dev, ebc->irq, ebc_irq, 0, DRIVER_NAME, ebc);
-	if (ret)
-		return dev_err_probe(dev, ret, "request_irq\n");
 
 	ret = ebc_hw_init(ebc);
 	if (ret)
@@ -2436,6 +2433,15 @@ static int ebc_probe(struct platform_device *pdev)
 	ret = devm_add_action_or_reset(dev, ebc_hw_fini, ebc);
 	if (ret)
 		return ret;
+
+	/*
+	 * After the clocks and @int_reg are set up: the handler reads EBC_INT
+	 * and acknowledges through @int_reg. Requested after ebc_hw_fini() is
+	 * registered, so devres frees it before the clocks go down.
+	 */
+	ret = devm_request_irq(dev, ebc->irq, ebc_irq, 0, DRIVER_NAME, ebc);
+	if (ret)
+		return dev_err_probe(dev, ret, "request_irq\n");
 
 	ebc->refresh_thread = kthread_run(ebc_refresh_thread, ebc, "ebc-refresh");
 	if (IS_ERR(ebc->refresh_thread))

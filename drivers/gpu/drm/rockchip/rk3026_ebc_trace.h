@@ -92,14 +92,15 @@ TRACE_EVENT(rk3026_ebc_update_queue,
 
 TRACE_EVENT(rk3026_ebc_scan_start,
 	TP_PROTO(u32 mode, u32 lut_mode, int temp, u32 frames, u32 marker,
-		 bool repair),
-	TP_ARGS(mode, lut_mode, temp, frames, marker, repair),
+		 u32 merged, bool repair),
+	TP_ARGS(mode, lut_mode, temp, frames, marker, merged, repair),
 	TP_STRUCT__entry(
 		__field(u32, mode)
 		__field(u32, lut_mode)
 		__field(int, temp)
 		__field(u32, frames)
 		__field(u32, marker)
+		__field(u32, merged)
 		__field(bool, repair)
 	),
 	TP_fast_assign(
@@ -108,13 +109,14 @@ TRACE_EVENT(rk3026_ebc_scan_start,
 		__entry->temp = temp;
 		__entry->frames = frames;
 		__entry->marker = marker;
+		__entry->merged = merged;
 		__entry->repair = repair;
 	),
-	TP_printk("mode=%u(%s) lut_mode=%u(%s) temp=%d frames=%u marker=%u repair=%d",
+	TP_printk("mode=%u(%s) lut_mode=%u(%s) temp=%d frames=%u marker=%u merged=%u repair=%d",
 		  __entry->mode, ebc_trace_mode(__entry->mode),
 		  __entry->lut_mode, ebc_trace_mode(__entry->lut_mode),
 		  __entry->temp, __entry->frames, __entry->marker,
-		  __entry->repair)
+		  __entry->merged, __entry->repair)
 );
 
 TRACE_EVENT(rk3026_ebc_scan_end,

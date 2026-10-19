@@ -616,6 +616,11 @@ struct ebc_waveform *rk3026_ebc_waveform_parse(struct device *dev,
 					       const u8 *buf, size_t len);
 const u8 *rk3026_ebc_waveform_lut(struct ebc_waveform *wf, u32 mode, int temp,
 				  u32 *frames);
+#if IS_ENABLED(CONFIG_KUNIT)
+int rk3026_ebc_rkf_decode(const s16 *left, const s16 *right, int root,
+			  u8 *dst, size_t dst_len, size_t n, const u8 *src,
+			  size_t len);
+#endif
 
 /* rk3026_ebc_debugfs.c */
 #if IS_ENABLED(CONFIG_DEBUG_FS)

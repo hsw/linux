@@ -1,14 +1,18 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * KUnit tests for the RK3026 EBC refresh bookkeeping (rk3026_ebc_core.c)
- * and the mxcfb waveform map (rk3026_ebc_mxcfb.c).
+ * KUnit tests for the RK3026 EBC refresh bookkeeping (rk3026_ebc_core.c),
+ * the waveform container bounds (rk3026_ebc_waveform.c) and the mxcfb
+ * waveform map (rk3026_ebc_mxcfb.c).
  */
 
+#include <kunit/device.h>
 #include <kunit/test.h>
 
+#include <linux/err.h>
 #include <linux/limits.h>
 #include <linux/module.h>
 #include <linux/string.h>
+#include <linux/unaligned.h>
 
 #include "../rk3026_ebc.h"
 #include "../rk3026_ebc_mxcfb.h"
@@ -1383,6 +1387,428 @@ static struct kunit_suite rk3026_ebc_mxcfb_test_suite = {
 kunit_test_suite(rk3026_ebc_mxcfb_test_suite);
 
 #endif /* CONFIG_DRM_RK3026_EBC_MXCFB */
+
+/* --- waveform container bounds --- */
+
+/*
+ * A five-node tree: "0" is symbol 0, "10" symbol 1, "11" symbol 2; nodes 3
+ * and 4 are inner, 4 the root.
+ */
+static const s16 t_left[] = { -1, -1, -1, 1, 0 };
+static const s16 t_right[] = { -1, -1, -1, 2, 3 };
+#define T_ROOT		4
+
+static int t_decode(u8 *dst, size_t dst_len, size_t n, const u8 *src,
+		    size_t len)
+{
+	return rk3026_ebc_rkf_decode(t_left, t_right, T_ROOT, dst, dst_len, n,
+				     src, len);
+}
+
+static void ebc_test_rkf_decode(struct kunit *test)
+{
+	/* 0 10 11 0 11: five symbols in exactly one byte. */
+	static const u8 src[] = { 0x5b };
+	static const u8 want[] = { 0, 1, 2, 0, 2 };
+	u8 dst[8];
+
+	memset(dst, 0xee, sizeof(dst));
+	KUNIT_EXPECT_EQ(test, t_decode(dst, sizeof(dst), 5, src, 1), 0);
+	KUNIT_EXPECT_MEMEQ(test, dst, want, sizeof(want));
+	KUNIT_EXPECT_EQ(test, dst[5], 0xee);
+
+	/* Nothing asked, nothing read. */
+	KUNIT_EXPECT_EQ(test, t_decode(dst, sizeof(dst), 0, src, 0), 0);
+}
+
+/* The stream ends before the last symbol: at a code boundary or inside one. */
+static void ebc_test_rkf_decode_truncated(struct kunit *test)
+{
+	/* 11 11 11 0 1|0: the second byte completes symbol 1. */
+	static const u8 src[] = { 0xfd, 0x00 };
+	static const u8 one[] = { 0x5b };
+	u8 dst[8];
+
+	KUNIT_EXPECT_EQ(test, t_decode(dst, sizeof(dst), 6, one, 1), -EINVAL);
+	KUNIT_EXPECT_EQ(test, t_decode(dst, sizeof(dst), 4, src, 1), 0);
+	KUNIT_EXPECT_EQ(test, t_decode(dst, sizeof(dst), 5, src, 1), -EINVAL);
+	/* The bound is @len, not the bytes that happen to follow. */
+	KUNIT_EXPECT_EQ(test, t_decode(dst, sizeof(dst), 5, src, 2), 0);
+	KUNIT_EXPECT_EQ(test, dst[4], 1);
+}
+
+static void ebc_test_rkf_decode_zero_length(struct kunit *test)
+{
+	static const u8 src[] = { 0x00 };
+	u8 dst[4];
+
+	KUNIT_EXPECT_EQ(test, t_decode(dst, sizeof(dst), 1, src, 0), -EINVAL);
+	KUNIT_EXPECT_EQ(test, t_decode(dst, 0, 1, src, 1), -EINVAL);
+}
+
+/* More symbols than the output holds: refused before anything is written. */
+static void ebc_test_rkf_decode_oversized(struct kunit *test)
+{
+	static const u8 src[] = { 0x00, 0x00 };
+	u8 dst[8];
+
+	memset(dst, 0xee, sizeof(dst));
+	KUNIT_EXPECT_EQ(test, t_decode(dst, 4, 5, src, sizeof(src)), -EINVAL);
+	KUNIT_EXPECT_EQ(test, dst[0], 0xee);
+	KUNIT_EXPECT_EQ(test, t_decode(dst, 5, 5, src, sizeof(src)), 0);
+	KUNIT_EXPECT_EQ(test, dst[0], 0);
+}
+
+/*
+ * Minimal containers: 256 equal Huffman weights, which make every code eight
+ * bits long, so one stream byte is one symbol, and all-zero temperature
+ * tables, so every temperature takes slot 0 of a mode's offset table. A
+ * segment is a frame-count byte, three pad bytes and its stream: 0x40 bytes
+ * a frame for GRAY16, MODE6 and GRAYA2, 8 for GRAY2, one per four RESET
+ * frames. The offsets mirror RKF_PAYLOAD_OFF and rkf_modes[] in
+ * rk3026_ebc_waveform.c, the 4 of T_RKF_SEG its RKF_SEG_HDR.
+ */
+#define T_RKF_PAYLOAD	0xad0
+#define T_RKF_RESET	0x1d0
+#define T_RKF_GRAY16	0x2d0
+#define T_RKF_GRAYA2	0x3d0
+#define T_RKF_MODE6	0x4d0
+#define T_RKF_GRAY2	0x5d0
+#define T_RKF_SEG	(4 + EBC_LUT_FRAME_BYTES)
+
+/* The vendor's CRC32: MSB-first, polynomial 0x04c10db7, init 0. */
+static u32 t_rkf_crc(const u8 *p, size_t n)
+{
+	u32 crc = 0;
+	int k;
+
+	while (n--) {
+		crc ^= (u32)*p++ << 24;
+		for (k = 0; k < 8; k++)
+			crc = (crc << 1) ^ (crc & 0x80000000u ? 0x04c10db7u : 0);
+	}
+	return crc;
+}
+
+/* A container of @size bytes plus its CRC word, in a buffer of @room. */
+static u8 *t_rkf_alloc(struct kunit *test, size_t size, size_t room)
+{
+	static const u32 key[2] = { 0xaa55aa55, 0x55aa55aa };
+	u8 *buf = kunit_kzalloc(test, room, GFP_KERNEL);
+	int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, buf);
+	put_unaligned_le32(size, buf);
+	put_unaligned_le32(T_RKF_PAYLOAD, buf + 4);
+	memcpy(buf + 8, "rkf:v", 5);
+	memcpy(buf + 0x1c, "Einks", 5);
+	/* Stored obfuscated, as in a pristine file. */
+	for (i = 0; i < 256; i++)
+		put_unaligned_le32(1 ^ key[i & 1], buf + 0x6d0 + i * 4);
+	return buf;
+}
+
+static void t_rkf_seal(u8 *buf, size_t size)
+{
+	put_unaligned_le32(t_rkf_crc(buf, size), buf + size);
+}
+
+/* One GRAY16 segment at @off, with one frame if it fits. */
+static u8 *t_rkf_container(struct kunit *test, size_t size, u32 off)
+{
+	u8 *buf = t_rkf_alloc(test, size, size + 4);
+
+	put_unaligned_le32(off, buf + T_RKF_GRAY16);
+	if (off >= T_RKF_PAYLOAD && off < size)
+		buf[off] = 1;
+	t_rkf_seal(buf, size);
+	return buf;
+}
+
+static struct device *t_rkf_dev(struct kunit *test)
+{
+	struct device *dev = kunit_device_register(test, "rk3026-ebc-test");
+
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, dev);
+	return dev;
+}
+
+struct t_rkf_seg {
+	u32	table;		/* the mode's offset table */
+	u8	frames;
+};
+
+static size_t t_rkf_stream(const struct t_rkf_seg *seg)
+{
+	switch (seg->table) {
+	case T_RKF_RESET:
+		return (seg->frames + 3) >> 2;
+	case T_RKF_GRAY2:
+		return seg->frames * 8;
+	default:
+		return seg->frames * EBC_LUT_FRAME_BYTES;
+	}
+}
+
+/*
+ * Segments laid out one after another from the payload start, the last one
+ * @cut bytes short of its stream: the container ends there.
+ */
+static struct ebc_waveform *t_rkf_wf(struct kunit *test, struct device *dev,
+				     const struct t_rkf_seg *segs,
+				     unsigned int n, size_t cut)
+{
+	struct ebc_waveform *wf;
+	size_t size = T_RKF_PAYLOAD;
+	unsigned int i;
+	u8 *buf;
+
+	for (i = 0; i < n; i++)
+		size += 4 + t_rkf_stream(&segs[i]);
+	size -= cut;
+	buf = t_rkf_alloc(test, size, size + 4);
+
+	size = T_RKF_PAYLOAD;
+	for (i = 0; i < n; i++) {
+		put_unaligned_le32(size, buf + segs[i].table);
+		buf[size] = segs[i].frames;
+		size += 4 + t_rkf_stream(&segs[i]);
+	}
+	size -= cut;
+	t_rkf_seal(buf, size);
+
+	wf = rk3026_ebc_waveform_parse(dev, buf, size + 4);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, wf);
+	return wf;
+}
+
+/* The frames of a mode's LUT, or -1 if there is none. */
+static int t_rkf_frames(struct ebc_waveform *wf, u32 mode)
+{
+	u32 frames = 0;
+
+	if (!rk3026_ebc_waveform_lut(wf, mode, 25, &frames))
+		return -1;
+	return frames;
+}
+
+static const u8 *t_rkf_lut(struct kunit *test, struct device *dev,
+			   size_t size, u32 off, u32 *frames)
+{
+	struct ebc_waveform *wf;
+
+	wf = rk3026_ebc_waveform_parse(dev, t_rkf_container(test, size, off),
+				       size + 4);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, wf);
+	*frames = 0;
+	return rk3026_ebc_waveform_lut(wf, EBC_MODE_PART, 25, frames);
+}
+
+/* A segment whose stream ends exactly at the container end is whole. */
+static void ebc_test_rkf_segment_fits(struct kunit *test)
+{
+	struct device *dev = t_rkf_dev(test);
+	size_t size = T_RKF_PAYLOAD + T_RKF_SEG;
+	u32 frames;
+
+	KUNIT_EXPECT_NOT_NULL(test, t_rkf_lut(test, dev, size, T_RKF_PAYLOAD,
+					      &frames));
+	KUNIT_EXPECT_EQ(test, frames, 1);
+}
+
+static void ebc_test_rkf_segment_truncated(struct kunit *test)
+{
+	struct device *dev = t_rkf_dev(test);
+	size_t size = T_RKF_PAYLOAD + T_RKF_SEG;
+	u32 frames;
+
+	/* One stream byte short; the CRC word follows and must not count. */
+	KUNIT_EXPECT_NULL(test, t_rkf_lut(test, dev, size - 1, T_RKF_PAYLOAD,
+					  &frames));
+	/* A frame count with no stream at all. */
+	KUNIT_EXPECT_NULL(test, t_rkf_lut(test, dev, size, size - 4, &frames));
+	/* A segment header cut by the end, and offsets past it. */
+	KUNIT_EXPECT_NULL(test, t_rkf_lut(test, dev, size, size - 2, &frames));
+	KUNIT_EXPECT_NULL(test, t_rkf_lut(test, dev, size, size, &frames));
+	KUNIT_EXPECT_NULL(test, t_rkf_lut(test, dev, size, U32_MAX, &frames));
+	/* An empty slot is an absent mode. */
+	KUNIT_EXPECT_NULL(test, t_rkf_lut(test, dev, size, 0, &frames));
+}
+
+/* Every LUT family decodes its own stream length. */
+static void ebc_test_rkf_modes(struct kunit *test)
+{
+	struct device *dev = t_rkf_dev(test);
+	static const struct t_rkf_seg segs[] = {
+		{ T_RKF_RESET, 5 }, { T_RKF_GRAY16, 1 }, { T_RKF_MODE6, 2 },
+		{ T_RKF_GRAY2, 3 }, { T_RKF_GRAYA2, 4 },
+	};
+	struct ebc_waveform *wf = t_rkf_wf(test, dev, segs, ARRAY_SIZE(segs), 0);
+
+	KUNIT_EXPECT_EQ(test, t_rkf_frames(wf, EBC_MODE_RESET), 5);
+	KUNIT_EXPECT_EQ(test, t_rkf_frames(wf, EBC_MODE_PART), 1);
+	KUNIT_EXPECT_EQ(test, t_rkf_frames(wf, EBC_MODE_FULL), 1);
+	KUNIT_EXPECT_EQ(test, t_rkf_frames(wf, EBC_MODE_OED_PART), 2);
+	KUNIT_EXPECT_EQ(test, t_rkf_frames(wf, EBC_MODE_BLACK_WHITE), 3);
+	KUNIT_EXPECT_EQ(test, t_rkf_frames(wf, EBC_MODE_A2), 4);
+	/* AUTO: GRAY16, the GRAY2 overlay skipped when longer than it */
+	KUNIT_EXPECT_EQ(test, t_rkf_frames(wf, EBC_MODE_AUTO), 1);
+}
+
+/* Each family cut one byte short, as the last segment, has no LUT. */
+static void ebc_test_rkf_truncated_modes(struct kunit *test)
+{
+	struct device *dev = t_rkf_dev(test);
+	static const struct {
+		struct t_rkf_seg	seg;
+		u32			mode;
+	} cases[] = {
+		{ { T_RKF_RESET, 5 }, EBC_MODE_RESET },
+		{ { T_RKF_GRAY16, 1 }, EBC_MODE_PART },
+		{ { T_RKF_GRAY2, 3 }, EBC_MODE_BLACK_WHITE },
+		/* GRAYA2 falls back to an absent GRAY2 */
+		{ { T_RKF_GRAYA2, 2 }, EBC_MODE_A2 },
+	};
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		KUNIT_EXPECT_EQ(test,
+				t_rkf_frames(t_rkf_wf(test, dev, &cases[i].seg, 1, 0),
+					     cases[i].mode),
+				cases[i].seg.frames);
+		KUNIT_EXPECT_EQ(test,
+				t_rkf_frames(t_rkf_wf(test, dev, &cases[i].seg, 1, 1),
+					     cases[i].mode), -1);
+	}
+}
+
+/* MODE6 and GRAYA2 fall back on any error, absent or damaged. */
+static void ebc_test_rkf_fallbacks(struct kunit *test)
+{
+	struct device *dev = t_rkf_dev(test);
+	static const struct t_rkf_seg mode6_absent[] = {
+		{ T_RKF_GRAY16, 3 },
+	};
+	static const struct t_rkf_seg mode6_cut[] = {
+		{ T_RKF_GRAY16, 3 }, { T_RKF_MODE6, 2 },
+	};
+	static const struct t_rkf_seg a2_absent[] = {
+		{ T_RKF_GRAY2, 3 },
+	};
+	static const struct t_rkf_seg a2_cut[] = {
+		{ T_RKF_GRAY2, 3 }, { T_RKF_GRAYA2, 2 },
+	};
+
+	KUNIT_EXPECT_EQ(test, t_rkf_frames(t_rkf_wf(test, dev, mode6_absent, 1, 0),
+					   EBC_MODE_OED_PART), 3);
+	KUNIT_EXPECT_EQ(test, t_rkf_frames(t_rkf_wf(test, dev, mode6_cut, 2, 0),
+					   EBC_MODE_OED_PART), 2);
+	KUNIT_EXPECT_EQ(test, t_rkf_frames(t_rkf_wf(test, dev, mode6_cut, 2, 1),
+					   EBC_MODE_OED_PART), 3);
+	KUNIT_EXPECT_EQ(test, t_rkf_frames(t_rkf_wf(test, dev, a2_absent, 1, 0),
+					   EBC_MODE_A2), 3);
+	KUNIT_EXPECT_EQ(test, t_rkf_frames(t_rkf_wf(test, dev, a2_cut, 2, 0),
+					   EBC_MODE_A2), 2);
+	KUNIT_EXPECT_EQ(test, t_rkf_frames(t_rkf_wf(test, dev, a2_cut, 2, 1),
+					   EBC_MODE_A2), 3);
+}
+
+/*
+ * AUTO overlays GRAY2 onto GRAY16: an absent overlay or a longer one is
+ * skipped, a damaged one fails the LUT.
+ */
+static void ebc_test_rkf_auto_overlay(struct kunit *test)
+{
+	struct device *dev = t_rkf_dev(test);
+	static const struct t_rkf_seg absent[] = {
+		{ T_RKF_GRAY16, 3 },
+	};
+	static const struct t_rkf_seg longer[] = {
+		{ T_RKF_GRAY16, 1 }, { T_RKF_GRAY2, 2 },
+	};
+	static const struct t_rkf_seg overlay[] = {
+		{ T_RKF_GRAY16, 3 }, { T_RKF_GRAY2, 2 },
+	};
+	struct ebc_waveform *wf;
+
+	KUNIT_EXPECT_EQ(test, t_rkf_frames(t_rkf_wf(test, dev, absent, 1, 0),
+					   EBC_MODE_AUTO), 3);
+	KUNIT_EXPECT_EQ(test, t_rkf_frames(t_rkf_wf(test, dev, longer, 2, 0),
+					   EBC_MODE_AUTO), 1);
+	KUNIT_EXPECT_EQ(test, t_rkf_frames(t_rkf_wf(test, dev, overlay, 2, 0),
+					   EBC_MODE_AUTO), 3);
+	/* The overlay one byte short: no LUT, though GRAY16 is whole. */
+	wf = t_rkf_wf(test, dev, overlay, 2, 1);
+	KUNIT_EXPECT_EQ(test, t_rkf_frames(wf, EBC_MODE_AUTO), -1);
+	KUNIT_EXPECT_EQ(test, t_rkf_frames(wf, EBC_MODE_PART), 3);
+}
+
+/* Containers whose size field does not match the buffer are refused. */
+static void ebc_test_rkf_parse_bounds(struct kunit *test)
+{
+	struct device *dev = t_rkf_dev(test);
+	size_t size = T_RKF_PAYLOAD + T_RKF_SEG;
+	size_t big = 0x40001;
+	u8 *buf;
+
+	buf = t_rkf_container(test, size, T_RKF_PAYLOAD);
+
+	KUNIT_EXPECT_NOT_ERR_OR_NULL(test,
+				     rk3026_ebc_waveform_parse(dev, buf,
+							       size + 4));
+	/* Zero-length and truncated buffers, the CRC word cut. */
+	KUNIT_EXPECT_EQ(test,
+			PTR_ERR(rk3026_ebc_waveform_parse(dev, buf, 0)),
+			-EINVAL);
+	KUNIT_EXPECT_EQ(test,
+			PTR_ERR(rk3026_ebc_waveform_parse(dev, buf, 16)),
+			-EINVAL);
+	KUNIT_EXPECT_EQ(test,
+			PTR_ERR(rk3026_ebc_waveform_parse(dev, buf, size + 3)),
+			-EINVAL);
+
+	/*
+	 * A size field one past the buffer, with a CRC that would close: only
+	 * the length check refuses it, and nothing past @len is read.
+	 */
+	buf = t_rkf_alloc(test, size + 1, size + 5);
+	t_rkf_seal(buf, size + 1);
+	KUNIT_EXPECT_NOT_ERR_OR_NULL(test,
+				     rk3026_ebc_waveform_parse(dev, buf,
+							       size + 5));
+	KUNIT_EXPECT_EQ(test,
+			PTR_ERR(rk3026_ebc_waveform_parse(dev, buf, size + 4)),
+			-EINVAL);
+
+	/* Larger than any container, though whole and sealed. */
+	buf = t_rkf_alloc(test, big, big + 4);
+	t_rkf_seal(buf, big);
+	KUNIT_EXPECT_EQ(test,
+			PTR_ERR(rk3026_ebc_waveform_parse(dev, buf, big + 4)),
+			-EINVAL);
+}
+
+static struct kunit_case rk3026_ebc_waveform_test_cases[] = {
+	KUNIT_CASE(ebc_test_rkf_decode),
+	KUNIT_CASE(ebc_test_rkf_decode_truncated),
+	KUNIT_CASE(ebc_test_rkf_decode_zero_length),
+	KUNIT_CASE(ebc_test_rkf_decode_oversized),
+	KUNIT_CASE(ebc_test_rkf_segment_fits),
+	KUNIT_CASE(ebc_test_rkf_segment_truncated),
+	KUNIT_CASE(ebc_test_rkf_modes),
+	KUNIT_CASE(ebc_test_rkf_truncated_modes),
+	KUNIT_CASE(ebc_test_rkf_fallbacks),
+	KUNIT_CASE(ebc_test_rkf_auto_overlay),
+	KUNIT_CASE(ebc_test_rkf_parse_bounds),
+	{}
+};
+
+static struct kunit_suite rk3026_ebc_waveform_test_suite = {
+	.name = "rk3026_ebc_waveform",
+	.test_cases = rk3026_ebc_waveform_test_cases,
+};
+
+kunit_test_suite(rk3026_ebc_waveform_test_suite);
 
 MODULE_DESCRIPTION("KUnit tests for the RK3026 EBC driver");
 MODULE_LICENSE("GPL");

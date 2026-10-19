@@ -20,6 +20,7 @@
 #include <linux/uaccess.h>
 
 #include <drm/drm_fb_helper.h>
+#include <drm/drm_managed.h>
 #include <drm/drm_print.h>
 #include <drm/drm_rect.h>
 
@@ -227,6 +228,12 @@ static int ebc_fb_release(struct fb_info *info, int user)
  *
  * The generic fb_ops is const and shared, so it is copied once and the three
  * entry points this shim needs are replaced in the copy.
+ *
+ * The copy is drm-managed, not devres-managed: an fb fd open across an
+ * unbind still reaches it from fb_release() and from the fb_destroy() of the
+ * last put_fb_info(). The fbdev client holds a reference on the drm_device
+ * until that fb_destroy() releases it, so the copy outlives every call made
+ * through it.
  */
 void rk3026_ebc_mxcfb_install(struct rk3026_ebc *ebc, struct fb_info *info)
 {
@@ -235,9 +242,10 @@ void rk3026_ebc_mxcfb_install(struct rk3026_ebc *ebc, struct fb_info *info)
 	if (!info || !info->fbops)
 		return;
 
-	ops = devm_kmemdup(ebc->dev, info->fbops, sizeof(*ops), GFP_KERNEL);
+	ops = drmm_kmalloc(&ebc->drm, sizeof(*ops), GFP_KERNEL);
 	if (!ops)
 		return;
+	*ops = *info->fbops;
 
 	ebc->orig_fbops = info->fbops;
 	ops->fb_ioctl = ebc_fb_ioctl;

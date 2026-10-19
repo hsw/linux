@@ -557,7 +557,10 @@ struct rk3026_ebc {
 	const struct firmware	*fw;
 	struct ebc_waveform	*waveform;
 
-	/* mxcfb shim state; unused when the shim is not built. */
+	/*
+	 * mxcfb shim state; unused when the shim is not built. @fbops is
+	 * drm-managed, see rk3026_ebc_mxcfb_install().
+	 */
 	struct fb_ops		*fbops;
 	const struct fb_ops	*orig_fbops;
 	atomic_t		fb_users;

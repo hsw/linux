@@ -552,32 +552,10 @@ static void ebc_set_epd_ctrl(struct rk3026_ebc *ebc)
 		  EPD_SDCK(n) | EPD_GATE_SCAN_DIR | EPD_SOURCE_SCAN_DIR);
 }
 
-/*
- * DSP_CTRL mode class. Modes split into three groups by the mask tests in the
- * controller's mode dispatch: LUT-driven full refreshes assert DISPLAY_MODE,
- * partial refreshes assert UPDATE_MODE as well, and the direct (non-LUT)
- * modes assert neither.
- */
-static u32 ebc_dsp_ctrl_mode(u32 mode)
-{
-	u32 bit;
-
-	if (mode > EBC_MODE_MAX)
-		return DSP_DISPLAY_MODE;
-
-	bit = BIT(mode);
-	if (bit & 0x0522)
-		return DSP_DISPLAY_MODE;
-	if (bit & 0x1a01)
-		return 0;
-	if (bit & 0x00cc)
-		return DSP_UPDATE_MODE | DSP_DISPLAY_MODE;
-	return DSP_DISPLAY_MODE;
-}
-
 static void ebc_set_dsp_ctrl(struct rk3026_ebc *ebc, u32 mode)
 {
-	ebc->dsp_ctrl = DSP_CTRL_FIXED | DSP_VCOM_MODE | ebc_dsp_ctrl_mode(mode);
+	ebc->dsp_ctrl = DSP_CTRL_FIXED | DSP_VCOM_MODE |
+			rk3026_ebc_dsp_ctrl_mode(mode);
 	ebc_write(ebc, EBC_DSP_CTRL, ebc->dsp_ctrl);
 	ebc_config_done(ebc);
 }
@@ -1232,9 +1210,10 @@ static void ebc_do_refresh(struct rk3026_ebc *ebc,
 	 * P29's case (fbcon redrawing one image forever) still skips.
 	 *
 	 * ⚠️ An MXCFB_SEND_UPDATE in a full-class mode is exempt too (the
-	 * update's own mode, as for RESET; full class = what ebc_dsp_ctrl_mode()
-	 * gives DISPLAY_MODE alone: FULL, i.e. GC16 or AUTO with UPDATE_MODE_FULL
-	 * and REAGLD, OED_PART for REAGL, RESET, BLOCK, FULL_DITHER). Neither
+	 * update's own mode, as for RESET; full class = what
+	 * rk3026_ebc_dsp_ctrl_mode() gives DISPLAY_MODE alone: FULL, i.e. GC16
+	 * or AUTO with UPDATE_MODE_FULL and REAGLD, OED_PART for REAGL, RESET,
+	 * BLOCK, FULL_DITHER). Neither
 	 * reason for the skip applies to it: it is queued once, by a client, not
 	 * by every fbdev commit or cursor blink. A GC16 full on identical content
 	 * is the ghost-clearing flash the client asks for, and it also repairs
@@ -1246,7 +1225,7 @@ static void ebc_do_refresh(struct rk3026_ebc *ebc,
 	if (!ebc_report_image(ebc) && upd->mode != EBC_MODE_RESET &&
 	    !ebc->prev_unknown &&
 	    !(upd->source == EBC_SOURCE_MXCFB &&
-	      ebc_dsp_ctrl_mode(upd->mode) == DSP_DISPLAY_MODE)) {
+	      rk3026_ebc_dsp_ctrl_mode(upd->mode) == DSP_DISPLAY_MODE)) {
 		if (debug_scan)
 			dev_info(ebc->dev, "scan: skipped, image identical to prev\n");
 		last->outcome = EBC_OUTCOME_SKIPPED;

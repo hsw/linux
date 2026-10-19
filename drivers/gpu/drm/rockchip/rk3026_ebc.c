@@ -1317,10 +1317,11 @@ static void ebc_do_refresh(struct rk3026_ebc *ebc, struct rk3026_ebc_last *last)
 	 *
 	 * ⚠️ An MXCFB_SEND_UPDATE in a full-class mode is exempt too
 	 * (@has_mxcfb_full; full class = what rk3026_ebc_dsp_ctrl_mode() gives
-	 * DISPLAY_MODE alone: FULL, i.e. GC16 or AUTO with UPDATE_MODE_FULL and
-	 * REAGLD, OED_PART for REAGL, RESET, BLOCK, FULL_DITHER). Neither
-	 * reason for the skip applies to it: it is queued once, by a client, not
-	 * by every fbdev commit or cursor blink. A GC16 full on identical content
+	 * DISPLAY_MODE alone: FULL, i.e. GC16, REAGL or AUTO with
+	 * UPDATE_MODE_FULL and REAGLD, OED_PART for GL16 with UPDATE_MODE_FULL,
+	 * RESET, BLOCK, FULL_DITHER). Neither reason for the skip applies to
+	 * it: it is queued once, by a client, not by every fbdev commit or
+	 * cursor blink. A GC16 full on identical content
 	 * is the ghost-clearing flash the client asks for, and a full sent
 	 * after a scan that already drew the same pixels would otherwise be
 	 * skipped as identical. Plane updates and partial-class mxcfb sends

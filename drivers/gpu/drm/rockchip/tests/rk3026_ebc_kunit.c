@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * KUnit tests for the RK3026 EBC refresh bookkeeping (rk3026_ebc_core.c).
+ * KUnit tests for the RK3026 EBC refresh bookkeeping (rk3026_ebc_core.c)
+ * and the mxcfb waveform map (rk3026_ebc_mxcfb.c).
  */
 
 #include <kunit/test.h>
@@ -10,6 +11,7 @@
 #include <linux/string.h>
 
 #include "../rk3026_ebc.h"
+#include "../rk3026_ebc_mxcfb.h"
 
 /* A 16x6 panel: 8 bytes per line, two pixels per byte, low nibble first. */
 #define T_W		16
@@ -1285,6 +1287,102 @@ static struct kunit_suite rk3026_ebc_core_test_suite = {
 };
 
 kunit_test_suite(rk3026_ebc_core_test_suite);
+
+#if IS_ENABLED(CONFIG_DRM_RK3026_EBC_MXCFB)
+
+/* --- the mxcfb waveform map --- */
+
+struct t_mxcfb {
+	const char	*desc;
+	u32		waveform;
+	u32		update_mode;
+	u32		mode;
+};
+
+#define T_PARTIAL	MXCFB_UPDATE_MODE_PARTIAL
+#define T_FULL		MXCFB_UPDATE_MODE_FULL
+
+static const struct t_mxcfb t_mxcfb_cases[] = {
+	{ "INIT partial", MXCFB_WAVEFORM_MODE_INIT, T_PARTIAL, EBC_MODE_RESET },
+	{ "INIT full", MXCFB_WAVEFORM_MODE_INIT, T_FULL, EBC_MODE_RESET },
+	{ "DU partial", MXCFB_WAVEFORM_MODE_DU, T_PARTIAL,
+	  EBC_MODE_BLACK_WHITE },
+	{ "DU full", MXCFB_WAVEFORM_MODE_DU, T_FULL, EBC_MODE_BLACK_WHITE },
+	{ "GC16 partial", MXCFB_WAVEFORM_MODE_GC16, T_PARTIAL, EBC_MODE_PART },
+	{ "GC16 full", MXCFB_WAVEFORM_MODE_GC16, T_FULL, EBC_MODE_FULL },
+	{ "GC4 partial", MXCFB_WAVEFORM_MODE_GC4, T_PARTIAL, EBC_MODE_PART },
+	{ "GC4 full", MXCFB_WAVEFORM_MODE_GC4, T_FULL, EBC_MODE_PART },
+	{ "A2 partial", MXCFB_WAVEFORM_MODE_A2, T_PARTIAL, EBC_MODE_A2 },
+	{ "A2 full", MXCFB_WAVEFORM_MODE_A2, T_FULL, EBC_MODE_A2 },
+	{ "GL16 partial", MXCFB_WAVEFORM_MODE_GL16, T_PARTIAL, EBC_MODE_PART },
+	{ "GL16 full", MXCFB_WAVEFORM_MODE_GL16, T_FULL, EBC_MODE_OED_PART },
+	{ "REAGL partial", MXCFB_WAVEFORM_MODE_REAGL, T_PARTIAL,
+	  EBC_MODE_PART },
+	{ "REAGL full", MXCFB_WAVEFORM_MODE_REAGL, T_FULL, EBC_MODE_FULL },
+	{ "REAGLD partial", MXCFB_WAVEFORM_MODE_REAGLD, T_PARTIAL,
+	  EBC_MODE_FULL },
+	{ "REAGLD full", MXCFB_WAVEFORM_MODE_REAGLD, T_FULL, EBC_MODE_FULL },
+	{ "AUTO partial", MXCFB_WAVEFORM_MODE_AUTO, T_PARTIAL, EBC_MODE_PART },
+	{ "AUTO full", MXCFB_WAVEFORM_MODE_AUTO, T_FULL, EBC_MODE_FULL },
+	{ "unknown partial", 99, T_PARTIAL, EBC_MODE_PART },
+	{ "unknown full", 99, T_FULL, EBC_MODE_FULL },
+	/* Only UPDATE_MODE_FULL is full. */
+	{ "GL16 update_mode 2", MXCFB_WAVEFORM_MODE_GL16, 2, EBC_MODE_PART },
+	{ "REAGL update_mode 2", MXCFB_WAVEFORM_MODE_REAGL, 2, EBC_MODE_PART },
+	{ "GC16 update_mode 2", MXCFB_WAVEFORM_MODE_GC16, 2, EBC_MODE_PART },
+};
+
+KUNIT_ARRAY_PARAM_DESC(t_mxcfb, t_mxcfb_cases, desc);
+
+static void ebc_test_mxcfb_map(struct kunit *test)
+{
+	const struct t_mxcfb *c = test->param_value;
+
+	KUNIT_EXPECT_EQ(test,
+			rk3026_ebc_mxcfb_to_ebc_mode(c->waveform,
+						     c->update_mode),
+			c->mode);
+}
+
+/*
+ * The 16-level waveforms' full updates are full class, so they are exempt
+ * from the identical-image skip; their partial updates are not.
+ */
+static void ebc_test_mxcfb_full_class(struct kunit *test)
+{
+	static const u32 waveforms[] = {
+		MXCFB_WAVEFORM_MODE_GC16, MXCFB_WAVEFORM_MODE_GL16,
+		MXCFB_WAVEFORM_MODE_REAGL, MXCFB_WAVEFORM_MODE_AUTO,
+	};
+	unsigned int i;
+	u32 mode;
+
+	for (i = 0; i < ARRAY_SIZE(waveforms); i++) {
+		mode = rk3026_ebc_mxcfb_to_ebc_mode(waveforms[i], T_FULL);
+		KUNIT_EXPECT_EQ(test, rk3026_ebc_dsp_ctrl_mode(mode),
+				DSP_DISPLAY_MODE);
+		KUNIT_EXPECT_TRUE(test, t_full_flag(mode, EBC_SOURCE_MXCFB));
+		mode = rk3026_ebc_mxcfb_to_ebc_mode(waveforms[i], T_PARTIAL);
+		KUNIT_EXPECT_EQ(test, rk3026_ebc_dsp_ctrl_mode(mode),
+				DSP_UPDATE_MODE | DSP_DISPLAY_MODE);
+		KUNIT_EXPECT_FALSE(test, t_full_flag(mode, EBC_SOURCE_MXCFB));
+	}
+}
+
+static struct kunit_case rk3026_ebc_mxcfb_test_cases[] = {
+	KUNIT_CASE_PARAM(ebc_test_mxcfb_map, t_mxcfb_gen_params),
+	KUNIT_CASE(ebc_test_mxcfb_full_class),
+	{}
+};
+
+static struct kunit_suite rk3026_ebc_mxcfb_test_suite = {
+	.name = "rk3026_ebc_mxcfb",
+	.test_cases = rk3026_ebc_mxcfb_test_cases,
+};
+
+kunit_test_suite(rk3026_ebc_mxcfb_test_suite);
+
+#endif /* CONFIG_DRM_RK3026_EBC_MXCFB */
 
 MODULE_DESCRIPTION("KUnit tests for the RK3026 EBC driver");
 MODULE_LICENSE("GPL");

@@ -7,8 +7,9 @@
  *
  * The ACT8931 (i2c0 0x5b) is described at the voltages it holds; its
  * driver writes it only within the node's maxima and compiled-in stock
- * limits (see the pmic@5b node), and no node uses its outputs (the rails
- * stay the fixed regulators of the board file). The gauge and the RTC
+ * limits (see the pmic@5b node). The CPUs use DCDC3 as their supply; no
+ * node uses the other outputs (those rails stay the fixed regulators of
+ * the board file). The gauge and the RTC
  * share its bus, and the gauge's charger state comes from the GRF, not
  * from the PMIC.
  */
@@ -87,8 +88,10 @@
  * that the RC2 stack compiles the same stock caps into the driver,
  * whatever this node says.
  *
- * Only two outputs get ops: DCDC3 (CPU) can be set, pinned here at its
- * current 1.40 V (minimum = maximum: no regulator consumer can move it);
+ * Only two outputs get ops: DCDC3 (CPU) can be set, from the lowest CPU
+ * operating point's voltage up to 1.40 V (RC2_OPP_UV_* in the board
+ * file), always on, with the board's ramp for a raise; its one consumer
+ * is cpufreq-dt;
  * LDO4 (panel logic) can be switched, and stays always-on until the EBC
  * driver takes it as its v3p3-supply: without a consumer the regulator
  * core would switch it off as unused. /init switches it on before the EBC
@@ -113,9 +116,12 @@
 				regulator-max-microvolt = <1350000>;
 			};
 
-			DCDC_REG3 {	/* ARM, 0x1c */
-				regulator-min-microvolt = <1400000>;
+			vdd_arm: DCDC_REG3 {	/* ARM, 0x1c at boot */
+				regulator-min-microvolt = <RC2_OPP_UV_312>;
 				regulator-max-microvolt = <1400000>;
+				regulator-ramp-delay = <RC2_VDD_ARM_RAMP>;
+				regulator-always-on;
+				regulator-boot-on;
 			};
 
 			LDO_REG1 {	/* touch, 0x37 */

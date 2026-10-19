@@ -54,6 +54,8 @@
 
 #include <video/of_display_timing.h>
 
+#include <kunit/visibility.h>
+
 #include "rk3026_ebc.h"
 
 #define CREATE_TRACE_POINTS
@@ -230,10 +232,11 @@ static unsigned int ebc_part_max_ms(struct rk3026_ebc *ebc)
  * Past this the thread is stuck outside the EBC (an I2C transfer, say), and
  * the waiter goes on without it.
  */
-static unsigned int rk3026_ebc_wait_timeout_ms(struct rk3026_ebc *ebc)
+VISIBLE_IF_KUNIT unsigned int rk3026_ebc_wait_timeout_ms(struct rk3026_ebc *ebc)
 {
 	return EBC_WAIT_PARTS * ebc_part_max_ms(ebc);
 }
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_wait_timeout_ms);
 
 /*
  * DIAGNOSTIC, REVERT ME. The scan completes -- frame-end interrupts arrive and
@@ -369,8 +372,8 @@ MODULE_PARM_DESC(debug_timeout, "force the next N chunks to time out (0 = off); 
 /*
  * DIAGNOSTIC: the snapshot a scan drives against the image the panel is
  * believed to show, from the cached shadows (debug_scan only). The skip
- * decision does not depend on it: ebc_do_refresh() makes that one on every
- * refresh, from what rk3026_ebc_build_snapshot() returns.
+ * decision does not depend on it: rk3026_ebc_do_refresh() makes that one on
+ * every refresh, from what rk3026_ebc_build_snapshot() returns.
  */
 static void ebc_report_image(struct rk3026_ebc *ebc)
 {
@@ -1203,7 +1206,8 @@ static void ebc_publish(struct rk3026_ebc *ebc, struct rk3026_ebc_last *last,
  *     published with it. The waiters on the part's updates are woken then,
  *     whatever the outcome, and @prev_virt follows.
  */
-static void ebc_do_refresh(struct rk3026_ebc *ebc, struct rk3026_ebc_last *last)
+VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
+					    struct rk3026_ebc_last *last)
 {
 	enum rk3026_ebc_repair repair_result = EBC_REPAIR_NONE;
 	struct rk3026_ebc_shadows *sh = &ebc->shadows;
@@ -1453,6 +1457,7 @@ finish:
 	if (prev_changed)
 		memcpy(ebc->prev_virt, sh->prev, ebc->img_size);
 }
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_do_refresh);
 
 /*
  * Idle power-off: rails_off_ms passed since the last waveform. Only this
@@ -1499,7 +1504,7 @@ static int ebc_refresh_thread(void *data)
 		if (kthread_should_stop())
 			break;
 
-		ebc_do_refresh(ebc, &last);
+		rk3026_ebc_do_refresh(ebc, &last);
 	}
 
 	mutex_lock(&ebc->rails_lock);
@@ -1530,8 +1535,9 @@ static int ebc_refresh_thread(void *data)
  * Returns 0, -ETIMEDOUT after @timeout_ms, or -ERESTARTSYS if @interruptible
  * and a signal arrived.
  */
-static int rk3026_ebc_wait_seq(struct rk3026_ebc *ebc, u32 seq,
-			       unsigned int timeout_ms, bool interruptible)
+VISIBLE_IF_KUNIT int rk3026_ebc_wait_seq(struct rk3026_ebc *ebc, u32 seq,
+					 unsigned int timeout_ms,
+					 bool interruptible)
 {
 	const struct rk3026_ebc_pending *p = &ebc->pending;
 	unsigned long timeout = msecs_to_jiffies(timeout_ms);
@@ -1549,6 +1555,7 @@ static int rk3026_ebc_wait_seq(struct rk3026_ebc *ebc, u32 seq,
 		return ret;
 	return ret ? 0 : -ETIMEDOUT;
 }
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_wait_seq);
 
 /*
  * For CRTC enable and disable: bounded, so a thread stuck elsewhere cannot
@@ -1620,6 +1627,7 @@ u32 rk3026_ebc_add_update(struct rk3026_ebc *ebc,
 	wake_up(&ebc->update_wq);
 	return seq;
 }
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_add_update);
 
 /**
  * rk3026_ebc_wait_marker - block until a sent update has been driven out
@@ -1647,6 +1655,7 @@ int rk3026_ebc_wait_marker(struct rk3026_ebc *ebc, u32 marker)
 	return rk3026_ebc_wait_seq(ebc, seq, rk3026_ebc_wait_timeout_ms(ebc),
 				   true);
 }
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_wait_marker);
 
 /* --- DRM --- */
 
@@ -1689,8 +1698,9 @@ static int ebc_plane_atomic_check(struct drm_plane *plane,
  *
  * Returns true if the update was queued.
  */
-static bool rk3026_ebc_plane_update(struct rk3026_ebc *ebc, const void *src,
-				    unsigned int src_pitch)
+VISIBLE_IF_KUNIT bool rk3026_ebc_plane_update(struct rk3026_ebc *ebc,
+					      const void *src,
+					      unsigned int src_pitch)
 {
 	struct rk3026_ebc_update upd = {
 		.clip	= DRM_RECT_INIT(0, 0, ebc->width, ebc->height),
@@ -1708,6 +1718,7 @@ static bool rk3026_ebc_plane_update(struct rk3026_ebc *ebc, const void *src,
 	mutex_unlock(&ebc->image_lock);
 	return queue;
 }
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_plane_update);
 
 static void ebc_plane_atomic_update(struct drm_plane *plane,
 				    struct drm_atomic_state *state)

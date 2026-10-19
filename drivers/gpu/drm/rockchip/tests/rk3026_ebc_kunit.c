@@ -1,18 +1,22 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  * KUnit tests for the RK3026 EBC refresh bookkeeping (rk3026_ebc_core.c),
- * the waveform container bounds (rk3026_ebc_waveform.c) and the mxcfb
- * waveform map (rk3026_ebc_mxcfb.c).
+ * the waveform container bounds (rk3026_ebc_waveform.c), the mxcfb waveform
+ * map (rk3026_ebc_mxcfb.c) and the refresh thread's glue (rk3026_ebc.c).
  */
 
 #include <kunit/device.h>
 #include <kunit/test.h>
 
 #include <linux/err.h>
+#include <linux/jiffies.h>
 #include <linux/limits.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/string.h>
 #include <linux/unaligned.h>
+#include <linux/wait.h>
+#include <linux/workqueue.h>
 
 #include "../rk3026_ebc.h"
 #include "../rk3026_ebc_mxcfb.h"
@@ -1809,6 +1813,375 @@ static struct kunit_suite rk3026_ebc_waveform_test_suite = {
 };
 
 kunit_test_suite(rk3026_ebc_waveform_test_suite);
+
+/* --- the refresh thread's glue (rk3026_ebc.c) --- */
+
+/*
+ * A bare struct rk3026_ebc with what the glue needs and no hardware: with
+ * the CRTC off, without a waveform, for a part whose snapshot moves
+ * nothing, or with the rails counted as up and no LUT for the part, a part
+ * finishes without touching a register or a regulator.
+ */
+static struct rk3026_ebc *t_ebc_alloc(struct kunit *test)
+{
+	struct rk3026_ebc *ebc = kunit_kzalloc(test, sizeof(*ebc), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, ebc);
+	ebc->dev = kunit_device_register(test, "rk3026-ebc-glue");
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, ebc->dev);
+	mutex_init(&ebc->image_lock);
+	mutex_init(&ebc->rails_lock);
+	init_waitqueue_head(&ebc->update_wq);
+	init_waitqueue_head(&ebc->marker_wq);
+	ebc->width = T_W;
+	ebc->height = T_H;
+	ebc->img_size = T_SIZE;
+	ebc->next_shadow = t_img_alloc(test, 15);
+	ebc->pre_shadow = t_img_alloc(test, 15);
+	ebc->shadows.prev = t_img_alloc(test, 15);
+	ebc->shadows.scan = t_img_alloc(test, 15);
+	ebc->shadows.pitch = T_PITCH;
+	ebc->shadows.height = T_H;
+	ebc->prev_virt = t_img_alloc(test, 15);
+	ebc->crtc_on = true;
+	return ebc;
+}
+
+static u32 t_send(struct rk3026_ebc *ebc, const struct drm_rect *clip,
+		  u32 mode, u32 marker, enum rk3026_ebc_source source)
+{
+	struct rk3026_ebc_update upd = t_upd(clip, mode, marker, source);
+	u32 seq;
+
+	mutex_lock(&ebc->image_lock);
+	seq = rk3026_ebc_add_update(ebc, &upd);
+	mutex_unlock(&ebc->image_lock);
+	return seq;
+}
+
+static void ebc_test_glue_add_update(struct kunit *test)
+{
+	struct rk3026_ebc *ebc = t_ebc_alloc(test);
+	struct drm_rect r = DRM_RECT_INIT(2, 1, 4, 2);
+	u32 s1, s2, s3, seq;
+
+	s1 = t_send(ebc, &r, EBC_MODE_PART, 5, EBC_SOURCE_MXCFB);
+	s2 = t_send(ebc, &r, EBC_MODE_A2, 6, EBC_SOURCE_MXCFB);
+	KUNIT_EXPECT_EQ(test, s2, s1 + 1);
+	KUNIT_EXPECT_EQ(test, ebc->stats.updates, 2);
+	KUNIT_EXPECT_EQ(test, ebc->stats.coalesced, 1);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_pending_parts(&ebc->pending), 1);
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_marker_seq_lookup(&ebc->markers, 5,
+							     &seq));
+	KUNIT_EXPECT_EQ(test, seq, s1);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_work_pending(&ebc->pending));
+
+	/*
+	 * A RESET whitens the target and drops a carry; the part pending in
+	 * front of it keeps its image.
+	 */
+	t_img_fill(ebc->next_shadow, 3);
+	ebc->pending.carry = (struct rk3026_ebc_set) {
+		.box = r, .mode = EBC_MODE_FULL, .merged = 1,
+	};
+	s3 = t_send(ebc, &t_panel, EBC_MODE_RESET, 0, EBC_SOURCE_ENABLE);
+	KUNIT_EXPECT_EQ(test, s3, s2 + 1);
+	t_expect_white(test, ebc->next_shadow);
+	t_expect_guard(test, ebc->next_shadow);
+	KUNIT_EXPECT_TRUE(test, ebc->pre_split);
+	KUNIT_EXPECT_EQ(test, ebc->pre_shadow[0], 0x33);
+	KUNIT_EXPECT_EQ(test, ebc->pre_shadow[T_SIZE - 1], 0x33);
+	KUNIT_EXPECT_FALSE(test, ebc->pending.carry.merged);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_pending_parts(&ebc->pending), 2);
+	KUNIT_EXPECT_EQ(test, ebc->stats.coalesced, 1);
+}
+
+/* With the CRTC off a part is dropped; its waits end all the same. */
+static void ebc_test_glue_crtc_off(struct kunit *test)
+{
+	struct rk3026_ebc *ebc = t_ebc_alloc(test);
+	struct rk3026_ebc_last last;
+	u8 *prev = ebc->shadows.prev;
+	u32 seq;
+
+	ebc->crtc_on = false;
+	seq = t_send(ebc, &t_panel, EBC_MODE_FULL, 1, EBC_SOURCE_MXCFB);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_CRTC_OFF);
+	KUNIT_EXPECT_EQ(test, last.marker, 1);
+	KUNIT_EXPECT_EQ(test, ebc->last.outcome, EBC_OUTCOME_CRTC_OFF);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_seq_finished(&ebc->pending, seq));
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_work_pending(&ebc->pending));
+	KUNIT_EXPECT_FALSE(test, ebc->pending.carry.merged);
+	KUNIT_EXPECT_PTR_EQ(test, ebc->shadows.prev, prev);
+	KUNIT_EXPECT_EQ(test, ebc->stats.done, 1);
+	KUNIT_EXPECT_EQ(test, ebc->stats.dropped, 1);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_marker(ebc, 1), 0);
+
+	/* Nothing pending: nothing taken, the record stays. */
+	last.outcome = EBC_OUTCOME_NONE;
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_NONE);
+	KUNIT_EXPECT_EQ(test, ebc->stats.done, 1);
+}
+
+/* Without a waveform a part is carried, even with the glass unknown. */
+static void ebc_test_glue_no_waveform(struct kunit *test)
+{
+	struct rk3026_ebc *ebc = t_ebc_alloc(test);
+	struct drm_rect a = DRM_RECT_INIT(0, 0, 4, 2);
+	struct drm_rect b = DRM_RECT_INIT(8, 4, 2, 2);
+	struct rk3026_ebc_last last;
+	u32 seq;
+
+	ebc->shadows.prev_unknown = true;
+	seq = t_send(ebc, &a, EBC_MODE_FULL, 2, EBC_SOURCE_MXCFB);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_NO_WAVEFORM);
+	KUNIT_EXPECT_FALSE(test, last.repaired);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_seq_finished(&ebc->pending, seq));
+	KUNIT_EXPECT_TRUE(test, drm_rect_equals(&ebc->pending.carry.box, &a));
+	KUNIT_EXPECT_TRUE(test, ebc->shadows.prev_unknown);
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_work_pending(&ebc->pending));
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_marker(ebc, 2), 0);
+
+	t_send(ebc, &b, EBC_MODE_A2, 0, EBC_SOURCE_PLANE);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.clip.x1, 0);
+	KUNIT_EXPECT_EQ(test, last.clip.x2, 10);
+	KUNIT_EXPECT_EQ(test, last.asked_mode, EBC_MODE_FULL);
+	KUNIT_EXPECT_EQ(test, ebc->stats.dropped, 2);
+}
+
+/* A snapshot that moves nothing is skipped before any hardware. */
+static void ebc_test_glue_skipped(struct kunit *test)
+{
+	static const struct t_rkf_seg seg = { T_RKF_GRAY16, 1 };
+	struct rk3026_ebc *ebc = t_ebc_alloc(test);
+	struct rk3026_ebc_last last;
+	u8 *prev = ebc->shadows.prev;
+	u32 seq;
+
+	/* Never read before the skip; a real one all the same. */
+	ebc->waveform = t_rkf_wf(test, ebc->dev, &seg, 1, 0);
+	seq = t_send(ebc, &t_panel, EBC_MODE_FULL, 0, EBC_SOURCE_PLANE);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_SKIPPED);
+	KUNIT_EXPECT_EQ(test, last.scans, 0);
+	KUNIT_EXPECT_FALSE(test, last.temp_read);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_seq_finished(&ebc->pending, seq));
+	KUNIT_EXPECT_PTR_EQ(test, ebc->shadows.prev, prev);
+	KUNIT_EXPECT_EQ(test, ebc->stats.skips, 1);
+	KUNIT_EXPECT_FALSE(test, ebc->pending.carry.merged);
+}
+
+/*
+ * A RESET sent behind a pending part leaves the part its own pixels: on a
+ * white glass its black box is drawn, not skipped as the RESET's white.
+ * Sends after the RESET and a second RESET leave that image alone. With the
+ * rails counted as up and a waveform that has only a RESET, the part stops
+ * at its missing LUT, before any register.
+ */
+static void ebc_test_glue_reset_keeps_pre(struct kunit *test)
+{
+	static const struct t_rkf_seg seg = { T_RKF_RESET, 5 };
+	struct rk3026_ebc *ebc = t_ebc_alloc(test);
+	struct drm_rect r = DRM_RECT_INIT(2, 1, 4, 2);
+	struct drm_rect after = DRM_RECT_INIT(8, 3, 2, 1);
+	struct rk3026_ebc_last last;
+	u8 *pre_image = ebc->next_shadow;
+	int x, y;
+
+	ebc->waveform = t_rkf_wf(test, ebc->dev, &seg, 1, 0);
+	ebc->next_virt = t_img_alloc(test, 15);
+	ebc->epd_on = true;
+
+	for (y = r.y1; y < r.y2; y++)
+		for (x = r.x1; x < r.x2; x++)
+			t_px_set(ebc->next_shadow, x, y, 0);
+	t_send(ebc, &r, EBC_MODE_PART, 1, EBC_SOURCE_MXCFB);
+	t_send(ebc, &t_panel, EBC_MODE_RESET, 2, EBC_SOURCE_MXCFB);
+	KUNIT_EXPECT_TRUE(test, ebc->pre_split);
+	KUNIT_EXPECT_PTR_EQ(test, ebc->pre_shadow, pre_image);
+	KUNIT_EXPECT_PTR_NE(test, ebc->next_shadow, pre_image);
+	t_expect_white(test, ebc->next_shadow);
+
+	/* Sent after the RESET: blitted on white, into the other image. */
+	t_px_set(ebc->next_shadow, 8, 3, 0);
+	t_send(ebc, &after, EBC_MODE_PART, 3, EBC_SOURCE_MXCFB);
+	KUNIT_EXPECT_EQ(test, t_px(pre_image, 8, 3), 15);
+	/* A second RESET absorbs it and whitens its image again. */
+	t_send(ebc, &t_panel, EBC_MODE_RESET, 4, EBC_SOURCE_MXCFB);
+	KUNIT_EXPECT_TRUE(test, ebc->pre_split);
+	KUNIT_EXPECT_PTR_EQ(test, ebc->pre_shadow, pre_image);
+	t_expect_white(test, ebc->next_shadow);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_pending_parts(&ebc->pending), 2);
+
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_NO_LUT);
+	KUNIT_EXPECT_EQ(test, last.marker, 1);
+	KUNIT_EXPECT_TRUE(test, drm_rect_equals(&last.clip, &r));
+	KUNIT_EXPECT_FALSE(test, ebc->pre_split);
+	for (y = 0; y < T_H; y++)
+		for (x = 0; x < T_W; x++)
+			KUNIT_EXPECT_EQ(test, t_px(ebc->shadows.scan, x, y),
+					t_in_rect(&r, x, y) ? 0 : 15);
+	t_expect_guard(test, ebc->shadows.scan);
+	t_expect_white(test, ebc->next_shadow);
+	KUNIT_EXPECT_TRUE(test, drm_rect_equals(&ebc->pending.carry.box, &r));
+	KUNIT_EXPECT_EQ(test, ebc->stats.dropped, 1);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_pending_parts(&ebc->pending), 1);
+}
+
+struct t_glue_work {
+	struct delayed_work	work;
+	struct rk3026_ebc	*ebc;
+	struct rk3026_ebc_last	last;
+	unsigned int		parts;
+};
+
+/* The refresh thread, later: take and finish @parts parts. */
+static void t_glue_refresh(struct work_struct *work)
+{
+	struct t_glue_work *w = container_of(to_delayed_work(work),
+					     struct t_glue_work, work);
+
+	while (w->parts--)
+		rk3026_ebc_do_refresh(w->ebc, &w->last);
+}
+
+static void ebc_test_glue_wait_marker(struct kunit *test)
+{
+	struct rk3026_ebc *ebc = t_ebc_alloc(test);
+	struct t_glue_work *w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
+	u32 seq;
+
+	KUNIT_ASSERT_NOT_NULL(test, w);
+	ebc->crtc_on = false;
+
+	/* Marker 0 and a marker never sent: nothing to wait for. */
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_marker(ebc, 0), 0);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_marker(ebc, 42), 0);
+
+	/* The thread does not come: the wait times out. */
+	seq = t_send(ebc, &t_panel, EBC_MODE_PART, 7, EBC_SOURCE_MXCFB);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_seq(ebc, seq, 20, true),
+			-ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_seq(ebc, seq, 20, false),
+			-ETIMEDOUT);
+
+	/* It comes later: the finish wakes the wait. */
+	w->ebc = ebc;
+	w->parts = 1;
+	INIT_DELAYED_WORK(&w->work, t_glue_refresh);
+	schedule_delayed_work(&w->work, msecs_to_jiffies(50));
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_marker(ebc, 7), 0);
+	flush_delayed_work(&w->work);
+	KUNIT_EXPECT_EQ(test, w->last.outcome, EBC_OUTCOME_CRTC_OFF);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_seq_finished(&ebc->pending, seq));
+	/* Finished: a wait returns at once. */
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_seq(ebc, seq, 0, false), 0);
+}
+
+/* A wait on the RESET ends at the RESET, not at what was sent after it. */
+static void ebc_test_glue_wait_barrier(struct kunit *test)
+{
+	struct rk3026_ebc *ebc = t_ebc_alloc(test);
+	struct t_glue_work *w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
+	struct drm_rect r = DRM_RECT_INIT(2, 2, 4, 2);
+	u32 s1, s2, s3;
+
+	KUNIT_ASSERT_NOT_NULL(test, w);
+	ebc->crtc_on = false;
+	s1 = t_send(ebc, &r, EBC_MODE_PART, 1, EBC_SOURCE_MXCFB);
+	s2 = t_send(ebc, &t_panel, EBC_MODE_RESET, 2, EBC_SOURCE_MXCFB);
+	s3 = t_send(ebc, &r, EBC_MODE_PART, 3, EBC_SOURCE_MXCFB);
+
+	w->ebc = ebc;
+	w->parts = 2;
+	INIT_DELAYED_WORK(&w->work, t_glue_refresh);
+	schedule_delayed_work(&w->work, msecs_to_jiffies(20));
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_seq(ebc, s2, 10000, false), 0);
+	flush_delayed_work(&w->work);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_seq_finished(&ebc->pending, s1));
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_seq_finished(&ebc->pending, s3));
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_work_pending(&ebc->pending));
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_seq(ebc, s3, 20, false),
+			-ETIMEDOUT);
+
+	w->parts = 1;
+	schedule_delayed_work(&w->work, 0);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_marker(ebc, 3), 0);
+	flush_delayed_work(&w->work);
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_work_pending(&ebc->pending));
+}
+
+/* Four parts, each a setup and eight chunks at their budget. */
+static void ebc_test_glue_wait_timeout(struct kunit *test)
+{
+	struct rk3026_ebc *ebc = t_ebc_alloc(test);
+
+	/* The fallback dot clock on a 16x6 panel: every budget at its floor. */
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_timeout_ms(ebc),
+			4 * (1000 + 8 * 5000));
+
+	/*
+	 * 1 kHz, 4 x 6 clocks a frame: 24 ms a frame, a 64-frame budget of
+	 * 64 x 24 x 4 = 6144 ms, above the floor.
+	 */
+	ebc->timing.pixelclock.typ = 1000;
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_timeout_ms(ebc),
+			4 * (1000 + 8 * 6144));
+}
+
+/* A plane update leaves the panel to an mxcfb client. */
+static void ebc_test_glue_plane_update(struct kunit *test)
+{
+	struct rk3026_ebc *ebc = t_ebc_alloc(test);
+	u32 *fb = kunit_kcalloc(test, T_W * T_H, sizeof(*fb), GFP_KERNEL);
+	int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, fb);
+
+	/* An mxcfb client owns the panel: no blit, no update. */
+	ebc->mxcfb_active = true;
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_plane_update(ebc, fb, T_W * 4));
+	t_expect_white(test, ebc->next_shadow);
+	KUNIT_EXPECT_EQ(test, ebc->stats.updates, 0);
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_work_pending(&ebc->pending));
+
+	/* None: the whole framebuffer (black), the whole panel, FULL. */
+	ebc->mxcfb_active = false;
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_plane_update(ebc, fb, T_W * 4));
+	for (i = 0; i < T_SIZE; i++)
+		KUNIT_EXPECT_EQ(test, ebc->next_shadow[i], 0);
+	t_expect_guard(test, ebc->next_shadow);
+	KUNIT_EXPECT_EQ(test, ebc->stats.updates, 1);
+	KUNIT_EXPECT_EQ(test, ebc->pending.pre.merged, 1);
+	KUNIT_EXPECT_TRUE(test, drm_rect_equals(&ebc->pending.pre.box, &t_panel));
+	KUNIT_EXPECT_EQ(test, ebc->pending.pre.mode, EBC_MODE_FULL);
+	KUNIT_EXPECT_EQ(test, ebc->pending.pre.source, EBC_SOURCE_PLANE);
+}
+
+static struct kunit_case rk3026_ebc_glue_test_cases[] = {
+	KUNIT_CASE(ebc_test_glue_add_update),
+	KUNIT_CASE(ebc_test_glue_crtc_off),
+	KUNIT_CASE(ebc_test_glue_no_waveform),
+	KUNIT_CASE(ebc_test_glue_skipped),
+	KUNIT_CASE(ebc_test_glue_reset_keeps_pre),
+	KUNIT_CASE(ebc_test_glue_wait_marker),
+	KUNIT_CASE(ebc_test_glue_wait_barrier),
+	KUNIT_CASE(ebc_test_glue_wait_timeout),
+	KUNIT_CASE(ebc_test_glue_plane_update),
+	{}
+};
+
+static struct kunit_suite rk3026_ebc_glue_test_suite = {
+	.name = "rk3026_ebc_glue",
+	.test_cases = rk3026_ebc_glue_test_cases,
+};
+
+kunit_test_suite(rk3026_ebc_glue_test_suite);
 
 MODULE_DESCRIPTION("KUnit tests for the RK3026 EBC driver");
 MODULE_LICENSE("GPL");

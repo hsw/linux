@@ -588,6 +588,14 @@ void rk3026_ebc_blit_xrgb8888(struct rk3026_ebc *ebc, const void *src,
 u32 rk3026_ebc_add_update(struct rk3026_ebc *ebc,
 			  const struct rk3026_ebc_update *upd);
 int rk3026_ebc_wait_marker(struct rk3026_ebc *ebc, u32 marker);
+#if IS_ENABLED(CONFIG_KUNIT)
+void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc, struct rk3026_ebc_last *last);
+int rk3026_ebc_wait_seq(struct rk3026_ebc *ebc, u32 seq,
+			unsigned int timeout_ms, bool interruptible);
+unsigned int rk3026_ebc_wait_timeout_ms(struct rk3026_ebc *ebc);
+bool rk3026_ebc_plane_update(struct rk3026_ebc *ebc, const void *src,
+			     unsigned int src_pitch);
+#endif
 
 /* rk3026_ebc_core.c */
 u32 rk3026_ebc_dsp_ctrl_mode(u32 mode);

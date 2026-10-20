@@ -302,7 +302,8 @@
 		led-0 {
 			label = "status";
 			gpios = <&gpio2 RK_PB7 GPIO_ACTIVE_HIGH>;
-			linux,default-trigger = "heartbeat";
+			/* dark by default; "heartbeat" via sysfs when a test needs it */
+			linux,default-trigger = "none";
 			panic-indicator;
 		};
 	};

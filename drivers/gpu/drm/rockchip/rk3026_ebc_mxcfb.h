@@ -72,6 +72,9 @@ static_assert(sizeof(struct mxcfb_update_data) == 64);
 #define MXCFB_WAVEFORM_MODE_REAGLD	7
 #define MXCFB_WAVEFORM_MODE_AUTO	257
 
+/* flags: only FORCE_MONOCHROME (as in i.MX mxcfb.h) is read. */
+#define EPDC_FLAG_FORCE_MONOCHROME	0x02
+
 /* temp: read the panel thermometer instead of using the supplied value */
 #define MXCFB_TEMP_USE_AMBIENT		0x1000
 

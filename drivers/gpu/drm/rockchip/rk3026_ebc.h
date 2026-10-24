@@ -256,7 +256,8 @@ enum rk3026_ebc_reason {
  *
  * @auto_mode: the sender asked for no particular waveform, so @mode is only
  * the default the content may override (rk3026_ebc_resolve_mode()). A plane
- * update sets it; an update that names its mode leaves it false.
+ * update and an mxcfb AUTO + PARTIAL send set it; an update that names its
+ * mode leaves it false.
  */
 struct rk3026_ebc_update {
 	struct drm_rect	clip;
@@ -694,7 +695,12 @@ static inline void rk3026_ebc_debugfs_fini(struct rk3026_ebc *ebc) { }
 #if IS_ENABLED(CONFIG_DRM_RK3026_EBC_MXCFB)
 void rk3026_ebc_mxcfb_install(struct rk3026_ebc *ebc, struct fb_info *info);
 #if IS_ENABLED(CONFIG_KUNIT)
-u32 rk3026_ebc_mxcfb_to_ebc_mode(u32 waveform_mode, u32 update_mode);
+struct mxcfb_update_data;
+u32 rk3026_ebc_mxcfb_to_ebc_mode(u32 waveform_mode, u32 update_mode,
+				 u32 flags, bool *auto_mode);
+int rk3026_ebc_mxcfb_send(struct rk3026_ebc *ebc, const void *src,
+			  unsigned int pitch,
+			  const struct mxcfb_update_data *req);
 #endif
 #else
 static inline void rk3026_ebc_mxcfb_install(struct rk3026_ebc *ebc,

@@ -1759,10 +1759,13 @@ struct t_mxcfb {
 	u32		waveform;
 	u32		update_mode;
 	u32		mode;
+	u32		flags;
+	bool		auto_mode;
 };
 
 #define T_PARTIAL	MXCFB_UPDATE_MODE_PARTIAL
 #define T_FULL		MXCFB_UPDATE_MODE_FULL
+#define T_MONO		EPDC_FLAG_FORCE_MONOCHROME
 
 static const struct t_mxcfb t_mxcfb_cases[] = {
 	{ "INIT partial", MXCFB_WAVEFORM_MODE_INIT, T_PARTIAL, EBC_MODE_RESET },
@@ -1784,7 +1787,9 @@ static const struct t_mxcfb t_mxcfb_cases[] = {
 	{ "REAGLD partial", MXCFB_WAVEFORM_MODE_REAGLD, T_PARTIAL,
 	  EBC_MODE_FULL },
 	{ "REAGLD full", MXCFB_WAVEFORM_MODE_REAGLD, T_FULL, EBC_MODE_FULL },
-	{ "AUTO partial", MXCFB_WAVEFORM_MODE_AUTO, T_PARTIAL, EBC_MODE_PART },
+	/* AUTO + PARTIAL leaves the mode to the content; AUTO + FULL does not. */
+	{ "AUTO partial", MXCFB_WAVEFORM_MODE_AUTO, T_PARTIAL, EBC_MODE_PART,
+	  0, true },
 	{ "AUTO full", MXCFB_WAVEFORM_MODE_AUTO, T_FULL, EBC_MODE_FULL },
 	{ "unknown partial", 99, T_PARTIAL, EBC_MODE_PART },
 	{ "unknown full", 99, T_FULL, EBC_MODE_FULL },
@@ -1792,6 +1797,34 @@ static const struct t_mxcfb t_mxcfb_cases[] = {
 	{ "GL16 update_mode 2", MXCFB_WAVEFORM_MODE_GL16, 2, EBC_MODE_PART },
 	{ "REAGL update_mode 2", MXCFB_WAVEFORM_MODE_REAGL, 2, EBC_MODE_PART },
 	{ "GC16 update_mode 2", MXCFB_WAVEFORM_MODE_GC16, 2, EBC_MODE_PART },
+	{ "AUTO update_mode 2", MXCFB_WAVEFORM_MODE_AUTO, 2, EBC_MODE_PART, 0,
+	  true },
+	/* AUTO + FORCE_MONOCHROME: monochrome first, so DU, as asked. */
+	{ "AUTO partial mono", MXCFB_WAVEFORM_MODE_AUTO, T_PARTIAL,
+	  EBC_MODE_BLACK_WHITE, T_MONO },
+	{ "AUTO full mono", MXCFB_WAVEFORM_MODE_AUTO, T_FULL,
+	  EBC_MODE_BLACK_WHITE, T_MONO },
+	{ "AUTO partial all flags", MXCFB_WAVEFORM_MODE_AUTO, T_PARTIAL,
+	  EBC_MODE_BLACK_WHITE, ~0u },
+	/* Only the FORCE_MONOCHROME bit is read. */
+	{ "AUTO partial other flags", MXCFB_WAVEFORM_MODE_AUTO, T_PARTIAL,
+	  EBC_MODE_PART, ~T_MONO, true },
+	{ "AUTO full other flags", MXCFB_WAVEFORM_MODE_AUTO, T_FULL,
+	  EBC_MODE_FULL, ~T_MONO },
+	/* With a named waveform the flag changes nothing. */
+	{ "INIT mono", MXCFB_WAVEFORM_MODE_INIT, T_PARTIAL, EBC_MODE_RESET,
+	  T_MONO },
+	{ "DU partial mono", MXCFB_WAVEFORM_MODE_DU, T_PARTIAL,
+	  EBC_MODE_BLACK_WHITE, T_MONO },
+	{ "A2 partial mono", MXCFB_WAVEFORM_MODE_A2, T_PARTIAL, EBC_MODE_A2,
+	  T_MONO },
+	{ "GC16 partial mono", MXCFB_WAVEFORM_MODE_GC16, T_PARTIAL,
+	  EBC_MODE_PART, T_MONO },
+	{ "GC16 full mono", MXCFB_WAVEFORM_MODE_GC16, T_FULL, EBC_MODE_FULL,
+	  T_MONO },
+	{ "GL16 full mono", MXCFB_WAVEFORM_MODE_GL16, T_FULL,
+	  EBC_MODE_OED_PART, T_MONO },
+	{ "unknown partial mono", 99, T_PARTIAL, EBC_MODE_PART, T_MONO },
 };
 
 KUNIT_ARRAY_PARAM_DESC(t_mxcfb, t_mxcfb_cases, desc);
@@ -1799,16 +1832,22 @@ KUNIT_ARRAY_PARAM_DESC(t_mxcfb, t_mxcfb_cases, desc);
 static void ebc_test_mxcfb_map(struct kunit *test)
 {
 	const struct t_mxcfb *c = test->param_value;
+	bool auto_mode = !c->auto_mode;
 
 	KUNIT_EXPECT_EQ(test,
 			rk3026_ebc_mxcfb_to_ebc_mode(c->waveform,
-						     c->update_mode),
+						     c->update_mode, c->flags,
+						     &auto_mode),
 			c->mode);
+	KUNIT_EXPECT_EQ(test, auto_mode, c->auto_mode);
 }
 
 /*
  * The 16-level waveforms' full updates are full class, so they are exempt
- * from the identical-image skip; their partial updates are not.
+ * from the identical-image skip; their partial updates are not. AUTO +
+ * PARTIAL is partial class, as before: it is PART, now with auto_mode, and
+ * resolves to DU or PART, both partial. AUTO + FULL stays a FULL without
+ * auto_mode, so the policy never takes its flash or its skip exemption.
  */
 static void ebc_test_mxcfb_full_class(struct kunit *test)
 {
@@ -1817,23 +1856,101 @@ static void ebc_test_mxcfb_full_class(struct kunit *test)
 		MXCFB_WAVEFORM_MODE_REAGL, MXCFB_WAVEFORM_MODE_AUTO,
 	};
 	unsigned int i;
+	bool auto_mode;
 	u32 mode;
 
 	for (i = 0; i < ARRAY_SIZE(waveforms); i++) {
-		mode = rk3026_ebc_mxcfb_to_ebc_mode(waveforms[i], T_FULL);
+		mode = rk3026_ebc_mxcfb_to_ebc_mode(waveforms[i], T_FULL, 0,
+						    &auto_mode);
 		KUNIT_EXPECT_EQ(test, rk3026_ebc_dsp_ctrl_mode(mode),
 				DSP_DISPLAY_MODE);
 		KUNIT_EXPECT_TRUE(test, t_full_flag(mode, EBC_SOURCE_MXCFB));
-		mode = rk3026_ebc_mxcfb_to_ebc_mode(waveforms[i], T_PARTIAL);
+		KUNIT_EXPECT_FALSE(test, auto_mode);
+		mode = rk3026_ebc_mxcfb_to_ebc_mode(waveforms[i], T_PARTIAL, 0,
+						    &auto_mode);
 		KUNIT_EXPECT_EQ(test, rk3026_ebc_dsp_ctrl_mode(mode),
 				DSP_UPDATE_MODE | DSP_DISPLAY_MODE);
 		KUNIT_EXPECT_FALSE(test, t_full_flag(mode, EBC_SOURCE_MXCFB));
+		KUNIT_EXPECT_EQ(test, auto_mode,
+				waveforms[i] == MXCFB_WAVEFORM_MODE_AUTO);
 	}
+
+	/*
+	 * A monochrome AUTO is DU, partial class whatever its update_mode:
+	 * an identical one is skipped, it has nothing to draw.
+	 */
+	mode = rk3026_ebc_mxcfb_to_ebc_mode(MXCFB_WAVEFORM_MODE_AUTO, T_FULL,
+					    T_MONO, &auto_mode);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_dsp_ctrl_mode(mode),
+			DSP_UPDATE_MODE | DSP_DISPLAY_MODE);
+	KUNIT_EXPECT_FALSE(test, t_full_flag(mode, EBC_SOURCE_MXCFB));
+}
+
+/* A mapped mxcfb send through the pending set and the mode policy. */
+static u32 t_mxcfb_resolve(struct kunit *test, u32 waveform, u32 update_mode,
+			   u32 flags, bool two_level,
+			   enum rk3026_ebc_reason *reason)
+{
+	struct rk3026_ebc_pending p = {};
+	struct rk3026_ebc_update upd;
+	struct rk3026_ebc_set part;
+	bool auto_mode;
+	u32 seq;
+
+	upd = t_upd(&t_panel,
+		    rk3026_ebc_mxcfb_to_ebc_mode(waveform, update_mode, flags,
+						 &auto_mode),
+		    0, EBC_SOURCE_MXCFB);
+	upd.auto_mode = auto_mode;
+	rk3026_ebc_pending_add(&p, &upd, &seq);
+	rk3026_ebc_pending_take(&p, &part);
+	KUNIT_EXPECT_EQ(test, part.auto_ok, auto_mode);
+	KUNIT_EXPECT_FALSE(test, part.has_plane);
+	return rk3026_ebc_resolve_mode(&part,
+				       rk3026_ebc_scan_mode(&part, false),
+				       two_level, false, true, reason);
+}
+
+/*
+ * AUTO + PARTIAL goes DU when the content is two-level, else PART, even
+ * with the plane's DU budget spent; AUTO + FULL and a named waveform keep
+ * their mode.
+ */
+static void ebc_test_mxcfb_auto_resolve(struct kunit *test)
+{
+	enum rk3026_ebc_reason reason;
+
+	KUNIT_EXPECT_EQ(test,
+			t_mxcfb_resolve(test, MXCFB_WAVEFORM_MODE_AUTO,
+					T_PARTIAL, 0, true, &reason),
+			EBC_MODE_BLACK_WHITE);
+	KUNIT_EXPECT_EQ(test, reason, EBC_REASON_AUTO_DU);
+	KUNIT_EXPECT_EQ(test,
+			t_mxcfb_resolve(test, MXCFB_WAVEFORM_MODE_AUTO,
+					T_PARTIAL, 0, false, &reason),
+			EBC_MODE_PART);
+	KUNIT_EXPECT_EQ(test, reason, EBC_REASON_EXPLICIT);
+	KUNIT_EXPECT_EQ(test,
+			t_mxcfb_resolve(test, MXCFB_WAVEFORM_MODE_AUTO,
+					T_FULL, 0, true, &reason),
+			EBC_MODE_FULL);
+	KUNIT_EXPECT_EQ(test, reason, EBC_REASON_EXPLICIT);
+	KUNIT_EXPECT_EQ(test,
+			t_mxcfb_resolve(test, MXCFB_WAVEFORM_MODE_AUTO,
+					T_PARTIAL, T_MONO, false, &reason),
+			EBC_MODE_BLACK_WHITE);
+	KUNIT_EXPECT_EQ(test, reason, EBC_REASON_EXPLICIT);
+	KUNIT_EXPECT_EQ(test,
+			t_mxcfb_resolve(test, MXCFB_WAVEFORM_MODE_GC16,
+					T_PARTIAL, 0, true, &reason),
+			EBC_MODE_PART);
+	KUNIT_EXPECT_EQ(test, reason, EBC_REASON_EXPLICIT);
 }
 
 static struct kunit_case rk3026_ebc_mxcfb_test_cases[] = {
 	KUNIT_CASE_PARAM(ebc_test_mxcfb_map, t_mxcfb_gen_params),
 	KUNIT_CASE(ebc_test_mxcfb_full_class),
+	KUNIT_CASE(ebc_test_mxcfb_auto_resolve),
 	{}
 };
 
@@ -2984,6 +3101,104 @@ static void ebc_test_glue_du_repaired(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ebc->du_area, 0);
 }
 
+#if IS_ENABLED(CONFIG_DRM_RK3026_EBC_MXCFB)
+/* The part one mxcfb send queued, taken as the refresh thread takes it. */
+static int t_mxcfb_part(struct rk3026_ebc *ebc, const u32 *src,
+			const struct mxcfb_update_data *req,
+			struct rk3026_ebc_set *part)
+{
+	int ret = rk3026_ebc_mxcfb_send(ebc, src, T_W * 4, req);
+
+	memset(part, 0, sizeof(*part));
+	mutex_lock(&ebc->image_lock);
+	rk3026_ebc_pending_take(&ebc->pending, part);
+	mutex_unlock(&ebc->image_lock);
+	return ret;
+}
+
+/*
+ * A send from the request to the pending set: the region clamped to the
+ * panel, the waveform and the flags mapped, auto_mode, the marker and the
+ * temperature passed on, the client's pixels converted and the panel
+ * claimed from the plane. A RESET converts nothing; a region off the
+ * panel and a send with the CRTC off are refused, and queue nothing.
+ */
+static void ebc_test_glue_mxcfb_send(struct kunit *test)
+{
+	static const struct drm_rect box = DRM_RECT_INIT(4, 2, 6, 2);
+	static const struct drm_rect clamped = DRM_RECT_INIT(12, 4, 4, 2);
+	struct rk3026_ebc *ebc = t_policy_ebc(test);
+	u32 *black = t_plane_fb(test, 0);
+	struct mxcfb_update_data req = {
+		.update_region = { .left = 4, .top = 2, .width = 6,
+				   .height = 2 },
+		.waveform_mode = MXCFB_WAVEFORM_MODE_AUTO,
+		.update_mode = MXCFB_UPDATE_MODE_PARTIAL,
+		.update_marker = 7,
+		.temp = MXCFB_TEMP_USE_AMBIENT,
+	};
+	struct rk3026_ebc_set part;
+
+	/* AUTO + PARTIAL: PART with auto_ok, the box converted. */
+	KUNIT_EXPECT_EQ(test, t_mxcfb_part(ebc, black, &req, &part), 0);
+	KUNIT_EXPECT_TRUE(test, ebc->mxcfb_active);
+	KUNIT_EXPECT_EQ(test, part.merged, 1);
+	KUNIT_EXPECT_TRUE(test, drm_rect_equals(&part.box, &box));
+	KUNIT_EXPECT_EQ(test, part.mode, EBC_MODE_PART);
+	KUNIT_EXPECT_TRUE(test, part.auto_ok);
+	KUNIT_EXPECT_FALSE(test, part.has_plane);
+	KUNIT_EXPECT_FALSE(test, part.has_mxcfb_full);
+	KUNIT_EXPECT_EQ(test, part.marker, 7);
+	KUNIT_EXPECT_EQ(test, part.source, EBC_SOURCE_MXCFB);
+	KUNIT_EXPECT_FALSE(test, part.temp_valid);
+	KUNIT_EXPECT_EQ(test, t_px(ebc->next_shadow, 4, 2), 0);
+	KUNIT_EXPECT_EQ(test, t_px(ebc->next_shadow, 9, 3), 0);
+	KUNIT_EXPECT_EQ(test, t_px(ebc->next_shadow, 3, 2), 15);
+	KUNIT_EXPECT_EQ(test, t_px(ebc->next_shadow, 10, 2), 15);
+	KUNIT_EXPECT_EQ(test, t_px(ebc->next_shadow, 4, 1), 15);
+
+	/* FORCE_MONOCHROME: DU, no auto; a temperature of the client's. */
+	req.flags = EPDC_FLAG_FORCE_MONOCHROME;
+	req.temp = 30;
+	KUNIT_EXPECT_EQ(test, t_mxcfb_part(ebc, black, &req, &part), 0);
+	KUNIT_EXPECT_EQ(test, part.mode, EBC_MODE_BLACK_WHITE);
+	KUNIT_EXPECT_FALSE(test, part.auto_ok);
+	KUNIT_EXPECT_TRUE(test, part.temp_valid);
+	KUNIT_EXPECT_EQ(test, part.temp, 30);
+
+	/* AUTO + FULL: FULL, full class, no auto; clamped to the panel. */
+	req.flags = 0;
+	req.update_mode = MXCFB_UPDATE_MODE_FULL;
+	req.update_region.left = 12;
+	req.update_region.top = 4;
+	KUNIT_EXPECT_EQ(test, t_mxcfb_part(ebc, black, &req, &part), 0);
+	KUNIT_EXPECT_EQ(test, part.mode, EBC_MODE_FULL);
+	KUNIT_EXPECT_FALSE(test, part.auto_ok);
+	KUNIT_EXPECT_TRUE(test, part.has_mxcfb_full);
+	KUNIT_EXPECT_TRUE(test, drm_rect_equals(&part.box, &clamped));
+
+	/* INIT: a RESET, the target white, nothing converted. */
+	req.waveform_mode = MXCFB_WAVEFORM_MODE_INIT;
+	KUNIT_EXPECT_EQ(test, t_mxcfb_part(ebc, black, &req, &part), 0);
+	KUNIT_EXPECT_EQ(test, part.mode, EBC_MODE_RESET);
+	t_expect_white(test, ebc->next_shadow);
+
+	/* Off the panel, then with the CRTC off: refused, nothing queued. */
+	req.waveform_mode = MXCFB_WAVEFORM_MODE_GC16;
+	req.update_region.left = T_W;
+	KUNIT_EXPECT_EQ(test, t_mxcfb_part(ebc, black, &req, &part), -EINVAL);
+	KUNIT_EXPECT_EQ(test, part.merged, 0);
+	req.update_region.left = 0;
+	ebc->crtc_on = false;
+	ebc->mxcfb_active = false;
+	KUNIT_EXPECT_EQ(test, t_mxcfb_part(ebc, black, &req, &part), -EBUSY);
+	KUNIT_EXPECT_EQ(test, part.merged, 0);
+	KUNIT_EXPECT_FALSE(test, ebc->mxcfb_active);
+	t_expect_white(test, ebc->next_shadow);
+	KUNIT_EXPECT_EQ(test, ebc->stats.updates, 4);
+}
+#endif
+
 static struct kunit_case rk3026_ebc_glue_test_cases[] = {
 	KUNIT_CASE(ebc_test_glue_add_update),
 	KUNIT_CASE(ebc_test_glue_crtc_off),
@@ -3006,6 +3221,9 @@ static struct kunit_case rk3026_ebc_glue_test_cases[] = {
 	KUNIT_CASE(ebc_test_glue_du_reset),
 	KUNIT_CASE(ebc_test_glue_du_driven),
 	KUNIT_CASE(ebc_test_glue_du_repaired),
+#if IS_ENABLED(CONFIG_DRM_RK3026_EBC_MXCFB)
+	KUNIT_CASE(ebc_test_glue_mxcfb_send),
+#endif
 	{}
 };
 

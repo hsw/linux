@@ -355,11 +355,7 @@ bool rk3026_ebc_build_snapshot(const struct rk3026_ebc_shadows *sh,
 
 	*two_level = false;
 	*changed_px = 0;
-	r.x1 = max(r.x1, 0) & ~1;
-	r.x2 = min_t(int, round_up(r.x2, 2), (int)(pitch * 2));
-	r.y1 = max(r.y1, 0);
-	r.y2 = min_t(int, r.y2, (int)height);
-	if (r.x1 >= r.x2 || r.y1 >= r.y2) {
+	if (!rk3026_ebc_widen_clip(&r, pitch * 2, height)) {
 		memcpy(dst, prev, (size_t)pitch * height);
 		return false;
 	}

@@ -804,17 +804,14 @@ static int ebc_read_temp(struct rk3026_ebc *ebc)
 void rk3026_ebc_blit_xrgb8888(struct rk3026_ebc *ebc, const void *src,
 			      unsigned int src_pitch, const struct drm_rect *clip)
 {
-	int x1 = max(clip->x1, 0) & ~1;
-	int x2 = min_t(int, round_up(clip->x2, 2), (int)ebc->width);
-	int y1 = max(clip->y1, 0);
-	int y2 = min_t(int, clip->y2, (int)ebc->height);
+	struct drm_rect r = *clip;
 
 	lockdep_assert_held(&ebc->image_lock);
-	if (x1 >= x2 || y1 >= y2)
+	if (!rk3026_ebc_widen_clip(&r, ebc->width, ebc->height))
 		return;
 
-	rk3026_ebc_blit_rows(ebc->next_shadow, src, src_pitch, x1, x2, y1, y2,
-			     ebc->width);
+	rk3026_ebc_blit_rows(ebc->next_shadow, src, src_pitch, r.x1, r.x2,
+			     r.y1, r.y2, ebc->width);
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_blit_xrgb8888);
 
@@ -1291,8 +1288,8 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 	 * update arrives here TWICE: FBIOPAN_DISPLAY alone produces two atomic
 	 * commits through drm_fb_helper's fbdev emulation (measured 2026-08-06 --
 	 * skipping the client's msync changes nothing), and ebc_plane_atomic_update()
-	 * queues a full-panel refresh for each without asking whether the pixels
-	 * moved. So the second scan runs a complete waveform with prev == next.
+	 * queues the damage of each without asking whether the pixels moved. So
+	 * the second scan runs a complete waveform with prev == next.
 	 *
 	 * A GC16 waveform with identical prev and next is NOT a no-op: it still
 	 * runs its whole flash sequence, so it re-shows the previous image and
@@ -1625,6 +1622,10 @@ static void ebc_wait_finished(struct rk3026_ebc *ebc, u32 seq)
  * second RESET finds the split made: @pending.pre is still the part
  * before the first.
  *
+ * Any update that is not a plane update sets @plane_resync: plane updates
+ * blit only their damage, and the target now holds pixels outside it that
+ * the plane's framebuffer may not.
+ *
  * Returns the update's seq, for rk3026_ebc_wait_seq().
  */
 u32 rk3026_ebc_add_update(struct rk3026_ebc *ebc,
@@ -1642,6 +1643,8 @@ u32 rk3026_ebc_add_update(struct rk3026_ebc *ebc,
 		}
 		memset(ebc->next_shadow, 0xff, ebc->img_size);
 	}
+	if (upd->source != EBC_SOURCE_PLANE)
+		ebc->plane_resync = true;
 	merged = rk3026_ebc_pending_add(&ebc->pending, upd, &seq);
 	rk3026_ebc_marker_seq_record(&ebc->markers, upd->marker, seq);
 	ebc->stats.updates++;
@@ -1713,26 +1716,63 @@ static int ebc_plane_atomic_check(struct drm_plane *plane,
 						   false, false);
 }
 
+/**
+ * rk3026_ebc_plane_box - the panel box a plane commit redraws
+ * @old_state: the plane state before the commit
+ * @new_state: the plane state of the commit
+ * @width: panel width
+ * @height: panel height
+ * @box: returns the box
+ *
+ * The commit's damage merged into one rectangle
+ * (drm_atomic_helper_damage_merged()): what fbcon drew, the rows an fb0 mmap
+ * writer dirtied, a KMS client's FB_DAMAGE_CLIPS. With no damage clips, after
+ * a modeset or with a new source rectangle, that is the whole plane. The
+ * framebuffer has the panel's size (mode_config min = max) and the plane
+ * covers the CRTC unscaled (ebc_plane_atomic_check()), so the source is the
+ * whole framebuffer at 0,0 and the damage is in panel coordinates. The box
+ * is widened to whole bytes and clamped to the panel, as the blit widens it,
+ * so the queued box is the region blitted.
+ *
+ * Returns false if nothing is damaged: the commit changes no pixel.
+ */
+VISIBLE_IF_KUNIT bool rk3026_ebc_plane_box(const struct drm_plane_state *old_state,
+					   const struct drm_plane_state *new_state,
+					   unsigned int width, unsigned int height,
+					   struct drm_rect *box)
+{
+	if (!drm_atomic_helper_damage_merged(old_state, new_state, box))
+		return false;
+	return rk3026_ebc_widen_clip(box, width, height);
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_plane_box);
+
 /*
- * A plane update: the whole framebuffer into @next_shadow and to the thread
- * in the default mode, as an auto update (DU if every changed pixel becomes
- * black or white, see EBC_MODE_DEFAULT), unless an mxcfb client drives the
- * panel. Such a client annotates its own updates with a waveform mode, so
- * its pixels are left alone rather than refreshed twice.
+ * A plane update: the box of the framebuffer into @next_shadow and to the
+ * thread in the default mode, as an auto update (DU if every changed pixel
+ * becomes black or white, see EBC_MODE_DEFAULT), unless an mxcfb client
+ * drives the panel. Such a client annotates its own updates with a waveform
+ * mode, so its pixels are left alone rather than refreshed twice.
+ *
+ * @box is the damage (rk3026_ebc_plane_box()), inside the panel. After
+ * another source wrote @next_shadow (@plane_resync) the whole panel is
+ * blitted and queued instead: the framebuffer may differ from the target
+ * anywhere.
  *
  * @mxcfb_active is checked in the @image_lock section of the blit, where a
  * send sets it. Checked before the lock, a plane update could take the lock
  * after a send that claimed the panel, overwrite the send's pixels in
- * @next_shadow and queue a refresh of the whole panel with it.
+ * @next_shadow and queue a refresh with it.
  *
  * Returns true if the update was queued.
  */
 VISIBLE_IF_KUNIT bool rk3026_ebc_plane_update(struct rk3026_ebc *ebc,
 					      const void *src,
-					      unsigned int src_pitch)
+					      unsigned int src_pitch,
+					      const struct drm_rect *box)
 {
 	struct rk3026_ebc_update upd = {
-		.clip		= DRM_RECT_INIT(0, 0, ebc->width, ebc->height),
+		.clip		= *box,
 		.mode		= EBC_MODE_DEFAULT,
 		.auto_mode	= true,
 		.source		= EBC_SOURCE_PLANE,
@@ -1742,6 +1782,9 @@ VISIBLE_IF_KUNIT bool rk3026_ebc_plane_update(struct rk3026_ebc *ebc,
 	mutex_lock(&ebc->image_lock);
 	queue = !ebc->mxcfb_active;
 	if (queue) {
+		if (ebc->plane_resync)
+			upd.clip = DRM_RECT_INIT(0, 0, ebc->width, ebc->height);
+		ebc->plane_resync = false;
 		rk3026_ebc_blit_xrgb8888(ebc, src, src_pitch, &upd.clip);
 		rk3026_ebc_add_update(ebc, &upd);
 	}
@@ -1760,35 +1803,30 @@ static void ebc_plane_atomic_update(struct drm_plane *plane,
 	struct drm_shadow_plane_state *shadow =
 		to_drm_shadow_plane_state(new_state);
 	struct rk3026_ebc *ebc = drm_to_ebc(plane->dev);
+	struct drm_rect box;
 	int idx;
 
-	/*
-	 * FULL FRAME, ALWAYS. Damage tracking is deliberately not used here.
-	 *
-	 * This driver cannot yet render a full frame correctly, so computing
-	 * merged damage rectangles and defaulting to a PARTIAL waveform was
-	 * sophistication ahead of the basics -- and it cost twice over. It is a
-	 * whole class of possible faults (a clip that is wrong, a region that is
-	 * never blitted, a stale prev buffer outside the damage) layered under an
-	 * unsolved one, and EBC_MODE_PART is separately CONFIRMED to be why
-	 * contrast was poor: a partial waveform under-saturates a full black/white
-	 * transition by design (docs/PENDING.md P18, force_mode=1 renders solid
-	 * black where the default renders washed grey).
-	 *
-	 * So: blit the whole framebuffer, scan the whole panel, use the full
-	 * waveform. Restore damage handling only once full refreshes are reliable,
-	 * and treat it as an optimisation with its own evidence rather than as a
-	 * default. old_state is consequently unused.
-	 */
-	(void)old_state;
-
 	if (!new_state->fb || !new_state->visible)
+		return;
+
+	/*
+	 * Only the damage is converted and queued. The box bounds the CPU
+	 * work and nothing else: the EBC still scans the whole panel, and the
+	 * snapshot lays the box over the prev image, which holds what the
+	 * glass shows (rk3026_ebc_scan_finish()), so the pixels outside it are
+	 * driven from their old level to the same level. The waveform is
+	 * chosen as for a whole-panel update: FULL, or DU when every changed
+	 * pixel ends black or white, never a partial waveform, which
+	 * under-saturates a full black/white transition.
+	 */
+	if (!rk3026_ebc_plane_box(old_state, new_state, ebc->width,
+				  ebc->height, &box))
 		return;
 	if (!drm_dev_enter(plane->dev, &idx))
 		return;
 
 	rk3026_ebc_plane_update(ebc, shadow->data[0].vaddr,
-				new_state->fb->pitches[0]);
+				new_state->fb->pitches[0], &box);
 
 	drm_dev_exit(idx);
 }
@@ -2517,11 +2555,11 @@ static int ebc_probe(struct platform_device *pdev)
 		return ret;
 	drm_plane_helper_add(&ebc->plane, &ebc_plane_helper_funcs);
 	/*
-	 * Damage clips are NOT advertised: ebc_plane_atomic_update() ignores damage
-	 * and always refreshes the whole panel, so claiming the capability would
-	 * invite userspace to send rectangles we then throw away. Re-enable it with
-	 * the partial path, not before.
+	 * ebc_plane_atomic_update() blits and queues only the damage. The fbdev
+	 * emulation attaches its damage either way; the property lets KMS
+	 * clients send theirs.
 	 */
+	drm_plane_enable_fb_damage_clips(&ebc->plane);
 
 	ret = drm_crtc_init_with_planes(drm, &ebc->crtc, &ebc->plane, NULL,
 					&ebc_crtc_funcs, NULL);

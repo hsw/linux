@@ -11,6 +11,8 @@
 #include <linux/atomic.h>
 #include <linux/bits.h>
 #include <linux/completion.h>
+#include <linux/math.h>
+#include <linux/minmax.h>
 #include <linux/mutex.h>
 #include <linux/types.h>
 #include <linux/wait.h>
@@ -398,6 +400,22 @@ struct rk3026_ebc_marker_ring {
 	unsigned int	next;		/* the slot written next, unwrapped */
 };
 
+/*
+ * Widens @r to whole bytes, an even x on both edges (two pixels a byte), and
+ * clamps it to an image of @width x @height pixels. Returns false if nothing
+ * of it is left.
+ */
+static inline bool rk3026_ebc_widen_clip(struct drm_rect *r,
+					 unsigned int width,
+					 unsigned int height)
+{
+	r->x1 = max(r->x1, 0) & ~1;
+	r->x2 = min_t(int, round_up(r->x2, 2), (int)width);
+	r->y1 = max(r->y1, 0);
+	r->y2 = min_t(int, r->y2, (int)height);
+	return r->x1 < r->x2 && r->y1 < r->y2;
+}
+
 /* The update queued with @seq has finished once @done_seq reached it. */
 static inline bool rk3026_ebc_seq_done(u32 done_seq, u32 seq)
 {
@@ -500,6 +518,12 @@ struct rk3026_ebc {
 	 * (rk3026_ebc_scan_finish()); being their only writer, it reads them
 	 * without the lock.
 	 *
+	 * @plane_resync: an update from another source wrote @next_shadow (an
+	 * mxcfb send, after which plane updates are blocked while its client
+	 * runs, or a RESET's white fill), so outside a later damage box it no
+	 * longer follows the plane's framebuffer: the next plane update redraws
+	 * the whole panel (rk3026_ebc_plane_update()).
+	 *
 	 * @shadows.prev_unknown: @shadows.prev does not describe the glass.
 	 * Set when a waveform starts, cleared ONLY when every frame has been
 	 * driven, so a timeout, an error path or a path nobody has written yet
@@ -530,6 +554,7 @@ struct rk3026_ebc {
 	u8			*next_shadow;
 	u8			*pre_shadow;
 	bool			pre_split;
+	bool			plane_resync;
 	struct rk3026_ebc_shadows shadows;
 	struct rk3026_ebc_pending pending;
 	struct rk3026_ebc_marker_ring markers;
@@ -631,8 +656,12 @@ int rk3026_ebc_drive(struct rk3026_ebc *ebc, const u8 *lut, u32 frames,
 int rk3026_ebc_wait_seq(struct rk3026_ebc *ebc, u32 seq,
 			unsigned int timeout_ms, bool interruptible);
 unsigned int rk3026_ebc_wait_timeout_ms(struct rk3026_ebc *ebc);
+bool rk3026_ebc_plane_box(const struct drm_plane_state *old_state,
+			  const struct drm_plane_state *new_state,
+			  unsigned int width, unsigned int height,
+			  struct drm_rect *box);
 bool rk3026_ebc_plane_update(struct rk3026_ebc *ebc, const void *src,
-			     unsigned int src_pitch);
+			     unsigned int src_pitch, const struct drm_rect *box);
 #endif
 
 /* rk3026_ebc_blit.c */

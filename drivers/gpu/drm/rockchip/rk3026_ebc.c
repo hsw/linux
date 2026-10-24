@@ -1214,8 +1214,8 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 	struct rk3026_ebc_shadows *sh = &ebc->shadows;
 	ktime_t start = ktime_get();
 	struct rk3026_ebc_set part;
-	bool repair_due, identical, prev_changed;
-	u32 frames, mode, scan_mode, lut_mode;
+	bool repair_due, identical, prev_changed, two_level;
+	u32 frames, mode, scan_mode, lut_mode, changed_px;
 	const u8 *lut, *target;
 	int temp;
 	int ret;
@@ -1273,9 +1273,13 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 	repair_due = sh->prev_unknown && part.mode != EBC_MODE_RESET;
 	scan_mode = rk3026_ebc_scan_mode(&part, repair_due);
 
-	/* An A2 scan over a grey of the glass comes back as DU. */
+	/*
+	 * An A2 scan over a grey of the glass comes back as DU. @two_level
+	 * and @changed_px are not used yet.
+	 */
 	identical = !rk3026_ebc_build_snapshot(sh, target, &part.box,
-					       &scan_mode);
+					       &scan_mode, &two_level,
+					       &changed_px);
 	if (debug_scan)
 		ebc_report_image(ebc);
 

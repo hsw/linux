@@ -219,6 +219,14 @@ bool rk3026_ebc_pending_take(struct rk3026_ebc_pending *p,
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_pending_take);
 
+/* What ebc_snap_word() collects over the box, see there. */
+struct ebc_snap_acc {
+	u32 over_grey;
+	u32 grey_new;
+	u32 moves;
+	u32 count;
+};
+
 /*
  * Eight pixels of the snapshot at once: @p and @n are one little-endian
  * word of prev and next, two pixels per byte, low nibble first.
@@ -229,21 +237,30 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_pending_take);
  *    else 0; @tl (all ones for a two-level mode, else 0) picks it;
  *  - a nibble of @p is grey when its four bits are not all equal; bit 3
  *    would be compared with the next nibble up, so bits 0..2 are tested.
- * @over_grey collects a grey of prev under a changed nibble, @moves the
- * bits that change. A short tail goes through zero-extended: its upper
- * nibbles are equal, so they neither change nor count.
+ * The accumulators of one snapshot:
+ *  - @over_grey collects a grey of prev under a changed nibble;
+ *  - @grey_new a grey of next in a changed nibble, tested as for prev;
+ *  - @moves the bits that change;
+ *  - @count the changed nibbles: with one bit per changed nibble, the
+ *    multiply by 0x11111111 sums the eight bits into the top nibble (no
+ *    partial sum reaches 16, so none carries).
+ * A short tail goes through zero-extended: its upper nibbles are equal,
+ * so they neither change nor count.
  */
 static __always_inline u32 ebc_snap_word(u32 p, u32 n, u32 tl,
-					 u32 *over_grey, u32 *moves)
+					 struct ebc_snap_acc *acc)
 {
 	u32 d = p ^ n;
-	u32 changed = ((d | d >> 1 | d >> 2 | d >> 3) & 0x11111111) * 0xf;
+	u32 bits = (d | d >> 1 | d >> 2 | d >> 3) & 0x11111111;
+	u32 changed = bits * 0xf;
 	u32 thr = ((n >> 3) & 0x11111111) * 0xf;
 	u32 v = (thr & tl) | (n & ~tl);
 	u32 out = (p & ~changed) | (v & changed);
 
-	*over_grey |= (p ^ (p >> 1)) & 0x77777777 & changed;
-	*moves |= out ^ p;
+	acc->over_grey |= (p ^ (p >> 1)) & 0x77777777 & changed;
+	acc->grey_new |= (n ^ (n >> 1)) & 0x77777777 & changed;
+	acc->moves |= out ^ p;
+	acc->count += (bits * 0x11111111) >> 28;
 	return out;
 }
 
@@ -251,7 +268,7 @@ static __always_inline u32 ebc_snap_word(u32 p, u32 n, u32 tl,
 static __always_inline void ebc_snap_rows(u8 *dst, const u8 *prev,
 					  const u8 *next, u32 pitch,
 					  const struct drm_rect *r, u32 tl,
-					  u32 *over_grey, u32 *moves)
+					  struct ebc_snap_acc *acc)
 {
 	int y;
 
@@ -264,12 +281,11 @@ static __always_inline void ebc_snap_rows(u8 *dst, const u8 *prev,
 
 		for (; nb >= 4; nb -= 4, p += 4, n += 4, d += 4) {
 			out = ebc_snap_word(get_unaligned_le32(p),
-					    get_unaligned_le32(n), tl,
-					    over_grey, moves);
+					    get_unaligned_le32(n), tl, acc);
 			put_unaligned_le32(out, d);
 		}
 		for (; nb > 0; nb--, p++, n++, d++)
-			*d = ebc_snap_word(*p, *n, tl, over_grey, moves);
+			*d = ebc_snap_word(*p, *n, tl, acc);
 	}
 }
 
@@ -280,6 +296,9 @@ static __always_inline void ebc_snap_rows(u8 *dst, const u8 *prev,
  * @box: the part's bounding box, in pixels
  * @mode: the scan's mode (rk3026_ebc_scan_mode()); returns the mode that
  *	draws the snapshot
+ * @two_level: returns true if some pixel changes and every changed pixel
+ *	of @next is 0 or 15
+ * @changed_px: returns the number of pixels where @next differs from @prev
  *
  * @prev (@sh->prev, the image on the glass) with @next laid over it inside
  * @box, pixel by pixel, where @next differs from @prev. Outside @box
@@ -302,21 +321,29 @@ static __always_inline void ebc_snap_rows(u8 *dst, const u8 *prev,
  * level to black or white and thresholds the same way, so the snapshot
  * stands.
  *
+ * @two_level and @changed_px describe the update, not the scan: they are
+ * taken on @next before the threshold and on the pixels where it differs
+ * from @prev, the widened edges included; greys that do not change do not
+ * count. A two-level update can be driven in DU with the same snapshot,
+ * as no changed pixel needs the threshold.
+ *
  * Returns true if the snapshot differs from @prev, false if the scan would
  * move nothing.
  */
 bool rk3026_ebc_build_snapshot(const struct rk3026_ebc_shadows *sh,
 			       const u8 *next, const struct drm_rect *box,
-			       u32 *mode)
+			       u32 *mode, bool *two_level, u32 *changed_px)
 {
 	const u8 *prev = sh->prev;
 	u32 pitch = sh->pitch, height = sh->height;
 	u8 *dst = sh->scan;
 	u32 tl = ebc_mode_two_level(*mode) ? ~0u : 0;
+	struct ebc_snap_acc acc = { 0 };
 	struct drm_rect r = *box;
-	u32 over_grey = 0, moves = 0;
 	int y;
 
+	*two_level = false;
+	*changed_px = 0;
 	r.x1 = max(r.x1, 0) & ~1;
 	r.x2 = min_t(int, round_up(r.x2, 2), (int)(pitch * 2));
 	r.y1 = max(r.y1, 0);
@@ -339,10 +366,12 @@ bool rk3026_ebc_build_snapshot(const struct rk3026_ebc_shadows *sh,
 		}
 	}
 
-	ebc_snap_rows(dst, prev, next, pitch, &r, tl, &over_grey, &moves);
-	if (over_grey && *mode == EBC_MODE_A2)
+	ebc_snap_rows(dst, prev, next, pitch, &r, tl, &acc);
+	if (acc.over_grey && *mode == EBC_MODE_A2)
 		*mode = EBC_MODE_BLACK_WHITE;
-	return moves != 0;
+	*two_level = acc.count && !acc.grey_new;
+	*changed_px = acc.count;
+	return acc.moves != 0;
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_build_snapshot);
 

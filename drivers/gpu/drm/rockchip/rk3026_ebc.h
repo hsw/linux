@@ -605,7 +605,7 @@ bool rk3026_ebc_pending_take(struct rk3026_ebc_pending *p,
 			     struct rk3026_ebc_set *part);
 bool rk3026_ebc_build_snapshot(const struct rk3026_ebc_shadows *sh,
 			       const u8 *next, const struct drm_rect *box,
-			       u32 *mode);
+			       u32 *mode, bool *two_level, u32 *changed_px);
 bool rk3026_ebc_should_skip(const struct rk3026_ebc_set *part,
 			    bool prev_unknown, bool identical);
 u32 rk3026_ebc_scan_mode(const struct rk3026_ebc_set *part, bool repaired);

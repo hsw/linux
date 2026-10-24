@@ -315,8 +315,11 @@ static bool t_snapshot(u8 *dst, u8 *prev, const u8 *next,
 	const struct rk3026_ebc_shadows sh = {
 		.prev = prev, .scan = dst, .pitch = T_PITCH, .height = T_H,
 	};
+	bool two_level;
+	u32 changed;
 
-	return rk3026_ebc_build_snapshot(&sh, next, box, &mode);
+	return rk3026_ebc_build_snapshot(&sh, next, box, &mode, &two_level,
+					 &changed);
 }
 
 static void ebc_test_snapshot_outside_box(struct kunit *test)
@@ -515,7 +518,8 @@ static void ebc_test_snapshot_a2_over_grey(struct kunit *test)
 		.prev = prev, .scan = dst, .pitch = T_PITCH, .height = T_H,
 	};
 	unsigned int i;
-	u32 mode;
+	bool two_level;
+	u32 mode, changed;
 
 	/* 0 and 15 under every laid-over pixel: A2 stays. */
 	t_px_set(next, 3, 1, 0);
@@ -528,7 +532,8 @@ static void ebc_test_snapshot_a2_over_grey(struct kunit *test)
 	t_px_set(next, 5, 1, 7);
 	mode = EBC_MODE_A2;
 	KUNIT_EXPECT_TRUE(test, rk3026_ebc_build_snapshot(&sh, next, &box,
-							  &mode));
+							  &mode, &two_level,
+							  &changed));
 	KUNIT_EXPECT_EQ(test, mode, EBC_MODE_A2);
 	KUNIT_EXPECT_EQ(test, t_px(dst, 3, 1), 0);
 	KUNIT_EXPECT_EQ(test, t_px(dst, 4, 2), 15);
@@ -538,7 +543,8 @@ static void ebc_test_snapshot_a2_over_grey(struct kunit *test)
 	t_px_set(prev, 2, 2, 6);
 	t_px_set(next, 2, 2, 12);
 	KUNIT_EXPECT_TRUE(test, rk3026_ebc_build_snapshot(&sh, next, &box,
-							  &mode));
+							  &mode, &two_level,
+							  &changed));
 	KUNIT_EXPECT_EQ(test, mode, EBC_MODE_BLACK_WHITE);
 	KUNIT_EXPECT_EQ(test, t_px(dst, 2, 2), 15);
 	KUNIT_EXPECT_EQ(test, t_px(dst, 5, 1), 7);
@@ -549,7 +555,8 @@ static void ebc_test_snapshot_a2_over_grey(struct kunit *test)
 	/* No other mode is raised. */
 	for (i = 0; i < ARRAY_SIZE(kept); i++) {
 		mode = kept[i];
-		rk3026_ebc_build_snapshot(&sh, next, &box, &mode);
+		rk3026_ebc_build_snapshot(&sh, next, &box, &mode, &two_level,
+					  &changed);
 		KUNIT_EXPECT_EQ(test, mode, kept[i]);
 	}
 }
@@ -2267,6 +2274,24 @@ static bool t_fix_guard_ok(const struct t_fix *f, const u8 *img)
 	return true;
 }
 
+/* Pixel (@x, @y) of an image of fixture @f. */
+static u8 t_px_w(const u8 *img, const struct t_fix *f, int x, int y)
+{
+	u8 b = img[(size_t)y * t_fix_pitch(f) + x / 2];
+
+	return x & 1 ? b >> 4 : b & 0xf;
+}
+
+static void t_px_set_w(u8 *img, const struct t_fix *f, int x, int y, u8 grey)
+{
+	u8 *b = &img[(size_t)y * t_fix_pitch(f) + x / 2];
+
+	if (x & 1)
+		*b = (*b & 0x0f) | grey << 4;
+	else
+		*b = (*b & 0xf0) | grey;
+}
+
 /*
  * Clips and boxes for @f: whole, odd edges, one pixel, word-misaligned
  * starts, tails of 2, 4 and 6 pixels, out of range, empty, inverted, and
@@ -2505,12 +2530,44 @@ struct t_snap_count {
 	int raised;
 	int moved;
 	int still;
+	int two_level;
 };
+
+/*
+ * The two-level result and the changed count pixel by pixel: on @box
+ * clipped and widened to whole bytes as the driver does, the pixels where
+ * @next differs from @prev, and whether every one of them is 0 or 15 in
+ * @next.
+ */
+static bool t_ref_two_level(const struct t_fix *f, const u8 *prev,
+			    const u8 *next, const struct drm_rect *box,
+			    u32 *changed_px)
+{
+	struct drm_rect w;
+	bool grey = false;
+	u32 n = 0;
+	int x, y;
+
+	t_widen(f, box, &w);
+	for (y = w.y1; y < w.y2; y++) {
+		for (x = w.x1; x < w.x2; x++) {
+			u8 lvl = t_px_w(next, f, x, y);
+
+			if (lvl == t_px_w(prev, f, x, y))
+				continue;
+			n++;
+			grey |= lvl != 0 && lvl != 15;
+		}
+	}
+	*changed_px = n;
+	return n && !grey;
+}
 
 /*
  * Every mode and box on one prev/next pair: the reference and the driver
  * write the same scan image over the same junk, guards included, return
- * the same and give the same mode. False after the first difference.
+ * the same and give the same mode; the two-level result and the changed
+ * count are t_ref_two_level()'s. False after the first difference.
  */
 static bool t_ref_snapshot_pair(struct kunit *test, const struct t_fix *f,
 				u8 *prev, const u8 *next, u8 *scan_ref,
@@ -2526,7 +2583,8 @@ static bool t_ref_snapshot_pair(struct kunit *test, const struct t_fix *f,
 	for (mi = 0; mi < ARRAY_SIZE(t_snap_modes); mi++) {
 		for (c = 0; c < n; c++) {
 			u32 mode_ref = t_snap_modes[mi], mode = mode_ref;
-			bool ret_ref, ret;
+			bool ret_ref, ret, tl_ref, tl;
+			u32 chg_ref, chg;
 			int diff;
 
 			prandom_bytes_state(rs, scan_ref, t_fix_size(f));
@@ -2534,23 +2592,27 @@ static bool t_ref_snapshot_pair(struct kunit *test, const struct t_fix *f,
 			sh.scan = scan_ref;
 			ret_ref = rk3026_ebc_ref_snapshot(&sh, next, &clips[c],
 							  &mode_ref);
+			tl_ref = t_ref_two_level(f, prev, next, &clips[c],
+						 &chg_ref);
 			sh.scan = scan;
 			ret = rk3026_ebc_build_snapshot(&sh, next, &clips[c],
-							&mode);
+							&mode, &tl, &chg);
 			diff = t_fix_diff(f, scan_ref, scan);
 			if (ret != ret_ref || mode != mode_ref ||
-			    diff != INT_MAX) {
+			    diff != INT_MAX || tl != tl_ref || chg != chg_ref) {
 				KUNIT_FAIL(test,
 					   "%s mode %u box " DRM_RECT_FMT
-					   ": ret %d/%d mode %u/%u byte %d",
+					   ": ret %d/%d mode %u/%u byte %d two-level %d/%d changed %u/%u",
 					   f->name, t_snap_modes[mi],
 					   DRM_RECT_ARG(&clips[c]), ret, ret_ref,
-					   mode, mode_ref, diff);
+					   mode, mode_ref, diff, tl, tl_ref,
+					   chg, chg_ref);
 				return false;
 			}
 			cnt->raised += mode_ref != t_snap_modes[mi];
 			cnt->moved += ret_ref;
 			cnt->still += !ret_ref;
+			cnt->two_level += tl_ref;
 		}
 	}
 	return true;
@@ -2558,8 +2620,8 @@ static bool t_ref_snapshot_pair(struct kunit *test, const struct t_fix *f,
 
 /*
  * rk3026_ebc_build_snapshot() equals rk3026_ebc_ref_snapshot() on every
- * fixture, image pair, mode and box. The cases reach a move, no move and
- * the A2-over-grey raise.
+ * fixture, image pair, mode and box. The cases reach a move, no move, the
+ * A2-over-grey raise and a two-level update.
  */
 static void ebc_test_ref_snapshot(struct kunit *test)
 {
@@ -2595,30 +2657,14 @@ static void ebc_test_ref_snapshot(struct kunit *test)
 	KUNIT_EXPECT_GT(test, cnt.raised, 0);
 	KUNIT_EXPECT_GT(test, cnt.moved, 0);
 	KUNIT_EXPECT_GT(test, cnt.still, 0);
-}
-
-/* Pixel (@x, @y) of an image of fixture @f. */
-static u8 t_px_w(const u8 *img, const struct t_fix *f, int x, int y)
-{
-	u8 b = img[(size_t)y * t_fix_pitch(f) + x / 2];
-
-	return x & 1 ? b >> 4 : b & 0xf;
-}
-
-static void t_px_set_w(u8 *img, const struct t_fix *f, int x, int y, u8 grey)
-{
-	u8 *b = &img[(size_t)y * t_fix_pitch(f) + x / 2];
-
-	if (x & 1)
-		*b = (*b & 0x0f) | grey << 4;
-	else
-		*b = (*b & 0xf0) | grey;
+	KUNIT_EXPECT_GT(test, cnt.two_level, 0);
 }
 
 /*
  * One snapshot of @box in @mode by the reference and the driver over the
- * same junk; *@mode_out is the driver's mode. False, with a failure, if
- * they differ.
+ * same junk; *@mode_out is the driver's mode. The two-level result and the
+ * changed count are checked against t_ref_two_level(). False, with a
+ * failure, if anything differs.
  */
 static bool t_snap_vs_ref(struct kunit *test, const struct t_fix *f,
 			  u8 *prev, const u8 *next, u8 *scan_ref,
@@ -2628,23 +2674,26 @@ static bool t_snap_vs_ref(struct kunit *test, const struct t_fix *f,
 	struct rk3026_ebc_shadows sh = {
 		.prev = prev, .pitch = t_fix_pitch(f), .height = f->h,
 	};
-	u32 mode_ref = mode;
-	bool ret_ref, ret;
+	u32 mode_ref = mode, chg_ref, chg;
+	bool ret_ref, ret, tl_ref, tl;
 	int diff;
 
 	prandom_bytes_state(rs, scan_ref, t_fix_size(f));
 	memcpy(scan, scan_ref, t_fix_size(f));
 	sh.scan = scan_ref;
 	ret_ref = rk3026_ebc_ref_snapshot(&sh, next, box, &mode_ref);
+	tl_ref = t_ref_two_level(f, prev, next, box, &chg_ref);
 	sh.scan = scan;
 	*mode_out = mode;
-	ret = rk3026_ebc_build_snapshot(&sh, next, box, mode_out);
+	ret = rk3026_ebc_build_snapshot(&sh, next, box, mode_out, &tl, &chg);
 	diff = t_fix_diff(f, scan_ref, scan);
-	if (ret == ret_ref && *mode_out == mode_ref && diff == INT_MAX)
+	if (ret == ret_ref && *mode_out == mode_ref && diff == INT_MAX &&
+	    tl == tl_ref && chg == chg_ref)
 		return true;
 	KUNIT_FAIL(test, "%s mode %u box " DRM_RECT_FMT
-		   ": ret %d/%d mode %u/%u byte %d", f->name, mode,
-		   DRM_RECT_ARG(box), ret, ret_ref, *mode_out, mode_ref, diff);
+		   ": ret %d/%d mode %u/%u byte %d two-level %d/%d changed %u/%u",
+		   f->name, mode, DRM_RECT_ARG(box), ret, ret_ref, *mode_out,
+		   mode_ref, diff, tl, tl_ref, chg, chg_ref);
 	return false;
 }
 
@@ -2729,6 +2778,164 @@ static void ebc_test_snapshot_a2_guard_positions(struct kunit *test)
 						    EBC_MODE_A2,
 						    "pixel %d grey %d at %d",
 						    j, g, x);
+			}
+		}
+	}
+}
+
+/* rk3026_ebc_build_snapshot() of @box on fixture @f, mode kept. */
+static bool t_snap_tl(const struct t_fix *f, u8 *prev, const u8 *next,
+		      u8 *scan, const struct drm_rect *box, u32 mode,
+		      bool *two_level, u32 *changed_px)
+{
+	const struct rk3026_ebc_shadows sh = {
+		.prev = prev, .scan = scan, .pitch = t_fix_pitch(f),
+		.height = f->h,
+	};
+
+	return rk3026_ebc_build_snapshot(&sh, next, box, &mode, two_level,
+					 changed_px);
+}
+
+/*
+ * The two-level result: true when every changed pixel goes to 0 or 15,
+ * whatever the greys that stay; false on one changed grey and when nothing
+ * changes, in every mode. The changed count counts what changes, also
+ * where the scan moves nothing, and on the widened byte of an odd box
+ * edge, but not past it.
+ */
+static void ebc_test_snapshot_two_level_result(struct kunit *test)
+{
+	const struct t_fix *f = &t_fixes[1];
+	u8 *prev = t_fix_img(test, f), *next = t_fix_img(test, f);
+	u8 *scan = t_fix_img(test, f);
+	const struct drm_rect all = DRM_RECT_INIT(0, 0, f->w, f->h);
+	/* x 5..24, widened to the bytes of pixels 4..25 */
+	const struct drm_rect odd = DRM_RECT_INIT(5, 2, 20, 3);
+	const struct drm_rect empty = DRM_RECT_INIT(8, 2, 0, 3);
+	struct rnd_state rs;
+	unsigned int mi;
+	bool tl;
+	u32 chg;
+	int x;
+
+	prandom_seed_state(&rs, 37);
+	t_img_gen(prev, f, NULL, T_IMG_RANDOM, &rs);
+	memcpy(next, prev, t_fix_size(f));
+	for (mi = 0; mi < ARRAY_SIZE(t_snap_modes); mi++) {
+		KUNIT_EXPECT_FALSE(test, t_snap_tl(f, prev, next, scan, &all,
+						   t_snap_modes[mi], &tl,
+						   &chg));
+		KUNIT_EXPECT_FALSE(test, tl);
+		KUNIT_EXPECT_EQ(test, chg, 0);
+	}
+
+	/* Black or white at every third pixel of a line, over greys. */
+	for (x = 0; x < f->w; x += 3)
+		t_px_set_w(next, f, x, 5, t_px_w(prev, f, x, 5) >= 8 ? 0 : 15);
+	for (mi = 0; mi < ARRAY_SIZE(t_snap_modes); mi++) {
+		KUNIT_EXPECT_TRUE(test, t_snap_tl(f, prev, next, scan, &all,
+						  t_snap_modes[mi], &tl, &chg));
+		KUNIT_EXPECT_TRUE(test, tl);
+		KUNIT_EXPECT_EQ(test, chg, (f->w + 2) / 3);
+	}
+	KUNIT_EXPECT_FALSE(test, t_snap_tl(f, prev, next, scan, &empty,
+					   EBC_MODE_PART, &tl, &chg));
+	KUNIT_EXPECT_FALSE(test, tl);
+	KUNIT_EXPECT_EQ(test, chg, 0);
+
+	/* One changed grey among them. */
+	t_px_set_w(next, f, 1, 5, t_px_w(prev, f, 1, 5) == 7 ? 8 : 7);
+	for (mi = 0; mi < ARRAY_SIZE(t_snap_modes); mi++) {
+		t_snap_tl(f, prev, next, scan, &all, t_snap_modes[mi], &tl,
+			  &chg);
+		KUNIT_EXPECT_FALSE(test, tl);
+		KUNIT_EXPECT_EQ(test, chg, (f->w + 2) / 3 + 1);
+	}
+
+	/* A 12 over a 15 in A2 moves nothing, but it changed, and is grey. */
+	memset(prev, 0xff, t_fix_size(f));
+	memset(next, 0xff, t_fix_size(f));
+	t_px_set_w(next, f, 9, 3, 12);
+	KUNIT_EXPECT_FALSE(test, t_snap_tl(f, prev, next, scan, &all,
+					   EBC_MODE_A2, &tl, &chg));
+	KUNIT_EXPECT_FALSE(test, tl);
+	KUNIT_EXPECT_EQ(test, chg, 1);
+	KUNIT_EXPECT_TRUE(test, t_snap_tl(f, prev, next, scan, &all,
+					  EBC_MODE_PART, &tl, &chg));
+	KUNIT_EXPECT_FALSE(test, tl);
+	KUNIT_EXPECT_EQ(test, chg, 1);
+	t_px_set_w(next, f, 9, 3, 0);
+	KUNIT_EXPECT_TRUE(test, t_snap_tl(f, prev, next, scan, &all,
+					  EBC_MODE_A2, &tl, &chg));
+	KUNIT_EXPECT_TRUE(test, tl);
+	KUNIT_EXPECT_EQ(test, chg, 1);
+
+	/* The widened edges count, the pixels past them do not. */
+	memcpy(next, prev, t_fix_size(f));
+	t_px_set_w(next, f, 10, 3, 0);
+	t_px_set_w(next, f, 3, 2, 6);
+	t_px_set_w(next, f, 26, 4, 6);
+	t_px_set_w(next, f, 12, 1, 6);
+	t_snap_tl(f, prev, next, scan, &odd, EBC_MODE_PART, &tl, &chg);
+	KUNIT_EXPECT_TRUE(test, tl);
+	KUNIT_EXPECT_EQ(test, chg, 1);
+	t_px_set_w(next, f, 4, 2, 6);
+	t_snap_tl(f, prev, next, scan, &odd, EBC_MODE_PART, &tl, &chg);
+	KUNIT_EXPECT_FALSE(test, tl);
+	KUNIT_EXPECT_EQ(test, chg, 2);
+	t_px_set_w(next, f, 4, 2, 15);
+	t_px_set_w(next, f, 25, 4, 9);
+	t_snap_tl(f, prev, next, scan, &odd, EBC_MODE_BLACK_WHITE, &tl, &chg);
+	KUNIT_EXPECT_FALSE(test, tl);
+	KUNIT_EXPECT_EQ(test, chg, 2);
+	t_px_set_w(next, f, 25, 4, 0);
+	t_snap_tl(f, prev, next, scan, &odd, EBC_MODE_BLACK_WHITE, &tl, &chg);
+	KUNIT_EXPECT_TRUE(test, tl);
+	KUNIT_EXPECT_EQ(test, chg, 2);
+	KUNIT_EXPECT_TRUE(test, t_fix_guard_ok(f, scan));
+}
+
+/*
+ * The two-level result at every pixel of three words, and of a word and a
+ * three-byte tail: on a black and white prev, pixel @j changed to each
+ * other level. Two-level iff the new level is 0 or 15, one pixel changed.
+ */
+static void ebc_test_snapshot_two_level_positions(struct kunit *test)
+{
+	const struct t_fix *f = &t_fixes[1];
+	u8 *prev = t_fix_img(test, f), *next = t_fix_img(test, f);
+	u8 *scan_ref = t_fix_img(test, f), *scan = t_fix_img(test, f);
+	const struct drm_rect boxes[] = {
+		DRM_RECT_INIT(0, 0, f->w, f->h),
+		DRM_RECT_INIT(0, 3, 14, 1),
+	};
+	struct rnd_state rs;
+	unsigned int bi;
+	int j, g, w;
+	bool tl;
+	u32 mode, chg;
+
+	prandom_seed_state(&rs, 41);
+	for (bi = 0; bi < ARRAY_SIZE(boxes); bi++) {
+		w = bi ? 14 : 24;
+		for (j = 0; j < w; j++) {
+			for (g = 0; g < 16; g++) {
+				t_img_gen(prev, f, NULL, T_IMG_TWO_LEVEL, &rs);
+				memcpy(next, prev, t_fix_size(f));
+				if (t_px_w(prev, f, j, 3) == g)
+					continue;
+				t_px_set_w(next, f, j, 3, g);
+				if (!t_snap_vs_ref(test, f, prev, next,
+						   scan_ref, scan, &boxes[bi],
+						   EBC_MODE_PART, &mode, &rs))
+					return;
+				t_snap_tl(f, prev, next, scan, &boxes[bi],
+					  EBC_MODE_BLACK_WHITE, &tl, &chg);
+				KUNIT_EXPECT_EQ_MSG(test, tl, g == 0 || g == 15,
+						    "box %u pixel %d level %d",
+						    bi, j, g);
+				KUNIT_EXPECT_EQ(test, chg, 1);
 			}
 		}
 	}
@@ -2832,6 +3039,8 @@ static struct kunit_case rk3026_ebc_conv_test_cases[] = {
 	KUNIT_CASE(ebc_test_ref_snapshot),
 	KUNIT_CASE(ebc_test_snapshot_nibble_pairs),
 	KUNIT_CASE(ebc_test_snapshot_a2_guard_positions),
+	KUNIT_CASE(ebc_test_snapshot_two_level_result),
+	KUNIT_CASE(ebc_test_snapshot_two_level_positions),
 	KUNIT_CASE(ebc_test_ref_blit),
 	{}
 };

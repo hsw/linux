@@ -2991,8 +2991,9 @@ static bool t_ref_blit_src(struct kunit *test, const struct t_fix *f,
 }
 
 /*
- * rk3026_ebc_blit_xrgb8888() equals rk3026_ebc_ref_blit_rows() on every
- * fixture, source set, dense and padded source pitch, and clip.
+ * rk3026_ebc_blit_xrgb8888() widens and clamps the clip to whole bytes and
+ * writes the bytes of the per-pixel reference loop, on every fixture,
+ * source set, dense and padded source pitch, and clip.
  */
 static void ebc_test_ref_blit(struct kunit *test)
 {
@@ -3035,6 +3036,147 @@ static void ebc_test_ref_blit(struct kunit *test)
 	}
 }
 
+/* A row conversion in the shape of rk3026_ebc_blit_rows(). */
+typedef void t_rows_fn(u8 *dst, const void *src, unsigned int src_pitch,
+		       int x1, int x2, int y1, int y2, unsigned int width);
+
+/*
+ * @rows and the reference rows on @x1..@x2 (even), @y1..@y2 of @f write the
+ * same bytes over the same junk, guards included. False after a difference.
+ */
+static bool t_rows_vs_ref(struct kunit *test, const struct t_fix *f,
+			  t_rows_fn *rows, u8 *out, u8 *ref, const u8 *src,
+			  unsigned int pitch, int x1, int x2, int y1, int y2,
+			  struct rnd_state *rs)
+{
+	int diff;
+
+	prandom_bytes_state(rs, ref, t_fix_size(f));
+	memcpy(out, ref, t_fix_size(f));
+	rk3026_ebc_ref_blit_rows(ref, src, pitch, x1, x2, y1, y2, f->w);
+	rows(out, src, pitch, x1, x2, y1, y2, f->w);
+	diff = t_fix_diff(f, ref, out);
+	if (diff == INT_MAX)
+		return true;
+	KUNIT_FAIL(test, "%s pitch %u x %d..%d y %d..%d: byte %d (%02x, ref %02x)",
+		   f->name, pitch, x1, x2, y1, y2, diff, out[diff], ref[diff]);
+	return false;
+}
+
+/*
+ * @rows against the reference on one source and every non-empty clip of
+ * @clips, widened and clamped as rk3026_ebc_blit_xrgb8888() does.
+ */
+static bool t_rows_clips(struct kunit *test, const struct t_fix *f,
+			 t_rows_fn *rows, u8 *out, u8 *ref, const u8 *src,
+			 unsigned int pitch, const struct drm_rect *clips,
+			 int n, struct rnd_state *rs)
+{
+	int c;
+
+	for (c = 0; c < n; c++) {
+		struct drm_rect w;
+
+		if (!t_widen(f, &clips[c], &w))
+			continue;
+		if (!t_rows_vs_ref(test, f, rows, out, ref, src, pitch,
+				   w.x1, w.x2, w.y1, w.y2, rs))
+			return false;
+	}
+	return true;
+}
+
+/*
+ * @rows against the reference on every fixture, source set, dense and
+ * padded source pitch, and clip.
+ */
+static void t_rows_sets(struct kunit *test, t_rows_fn *rows)
+{
+	unsigned int fi, pad, kind;
+	u32 seed;
+
+	for (fi = 0; fi < ARRAY_SIZE(t_fixes); fi++) {
+		const struct t_fix *f = &t_fixes[fi];
+		u8 *out = t_fix_img(test, f);
+		u8 *ref = t_fix_img(test, f);
+		struct drm_rect clips[T_CLIPS_MAX];
+		struct rnd_state rs;
+		u8 *src;
+		int n;
+
+		src = kunit_kmalloc(test, (size_t)(f->w * 4 + 4) * f->h,
+				    GFP_KERNEL);
+		KUNIT_ASSERT_NOT_NULL(test, src);
+
+		for (pad = 0; pad <= 4; pad += 4) {
+			unsigned int pitch = f->w * 4 + pad;
+
+			for (kind = 0; kind < T_SRC_COUNT; kind++) {
+				for (seed = 1; seed <= 2; seed++) {
+					t_src_fill(src, pitch, f, kind, seed);
+					prandom_seed_state(&rs, seed * 11 + kind);
+					n = t_fix_clips(f, &rs, clips);
+					if (t_rows_clips(test, f, rows, out, ref,
+							 src, pitch, clips, n,
+							 &rs))
+						continue;
+					kunit_info(test, "source %u seed %u\n",
+						   kind, seed);
+					return;
+				}
+			}
+		}
+	}
+}
+
+/*
+ * Every alignment of a row: every even start 0..30 and every even length
+ * 2..80, so every way a row splits into blocks and a tail for blocks of
+ * up to 16 pixels, on random colours, white and black, each with a random
+ * X byte.
+ */
+static void t_rows_tails(struct kunit *test, t_rows_fn *rows)
+{
+	static const struct t_fix f = { "112x3", 112, 3 };
+	unsigned int pitch = f.w * 4;
+	u8 *out = t_fix_img(test, &f);
+	u8 *ref = t_fix_img(test, &f);
+	u8 *src = kunit_kmalloc(test, (size_t)pitch * f.h, GFP_KERNEL);
+	struct rnd_state rs;
+	int x, x1, len;
+
+	KUNIT_ASSERT_NOT_NULL(test, src);
+	prandom_seed_state(&rs, 1616);
+	for (x = 0; x < f.w; x++) {
+		u32 x_byte = prandom_u32_state(&rs) & 0xff000000;
+
+		put_unaligned_le32(prandom_u32_state(&rs), src + x * 4);
+		put_unaligned_le32(x_byte | 0xffffff, src + pitch + x * 4);
+		put_unaligned_le32(x_byte, src + 2 * pitch + x * 4);
+	}
+	for (x1 = 0; x1 <= 30; x1 += 2) {
+		for (len = 2; len <= 80; len += 2) {
+			if (t_rows_vs_ref(test, &f, rows, out, ref, src, pitch,
+					  x1, x1 + len, 0, f.h, &rs))
+				continue;
+			kunit_info(test, "start %d length %d\n", x1, len);
+			return;
+		}
+	}
+}
+
+/* rk3026_ebc_blit_rows() writes the bytes of the per-pixel reference. */
+static void ebc_test_blit_rows(struct kunit *test)
+{
+	t_rows_sets(test, rk3026_ebc_blit_rows);
+}
+
+/* The 4-px stores and the 2-px tail from every start. */
+static void ebc_test_blit_rows_tails(struct kunit *test)
+{
+	t_rows_tails(test, rk3026_ebc_blit_rows);
+}
+
 static struct kunit_case rk3026_ebc_conv_test_cases[] = {
 	KUNIT_CASE(ebc_test_ref_snapshot),
 	KUNIT_CASE(ebc_test_snapshot_nibble_pairs),
@@ -3042,6 +3184,8 @@ static struct kunit_case rk3026_ebc_conv_test_cases[] = {
 	KUNIT_CASE(ebc_test_snapshot_two_level_result),
 	KUNIT_CASE(ebc_test_snapshot_two_level_positions),
 	KUNIT_CASE(ebc_test_ref_blit),
+	KUNIT_CASE(ebc_test_blit_rows),
+	KUNIT_CASE(ebc_test_blit_rows_tails),
 	{}
 };
 

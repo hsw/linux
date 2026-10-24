@@ -790,7 +790,8 @@ static int ebc_read_temp(struct rk3026_ebc *ebc)
  * @clip: damaged region, in pixels
  *
  * The panel is 4bpp with two pixels per byte, low nibble first. The clip is
- * widened to an even pixel boundary so byte writes stay whole.
+ * widened to an even pixel boundary so byte writes stay whole, and clamped
+ * to the panel; rk3026_ebc_blit_rows() converts it.
  *
  * Writes @next_shadow. Called under @image_lock, in the same section that
  * queues the update, so no snapshot sees the pixels without their update.
@@ -802,29 +803,13 @@ void rk3026_ebc_blit_xrgb8888(struct rk3026_ebc *ebc, const void *src,
 	int x2 = min_t(int, round_up(clip->x2, 2), (int)ebc->width);
 	int y1 = max(clip->y1, 0);
 	int y2 = min_t(int, clip->y2, (int)ebc->height);
-	int x, y;
 
 	lockdep_assert_held(&ebc->image_lock);
 	if (x1 >= x2 || y1 >= y2)
 		return;
 
-	for (y = y1; y < y2; y++) {
-		const u8 *s = (const u8 *)src + (size_t)y * src_pitch + x1 * 4;
-		u8 *d = ebc->next_shadow + ((size_t)y * ebc->width + x1) / 2;
-
-		for (x = x1; x < x2; x += 2, s += 8, d++) {
-			u32 p0 = get_unaligned_le32(s);
-			u32 p1 = get_unaligned_le32(s + 4);
-			u32 g0 = (77 * ((p0 >> 16) & 0xff) +
-				  150 * ((p0 >> 8) & 0xff) +
-				  29 * (p0 & 0xff)) / 256;
-			u32 g1 = (77 * ((p1 >> 16) & 0xff) +
-				  150 * ((p1 >> 8) & 0xff) +
-				  29 * (p1 & 0xff)) / 256;
-
-			*d = (g0 >> 4) | (g1 & 0xf0);
-		}
-	}
+	rk3026_ebc_blit_rows(ebc->next_shadow, src, src_pitch, x1, x2, y1, y2,
+			     ebc->width);
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_blit_xrgb8888);
 

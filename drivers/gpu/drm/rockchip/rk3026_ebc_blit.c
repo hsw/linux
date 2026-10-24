@@ -138,6 +138,11 @@ static bool ebc_blit_neon(u8 *dst, const void *src, unsigned int src_pitch,
 	return true;
 }
 #else
+static bool ebc_neon_cpu(void)
+{
+	return false;
+}
+
 static bool ebc_blit_neon(u8 *dst, const void *src, unsigned int src_pitch,
 			  int x1, int x2, int y1, int y2, unsigned int width)
 {
@@ -170,3 +175,18 @@ void rk3026_ebc_blit_convert(u8 *dst, const void *src, unsigned int src_pitch,
 				     width);
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_blit_convert);
+
+/**
+ * rk3026_ebc_blit_impl - the conversion rk3026_ebc_blit_xrgb8888() runs
+ *
+ * For the probe line and debugfs "timing", so a measured blit time says
+ * which loop it is from.
+ *
+ * Returns "neon" if rk3026_ebc_blit_convert() takes the NEON rows for a
+ * clip of 16 pixels or more in process context, else "scalar".
+ */
+const char *rk3026_ebc_blit_impl(void)
+{
+	return ebc_neon_cpu() ? "neon" : "scalar";
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_blit_impl);

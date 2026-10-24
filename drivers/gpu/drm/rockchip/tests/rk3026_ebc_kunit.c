@@ -3147,9 +3147,10 @@ static int t_mxcfb_part(struct rk3026_ebc *ebc, const u32 *src,
 /*
  * A send from the request to the pending set: the region clamped to the
  * panel, the waveform and the flags mapped, auto_mode, the marker and the
- * temperature passed on, the client's pixels converted and the panel
- * claimed from the plane. A RESET converts nothing; a region off the
- * panel and a send with the CRTC off are refused, and queue nothing.
+ * temperature passed on, the client's pixels converted, with the time
+ * that took, and the panel claimed from the plane. A RESET converts
+ * nothing; a region off the panel and a send with the CRTC off are
+ * refused, and queue nothing.
  */
 static void ebc_test_glue_mxcfb_send(struct kunit *test)
 {
@@ -3184,6 +3185,7 @@ static void ebc_test_glue_mxcfb_send(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, t_px(ebc->next_shadow, 3, 2), 15);
 	KUNIT_EXPECT_EQ(test, t_px(ebc->next_shadow, 10, 2), 15);
 	KUNIT_EXPECT_EQ(test, t_px(ebc->next_shadow, 4, 1), 15);
+	KUNIT_EXPECT_GE(test, part.blit_us, 1);
 
 	/* FORCE_MONOCHROME: DU, no auto; a temperature of the client's. */
 	req.flags = EPDC_FLAG_FORCE_MONOCHROME;
@@ -3209,6 +3211,7 @@ static void ebc_test_glue_mxcfb_send(struct kunit *test)
 	req.waveform_mode = MXCFB_WAVEFORM_MODE_INIT;
 	KUNIT_EXPECT_EQ(test, t_mxcfb_part(ebc, black, &req, &part), 0);
 	KUNIT_EXPECT_EQ(test, part.mode, EBC_MODE_RESET);
+	KUNIT_EXPECT_EQ(test, part.blit_us, 0);
 	t_expect_white(test, ebc->next_shadow);
 
 	/* Off the panel, then with the CRTC off: refused, nothing queued. */
@@ -3226,6 +3229,131 @@ static void ebc_test_glue_mxcfb_send(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ebc->stats.updates, 4);
 }
 #endif
+/*
+ * The CPU time of a part in its record: the blit of its newest update, as
+ * the sender measured it, and the snapshot the thread built for it. The
+ * fixture cannot drive a waveform, so the run that builds a snapshot and
+ * would drive it stops at the missing LUT.
+ */
+static u32 t_send_blit(struct rk3026_ebc *ebc, u32 mode, u32 blit_us)
+{
+	struct rk3026_ebc_update upd = t_upd(&t_panel, mode, 0,
+					     EBC_SOURCE_PLANE);
+	u32 seq;
+
+	upd.blit_us = blit_us;
+	mutex_lock(&ebc->image_lock);
+	seq = rk3026_ebc_add_update(ebc, &upd);
+	mutex_unlock(&ebc->image_lock);
+	return seq;
+}
+
+static void ebc_test_glue_timing(struct kunit *test)
+{
+	struct rk3026_ebc *ebc = t_policy_ebc(test);
+	struct rk3026_ebc_last last;
+
+	/* Two updates in one part: the newest one's blit. */
+	t_img_fill(ebc->next_shadow, 0);
+	t_send_blit(ebc, EBC_MODE_FULL, 7);
+	t_send_blit(ebc, EBC_MODE_FULL, 9);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_NO_LUT);
+	KUNIT_EXPECT_EQ(test, last.merged, 2);
+	KUNIT_EXPECT_EQ(test, last.blit_us, 9);
+	KUNIT_EXPECT_GE(test, last.snap_us, 1);
+	KUNIT_EXPECT_EQ(test, ebc->last.blit_us, 9);
+	KUNIT_EXPECT_EQ(test, ebc->last.snap_us, last.snap_us);
+	/* Nothing was driven: no scan record. */
+	KUNIT_EXPECT_EQ(test, ebc->last_driven.snap_us, 0);
+
+	/* A carry blitted nothing of its own: the new update's blit. */
+	KUNIT_ASSERT_TRUE(test, ebc->pending.carry.merged);
+	KUNIT_EXPECT_EQ(test, ebc->pending.carry.blit_us, 0);
+	t_send_blit(ebc, EBC_MODE_FULL, 5);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_NO_LUT);
+	KUNIT_EXPECT_EQ(test, last.blit_us, 5);
+	KUNIT_EXPECT_GE(test, last.snap_us, 1);
+}
+
+/* A skipped part had its snapshot built. */
+static void ebc_test_glue_timing_skipped(struct kunit *test)
+{
+	struct rk3026_ebc *ebc = t_policy_ebc(test);
+	struct rk3026_ebc_last last;
+
+	t_send_blit(ebc, EBC_MODE_FULL, 3);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_SKIPPED);
+	KUNIT_EXPECT_EQ(test, last.blit_us, 3);
+	KUNIT_EXPECT_GE(test, last.snap_us, 1);
+}
+
+/* No snapshot with the CRTC off or without a waveform; a RESET blits none. */
+static void ebc_test_glue_timing_dropped(struct kunit *test)
+{
+	struct rk3026_ebc *ebc = t_ebc_alloc(test);
+	struct rk3026_ebc_last last;
+
+	t_send_blit(ebc, EBC_MODE_FULL, 4);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_NO_WAVEFORM);
+	KUNIT_EXPECT_EQ(test, last.blit_us, 4);
+	KUNIT_EXPECT_EQ(test, last.snap_us, 0);
+
+	ebc->crtc_on = false;
+	t_send_blit(ebc, EBC_MODE_FULL, 6);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_CRTC_OFF);
+	KUNIT_EXPECT_EQ(test, last.blit_us, 6);
+	KUNIT_EXPECT_EQ(test, last.snap_us, 0);
+
+	t_send(ebc, &t_panel, EBC_MODE_RESET, 0, EBC_SOURCE_ENABLE);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.asked_mode, EBC_MODE_RESET);
+	KUNIT_EXPECT_EQ(test, last.blit_us, 0);
+	KUNIT_EXPECT_EQ(test, last.snap_us, 0);
+}
+
+/* The conversion rk3026_ebc_blit_impl() should name on this kernel and CPU. */
+static const char *t_blit_impl(void)
+{
+#if IS_ENABLED(CONFIG_DRM_RK3026_EBC_NEON)
+	if (cpu_has_neon())
+		return "neon";
+#endif
+	return "scalar";
+}
+
+/*
+ * The blit reports its own time: none for a clip off the panel, at least
+ * 1 us for one it converted, carried by a plane update into its part.
+ */
+static void ebc_test_glue_blit_time(struct kunit *test)
+{
+	static const struct drm_rect off = DRM_RECT_INIT(T_W, 0, 4, 2);
+	struct rk3026_ebc *ebc = t_ebc_alloc(test);
+	u32 *black = t_plane_fb(test, 0);
+	u32 us;
+
+	KUNIT_EXPECT_STREQ(test, rk3026_ebc_blit_impl(), t_blit_impl());
+
+	mutex_lock(&ebc->image_lock);
+	us = rk3026_ebc_blit_xrgb8888(ebc, black, T_W * 4, &off);
+	mutex_unlock(&ebc->image_lock);
+	KUNIT_EXPECT_EQ(test, us, 0);
+	t_expect_white(test, ebc->next_shadow);
+
+	mutex_lock(&ebc->image_lock);
+	us = rk3026_ebc_blit_xrgb8888(ebc, black, T_W * 4, &t_panel);
+	mutex_unlock(&ebc->image_lock);
+	KUNIT_EXPECT_GE(test, us, 1);
+
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
+							&t_panel));
+	KUNIT_EXPECT_GE(test, ebc->pending.pre.blit_us, 1);
+}
 
 /*
  * The plane box. A plane state just complete enough for the damage helpers,
@@ -3536,6 +3664,10 @@ static struct kunit_case rk3026_ebc_glue_test_cases[] = {
 #if IS_ENABLED(CONFIG_DRM_RK3026_EBC_MXCFB)
 	KUNIT_CASE(ebc_test_glue_mxcfb_send),
 #endif
+	KUNIT_CASE(ebc_test_glue_timing),
+	KUNIT_CASE(ebc_test_glue_timing_skipped),
+	KUNIT_CASE(ebc_test_glue_timing_dropped),
+	KUNIT_CASE(ebc_test_glue_blit_time),
 	KUNIT_CASE(ebc_test_plane_box),
 	KUNIT_CASE(ebc_test_glue_plane_box_update),
 	KUNIT_CASE(ebc_test_glue_plane_box_merge),

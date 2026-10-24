@@ -183,7 +183,7 @@ VISIBLE_IF_KUNIT int rk3026_ebc_mxcfb_send(struct rk3026_ebc *ebc,
 
 	/* A RESET discards the pixels: rk3026_ebc_add_update() whitens them. */
 	if (upd.mode != EBC_MODE_RESET)
-		rk3026_ebc_blit_xrgb8888(ebc, src, pitch, &clip);
+		upd.blit_us = rk3026_ebc_blit_xrgb8888(ebc, src, pitch, &clip);
 	rk3026_ebc_add_update(ebc, &upd);
 	mutex_unlock(&ebc->image_lock);
 	return 0;

@@ -787,6 +787,17 @@ static int ebc_read_temp(struct rk3026_ebc *ebc)
 	return temp;
 }
 
+/*
+ * Microseconds since @start, rounded up and at least 1, so a time that was
+ * measured is never 0 (0 means none), even on a clock too coarse to see it.
+ */
+static u32 ebc_us_since(ktime_t start)
+{
+	u64 ns = ktime_to_ns(ktime_sub(ktime_get(), start));
+
+	return clamp_t(u64, DIV_ROUND_UP_ULL(ns, NSEC_PER_USEC), 1, U32_MAX);
+}
+
 /**
  * rk3026_ebc_blit_xrgb8888 - pack a damaged region into the target image
  * @ebc: controller
@@ -800,18 +811,25 @@ static int ebc_read_temp(struct rk3026_ebc *ebc)
  *
  * Writes @next_shadow. Called under @image_lock, in the same section that
  * queues the update, so no snapshot sees the pixels without their update.
+ *
+ * Returns the time the conversion took in us, rounded up, or 0 if the clip
+ * is off the panel; the sender passes it on with the update
+ * (&rk3026_ebc_update.blit_us).
  */
-void rk3026_ebc_blit_xrgb8888(struct rk3026_ebc *ebc, const void *src,
-			      unsigned int src_pitch, const struct drm_rect *clip)
+u32 rk3026_ebc_blit_xrgb8888(struct rk3026_ebc *ebc, const void *src,
+			     unsigned int src_pitch, const struct drm_rect *clip)
 {
 	struct drm_rect r = *clip;
+	ktime_t start;
 
 	lockdep_assert_held(&ebc->image_lock);
 	if (!rk3026_ebc_widen_clip(&r, ebc->width, ebc->height))
-		return;
+		return 0;
 
+	start = ktime_get();
 	rk3026_ebc_blit_convert(ebc->next_shadow, src, src_pitch, r.x1, r.x2,
 				r.y1, r.y2, ebc->width);
+	return ebc_us_since(start);
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_blit_xrgb8888);
 
@@ -1211,7 +1229,7 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 {
 	enum rk3026_ebc_repair repair_result = EBC_REPAIR_NONE;
 	struct rk3026_ebc_shadows *sh = &ebc->shadows;
-	ktime_t start = ktime_get();
+	ktime_t start = ktime_get(), snap_start;
 	enum rk3026_ebc_reason reason;
 	struct rk3026_ebc_set part;
 	bool repair_due, identical, prev_changed, two_level, cleanup_due;
@@ -1246,6 +1264,7 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 	last->marker = part.marker;
 	last->merged = part.merged;
 	last->source = part.source;
+	last->blit_us = part.blit_us;
 
 	/*
 	 * Nothing reaches the panel while the CRTC is off: the rails stay
@@ -1275,9 +1294,11 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 	scan_mode = rk3026_ebc_scan_mode(&part, repair_due);
 
 	/* An A2 scan over a grey of the glass comes back as DU. */
+	snap_start = ktime_get();
 	identical = !rk3026_ebc_build_snapshot(sh, target, &part.box,
 					       &scan_mode, &two_level,
 					       &changed_px);
+	last->snap_us = ebc_us_since(snap_start);
 	if (debug_scan)
 		ebc_report_image(ebc);
 
@@ -1785,7 +1806,8 @@ VISIBLE_IF_KUNIT bool rk3026_ebc_plane_update(struct rk3026_ebc *ebc,
 		if (ebc->plane_resync)
 			upd.clip = DRM_RECT_INIT(0, 0, ebc->width, ebc->height);
 		ebc->plane_resync = false;
-		rk3026_ebc_blit_xrgb8888(ebc, src, src_pitch, &upd.clip);
+		upd.blit_us = rk3026_ebc_blit_xrgb8888(ebc, src, src_pitch,
+						       &upd.clip);
 		rk3026_ebc_add_update(ebc, &upd);
 	}
 	mutex_unlock(&ebc->image_lock);
@@ -2589,6 +2611,7 @@ static int ebc_probe(struct platform_device *pdev)
 
 	drm_client_setup(drm, NULL);
 
+	dev_info(dev, "blit: %s\n", rk3026_ebc_blit_impl());
 	dev_info(dev, "RK3026 EBC %ux%u\n", ebc->width, ebc->height);
 	return 0;
 }

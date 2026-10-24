@@ -190,6 +190,18 @@ config DRM_RK3026_EBC_MXCFB
 	  upstream interface; without it the display degrades to
 	  single-mode partial refresh rather than breaking.
 
+config DRM_RK3026_EBC_NEON
+	bool "NEON conversion for the RK3026 EBC"
+	depends on DRM_RK3026_EBC && ARM && KERNEL_MODE_NEON
+	default y
+	help
+	  Convert the XRGB8888 framebuffer to the panel's 4-bit grey with
+	  NEON where the CPU has it, in short kernel-mode NEON sections.
+	  The plain C conversion stays for every other case and gives the
+	  same bytes, so turning this off only makes the conversion slower.
+
+	  If unsure, say Y.
+
 config DRM_RK3026_EBC_KUNIT_TEST
 	tristate "KUnit tests for the RK3026 EBC" if !KUNIT_ALL_TESTS
 	depends on DRM_RK3026_EBC && KUNIT

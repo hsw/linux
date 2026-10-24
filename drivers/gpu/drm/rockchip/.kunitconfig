@@ -1,3 +1,8 @@
+# The NEON blit needs ARM with kernel-mode NEON; run it a second time with
+# --arch=arm --kconfig_add CONFIG_VFP=y --kconfig_add CONFIG_NEON=y
+# --kconfig_add CONFIG_KERNEL_MODE_NEON=y (qemu virt is a Cortex-A15), and
+# expect no skipped case there.
+
 CONFIG_KUNIT=y
 CONFIG_COMPILE_TEST=y
 CONFIG_OF=y

@@ -796,7 +796,7 @@ static int ebc_read_temp(struct rk3026_ebc *ebc)
  *
  * The panel is 4bpp with two pixels per byte, low nibble first. The clip is
  * widened to an even pixel boundary so byte writes stay whole, and clamped
- * to the panel; rk3026_ebc_blit_rows() converts it.
+ * to the panel; rk3026_ebc_blit_convert() converts it.
  *
  * Writes @next_shadow. Called under @image_lock, in the same section that
  * queues the update, so no snapshot sees the pixels without their update.
@@ -810,8 +810,8 @@ void rk3026_ebc_blit_xrgb8888(struct rk3026_ebc *ebc, const void *src,
 	if (!rk3026_ebc_widen_clip(&r, ebc->width, ebc->height))
 		return;
 
-	rk3026_ebc_blit_rows(ebc->next_shadow, src, src_pitch, r.x1, r.x2,
-			     r.y1, r.y2, ebc->width);
+	rk3026_ebc_blit_convert(ebc->next_shadow, src, src_pitch, r.x1, r.x2,
+				r.y1, r.y2, ebc->width);
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_blit_xrgb8888);
 

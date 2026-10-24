@@ -667,6 +667,9 @@ bool rk3026_ebc_plane_update(struct rk3026_ebc *ebc, const void *src,
 /* rk3026_ebc_blit.c */
 void rk3026_ebc_blit_rows(u8 *dst, const void *src, unsigned int src_pitch,
 			  int x1, int x2, int y1, int y2, unsigned int width);
+void rk3026_ebc_blit_convert(u8 *dst, const void *src, unsigned int src_pitch,
+			     int x1, int x2, int y1, int y2,
+			     unsigned int width);
 
 /* rk3026_ebc_core.c */
 u32 rk3026_ebc_dsp_ctrl_mode(u32 mode);

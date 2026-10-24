@@ -10,6 +10,8 @@
  *   du_state         text, the DU cleanup budget (rk3026_ebc_du_state_show())
  *   du_cleanup_area  the budget's limit in pixels, read-write; 0: no
  *                    cleanup FULL. A diagnostic: probe sets one panel's area.
+ *   timing  text, the blit and snapshot times of the last part and the last
+ *           driven one (rk3026_ebc_timing_show())
  *
  * Both images are @img_size = width * height / 2 bytes: 4 bpp, two pixels per
  * byte with the LEFT pixel in the LOW nibble, rows of width / 2 bytes, top row
@@ -243,6 +245,34 @@ static int rk3026_ebc_du_state_show(struct seq_file *m, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(rk3026_ebc_du_state);
 
+/*
+ * "timing", apart from "state" so that file keeps its version: blit_impl is
+ * the conversion (rk3026_ebc_blit_impl()); *_blit_us is what the newest
+ * update of the part took to convert on its sender, *_snap_us the snapshot
+ * the refresh thread built for it, in us rounded up, 0 for none. last_* and
+ * scan_* are the records of "state".
+ */
+static int rk3026_ebc_timing_show(struct seq_file *m, void *unused)
+{
+	struct rk3026_ebc *ebc = m->private;
+	u32 last_blit, last_snap, scan_blit, scan_snap;
+
+	mutex_lock(&ebc->image_lock);
+	last_blit = ebc->last.blit_us;
+	last_snap = ebc->last.snap_us;
+	scan_blit = ebc->last_driven.blit_us;
+	scan_snap = ebc->last_driven.snap_us;
+	mutex_unlock(&ebc->image_lock);
+
+	seq_printf(m, "blit_impl %s\n", rk3026_ebc_blit_impl());
+	seq_printf(m, "last_blit_us %u\n", last_blit);
+	seq_printf(m, "last_snap_us %u\n", last_snap);
+	seq_printf(m, "scan_blit_us %u\n", scan_blit);
+	seq_printf(m, "scan_snap_us %u\n", scan_snap);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(rk3026_ebc_timing);
+
 void rk3026_ebc_debugfs_init(struct rk3026_ebc *ebc)
 {
 	struct dentry *dir = debugfs_create_dir("rk3026-ebc", NULL);
@@ -256,6 +286,7 @@ void rk3026_ebc_debugfs_init(struct rk3026_ebc *ebc)
 	debugfs_create_file("du_state", 0444, dir, ebc,
 			    &rk3026_ebc_du_state_fops);
 	debugfs_create_u32("du_cleanup_area", 0644, dir, &ebc->du_cleanup_area);
+	debugfs_create_file("timing", 0444, dir, ebc, &rk3026_ebc_timing_fops);
 }
 
 void rk3026_ebc_debugfs_fini(struct rk3026_ebc *ebc)

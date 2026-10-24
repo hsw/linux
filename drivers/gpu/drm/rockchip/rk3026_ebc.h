@@ -260,11 +260,14 @@ enum rk3026_ebc_reason {
  * the default the content may override (rk3026_ebc_resolve_mode()). A plane
  * update and an mxcfb AUTO + PARTIAL send set it; an update that names its
  * mode leaves it false.
+ *
+ * @blit_us: what its blit took (rk3026_ebc_blit_xrgb8888()), 0 without one.
  */
 struct rk3026_ebc_update {
 	struct drm_rect	clip;
 	u32		mode;
 	u32		marker;
+	u32		blit_us;
 	int		temp;
 	bool		temp_valid;
 	bool		auto_mode;
@@ -273,7 +276,8 @@ struct rk3026_ebc_update {
 
 /*
  * The record of one part, for debugfs. Filled by the refresh thread and
- * published under @image_lock.
+ * published under @image_lock. The _us times (debugfs "timing") are
+ * rounded up and at least 1 when measured; 0 means none.
  */
 struct rk3026_ebc_last {
 	struct drm_rect	clip;
@@ -294,6 +298,8 @@ struct rk3026_ebc_last {
 	u32		timeouts;
 	u32		ms;		/* take to done */
 	u32		scan_ms;	/* the last waveform */
+	u32		blit_us;	/* the newest update's blit */
+	u32		snap_us;	/* its snapshot, 0: none built */
 };
 
 /*
@@ -334,6 +340,7 @@ struct rk3026_ebc_set {
 	u32		mode;
 	u32		seq;		/* the newest update's */
 	u32		marker;		/* the newest update's, or 0 */
+	u32		blit_us;	/* the newest update's */
 	u32		merged;		/* updates in the set */
 	int		temp;		/* the newest valid one */
 	bool		temp_valid;
@@ -644,8 +651,8 @@ static inline struct rk3026_ebc *drm_to_ebc(struct drm_device *drm)
 }
 
 /* rk3026_ebc.c */
-void rk3026_ebc_blit_xrgb8888(struct rk3026_ebc *ebc, const void *src,
-			      unsigned int src_pitch, const struct drm_rect *clip);
+u32 rk3026_ebc_blit_xrgb8888(struct rk3026_ebc *ebc, const void *src,
+			     unsigned int src_pitch, const struct drm_rect *clip);
 u32 rk3026_ebc_add_update(struct rk3026_ebc *ebc,
 			  const struct rk3026_ebc_update *upd);
 int rk3026_ebc_wait_marker(struct rk3026_ebc *ebc, u32 marker);
@@ -670,6 +677,7 @@ void rk3026_ebc_blit_rows(u8 *dst, const void *src, unsigned int src_pitch,
 void rk3026_ebc_blit_convert(u8 *dst, const void *src, unsigned int src_pitch,
 			     int x1, int x2, int y1, int y2,
 			     unsigned int width);
+const char *rk3026_ebc_blit_impl(void);
 
 /* rk3026_ebc_core.c */
 u32 rk3026_ebc_dsp_ctrl_mode(u32 mode);

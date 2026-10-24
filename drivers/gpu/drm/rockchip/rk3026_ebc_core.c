@@ -146,6 +146,7 @@ static void ebc_set_add(struct rk3026_ebc_set *set,
 	}
 	set->seq = seq;
 	set->marker = upd->marker;
+	set->blit_us = upd->blit_us;
 	set->source = upd->source;
 	set->merged++;
 }

@@ -54,6 +54,7 @@
 
 #include <video/of_display_timing.h>
 
+#include <kunit/static_stub.h>
 #include <kunit/visibility.h>
 
 #include "rk3026_ebc.h"
@@ -870,7 +871,7 @@ static void ebc_stop_scan(struct rk3026_ebc *ebc)
 }
 
 /**
- * ebc_drive - run one whole waveform, and own the "is prev true?" flag
+ * rk3026_ebc_drive - run one whole waveform, and own the "is prev true?" flag
  * @ebc: controller
  * @lut: packed LUT for @mode, @frames frames of EBC_LUT_FRAME_BYTES
  * @frames: frames in the waveform
@@ -891,13 +892,20 @@ static void ebc_stop_scan(struct rk3026_ebc *ebc)
  * the flag set without having to be listed anywhere. Do not "improve" this
  * into a set of clears on the known failure paths; the failure that matters
  * is the path not yet written.
+ *
+ * KUnit replaces it with a static stub, so that the refresh thread's glue
+ * can be run to a driven part without the controller.
  */
-static int ebc_drive(struct rk3026_ebc *ebc, const u8 *lut, u32 frames,
-		     u32 mode, u32 lut_mode, struct rk3026_ebc_last *last)
+VISIBLE_IF_KUNIT int rk3026_ebc_drive(struct rk3026_ebc *ebc, const u8 *lut,
+				      u32 frames, u32 mode, u32 lut_mode,
+				      struct rk3026_ebc_last *last)
 {
 	u32 done = 0, chunk = 0;
 	ktime_t start = ktime_get();
 	int ret = 0;
+
+	KUNIT_STATIC_STUB_REDIRECT(rk3026_ebc_drive, ebc, lut, frames, mode,
+				   lut_mode, last);
 
 	/* A repair is the first waveform of an update that has repaired set. */
 	trace_rk3026_ebc_scan_start(mode, lut_mode, last->temp, frames,
@@ -980,6 +988,7 @@ out:
 	trace_rk3026_ebc_scan_end(mode, frames, done, last->scan_ms, ret);
 	return ret;
 }
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_drive);
 
 /**
  * ebc_recover_panel - drive the glass back to a state @prev_virt can describe
@@ -1005,7 +1014,8 @@ out:
  *
  * Returns 0 if the RESET ran to completion (@last->repaired set) or there is
  * no RESET waveform at @temp (@last->repaired clear: nothing was driven), or
- * ebc_drive()'s error: the rails are down and the part must not be driven.
+ * rk3026_ebc_drive()'s error: the rails are down and the part must not be
+ * driven.
  */
 static int ebc_recover_panel(struct rk3026_ebc *ebc, int temp,
 			     struct rk3026_ebc_last *last)
@@ -1027,7 +1037,8 @@ static int ebc_recover_panel(struct rk3026_ebc *ebc, int temp,
 		 frames);
 
 	last->repaired = true;
-	ret = ebc_drive(ebc, lut, frames, EBC_MODE_RESET, EBC_MODE_RESET, last);
+	ret = rk3026_ebc_drive(ebc, lut, frames, EBC_MODE_RESET, EBC_MODE_RESET,
+			       last);
 	if (ret)
 		return ret;
 
@@ -1193,8 +1204,9 @@ static void ebc_publish(struct rk3026_ebc *ebc, struct rk3026_ebc_last *last,
  *  2. without it: the sensor, the rails, the snapshot into @next_virt, a
  *     repair if the glass is not known, the waveform;
  *  3. under @image_lock again: rk3026_ebc_scan_finish() says what the glass
- *     shows now and moves @pending.done_seq over the part, and the record is
- *     published with it. The waiters on the part's updates are woken then,
+ *     shows now and moves @pending.done_seq over the part, the DU cleanup
+ *     budget follows it (rk3026_ebc_du_account()), and the record is
+ *     published with them. The waiters on the part's updates are woken then,
  *     whatever the outcome, and @prev_virt follows.
  */
 VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
@@ -1205,8 +1217,9 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 	ktime_t start = ktime_get();
 	enum rk3026_ebc_reason reason;
 	struct rk3026_ebc_set part;
-	bool repair_due, identical, prev_changed, two_level;
-	u32 frames, mode, scan_mode, resolved, lut_mode, changed_px;
+	bool repair_due, identical, prev_changed, two_level, cleanup_due;
+	u32 frames, mode, scan_mode, resolved, lut_mode, limit;
+	u32 changed_px = 0;
 	const u8 *lut, *target;
 	int temp;
 	int ret;
@@ -1264,10 +1277,7 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 	repair_due = sh->prev_unknown && part.mode != EBC_MODE_RESET;
 	scan_mode = rk3026_ebc_scan_mode(&part, repair_due);
 
-	/*
-	 * An A2 scan over a grey of the glass comes back as DU. @changed_px
-	 * is not used yet.
-	 */
+	/* An A2 scan over a grey of the glass comes back as DU. */
 	identical = !rk3026_ebc_build_snapshot(sh, target, &part.box,
 					       &scan_mode, &two_level,
 					       &changed_px);
@@ -1330,11 +1340,14 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 
 	/*
 	 * The content's choice for a part of auto updates: DU when every
-	 * changed pixel becomes black or white. It comes after the skip,
-	 * which stays on the part's own mode, and before force_mode.
+	 * changed pixel becomes black or white, until the plane parts' DU
+	 * budget is spent. It comes after the skip, which stays on the part's
+	 * own mode, and before force_mode.
 	 */
+	limit = READ_ONCE(ebc->du_cleanup_area);
+	cleanup_due = limit && ebc->du_area >= limit;
 	resolved = rk3026_ebc_resolve_mode(&part, scan_mode, two_level,
-					   repair_due, &reason);
+					   repair_due, cleanup_due, &reason);
 	last->reason = reason;
 
 	/* DIAGNOSTIC: drive a different mode class with the same data and scan. */
@@ -1433,7 +1446,7 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 		ebc_report_env(ebc);
 	}
 
-	ebc_drive(ebc, lut, frames, mode, lut_mode, last);
+	rk3026_ebc_drive(ebc, lut, frames, mode, lut_mode, last);
 
 	if (debug_scan)
 		debug_scan--;
@@ -1442,8 +1455,9 @@ relock:
 	mutex_lock(&ebc->image_lock);
 finish:
 	/*
-	 * What was driven in is now what the panel shows: once ebc_drive() was
-	 * entered for the part, the snapshot becomes prev whatever the outcome.
+	 * What was driven in is now what the panel shows: once rk3026_ebc_drive()
+	 * was entered for the part, the snapshot becomes prev whatever the
+	 * outcome.
 	 * A repair RESET that failed never got that far: the part is carried
 	 * and prev stays, marked unknown.
 	 *
@@ -1454,6 +1468,9 @@ finish:
 	 */
 	prev_changed = rk3026_ebc_scan_finish(sh, &ebc->pending, &part,
 					      last->outcome, repair_result);
+	ebc->du_area = rk3026_ebc_du_account(ebc->du_area, &part, last->mode,
+					     changed_px, last->outcome,
+					     repair_result);
 	ebc_publish(ebc, last, start);
 	mutex_unlock(&ebc->image_lock);
 
@@ -1873,7 +1890,7 @@ static void ebc_crtc_atomic_disable(struct drm_crtc *crtc,
 	mutex_unlock(&ebc->image_lock);
 	/*
 	 * If the thread does not come back, drop the rails under it anyway:
-	 * ebc_drive() checks them before every chunk and abandons the
+	 * rk3026_ebc_drive() checks them before every chunk and abandons the
 	 * waveform, leaving prev_unknown set.
 	 */
 	ebc_wait_finished(ebc, seq);
@@ -2369,6 +2386,8 @@ static int ebc_probe(struct platform_device *pdev)
 	ebc->height = ebc->timing.vactive.typ;
 	if (ebc->width % 8 || ebc->height % 2)
 		return dev_err_probe(dev, -EINVAL, "unsupported panel size\n");
+	/* One panel's worth of DU-changed pixels before a cleanup FULL. */
+	ebc->du_cleanup_area = ebc->width * ebc->height;
 
 	/* E Ink GDCK_STA / LGONL; no display-timing binding covers them. */
 	if (of_property_read_u32(dev->of_node, "rockchip,gdck-sta",

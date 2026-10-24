@@ -7,6 +7,9 @@
  *   target  the target image the senders write (@next_shadow); a scan draws
  *           the part of it its updates cover, read-only binary
  *   state   text, one "key value" line per item (rk3026_ebc_state_show())
+ *   du_state         text, the DU cleanup budget (rk3026_ebc_du_state_show())
+ *   du_cleanup_area  the budget's limit in pixels, read-write; 0: no
+ *                    cleanup FULL. A diagnostic: probe sets one panel's area.
  *
  * Both images are @img_size = width * height / 2 bytes: 4 bpp, two pixels per
  * byte with the LEFT pixel in the LOW nibble, rows of width / 2 bytes, top row
@@ -216,6 +219,30 @@ static int rk3026_ebc_state_show(struct seq_file *m, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(rk3026_ebc_state);
 
+/*
+ * "du_state", apart from "state" so that file keeps its version: du_area is
+ * the pixels plane parts changed in DU since the glass was last cleared
+ * (rk3026_ebc_du_account()), du_cleanup_area the limit (0: none), and
+ * cleanup_due 1 when the next two-level plane part will be driven FULL
+ * (rk3026_ebc_resolve_mode()).
+ */
+static int rk3026_ebc_du_state_show(struct seq_file *m, void *unused)
+{
+	struct rk3026_ebc *ebc = m->private;
+	u32 area, limit;
+
+	mutex_lock(&ebc->image_lock);
+	area = ebc->du_area;
+	mutex_unlock(&ebc->image_lock);
+	limit = READ_ONCE(ebc->du_cleanup_area);
+
+	seq_printf(m, "du_area %u\n", area);
+	seq_printf(m, "du_cleanup_area %u\n", limit);
+	seq_printf(m, "cleanup_due %d\n", limit && area >= limit);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(rk3026_ebc_du_state);
+
 void rk3026_ebc_debugfs_init(struct rk3026_ebc *ebc)
 {
 	struct dentry *dir = debugfs_create_dir("rk3026-ebc", NULL);
@@ -226,6 +253,9 @@ void rk3026_ebc_debugfs_init(struct rk3026_ebc *ebc)
 	debugfs_create_file_size("target", 0400, dir, ebc, &ebc_target_fops,
 				 ebc->img_size);
 	debugfs_create_file("state", 0444, dir, ebc, &rk3026_ebc_state_fops);
+	debugfs_create_file("du_state", 0444, dir, ebc,
+			    &rk3026_ebc_du_state_fops);
+	debugfs_create_u32("du_cleanup_area", 0644, dir, &ebc->du_cleanup_area);
 }
 
 void rk3026_ebc_debugfs_fini(struct rk3026_ebc *ebc)

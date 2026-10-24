@@ -246,6 +246,7 @@ enum rk3026_ebc_reason {
 	EBC_REASON_EXPLICIT,	/* the part's own mode, as asked or by default */
 	EBC_REASON_AUTO_DU,	/* an auto part whose changes are all 0 or 15 */
 	EBC_REASON_REPAIR_FLOOR, /* raised to PART after a repair RESET */
+	EBC_REASON_CLEANUP,	/* a two-level plane part kept FULL: DU budget */
 };
 
 /*
@@ -504,9 +505,9 @@ struct rk3026_ebc {
 	 * all leave it set by construction. ⚠️ Do not turn this into a list of
 	 * clears on the known abort paths: the one that matters is the path not
 	 * yet written. Read at the next draw, which then clears the panel first.
-	 * Written by the refresh thread alone: ebc_drive() owns it during a
-	 * waveform, and rk3026_ebc_scan_finish() records the part's outcome
-	 * under @image_lock, never clearing what ebc_drive() left set.
+	 * Written by the refresh thread alone: rk3026_ebc_drive() owns it during
+	 * a waveform, and rk3026_ebc_scan_finish() records the part's outcome
+	 * under @image_lock, never clearing what rk3026_ebc_drive() left set.
 	 *
 	 * @pending holds every update sent and not yet taken (a sender blits
 	 * and adds its update in one section, so no snapshot sees pixels
@@ -531,6 +532,18 @@ struct rk3026_ebc {
 	struct rk3026_ebc_shadows shadows;
 	struct rk3026_ebc_pending pending;
 	struct rk3026_ebc_marker_ring markers;
+
+	/*
+	 * The DU cleanup budget (rk3026_ebc_du_account()). @du_area counts the
+	 * pixels plane parts changed in DU since the glass was last cleared;
+	 * the refresh thread alone writes it, under @image_lock. Once it
+	 * reaches @du_cleanup_area, a two-level plane part is driven FULL
+	 * instead (rk3026_ebc_resolve_mode()). @du_cleanup_area is one panel's
+	 * area from probe on; debugfs may change it (0: never), and the thread
+	 * reads it with READ_ONCE().
+	 */
+	u32			du_area;
+	u32			du_cleanup_area;
 
 	/* Write-only registers the controller does not read back. */
 	u32			dsp_start;
@@ -612,6 +625,8 @@ u32 rk3026_ebc_add_update(struct rk3026_ebc *ebc,
 int rk3026_ebc_wait_marker(struct rk3026_ebc *ebc, u32 marker);
 #if IS_ENABLED(CONFIG_KUNIT)
 void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc, struct rk3026_ebc_last *last);
+int rk3026_ebc_drive(struct rk3026_ebc *ebc, const u8 *lut, u32 frames,
+		     u32 mode, u32 lut_mode, struct rk3026_ebc_last *last);
 int rk3026_ebc_wait_seq(struct rk3026_ebc *ebc, u32 seq,
 			unsigned int timeout_ms, bool interruptible);
 unsigned int rk3026_ebc_wait_timeout_ms(struct rk3026_ebc *ebc);
@@ -636,8 +651,12 @@ bool rk3026_ebc_should_skip(const struct rk3026_ebc_set *part,
 			    bool prev_unknown, bool identical);
 u32 rk3026_ebc_scan_mode(const struct rk3026_ebc_set *part, bool repaired);
 u32 rk3026_ebc_resolve_mode(const struct rk3026_ebc_set *part, u32 scan_mode,
-			    bool two_level, bool repair_due,
+			    bool two_level, bool repair_due, bool cleanup_due,
 			    enum rk3026_ebc_reason *reason);
+u32 rk3026_ebc_du_account(u32 du_area, const struct rk3026_ebc_set *part,
+			  u32 mode, u32 changed_px,
+			  enum rk3026_ebc_outcome outcome,
+			  enum rk3026_ebc_repair repair);
 bool rk3026_ebc_scan_finish(struct rk3026_ebc_shadows *sh,
 			    struct rk3026_ebc_pending *p,
 			    const struct rk3026_ebc_set *part,

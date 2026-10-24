@@ -47,7 +47,7 @@
  *   REAGL      PART          FULL          gray16 LUT
  *   REAGLD     FULL          FULL          gray16 LUT, full class
  *   GC4        PART          PART          gray16 LUT; no 4-level LUT
- *   AUTO       PART          FULL          gray16 LUT
+ *   AUTO       PART, auto    FULL          gray16 LUT, or gray2 (below)
  *   (other)    PART          FULL          gray16 LUT
  *
  * The "mode 6" family is the container's 16-level no-flash table: it drives
@@ -63,15 +63,39 @@
  *
  * AUTO is deliberately not routed to EBC_MODE_AUTO: that work mode is one of
  * the controller's direct modes, driven line by line with no LUT upload and
- * with DISPLAY_MODE clear, which is a different data path entirely. Treating
- * AUTO as GC16 keeps every update on the LUT path.
+ * with DISPLAY_MODE clear, which is a different data path entirely. AUTO
+ * stays on the LUT path. A partial AUTO update is PART with @auto_mode set:
+ * the core drives it in DU when every pixel it changes becomes black or
+ * white, else in PART (rk3026_ebc_resolve_mode()). This file only sets the
+ * flag; the content test is the snapshot's. A full AUTO update is a plain
+ * FULL: the client asked for the flash.
+ *
+ * EPDC_FLAG_FORCE_MONOCHROME: i.MX thresholds the update to black and white
+ * before it picks the waveform, so AUTO with the flag is DU, treated as an
+ * explicit mode (no @auto_mode), for a full update as for a partial one: DU
+ * drives only the pixels that change either way. Such a full update is not
+ * full class, so an identical one is skipped; an identical DU moves nothing
+ * on the glass, so the skip is exact. With DU and A2 the flag needs no
+ * code: the snapshot lays every changed pixel of a two-level mode over the
+ * old image as black or white already (grey >= 8 is white), and unchanged
+ * pixels stay, which DU and A2 would not drive anyway. With a grey waveform
+ * it is not honoured. The client's image in the shadow is never
+ * thresholded, so a later grey update of the same pixels restores them.
  */
 VISIBLE_IF_KUNIT u32 rk3026_ebc_mxcfb_to_ebc_mode(u32 waveform_mode,
-						  u32 update_mode)
+						  u32 update_mode, u32 flags,
+						  bool *auto_mode)
 {
 	bool full = update_mode == MXCFB_UPDATE_MODE_FULL;
 
+	*auto_mode = false;
+
 	switch (waveform_mode) {
+	case MXCFB_WAVEFORM_MODE_AUTO:
+		if (flags & EPDC_FLAG_FORCE_MONOCHROME)
+			return EBC_MODE_BLACK_WHITE;
+		*auto_mode = !full;
+		return full ? EBC_MODE_FULL : EBC_MODE_PART;
 	case MXCFB_WAVEFORM_MODE_INIT:
 		return EBC_MODE_RESET;
 	case MXCFB_WAVEFORM_MODE_DU:
@@ -86,38 +110,49 @@ VISIBLE_IF_KUNIT u32 rk3026_ebc_mxcfb_to_ebc_mode(u32 waveform_mode,
 		return EBC_MODE_PART;
 	case MXCFB_WAVEFORM_MODE_GC16:
 	case MXCFB_WAVEFORM_MODE_REAGL:
-	case MXCFB_WAVEFORM_MODE_AUTO:
 	default:
 		return full ? EBC_MODE_FULL : EBC_MODE_PART;
 	}
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_mxcfb_to_ebc_mode);
 
-static int mxcfb_send_update(struct rk3026_ebc *ebc, struct fb_info *info,
-			     unsigned long arg)
+/*
+ * One MXCFB_SEND_UPDATE request, already copied in: the region clamped to
+ * the panel, the waveform and the flags mapped
+ * (rk3026_ebc_mxcfb_to_ebc_mode()), and, in one @image_lock section, the
+ * client's pixels converted from @src, its framebuffer with @pitch bytes
+ * per row, and the update queued.
+ *
+ * Returns 0, -EINVAL if nothing of the region is on the panel, or -EBUSY
+ * with the CRTC off.
+ */
+VISIBLE_IF_KUNIT int rk3026_ebc_mxcfb_send(struct rk3026_ebc *ebc,
+					   const void *src, unsigned int pitch,
+					   const struct mxcfb_update_data *req)
 {
 	struct rk3026_ebc_update upd;
-	struct mxcfb_update_data req;
 	struct drm_rect clip;
+	bool auto_mode;
+	u32 mode;
 
-	if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
-		return -EFAULT;
-
-	clip.x1 = min_t(u32, req.update_region.left, ebc->width);
-	clip.y1 = min_t(u32, req.update_region.top, ebc->height);
-	clip.x2 = min_t(u32, clip.x1 + req.update_region.width, ebc->width);
-	clip.y2 = min_t(u32, clip.y1 + req.update_region.height, ebc->height);
+	clip.x1 = min_t(u32, req->update_region.left, ebc->width);
+	clip.y1 = min_t(u32, req->update_region.top, ebc->height);
+	clip.x2 = min_t(u32, clip.x1 + req->update_region.width, ebc->width);
+	clip.y2 = min_t(u32, clip.y1 + req->update_region.height, ebc->height);
 	if (clip.x1 >= clip.x2 || clip.y1 >= clip.y2)
 		return -EINVAL;
 
+	mode = rk3026_ebc_mxcfb_to_ebc_mode(req->waveform_mode,
+					    req->update_mode, req->flags,
+					    &auto_mode);
 	upd = (struct rk3026_ebc_update) {
 		.clip		= clip,
-		.mode		= rk3026_ebc_mxcfb_to_ebc_mode(req.waveform_mode,
-							       req.update_mode),
-		.marker		= req.update_marker,
-		.temp		= req.temp,
-		.temp_valid	= req.temp != MXCFB_TEMP_USE_AMBIENT &&
-				  req.temp > -128 && req.temp < 128,
+		.mode		= mode,
+		.auto_mode	= auto_mode,
+		.marker		= req->update_marker,
+		.temp		= req->temp,
+		.temp_valid	= req->temp != MXCFB_TEMP_USE_AMBIENT &&
+				  req->temp > -128 && req->temp < 128,
 		.source		= EBC_SOURCE_MXCFB,
 	};
 
@@ -148,11 +183,23 @@ static int mxcfb_send_update(struct rk3026_ebc *ebc, struct fb_info *info,
 
 	/* A RESET discards the pixels: rk3026_ebc_add_update() whitens them. */
 	if (upd.mode != EBC_MODE_RESET)
-		rk3026_ebc_blit_xrgb8888(ebc, info->screen_buffer,
-					 info->fix.line_length, &clip);
+		rk3026_ebc_blit_xrgb8888(ebc, src, pitch, &clip);
 	rk3026_ebc_add_update(ebc, &upd);
 	mutex_unlock(&ebc->image_lock);
 	return 0;
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_mxcfb_send);
+
+static int mxcfb_send_update(struct rk3026_ebc *ebc, struct fb_info *info,
+			     unsigned long arg)
+{
+	struct mxcfb_update_data req;
+
+	if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
+		return -EFAULT;
+
+	return rk3026_ebc_mxcfb_send(ebc, info->screen_buffer,
+				     info->fix.line_length, &req);
 }
 
 /*

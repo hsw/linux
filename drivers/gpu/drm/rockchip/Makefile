@@ -26,6 +26,9 @@ rk3026-ebc-y := rk3026_ebc.o rk3026_ebc_blit.o rk3026_ebc_core.o \
 		rk3026_ebc_waveform.o
 rk3026-ebc-$(CONFIG_DRM_RK3026_EBC_MXCFB) += rk3026_ebc_mxcfb.o
 rk3026-ebc-$(CONFIG_DEBUG_FS) += rk3026_ebc_debugfs.o
+rk3026-ebc-$(CONFIG_DRM_RK3026_EBC_NEON) += rk3026_ebc_blit_neon.o
+CFLAGS_rk3026_ebc_blit_neon.o += $(CC_FLAGS_FPU)
+CFLAGS_REMOVE_rk3026_ebc_blit_neon.o += $(CC_FLAGS_NO_FPU)
 
 obj-$(CONFIG_DRM_RK3026_EBC) += rk3026-ebc.o
 tests/rk3026_ebc_kunit_test-y := tests/rk3026_ebc_kunit.o \

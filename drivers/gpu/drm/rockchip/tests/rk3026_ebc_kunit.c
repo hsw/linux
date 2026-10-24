@@ -4,7 +4,7 @@
  * the waveform container bounds (rk3026_ebc_waveform.c), the mxcfb waveform
  * map (rk3026_ebc_mxcfb.c), the refresh thread's glue (rk3026_ebc.c), and
  * the snapshot and the blit against the per-pixel references of
- * rk3026_ebc_kunit_ref.c.
+ * rk3026_ebc_kunit_ref.c, and the NEON blit against the scalar one.
  */
 
 #include <kunit/device.h>
@@ -28,7 +28,13 @@
 #include <drm/drm_framebuffer.h>
 #include <drm/drm_plane.h>
 
+#if IS_ENABLED(CONFIG_DRM_RK3026_EBC_NEON)
+#include <asm/neon.h>
+#include <asm/simd.h>
+#endif
+
 #include "../rk3026_ebc.h"
+#include "../rk3026_ebc_blit_neon.h"
 #include "../rk3026_ebc_mxcfb.h"
 #include "rk3026_ebc_kunit_ref.h"
 
@@ -4391,19 +4397,20 @@ typedef void t_rows_fn(u8 *dst, const void *src, unsigned int src_pitch,
 		       int x1, int x2, int y1, int y2, unsigned int width);
 
 /*
- * @rows and the reference rows on @x1..@x2 (even), @y1..@y2 of @f write the
- * same bytes over the same junk, guards included. False after a difference.
+ * @rows and the reference rows @ref_rows on @x1..@x2 (even), @y1..@y2 of
+ * @f write the same bytes over the same junk, guards included. False after
+ * a difference.
  */
 static bool t_rows_vs_ref(struct kunit *test, const struct t_fix *f,
-			  t_rows_fn *rows, u8 *out, u8 *ref, const u8 *src,
-			  unsigned int pitch, int x1, int x2, int y1, int y2,
-			  struct rnd_state *rs)
+			  t_rows_fn *rows, t_rows_fn *ref_rows, u8 *out,
+			  u8 *ref, const u8 *src, unsigned int pitch, int x1,
+			  int x2, int y1, int y2, struct rnd_state *rs)
 {
 	int diff;
 
 	prandom_bytes_state(rs, ref, t_fix_size(f));
 	memcpy(out, ref, t_fix_size(f));
-	rk3026_ebc_ref_blit_rows(ref, src, pitch, x1, x2, y1, y2, f->w);
+	ref_rows(ref, src, pitch, x1, x2, y1, y2, f->w);
 	rows(out, src, pitch, x1, x2, y1, y2, f->w);
 	diff = t_fix_diff(f, ref, out);
 	if (diff == INT_MAX)
@@ -4414,13 +4421,14 @@ static bool t_rows_vs_ref(struct kunit *test, const struct t_fix *f,
 }
 
 /*
- * @rows against the reference on one source and every non-empty clip of
+ * @rows against @ref_rows on one source and every non-empty clip of
  * @clips, widened and clamped as rk3026_ebc_blit_xrgb8888() does.
  */
 static bool t_rows_clips(struct kunit *test, const struct t_fix *f,
-			 t_rows_fn *rows, u8 *out, u8 *ref, const u8 *src,
-			 unsigned int pitch, const struct drm_rect *clips,
-			 int n, struct rnd_state *rs)
+			 t_rows_fn *rows, t_rows_fn *ref_rows, u8 *out,
+			 u8 *ref, const u8 *src, unsigned int pitch,
+			 const struct drm_rect *clips, int n,
+			 struct rnd_state *rs)
 {
 	int c;
 
@@ -4429,18 +4437,19 @@ static bool t_rows_clips(struct kunit *test, const struct t_fix *f,
 
 		if (!t_widen(f, &clips[c], &w))
 			continue;
-		if (!t_rows_vs_ref(test, f, rows, out, ref, src, pitch,
-				   w.x1, w.x2, w.y1, w.y2, rs))
+		if (!t_rows_vs_ref(test, f, rows, ref_rows, out, ref, src,
+				   pitch, w.x1, w.x2, w.y1, w.y2, rs))
 			return false;
 	}
 	return true;
 }
 
 /*
- * @rows against the reference on every fixture, source set, dense and
- * padded source pitch, and clip.
+ * @rows against @ref_rows on every fixture, source set, dense and padded
+ * source pitch, and clip.
  */
-static void t_rows_sets(struct kunit *test, t_rows_fn *rows)
+static void t_rows_sets(struct kunit *test, t_rows_fn *rows,
+			t_rows_fn *ref_rows)
 {
 	unsigned int fi, pad, kind;
 	u32 seed;
@@ -4466,9 +4475,9 @@ static void t_rows_sets(struct kunit *test, t_rows_fn *rows)
 					t_src_fill(src, pitch, f, kind, seed);
 					prandom_seed_state(&rs, seed * 11 + kind);
 					n = t_fix_clips(f, &rs, clips);
-					if (t_rows_clips(test, f, rows, out, ref,
-							 src, pitch, clips, n,
-							 &rs))
+					if (t_rows_clips(test, f, rows, ref_rows,
+							 out, ref, src, pitch,
+							 clips, n, &rs))
 						continue;
 					kunit_info(test, "source %u seed %u\n",
 						   kind, seed);
@@ -4483,9 +4492,10 @@ static void t_rows_sets(struct kunit *test, t_rows_fn *rows)
  * Every alignment of a row: every even start 0..30 and every even length
  * 2..80, so every way a row splits into blocks and a tail for blocks of
  * up to 16 pixels, on random colours, white and black, each with a random
- * X byte.
+ * X byte; @rows against @ref_rows.
  */
-static void t_rows_tails(struct kunit *test, t_rows_fn *rows)
+static void t_rows_tails(struct kunit *test, t_rows_fn *rows,
+			 t_rows_fn *ref_rows)
 {
 	static const struct t_fix f = { "112x3", 112, 3 };
 	unsigned int pitch = f.w * 4;
@@ -4506,8 +4516,9 @@ static void t_rows_tails(struct kunit *test, t_rows_fn *rows)
 	}
 	for (x1 = 0; x1 <= 30; x1 += 2) {
 		for (len = 2; len <= 80; len += 2) {
-			if (t_rows_vs_ref(test, &f, rows, out, ref, src, pitch,
-					  x1, x1 + len, 0, f.h, &rs))
+			if (t_rows_vs_ref(test, &f, rows, ref_rows, out, ref,
+					  src, pitch, x1, x1 + len, 0, f.h,
+					  &rs))
 				continue;
 			kunit_info(test, "start %d length %d\n", x1, len);
 			return;
@@ -4518,13 +4529,112 @@ static void t_rows_tails(struct kunit *test, t_rows_fn *rows)
 /* rk3026_ebc_blit_rows() writes the bytes of the per-pixel reference. */
 static void ebc_test_blit_rows(struct kunit *test)
 {
-	t_rows_sets(test, rk3026_ebc_blit_rows);
+	t_rows_sets(test, rk3026_ebc_blit_rows, rk3026_ebc_ref_blit_rows);
 }
 
 /* The 4-px stores and the 2-px tail from every start. */
 static void ebc_test_blit_rows_tails(struct kunit *test)
 {
-	t_rows_tails(test, rk3026_ebc_blit_rows);
+	t_rows_tails(test, rk3026_ebc_blit_rows, rk3026_ebc_ref_blit_rows);
+}
+
+/*
+ * Whether the NEON rows can be compared here: built in
+ * (DRM_RK3026_EBC_NEON) and a CPU with NEON, in a thread where
+ * may_use_simd() holds. Else the case is skipped, so the run with the NEON
+ * options of .kunitconfig must show no skip.
+ */
+static bool t_neon_ready(struct kunit *test)
+{
+#if IS_ENABLED(CONFIG_DRM_RK3026_EBC_NEON)
+	if (!cpu_has_neon())
+		kunit_skip(test, "the CPU has no NEON");
+	KUNIT_ASSERT_TRUE_MSG(test, may_use_simd(),
+			      "may_use_simd() false in a test thread");
+	return true;
+#else
+	kunit_skip(test, "built without CONFIG_DRM_RK3026_EBC_NEON");
+	return false;
+#endif
+}
+
+#if IS_ENABLED(CONFIG_DRM_RK3026_EBC_NEON)
+/* rk3026_ebc_blit_rows_neon() in the NEON section it needs. */
+static void t_rows_neon(u8 *dst, const void *src, unsigned int src_pitch,
+			int x1, int x2, int y1, int y2, unsigned int width)
+{
+	scoped_ksimd()
+		rk3026_ebc_blit_rows_neon(dst, src, src_pitch, x1, x2, y1, y2,
+					  width);
+}
+
+/*
+ * rk3026_ebc_blit_rows_neon() writes the bytes of rk3026_ebc_blit_rows():
+ * every fixture (1448 px leave an 8-px tail), source set, pitch and clip.
+ */
+static void ebc_test_blit_neon_rows(struct kunit *test)
+{
+	if (!t_neon_ready(test))
+		return;
+	t_rows_sets(test, t_rows_neon, rk3026_ebc_blit_rows);
+}
+
+/* The 16-px blocks and every tail of 0 to 14 px after 0 to 5 of them. */
+static void ebc_test_blit_neon_tails(struct kunit *test)
+{
+	if (!t_neon_ready(test))
+		return;
+	t_rows_tails(test, t_rows_neon, rk3026_ebc_blit_rows);
+}
+#else
+/* No NEON rows: a skip. */
+static void ebc_test_blit_neon_rows(struct kunit *test)
+{
+	t_neon_ready(test);
+}
+
+static void ebc_test_blit_neon_tails(struct kunit *test)
+{
+	t_neon_ready(test);
+}
+#endif
+
+/*
+ * rk3026_ebc_blit_convert() writes the bytes of rk3026_ebc_blit_rows() on
+ * any kernel: with NEON in bands of 64 rows, so on row ranges that start
+ * and end inside a band and on its edges, and with the scalar rows for a
+ * clip narrower than 16 px. With the NEON rows built in, the NEON path
+ * must be able to run here, as for the NEON cases; without them the case
+ * only shows that the dispatch reaches the scalar rows.
+ */
+static void ebc_test_blit_convert(struct kunit *test)
+{
+	static const struct t_fix f = { "48x200", 48, 200 };
+	static const struct {
+		int x1, x2, y1, y2;
+	} r[] = {
+		{ 0, 48, 0, 200 }, { 2, 46, 1, 130 }, { 0, 48, 63, 65 },
+		{ 4, 38, 5, 69 }, { 0, 48, 0, 64 }, { 0, 48, 0, 65 },
+		{ 0, 48, 64, 128 }, { 16, 32, 199, 200 }, { 0, 16, 0, 200 },
+		{ 2, 16, 0, 200 }, { 6, 8, 60, 70 },
+	};
+	unsigned int pitch = f.w * 4;
+	u8 *out = t_fix_img(test, &f);
+	u8 *ref = t_fix_img(test, &f);
+	u8 *src = kunit_kmalloc(test, (size_t)pitch * f.h, GFP_KERNEL);
+	struct rnd_state rs;
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, src);
+	if (IS_ENABLED(CONFIG_DRM_RK3026_EBC_NEON) && !t_neon_ready(test))
+		return;
+	t_src_fill(src, pitch, &f, T_SRC_RANDOM, 77);
+	prandom_seed_state(&rs, 7700);
+	for (i = 0; i < ARRAY_SIZE(r); i++)
+		if (!t_rows_vs_ref(test, &f, rk3026_ebc_blit_convert,
+				   rk3026_ebc_blit_rows, out, ref, src, pitch,
+				   r[i].x1, r[i].x2, r[i].y1, r[i].y2, &rs))
+			return;
 }
 
 static struct kunit_case rk3026_ebc_conv_test_cases[] = {
@@ -4536,6 +4646,9 @@ static struct kunit_case rk3026_ebc_conv_test_cases[] = {
 	KUNIT_CASE(ebc_test_ref_blit),
 	KUNIT_CASE(ebc_test_blit_rows),
 	KUNIT_CASE(ebc_test_blit_rows_tails),
+	KUNIT_CASE(ebc_test_blit_neon_rows),
+	KUNIT_CASE(ebc_test_blit_neon_tails),
+	KUNIT_CASE(ebc_test_blit_convert),
 	{}
 };
 

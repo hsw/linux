@@ -98,22 +98,25 @@ static void ebc_box_union(struct drm_rect *dst, const struct drm_rect *src)
 }
 
 /*
- * Merge a box, a mode and the full-class flag into @set: the bounding box,
- * the stronger mode, either flag. An @empty set takes the box and the mode
+ * Merge the box, the mode and the flags of @src into @set: the bounding box,
+ * the stronger mode, either full-class or plane flag, and @auto_ok only if
+ * both have it. An @empty set takes the box, the mode and @auto_ok of @src
  * as they are.
  */
 static void ebc_set_merge(struct rk3026_ebc_set *set, bool empty,
-			  const struct drm_rect *box, u32 mode,
-			  bool has_mxcfb_full)
+			  const struct rk3026_ebc_set *src)
 {
 	if (empty) {
-		set->box = *box;
-		set->mode = mode;
+		set->box = src->box;
+		set->mode = src->mode;
+		set->auto_ok = src->auto_ok;
 	} else {
-		ebc_box_union(&set->box, box);
-		set->mode = ebc_mode_max(set->mode, mode);
+		ebc_box_union(&set->box, &src->box);
+		set->mode = ebc_mode_max(set->mode, src->mode);
+		set->auto_ok &= src->auto_ok;
 	}
-	set->has_mxcfb_full |= has_mxcfb_full;
+	set->has_mxcfb_full |= src->has_mxcfb_full;
+	set->has_plane |= src->has_plane;
 }
 
 static void ebc_set_add(struct rk3026_ebc_set *set,
@@ -125,10 +128,17 @@ static void ebc_set_add(struct rk3026_ebc_set *set,
 	 * skip must not take it away; fbdev and plane commits arrive twice and
 	 * still skip.
 	 */
-	bool full = upd->source == EBC_SOURCE_MXCFB &&
-		    rk3026_ebc_dsp_ctrl_mode(upd->mode) == DSP_DISPLAY_MODE;
+	const struct rk3026_ebc_set one = {
+		.box		= upd->clip,
+		.mode		= upd->mode,
+		.has_mxcfb_full	= upd->source == EBC_SOURCE_MXCFB &&
+				  rk3026_ebc_dsp_ctrl_mode(upd->mode) ==
+				  DSP_DISPLAY_MODE,
+		.auto_ok	= upd->auto_mode,
+		.has_plane	= upd->source == EBC_SOURCE_PLANE,
+	};
 
-	ebc_set_merge(set, !set->merged, &upd->clip, upd->mode, full);
+	ebc_set_merge(set, !set->merged, &one);
 	if (upd->temp_valid) {
 		set->temp = upd->temp;
 		set->temp_valid = true;
@@ -187,7 +197,8 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_pending_add);
  * @p: pending state
  * @part: returns the part
  *
- * @pre comes first, with the carry merged in. Then the RESET alone, after
+ * @pre comes first, with the carry merged in; a carry clears @auto_ok, so
+ * what it carries is drawn in its plain mode. Then the RESET alone, after
  * which @post becomes @pre: everything left was queued after the RESET.
  *
  * Returns false, with @part cleared, if nothing is pending.
@@ -204,8 +215,7 @@ bool rk3026_ebc_pending_take(struct rk3026_ebc_pending *p,
 		*part = p->pre;
 		memset(&p->pre, 0, sizeof(p->pre));
 		if (p->carry.merged) {
-			ebc_set_merge(part, false, &p->carry.box, p->carry.mode,
-				      p->carry.has_mxcfb_full);
+			ebc_set_merge(part, false, &p->carry);
 			memset(&p->carry, 0, sizeof(p->carry));
 		}
 		return true;
@@ -413,10 +423,55 @@ u32 rk3026_ebc_scan_mode(const struct rk3026_ebc_set *part, bool repaired)
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_scan_mode);
 
-static void ebc_carry(struct rk3026_ebc_pending *p, const struct drm_rect *box,
-		      u32 mode, bool has_mxcfb_full)
+/**
+ * rk3026_ebc_resolve_mode - the mode the content picks for a part
+ * @part: the part
+ * @scan_mode: its scan mode (rk3026_ebc_scan_mode()), as the snapshot
+ *	returned it
+ * @two_level: the snapshot's two-level result (rk3026_ebc_build_snapshot())
+ * @repair_due: a repair RESET runs before it
+ * @reason: returns why the part is driven in the returned mode
+ *
+ * Only a part made of auto updates alone (@part->auto_ok) is the content's
+ * to decide: if some pixel changes and every changed pixel becomes black or
+ * white, it is driven in DU, which moves exactly those pixels and leaves the
+ * rest of the glass alone. The snapshot built for @scan_mode stands as it
+ * is: no changed pixel needs the two-level threshold. Otherwise it keeps
+ * @scan_mode: FULL for a plane part (never PART, which under-saturates a
+ * full black/white transition), the client's default for the others.
+ *
+ * A part that has a mode of its own keeps @scan_mode, and so does one
+ * behind a repair: the glass is white then outside the box, and only a
+ * 16-level scan draws the old greys back.
+ */
+u32 rk3026_ebc_resolve_mode(const struct rk3026_ebc_set *part, u32 scan_mode,
+			    bool two_level, bool repair_due,
+			    enum rk3026_ebc_reason *reason)
 {
-	ebc_set_merge(&p->carry, !p->carry.merged, box, mode, has_mxcfb_full);
+	*reason = EBC_REASON_EXPLICIT;
+	if (repair_due) {
+		if (scan_mode != part->mode)
+			*reason = EBC_REASON_REPAIR_FLOOR;
+		return scan_mode;
+	}
+	if (part->auto_ok && two_level) {
+		*reason = EBC_REASON_AUTO_DU;
+		return EBC_MODE_BLACK_WHITE;
+	}
+	return scan_mode;
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_resolve_mode);
+
+/*
+ * A part not driven is carried in its plain mode: the carry's @auto_ok is
+ * cleared, which is conservative (rk3026_ebc_resolve_mode() keeps the mode
+ * as it is).
+ */
+static void ebc_carry(struct rk3026_ebc_pending *p,
+		      const struct rk3026_ebc_set *part)
+{
+	ebc_set_merge(&p->carry, !p->carry.merged, part);
+	p->carry.auto_ok = false;
 	p->carry.merged = 1;
 }
 
@@ -458,14 +513,14 @@ bool rk3026_ebc_scan_finish(struct rk3026_ebc_shadows *sh,
 {
 	size_t size = (size_t)sh->pitch * sh->height;
 	bool reset = part->mode == EBC_MODE_RESET;
-	struct drm_rect panel;
+	struct rk3026_ebc_set whole;
 
 	/* Read without the lock by the waits on it. */
 	WRITE_ONCE(p->done_seq, part->seq);
 
 	if (repair == EBC_REPAIR_FAILED && !reset) {
 		sh->prev_unknown = true;
-		ebc_carry(p, &part->box, part->mode, part->has_mxcfb_full);
+		ebc_carry(p, part);
 		return false;
 	}
 
@@ -489,13 +544,13 @@ bool rk3026_ebc_scan_finish(struct rk3026_ebc_shadows *sh,
 			return false;
 		}
 		if (repair != EBC_REPAIR_DONE) {
-			ebc_carry(p, &part->box, part->mode,
-				  part->has_mxcfb_full);
+			ebc_carry(p, part);
 			return false;
 		}
-		panel = DRM_RECT_INIT(0, 0, sh->pitch * 2, sh->height);
-		ebc_carry(p, &panel, ebc_mode_max(part->mode, EBC_MODE_PART),
-			  part->has_mxcfb_full);
+		whole = *part;
+		whole.box = DRM_RECT_INIT(0, 0, sh->pitch * 2, sh->height);
+		whole.mode = ebc_mode_max(part->mode, EBC_MODE_PART);
+		ebc_carry(p, &whole);
 		memset(sh->prev, 0xff, size);
 		sh->prev_unknown = false;
 		return true;

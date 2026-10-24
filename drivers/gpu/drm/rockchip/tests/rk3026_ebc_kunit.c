@@ -8,6 +8,7 @@
  */
 
 #include <kunit/device.h>
+#include <kunit/static_stub.h>
 #include <kunit/test.h>
 
 #include <linux/err.h>
@@ -1335,12 +1336,14 @@ struct t_resolve {
 	bool			two_level;
 	u32			mode;
 	enum rk3026_ebc_reason	reason;
+	bool			cleanup;
 };
 
 #define T_DU_MODE	EBC_MODE_BLACK_WHITE
 #define T_EXPL		EBC_REASON_EXPLICIT
 #define T_AUTO_DU	EBC_REASON_AUTO_DU
 #define T_FLOOR		EBC_REASON_REPAIR_FLOOR
+#define T_CLEANUP	EBC_REASON_CLEANUP
 
 static const struct t_resolve t_resolve_cases[] = {
 	{ "plane two-level", T_PLANE, false, true, T_DU_MODE, T_AUTO_DU },
@@ -1377,6 +1380,26 @@ static const struct t_resolve t_resolve_cases[] = {
 	{ "DU two-level", T_DU, false, true, T_DU_MODE, T_EXPL },
 	{ "DU repair", T_DU, true, true, EBC_MODE_PART, T_FLOOR },
 	{ "RESET", T_RESET, false, true, EBC_MODE_RESET, T_EXPL },
+	/* The DU budget is spent: a part with a plane update keeps FULL. */
+	{ "plane two-level cleanup", T_PLANE, false, true, EBC_MODE_FULL,
+	  T_CLEANUP, true },
+	{ "plane grey cleanup", T_PLANE, false, false, EBC_MODE_FULL, T_EXPL,
+	  true },
+	{ "plane repair two-level cleanup", T_PLANE, true, true,
+	  EBC_MODE_FULL, T_EXPL, true },
+	{ "plane and auto part two-level cleanup", T_PLANE_AUTO_PART, false,
+	  true, EBC_MODE_FULL, T_CLEANUP, true },
+	{ "plane and DU two-level cleanup", T_PLANE_DU, false, true,
+	  EBC_MODE_FULL, T_EXPL, true },
+	/* An mxcfb client runs its own fulls: its auto parts stay DU. */
+	{ "auto part two-level cleanup", T_AUTO_PART, false, true, T_DU_MODE,
+	  T_AUTO_DU, true },
+	{ "auto part grey cleanup", T_AUTO_PART, false, false, EBC_MODE_PART,
+	  T_EXPL, true },
+	{ "DU two-level cleanup", T_DU, false, true, T_DU_MODE, T_EXPL, true },
+	{ "mxcfb full cleanup", T_MXCFB_FULL, false, true, EBC_MODE_FULL,
+	  T_EXPL, true },
+	{ "RESET cleanup", T_RESET, false, true, EBC_MODE_RESET, T_EXPL, true },
 };
 
 KUNIT_ARRAY_PARAM_DESC(t_resolve, t_resolve_cases, desc);
@@ -1384,7 +1407,7 @@ KUNIT_ARRAY_PARAM_DESC(t_resolve, t_resolve_cases, desc);
 static void ebc_test_resolve_mode(struct kunit *test)
 {
 	const struct t_resolve *c = test->param_value;
-	enum rk3026_ebc_reason reason = EBC_REASON_REPAIR_FLOOR + 1;
+	enum rk3026_ebc_reason reason = EBC_REASON_CLEANUP + 1;
 	struct rk3026_ebc_set part;
 	u32 scan_mode;
 
@@ -1392,7 +1415,7 @@ static void ebc_test_resolve_mode(struct kunit *test)
 	scan_mode = rk3026_ebc_scan_mode(&part, c->repair);
 	KUNIT_EXPECT_EQ(test,
 			rk3026_ebc_resolve_mode(&part, scan_mode, c->two_level,
-						c->repair, &reason),
+						c->repair, c->cleanup, &reason),
 			c->mode);
 	KUNIT_EXPECT_EQ(test, reason, c->reason);
 }
@@ -1531,6 +1554,147 @@ static void ebc_test_pending_auto_ok_carry(struct kunit *test)
 	}
 }
 
+/* --- the DU cleanup budget --- */
+
+static const enum rk3026_ebc_outcome t_waveform_outcomes[] = {
+	EBC_OUTCOME_DRIVEN, EBC_OUTCOME_TIMEOUT, EBC_OUTCOME_ABANDONED,
+};
+
+static const enum rk3026_ebc_outcome t_undriven_outcomes[] = {
+	EBC_OUTCOME_NONE, EBC_OUTCOME_SKIPPED, EBC_OUTCOME_CRTC_OFF,
+	EBC_OUTCOME_NO_WAVEFORM, EBC_OUTCOME_NO_RAILS, EBC_OUTCOME_NO_LUT,
+};
+
+static const enum rk3026_ebc_repair t_repairs[] = {
+	EBC_REPAIR_NONE, EBC_REPAIR_DONE, EBC_REPAIR_FAILED,
+};
+
+static u32 t_du(u32 area, const struct rk3026_ebc_set *part, u32 mode,
+		u32 changed_px, enum rk3026_ebc_outcome outcome,
+		enum rk3026_ebc_repair repair)
+{
+	return rk3026_ebc_du_account(area, part, mode, changed_px, outcome,
+				     repair);
+}
+
+/* A driven plane DU part grows the budget, a FULL of anyone's clears it. */
+static void ebc_test_du_account_driven(struct kunit *test)
+{
+	struct rk3026_ebc_set plane, mxcfb;
+	unsigned int i, j;
+
+	t_kind_part(T_PLANE, &plane);
+	t_kind_part(T_AUTO_PART, &mxcfb);
+	KUNIT_ASSERT_TRUE(test, plane.has_plane);
+	KUNIT_ASSERT_FALSE(test, mxcfb.has_plane);
+
+	for (i = 0; i < ARRAY_SIZE(t_waveform_outcomes); i++) {
+		enum rk3026_ebc_outcome o = t_waveform_outcomes[i];
+
+		/*
+		 * No repair, or one that ran to the end and so cleared the
+		 * glass, and the budget with it, before the part.
+		 */
+		for (j = 0; j < 2; j++) {
+			enum rk3026_ebc_repair r = t_repairs[j];
+			u32 left = r == EBC_REPAIR_DONE ? 0 : 100;
+
+			KUNIT_EXPECT_EQ(test,
+					t_du(100, &plane, T_DU_MODE, 28, o, r),
+					left + 28);
+			KUNIT_EXPECT_EQ(test,
+					t_du(0, &plane, T_DU_MODE, 0, o, r), 0);
+			/* An mxcfb DU send never counts. */
+			KUNIT_EXPECT_EQ(test,
+					t_du(100, &mxcfb, T_DU_MODE, 28, o, r),
+					left);
+			KUNIT_EXPECT_EQ(test,
+					t_du(100, &plane, EBC_MODE_FULL, 28, o,
+					     r), 0);
+			KUNIT_EXPECT_EQ(test,
+					t_du(100, &mxcfb, EBC_MODE_FULL, 28, o,
+					     r), 0);
+			/*
+			 * Other modes neither count nor clear; GL16 full
+			 * (OED_PART) is full class, but leaves white over
+			 * white alone, so it clears no ghost.
+			 */
+			KUNIT_EXPECT_EQ(test,
+					t_du(100, &plane, EBC_MODE_PART, 28, o,
+					     r), left);
+			KUNIT_EXPECT_EQ(test,
+					t_du(100, &plane, EBC_MODE_A2, 28, o,
+					     r), left);
+			KUNIT_EXPECT_EQ(test,
+					t_du(100, &plane, EBC_MODE_OED_PART, 28,
+					     o, r), left);
+		}
+	}
+
+	/* Saturating, never wrapping round to a fresh budget. */
+	KUNIT_EXPECT_EQ(test,
+			t_du(U32_MAX - 5, &plane, T_DU_MODE, 10,
+			     EBC_OUTCOME_DRIVEN, EBC_REPAIR_NONE), U32_MAX);
+	KUNIT_EXPECT_EQ(test,
+			t_du(U32_MAX - 10, &plane, T_DU_MODE, 10,
+			     EBC_OUTCOME_DRIVEN, EBC_REPAIR_NONE), U32_MAX);
+	KUNIT_EXPECT_EQ(test,
+			t_du(U32_MAX, &plane, T_DU_MODE, 1,
+			     EBC_OUTCOME_DRIVEN, EBC_REPAIR_NONE), U32_MAX);
+}
+
+/*
+ * Nothing driven, nothing counted: a skip, a drop, a carry (no rails, LUT or
+ * waveform) or a repair cut short leave the budget as it is, so a part that
+ * is carried counts once, when it is drawn. A repair that ran to its end
+ * whitened the glass before the part was carried: that clears it.
+ */
+static void ebc_test_du_account_undriven(struct kunit *test)
+{
+	static const u32 modes[] = { T_DU_MODE, EBC_MODE_FULL };
+	struct rk3026_ebc_set plane;
+	unsigned int i, j, k;
+
+	t_kind_part(T_PLANE, &plane);
+	for (i = 0; i < ARRAY_SIZE(t_undriven_outcomes); i++)
+		for (j = 0; j < ARRAY_SIZE(t_repairs); j++)
+			for (k = 0; k < ARRAY_SIZE(modes); k++)
+				KUNIT_EXPECT_EQ(test,
+						t_du(100, &plane, modes[k], 28,
+						     t_undriven_outcomes[i],
+						     t_repairs[j]),
+						t_repairs[j] == EBC_REPAIR_DONE ?
+						0 : 100);
+
+	for (i = 0; i < ARRAY_SIZE(t_waveform_outcomes); i++)
+		for (k = 0; k < ARRAY_SIZE(modes); k++)
+			KUNIT_EXPECT_EQ(test,
+					t_du(100, &plane, modes[k], 28,
+					     t_waveform_outcomes[i],
+					     EBC_REPAIR_FAILED), 100);
+}
+
+/* A RESET taken clears the budget, whatever became of it. */
+static void ebc_test_du_account_reset(struct kunit *test)
+{
+	struct rk3026_ebc_set reset;
+	unsigned int i, j;
+
+	t_kind_part(T_RESET, &reset);
+	for (j = 0; j < ARRAY_SIZE(t_repairs); j++) {
+		for (i = 0; i < ARRAY_SIZE(t_waveform_outcomes); i++)
+			KUNIT_EXPECT_EQ(test,
+					t_du(100, &reset, EBC_MODE_RESET, 0,
+					     t_waveform_outcomes[i],
+					     t_repairs[j]), 0);
+		for (i = 0; i < ARRAY_SIZE(t_undriven_outcomes); i++)
+			KUNIT_EXPECT_EQ(test,
+					t_du(100, &reset, EBC_MODE_RESET, 0,
+					     t_undriven_outcomes[i],
+					     t_repairs[j]), 0);
+	}
+}
+
 static struct kunit_case rk3026_ebc_core_test_cases[] = {
 	KUNIT_CASE(ebc_test_dsp_ctrl_mode),
 	KUNIT_CASE(ebc_test_rank_order),
@@ -1553,6 +1717,9 @@ static struct kunit_case rk3026_ebc_core_test_cases[] = {
 	KUNIT_CASE(ebc_test_pending_auto_ok),
 	KUNIT_CASE(ebc_test_pending_auto_ok_reset),
 	KUNIT_CASE(ebc_test_pending_auto_ok_carry),
+	KUNIT_CASE(ebc_test_du_account_driven),
+	KUNIT_CASE(ebc_test_du_account_undriven),
+	KUNIT_CASE(ebc_test_du_account_reset),
 	KUNIT_CASE(ebc_test_seq_barrier),
 	KUNIT_CASE(ebc_test_seq_reset_pending_twice),
 	KUNIT_CASE(ebc_test_seq_merged_markers),
@@ -2131,6 +2298,8 @@ static struct rk3026_ebc *t_ebc_alloc(struct kunit *test)
 	ebc->shadows.height = T_H;
 	ebc->prev_virt = t_img_alloc(test, 15);
 	ebc->crtc_on = true;
+	/* As probe sets it: one panel's area. */
+	ebc->du_cleanup_area = T_W * T_H;
 	return ebc;
 }
 
@@ -2600,6 +2769,221 @@ static void ebc_test_glue_a2_over_grey(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, ebc->pending.carry.auto_ok);
 }
 
+/*
+ * The DU budget spent: the black plane update over white that would be DU
+ * is FULL, reason cleanup. It stops at the missing LUT, so the budget stays
+ * as it was and the part is carried.
+ */
+static void ebc_test_glue_du_cleanup(struct kunit *test)
+{
+	struct rk3026_ebc *ebc = t_policy_ebc(test);
+	u32 *black = t_plane_fb(test, 0);
+	struct rk3026_ebc_last last;
+
+	ebc->du_area = ebc->du_cleanup_area;
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.asked_mode, EBC_MODE_FULL);
+	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_FULL);
+	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_CLEANUP);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_NO_LUT);
+	KUNIT_EXPECT_EQ(test, ebc->du_area, ebc->du_cleanup_area);
+	KUNIT_EXPECT_TRUE(test, ebc->pending.carry.merged);
+	KUNIT_EXPECT_EQ(test, ebc->pending.carry.mode, EBC_MODE_FULL);
+}
+
+/* A black plane update over white with @area spent of @limit: DU. */
+static void t_du_budget_left(struct kunit *test, u32 limit, u32 area)
+{
+	struct rk3026_ebc *ebc = t_policy_ebc(test);
+	u32 *black = t_plane_fb(test, 0);
+	struct rk3026_ebc_last last;
+
+	ebc->du_cleanup_area = limit;
+	ebc->du_area = area;
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_BLACK_WHITE);
+	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_AUTO_DU);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_NO_LUT);
+	/* Not driven: not counted. */
+	KUNIT_EXPECT_EQ(test, ebc->du_area, area);
+}
+
+/* One pixel short of the budget. */
+static void ebc_test_glue_du_budget_left(struct kunit *test)
+{
+	t_du_budget_left(test, T_W * T_H, T_W * T_H - 1);
+}
+
+/* No budget at all (debugfs du_cleanup_area 0): never a cleanup. */
+static void ebc_test_glue_du_budget_off(struct kunit *test)
+{
+	t_du_budget_left(test, 0, U32_MAX);
+}
+
+/*
+ * The fbdev duplicate: identical, skipped in its own mode before a cleanup
+ * is chosen, so the budget neither counts it nor clears.
+ */
+static void ebc_test_glue_du_skipped(struct kunit *test)
+{
+	struct rk3026_ebc *ebc = t_policy_ebc(test);
+	u32 *white = t_plane_fb(test, 0xffffff);
+	struct rk3026_ebc_last last;
+
+	ebc->du_area = ebc->du_cleanup_area;
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, white, T_W * 4));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_SKIPPED);
+	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_FULL);
+	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_EXPLICIT);
+	KUNIT_EXPECT_EQ(test, ebc->du_area, ebc->du_cleanup_area);
+}
+
+/* A RESET taken clears the budget, here one dropped with the CRTC off. */
+static void ebc_test_glue_du_reset(struct kunit *test)
+{
+	struct rk3026_ebc *ebc = t_policy_ebc(test);
+	struct rk3026_ebc_last last;
+
+	ebc->du_area = 50;
+	t_send(ebc, &t_panel, EBC_MODE_FULL, 0, EBC_SOURCE_MXCFB);
+	ebc->crtc_on = false;
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_CRTC_OFF);
+	KUNIT_EXPECT_EQ(test, ebc->du_area, 50);
+
+	t_send(ebc, &t_panel, EBC_MODE_RESET, 0, EBC_SOURCE_ENABLE);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_CRTC_OFF);
+	KUNIT_EXPECT_EQ(test, last.asked_mode, EBC_MODE_RESET);
+	KUNIT_EXPECT_EQ(test, ebc->du_area, 0);
+}
+
+/* The waveforms the static stub of rk3026_ebc_drive() was asked for. */
+struct t_drives {
+	unsigned int	n;
+	u32		mode[4];
+};
+
+/*
+ * rk3026_ebc_drive() without the controller: every frame driven, as the
+ * real one records it, and the mode noted in the test's struct t_drives.
+ */
+static int t_drive_ok(struct rk3026_ebc *ebc, const u8 *lut, u32 frames,
+		      u32 mode, u32 lut_mode, struct rk3026_ebc_last *last)
+{
+	struct t_drives *d = kunit_get_current_test()->priv;
+
+	if (d->n < ARRAY_SIZE(d->mode))
+		d->mode[d->n] = mode;
+	d->n++;
+	last->scans++;
+	last->lut_mode = lut_mode;
+	last->frames = frames;
+	last->driven = frames;
+	last->outcome = EBC_OUTCOME_DRIVEN;
+	WRITE_ONCE(ebc->shadows.prev_unknown, false);
+	return 0;
+}
+
+/*
+ * The policy fixture with rk3026_ebc_drive() stubbed by t_drive_ok() and,
+ * with @luts, a waveform that also has gray16 and gray2 LUTs: FULL, PART
+ * and DU parts are driven.
+ */
+static struct rk3026_ebc *t_driven_ebc(struct kunit *test, struct t_drives *d,
+				       bool luts)
+{
+	static const struct t_rkf_seg segs[] = {
+		{ T_RKF_RESET, 5 }, { T_RKF_GRAY16, 1 }, { T_RKF_GRAY2, 1 },
+	};
+	struct rk3026_ebc *ebc = t_policy_ebc(test);
+
+	if (luts)
+		ebc->waveform = t_rkf_wf(test, ebc->dev, segs,
+					 ARRAY_SIZE(segs), 0);
+	memset(d, 0, sizeof(*d));
+	test->priv = d;
+	kunit_activate_static_stub(test, rk3026_ebc_drive, t_drive_ok);
+	return ebc;
+}
+
+/*
+ * The budget follows driven parts with the counts of their own snapshots.
+ * A black plane update over the white glass is driven DU and adds every
+ * pixel of the panel, which spends the budget; the white one after it,
+ * two-level too, is driven FULL for the cleanup and clears it; then a
+ * black box of 4 x 2 pixels on white is driven DU and adds its 8 changed
+ * pixels (not the mode, not the panel's area).
+ */
+static void ebc_test_glue_du_driven(struct kunit *test)
+{
+	struct t_drives d;
+	struct rk3026_ebc *ebc = t_driven_ebc(test, &d, true);
+	u32 *black = t_plane_fb(test, 0);
+	u32 *white = t_plane_fb(test, 0xffffff);
+	u32 *box = t_plane_fb(test, 0xffffff);
+	struct rk3026_ebc_last last;
+	int x, y;
+
+	for (y = 2; y < 4; y++)
+		for (x = 4; x < 8; x++)
+			box[y * T_W + x] = 0;
+
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_BLACK_WHITE);
+	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_AUTO_DU);
+	KUNIT_EXPECT_EQ(test, ebc->du_area, T_W * T_H);
+	KUNIT_EXPECT_EQ(test, ebc->shadows.prev[0], 0);
+
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, white, T_W * 4));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_FULL);
+	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_CLEANUP);
+	KUNIT_EXPECT_EQ(test, ebc->du_area, 0);
+
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, box, T_W * 4));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_BLACK_WHITE);
+	KUNIT_EXPECT_EQ(test, ebc->du_area, 8);
+
+	KUNIT_EXPECT_EQ(test, d.n, 3);
+	KUNIT_EXPECT_EQ(test, d.mode[0], EBC_MODE_BLACK_WHITE);
+	KUNIT_EXPECT_EQ(test, d.mode[1], EBC_MODE_FULL);
+	KUNIT_EXPECT_EQ(test, d.mode[2], EBC_MODE_BLACK_WHITE);
+	KUNIT_EXPECT_EQ(test, ebc->stats.scans, 3);
+}
+
+/*
+ * A repair RESET that runs to its end whitens the glass: the budget is
+ * cleared even though the part after it is not driven (no gray16 LUT).
+ */
+static void ebc_test_glue_du_repaired(struct kunit *test)
+{
+	struct t_drives d;
+	struct rk3026_ebc *ebc = t_driven_ebc(test, &d, false);
+	u32 *black = t_plane_fb(test, 0);
+	struct rk3026_ebc_last last;
+
+	ebc->du_area = 50;
+	ebc->shadows.prev_unknown = true;
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_TRUE(test, last.repaired);
+	KUNIT_EXPECT_EQ(test, d.n, 1);
+	KUNIT_EXPECT_EQ(test, d.mode[0], EBC_MODE_RESET);
+	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_FULL);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_NO_LUT);
+	KUNIT_EXPECT_FALSE(test, ebc->shadows.prev_unknown);
+	KUNIT_EXPECT_EQ(test, ebc->du_area, 0);
+}
+
 static struct kunit_case rk3026_ebc_glue_test_cases[] = {
 	KUNIT_CASE(ebc_test_glue_add_update),
 	KUNIT_CASE(ebc_test_glue_crtc_off),
@@ -2615,6 +2999,13 @@ static struct kunit_case rk3026_ebc_glue_test_cases[] = {
 	KUNIT_CASE(ebc_test_glue_auto_skipped),
 	KUNIT_CASE(ebc_test_glue_explicit_full),
 	KUNIT_CASE(ebc_test_glue_a2_over_grey),
+	KUNIT_CASE(ebc_test_glue_du_cleanup),
+	KUNIT_CASE(ebc_test_glue_du_budget_left),
+	KUNIT_CASE(ebc_test_glue_du_budget_off),
+	KUNIT_CASE(ebc_test_glue_du_skipped),
+	KUNIT_CASE(ebc_test_glue_du_reset),
+	KUNIT_CASE(ebc_test_glue_du_driven),
+	KUNIT_CASE(ebc_test_glue_du_repaired),
 	{}
 };
 

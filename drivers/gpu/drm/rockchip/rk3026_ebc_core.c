@@ -11,6 +11,7 @@
 #include <linux/compiler.h>
 #include <linux/export.h>
 #include <linux/minmax.h>
+#include <linux/overflow.h>
 #include <linux/string.h>
 #include <linux/unaligned.h>
 
@@ -430,6 +431,7 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_scan_mode);
  *	returned it
  * @two_level: the snapshot's two-level result (rk3026_ebc_build_snapshot())
  * @repair_due: a repair RESET runs before it
+ * @cleanup_due: the DU cleanup budget is spent (rk3026_ebc_du_account())
  * @reason: returns why the part is driven in the returned mode
  *
  * Only a part made of auto updates alone (@part->auto_ok) is the content's
@@ -440,12 +442,17 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_scan_mode);
  * @scan_mode: FULL for a plane part (never PART, which under-saturates a
  * full black/white transition), the client's default for the others.
  *
+ * DU leaves the ghosts of what it draws over; once the plane parts' DU
+ * budget is spent (@cleanup_due), a two-level part with a plane update in
+ * it keeps @scan_mode, FULL, which clears the glass. A part of mxcfb sends
+ * alone still goes DU: such a client runs its own fulls.
+ *
  * A part that has a mode of its own keeps @scan_mode, and so does one
  * behind a repair: the glass is white then outside the box, and only a
  * 16-level scan draws the old greys back.
  */
 u32 rk3026_ebc_resolve_mode(const struct rk3026_ebc_set *part, u32 scan_mode,
-			    bool two_level, bool repair_due,
+			    bool two_level, bool repair_due, bool cleanup_due,
 			    enum rk3026_ebc_reason *reason)
 {
 	*reason = EBC_REASON_EXPLICIT;
@@ -454,13 +461,74 @@ u32 rk3026_ebc_resolve_mode(const struct rk3026_ebc_set *part, u32 scan_mode,
 			*reason = EBC_REASON_REPAIR_FLOOR;
 		return scan_mode;
 	}
-	if (part->auto_ok && two_level) {
-		*reason = EBC_REASON_AUTO_DU;
-		return EBC_MODE_BLACK_WHITE;
+	if (!part->auto_ok || !two_level)
+		return scan_mode;
+	if (cleanup_due && part->has_plane) {
+		*reason = EBC_REASON_CLEANUP;
+		return scan_mode;
 	}
-	return scan_mode;
+	*reason = EBC_REASON_AUTO_DU;
+	return EBC_MODE_BLACK_WHITE;
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_resolve_mode);
+
+/**
+ * rk3026_ebc_du_account - the DU cleanup budget after one part
+ * @du_area: the pixels plane parts changed in DU since the glass was cleared
+ * @part: the part, as rk3026_ebc_pending_take() gave it
+ * @mode: the mode it was driven in (force_mode included)
+ * @changed_px: the pixels its snapshot changed (rk3026_ebc_build_snapshot())
+ * @outcome: what became of it
+ * @repair: the repair RESET run before it, and how it ended
+ *
+ * The budget counts what the glass went through, so it changes only for a
+ * part whose waveform was entered (DRIVEN, TIMEOUT, ABANDONED), and for a
+ * RESET:
+ *
+ * - a DU part with a plane update in it adds @changed_px (saturating);
+ * - a FULL part clears it, whoever sent it: the controller scans the whole
+ *   frame, and GC16 drives every pixel, unchanged ones too;
+ * - a RESET part clears it whatever its outcome: one that was not driven
+ *   leaves the glass unknown, and the next draw repairs it first;
+ * - a repair RESET that ran to its end clears it too, whatever became of
+ *   the part after it: the glass is white.
+ *
+ * A part that was skipped, dropped or carried, or whose repair RESET was cut
+ * short, leaves it as it is, so a carried part counts once, when it is
+ * drawn. So does an mxcfb DU send: such a client runs its own fulls.
+ *
+ * Returns the new @du_area.
+ */
+u32 rk3026_ebc_du_account(u32 du_area, const struct rk3026_ebc_set *part,
+			  u32 mode, u32 changed_px,
+			  enum rk3026_ebc_outcome outcome,
+			  enum rk3026_ebc_repair repair)
+{
+	if (part->mode == EBC_MODE_RESET)
+		return 0;
+	if (repair == EBC_REPAIR_FAILED)
+		return du_area;
+	if (repair == EBC_REPAIR_DONE)
+		du_area = 0;
+
+	switch (outcome) {
+	case EBC_OUTCOME_DRIVEN:
+	case EBC_OUTCOME_TIMEOUT:
+	case EBC_OUTCOME_ABANDONED:
+		break;
+	default:
+		return du_area;
+	}
+
+	if (mode == EBC_MODE_FULL)
+		return 0;
+	if (mode != EBC_MODE_BLACK_WHITE || !part->has_plane)
+		return du_area;
+	if (check_add_overflow(du_area, changed_px, &du_area))
+		return U32_MAX;
+	return du_area;
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_du_account);
 
 /*
  * A part not driven is carried in its plain mode: the carry's @auto_ok is

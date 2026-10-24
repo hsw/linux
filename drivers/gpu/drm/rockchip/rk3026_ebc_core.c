@@ -12,6 +12,7 @@
 #include <linux/export.h>
 #include <linux/minmax.h>
 #include <linux/string.h>
+#include <linux/unaligned.h>
 
 #include <kunit/visibility.h>
 
@@ -218,18 +219,58 @@ bool rk3026_ebc_pending_take(struct rk3026_ebc_pending *p,
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_pending_take);
 
-/* A grey level as a two-level waveform can reach it: 0..7 black, 8..15 white. */
-static u8 ebc_level(u8 grey, bool two_level)
+/*
+ * Eight pixels of the snapshot at once: @p and @n are one little-endian
+ * word of prev and next, two pixels per byte, low nibble first.
+ *  - @changed has all four bits set in every nibble where @n differs from
+ *    @p: the OR of the nibble's bits lands in its bit 0, and the multiply
+ *    by 15 fills the nibble without a carry between nibbles;
+ *  - @thr is the two-level threshold of @n, 15 where bit 3 is set (8..15),
+ *    else 0; @tl (all ones for a two-level mode, else 0) picks it;
+ *  - a nibble of @p is grey when its four bits are not all equal; bit 3
+ *    would be compared with the next nibble up, so bits 0..2 are tested.
+ * @over_grey collects a grey of prev under a changed nibble, @moves the
+ * bits that change. A short tail goes through zero-extended: its upper
+ * nibbles are equal, so they neither change nor count.
+ */
+static __always_inline u32 ebc_snap_word(u32 p, u32 n, u32 tl,
+					 u32 *over_grey, u32 *moves)
 {
-	if (!two_level)
-		return grey;
-	return grey >= 8 ? 0xf : 0;
+	u32 d = p ^ n;
+	u32 changed = ((d | d >> 1 | d >> 2 | d >> 3) & 0x11111111) * 0xf;
+	u32 thr = ((n >> 3) & 0x11111111) * 0xf;
+	u32 v = (thr & tl) | (n & ~tl);
+	u32 out = (p & ~changed) | (v & changed);
+
+	*over_grey |= (p ^ (p >> 1)) & 0x77777777 & changed;
+	*moves |= out ^ p;
+	return out;
 }
 
-/* A level between black and white. */
-static bool ebc_grey(u8 level)
+/* ebc_snap_word() over the box rows: words of 8 pixels, then bytes. */
+static __always_inline void ebc_snap_rows(u8 *dst, const u8 *prev,
+					  const u8 *next, u32 pitch,
+					  const struct drm_rect *r, u32 tl,
+					  u32 *over_grey, u32 *moves)
 {
-	return level != 0 && level != 0xf;
+	int y;
+
+	for (y = r->y1; y < r->y2; y++) {
+		size_t off = (size_t)y * pitch + r->x1 / 2;
+		const u8 *p = prev + off, *n = next + off;
+		u8 *d = dst + off;
+		int nb = (r->x2 - r->x1) / 2;
+		u32 out;
+
+		for (; nb >= 4; nb -= 4, p += 4, n += 4, d += 4) {
+			out = ebc_snap_word(get_unaligned_le32(p),
+					    get_unaligned_le32(n), tl,
+					    over_grey, moves);
+			put_unaligned_le32(out, d);
+		}
+		for (; nb > 0; nb--, p++, n++, d++)
+			*d = ebc_snap_word(*p, *n, tl, over_grey, moves);
+	}
 }
 
 /**
@@ -240,15 +281,19 @@ static bool ebc_grey(u8 level)
  * @mode: the scan's mode (rk3026_ebc_scan_mode()); returns the mode that
  *	draws the snapshot
  *
- * A copy of @prev (@sh->prev, the image on the glass) with @next laid over
- * it inside @box, pixel by pixel, where @next differs from @prev. Outside
- * @box nothing moves, so a scan draws only what its updates covered. For a
+ * @prev (@sh->prev, the image on the glass) with @next laid over it inside
+ * @box, pixel by pixel, where @next differs from @prev. Outside @box
+ * nothing moves, so a scan draws only what its updates covered. For a
  * two-level mode (DU, A2) the laid-over pixels are thresholded to 0 or 15,
  * which is what the glass will show and so what @prev must hold afterwards.
  * Pixels where @next equals @prev keep @prev, so a grey the scan does not
  * change is never thresholded: not inside @box, and not on the even-pixel
  * widening of an odd @box edge (the images are packed two pixels per byte,
  * low nibble first, and blits are widened the same way).
+ *
+ * The box rows are worked eight pixels per 32-bit word (ebc_snap_word()),
+ * without a branch per pixel, and every byte of the box is written once;
+ * only what lies outside the box is copied from @prev.
  *
  * The A2 waveform drives only black <-> white: from a grey it does not
  * move a pixel at all (the A2 table of the panel's waveform), so the glass
@@ -267,40 +312,37 @@ bool rk3026_ebc_build_snapshot(const struct rk3026_ebc_shadows *sh,
 	const u8 *prev = sh->prev;
 	u32 pitch = sh->pitch, height = sh->height;
 	u8 *dst = sh->scan;
-	bool two_level = ebc_mode_two_level(*mode);
-	bool over_grey = false;
-	int x1 = max(box->x1, 0) & ~1;
-	int x2 = min_t(int, round_up(box->x2, 2), (int)(pitch * 2));
-	int y1 = max(box->y1, 0);
-	int y2 = min_t(int, box->y2, (int)height);
-	bool moves = false;
-	int x, y;
+	u32 tl = ebc_mode_two_level(*mode) ? ~0u : 0;
+	struct drm_rect r = *box;
+	u32 over_grey = 0, moves = 0;
+	int y;
 
-	memcpy(dst, prev, (size_t)pitch * height);
-	if (x1 >= x2 || y1 >= y2)
+	r.x1 = max(r.x1, 0) & ~1;
+	r.x2 = min_t(int, round_up(r.x2, 2), (int)(pitch * 2));
+	r.y1 = max(r.y1, 0);
+	r.y2 = min_t(int, r.y2, (int)height);
+	if (r.x1 >= r.x2 || r.y1 >= r.y2) {
+		memcpy(dst, prev, (size_t)pitch * height);
 		return false;
+	}
 
-	for (y = y1; y < y2; y++) {
-		size_t off = (size_t)y * pitch + x1 / 2;
+	memcpy(dst, prev, (size_t)pitch * r.y1);
+	memcpy(dst + (size_t)pitch * r.y2, prev + (size_t)pitch * r.y2,
+	       (size_t)pitch * (height - r.y2));
+	if (r.x1 > 0 || r.x2 < (int)(pitch * 2)) {
+		for (y = r.y1; y < r.y2; y++) {
+			size_t row = (size_t)y * pitch;
 
-		for (x = x1; x < x2; x += 2, off++) {
-			u8 p = prev[off], n = next[off], out = p;
-
-			if ((p ^ n) & 0x0f) {
-				out = (out & 0xf0) | ebc_level(n & 0x0f, two_level);
-				over_grey |= ebc_grey(p & 0x0f);
-			}
-			if ((p ^ n) & 0xf0) {
-				out = (out & 0x0f) | ebc_level(n >> 4, two_level) << 4;
-				over_grey |= ebc_grey(p >> 4);
-			}
-			dst[off] = out;
-			moves |= out != p;
+			memcpy(dst + row, prev + row, r.x1 / 2);
+			memcpy(dst + row + r.x2 / 2, prev + row + r.x2 / 2,
+			       pitch - r.x2 / 2);
 		}
 	}
+
+	ebc_snap_rows(dst, prev, next, pitch, &r, tl, &over_grey, &moves);
 	if (over_grey && *mode == EBC_MODE_A2)
 		*mode = EBC_MODE_BLACK_WHITE;
-	return moves;
+	return moves != 0;
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_build_snapshot);
 

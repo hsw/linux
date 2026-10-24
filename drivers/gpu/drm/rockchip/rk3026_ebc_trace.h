@@ -22,6 +22,9 @@ TRACE_DEFINE_ENUM(EBC_OUTCOME_CRTC_OFF);
 TRACE_DEFINE_ENUM(EBC_OUTCOME_NO_WAVEFORM);
 TRACE_DEFINE_ENUM(EBC_OUTCOME_NO_RAILS);
 TRACE_DEFINE_ENUM(EBC_OUTCOME_NO_LUT);
+TRACE_DEFINE_ENUM(EBC_REASON_EXPLICIT);
+TRACE_DEFINE_ENUM(EBC_REASON_AUTO_DU);
+TRACE_DEFINE_ENUM(EBC_REASON_REPAIR_FLOOR);
 
 #define ebc_trace_mode(m)						\
 	__print_symbolic(m,						\
@@ -90,10 +93,21 @@ TRACE_EVENT(rk3026_ebc_update_queue,
 		  __entry->temp_valid, __entry->coalesced, __entry->queued)
 );
 
+#define ebc_trace_reason(r)						\
+	__print_symbolic(r,						\
+			 { EBC_REASON_EXPLICIT,		"explicit" },	\
+			 { EBC_REASON_AUTO_DU,		"auto_du" },	\
+			 { EBC_REASON_REPAIR_FLOOR,	"repair_floor" })
+
+/*
+ * One waveform starts. @reason is why the part is driven in its mode
+ * (rk3026_ebc_resolve_mode()); the repair RESET in front of a part (@repair)
+ * carries the part's reason.
+ */
 TRACE_EVENT(rk3026_ebc_scan_start,
 	TP_PROTO(u32 mode, u32 lut_mode, int temp, u32 frames, u32 marker,
-		 u32 merged, bool repair),
-	TP_ARGS(mode, lut_mode, temp, frames, marker, merged, repair),
+		 u32 merged, bool repair, u32 reason),
+	TP_ARGS(mode, lut_mode, temp, frames, marker, merged, repair, reason),
 	TP_STRUCT__entry(
 		__field(u32, mode)
 		__field(u32, lut_mode)
@@ -102,6 +116,7 @@ TRACE_EVENT(rk3026_ebc_scan_start,
 		__field(u32, marker)
 		__field(u32, merged)
 		__field(bool, repair)
+		__field(u32, reason)
 	),
 	TP_fast_assign(
 		__entry->mode = mode;
@@ -111,12 +126,14 @@ TRACE_EVENT(rk3026_ebc_scan_start,
 		__entry->marker = marker;
 		__entry->merged = merged;
 		__entry->repair = repair;
+		__entry->reason = reason;
 	),
-	TP_printk("mode=%u(%s) lut_mode=%u(%s) temp=%d frames=%u marker=%u merged=%u repair=%d",
+	TP_printk("mode=%u(%s) lut_mode=%u(%s) temp=%d frames=%u marker=%u merged=%u repair=%d reason=%s",
 		  __entry->mode, ebc_trace_mode(__entry->mode),
 		  __entry->lut_mode, ebc_trace_mode(__entry->lut_mode),
 		  __entry->temp, __entry->frames, __entry->marker,
-		  __entry->merged, __entry->repair)
+		  __entry->merged, __entry->repair,
+		  ebc_trace_reason(__entry->reason))
 );
 
 TRACE_EVENT(rk3026_ebc_scan_end,

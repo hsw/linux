@@ -239,9 +239,23 @@ enum rk3026_ebc_repair {
 };
 
 /*
+ * Why a part is driven in the mode it is (rk3026_ebc_resolve_mode()), for the
+ * scan_start tracepoint.
+ */
+enum rk3026_ebc_reason {
+	EBC_REASON_EXPLICIT,	/* the part's own mode, as asked or by default */
+	EBC_REASON_AUTO_DU,	/* an auto part whose changes are all 0 or 15 */
+	EBC_REASON_REPAIR_FLOOR, /* raised to PART after a repair RESET */
+};
+
+/*
  * One update as a sender hands it over (rk3026_ebc_add_update()): its region,
  * EBC work mode, MXCFB_WAIT_FOR_UPDATE_COMPLETE marker (0: none), the panel
  * temperature it brings (@temp, if @temp_valid) and who sent it.
+ *
+ * @auto_mode: the sender asked for no particular waveform, so @mode is only
+ * the default the content may override (rk3026_ebc_resolve_mode()). A plane
+ * update sets it; an update that names its mode leaves it false.
  */
 struct rk3026_ebc_update {
 	struct drm_rect	clip;
@@ -249,6 +263,7 @@ struct rk3026_ebc_update {
 	u32		marker;
 	int		temp;
 	bool		temp_valid;
+	bool		auto_mode;
 	u8		source;		/* enum rk3026_ebc_source */
 };
 
@@ -268,6 +283,7 @@ struct rk3026_ebc_last {
 	bool		repaired;	/* a RESET repair ran before it */
 	u8		source;		/* enum rk3026_ebc_source */
 	u8		outcome;	/* enum rk3026_ebc_outcome */
+	u8		reason;		/* enum rk3026_ebc_reason, of @mode */
 	u32		frames;		/* frames in its (last) waveform */
 	u32		driven;		/* of those, driven */
 	u32		scans;		/* waveforms started, repair included */
@@ -304,6 +320,10 @@ struct rk3026_ebc_stats {
  * strongest of their modes (rk3026_ebc_mode_rank()), the newest seq. Empty
  * while @merged is 0. Taken out of a struct rk3026_ebc_pending it is the part
  * one scan drives; a part whose @mode is EBC_MODE_RESET is a RESET alone.
+ *
+ * @auto_ok: every update in the set has @auto_mode, so the content may pick
+ * the mode (rk3026_ebc_resolve_mode()); one that names its mode clears it,
+ * and so does a carry. @mode and its rank stay the plain modes' either way.
  */
 struct rk3026_ebc_set {
 	struct drm_rect	box;
@@ -315,6 +335,8 @@ struct rk3026_ebc_set {
 	bool		temp_valid;
 	/* an MXCFB_SEND_UPDATE in a full-class mode: never skipped */
 	bool		has_mxcfb_full;
+	bool		auto_ok;
+	bool		has_plane;	/* a plane update is in the set */
 	u8		source;		/* the newest update's */
 };
 
@@ -613,6 +635,9 @@ bool rk3026_ebc_build_snapshot(const struct rk3026_ebc_shadows *sh,
 bool rk3026_ebc_should_skip(const struct rk3026_ebc_set *part,
 			    bool prev_unknown, bool identical);
 u32 rk3026_ebc_scan_mode(const struct rk3026_ebc_set *part, bool repaired);
+u32 rk3026_ebc_resolve_mode(const struct rk3026_ebc_set *part, u32 scan_mode,
+			    bool two_level, bool repair_due,
+			    enum rk3026_ebc_reason *reason);
 bool rk3026_ebc_scan_finish(struct rk3026_ebc_shadows *sh,
 			    struct rk3026_ebc_pending *p,
 			    const struct rk3026_ebc_set *part,

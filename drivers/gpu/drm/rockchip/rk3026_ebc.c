@@ -129,6 +129,10 @@ static void ebc_rails_rearm(struct rk3026_ebc *ebc)
  * default rendered washed grey (docs/PENDING.md P18). A partial waveform is an
  * optimisation for small incremental changes, and this driver has no business
  * defaulting to one before it can render a full frame at all.
+ *
+ * Such an update is sent with @auto_mode: when every pixel it changes becomes
+ * black or white, the part is driven in DU instead, which drives those pixels
+ * fully and does not flash (rk3026_ebc_resolve_mode()). Never PART.
  */
 #define EBC_MODE_DEFAULT	EBC_MODE_FULL
 
@@ -898,7 +902,8 @@ static int ebc_drive(struct rk3026_ebc *ebc, const u8 *lut, u32 frames,
 	/* A repair is the first waveform of an update that has repaired set. */
 	trace_rk3026_ebc_scan_start(mode, lut_mode, last->temp, frames,
 				    last->marker, last->merged,
-				    last->repaired && !last->scans);
+				    last->repaired && !last->scans,
+				    last->reason);
 
 	WRITE_ONCE(ebc->shadows.prev_unknown, true);
 	last->scans++;
@@ -1198,9 +1203,10 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 	enum rk3026_ebc_repair repair_result = EBC_REPAIR_NONE;
 	struct rk3026_ebc_shadows *sh = &ebc->shadows;
 	ktime_t start = ktime_get();
+	enum rk3026_ebc_reason reason;
 	struct rk3026_ebc_set part;
 	bool repair_due, identical, prev_changed, two_level;
-	u32 frames, mode, scan_mode, lut_mode, changed_px;
+	u32 frames, mode, scan_mode, resolved, lut_mode, changed_px;
 	const u8 *lut, *target;
 	int temp;
 	int ret;
@@ -1259,20 +1265,14 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 	scan_mode = rk3026_ebc_scan_mode(&part, repair_due);
 
 	/*
-	 * An A2 scan over a grey of the glass comes back as DU. @two_level
-	 * and @changed_px are not used yet.
+	 * An A2 scan over a grey of the glass comes back as DU. @changed_px
+	 * is not used yet.
 	 */
 	identical = !rk3026_ebc_build_snapshot(sh, target, &part.box,
 					       &scan_mode, &two_level,
 					       &changed_px);
 	if (debug_scan)
 		ebc_report_image(ebc);
-
-	/* DIAGNOSTIC: drive a different mode class with the same data and scan. */
-	mode = scan_mode;
-	if (force_mode >= 0 && force_mode <= EBC_MODE_MAX)
-		mode = force_mode;
-	last->mode = mode;
 
 	/*
 	 * Nothing changed? Then do not drive the panel.
@@ -1327,6 +1327,21 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 		last->outcome = EBC_OUTCOME_SKIPPED;
 		goto finish;
 	}
+
+	/*
+	 * The content's choice for a part of auto updates: DU when every
+	 * changed pixel becomes black or white. It comes after the skip,
+	 * which stays on the part's own mode, and before force_mode.
+	 */
+	resolved = rk3026_ebc_resolve_mode(&part, scan_mode, two_level,
+					   repair_due, &reason);
+	last->reason = reason;
+
+	/* DIAGNOSTIC: drive a different mode class with the same data and scan. */
+	mode = resolved;
+	if (force_mode >= 0 && force_mode <= EBC_MODE_MAX)
+		mode = force_mode;
+	last->mode = mode;
 	mutex_unlock(&ebc->image_lock);
 
 	/*
@@ -1386,14 +1401,20 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 	}
 
 	/*
-	 * A direct mode has no LUT of its own; fall back to the part's own mode
+	 * A direct mode has no LUT of its own; fall back to the resolved mode
 	 * for the scan data so the DSP_CTRL class is the only thing that changed.
+	 * A resolved mode without a LUT is not driven in another one: the part
+	 * is carried in its plain mode (rk3026_ebc_scan_finish()). A carry
+	 * alone is no work for the thread, so such a part waits for the next
+	 * update and is drawn with it, in the stronger of the two plain modes:
+	 * an auto plane part without a DU LUT ends up FULL, as before the
+	 * policy.
 	 */
 	lut_mode = mode;
 	lut = rk3026_ebc_waveform_lut(ebc->waveform, mode, temp, &frames);
-	if (!lut && mode != scan_mode) {
-		lut_mode = scan_mode;
-		lut = rk3026_ebc_waveform_lut(ebc->waveform, scan_mode, temp,
+	if (!lut && mode != resolved) {
+		lut_mode = resolved;
+		lut = rk3026_ebc_waveform_lut(ebc->waveform, resolved, temp,
 					      &frames);
 	}
 	if (!lut) {
@@ -1677,9 +1698,10 @@ static int ebc_plane_atomic_check(struct drm_plane *plane,
 
 /*
  * A plane update: the whole framebuffer into @next_shadow and to the thread
- * in the default mode, unless an mxcfb client drives the panel. Such a
- * client annotates its own updates with a waveform mode, so its pixels are
- * left alone rather than refreshed twice.
+ * in the default mode, as an auto update (DU if every changed pixel becomes
+ * black or white, see EBC_MODE_DEFAULT), unless an mxcfb client drives the
+ * panel. Such a client annotates its own updates with a waveform mode, so
+ * its pixels are left alone rather than refreshed twice.
  *
  * @mxcfb_active is checked in the @image_lock section of the blit, where a
  * send sets it. Checked before the lock, a plane update could take the lock
@@ -1693,9 +1715,10 @@ VISIBLE_IF_KUNIT bool rk3026_ebc_plane_update(struct rk3026_ebc *ebc,
 					      unsigned int src_pitch)
 {
 	struct rk3026_ebc_update upd = {
-		.clip	= DRM_RECT_INIT(0, 0, ebc->width, ebc->height),
-		.mode	= EBC_MODE_DEFAULT,
-		.source	= EBC_SOURCE_PLANE,
+		.clip		= DRM_RECT_INIT(0, 0, ebc->width, ebc->height),
+		.mode		= EBC_MODE_DEFAULT,
+		.auto_mode	= true,
+		.source		= EBC_SOURCE_PLANE,
 	};
 	bool queue;
 

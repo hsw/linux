@@ -1261,6 +1261,276 @@ static void ebc_test_marker_eviction(struct kunit *test)
 	}
 }
 
+/* --- the mode policy --- */
+
+/* An auto update, as a plane update or an mxcfb AUTO send makes it. */
+static u32 t_add_auto(struct rk3026_ebc_pending *p, const struct drm_rect *clip,
+		      u32 mode, enum rk3026_ebc_source source)
+{
+	struct rk3026_ebc_update upd = t_upd(clip, mode, 0, source);
+	u32 seq;
+
+	upd.auto_mode = true;
+	rk3026_ebc_pending_add(p, &upd, &seq);
+	return seq;
+}
+
+/* The parts of the resolve table, as their updates make them. */
+enum t_kind {
+	T_PLANE,		/* plane updates only */
+	T_AUTO_PART,		/* mxcfb AUTO + PARTIAL only */
+	T_PLANE_AUTO_PART,	/* both, merged */
+	T_PLANE_DU,		/* a plane update and an explicit DU */
+	T_AUTO_PART_DU,		/* AUTO + PARTIAL and an explicit DU */
+	T_MXCFB_FULL,		/* AUTO + FULL: FULL, no auto */
+	T_A2,			/* an explicit A2 */
+	T_DU,			/* an explicit DU */
+	T_RESET,
+};
+
+static void t_kind_part(enum t_kind kind, struct rk3026_ebc_set *part)
+{
+	struct rk3026_ebc_pending p = {};
+
+	switch (kind) {
+	case T_PLANE:
+		t_add_auto(&p, &t_panel, EBC_MODE_FULL, EBC_SOURCE_PLANE);
+		t_add_auto(&p, &t_panel, EBC_MODE_FULL, EBC_SOURCE_PLANE);
+		break;
+	case T_AUTO_PART:
+		t_add_auto(&p, &t_panel, EBC_MODE_PART, EBC_SOURCE_MXCFB);
+		break;
+	case T_PLANE_AUTO_PART:
+		t_add_auto(&p, &t_panel, EBC_MODE_PART, EBC_SOURCE_MXCFB);
+		t_add_auto(&p, &t_panel, EBC_MODE_FULL, EBC_SOURCE_PLANE);
+		break;
+	case T_PLANE_DU:
+		t_add_auto(&p, &t_panel, EBC_MODE_FULL, EBC_SOURCE_PLANE);
+		t_add(&p, &t_panel, EBC_MODE_BLACK_WHITE, EBC_SOURCE_MXCFB);
+		break;
+	case T_AUTO_PART_DU:
+		t_add_auto(&p, &t_panel, EBC_MODE_PART, EBC_SOURCE_MXCFB);
+		t_add(&p, &t_panel, EBC_MODE_BLACK_WHITE, EBC_SOURCE_MXCFB);
+		break;
+	case T_MXCFB_FULL:
+		t_add(&p, &t_panel, EBC_MODE_FULL, EBC_SOURCE_MXCFB);
+		break;
+	case T_A2:
+		t_add(&p, &t_panel, EBC_MODE_A2, EBC_SOURCE_MXCFB);
+		break;
+	case T_DU:
+		t_add(&p, &t_panel, EBC_MODE_BLACK_WHITE, EBC_SOURCE_MXCFB);
+		break;
+	case T_RESET:
+		t_add(&p, &t_panel, EBC_MODE_RESET, EBC_SOURCE_ENABLE);
+		break;
+	}
+	rk3026_ebc_pending_take(&p, part);
+}
+
+struct t_resolve {
+	const char		*desc;
+	enum t_kind		kind;
+	bool			repair;
+	bool			two_level;
+	u32			mode;
+	enum rk3026_ebc_reason	reason;
+};
+
+#define T_DU_MODE	EBC_MODE_BLACK_WHITE
+#define T_EXPL		EBC_REASON_EXPLICIT
+#define T_AUTO_DU	EBC_REASON_AUTO_DU
+#define T_FLOOR		EBC_REASON_REPAIR_FLOOR
+
+static const struct t_resolve t_resolve_cases[] = {
+	{ "plane two-level", T_PLANE, false, true, T_DU_MODE, T_AUTO_DU },
+	{ "plane grey", T_PLANE, false, false, EBC_MODE_FULL, T_EXPL },
+	/* A repair keeps FULL: a PART floor would under-saturate black/white. */
+	{ "plane repair two-level", T_PLANE, true, true, EBC_MODE_FULL,
+	  T_EXPL },
+	{ "plane repair grey", T_PLANE, true, false, EBC_MODE_FULL, T_EXPL },
+	{ "auto part two-level", T_AUTO_PART, false, true, T_DU_MODE,
+	  T_AUTO_DU },
+	{ "auto part grey", T_AUTO_PART, false, false, EBC_MODE_PART, T_EXPL },
+	{ "auto part repair two-level", T_AUTO_PART, true, true,
+	  EBC_MODE_PART, T_EXPL },
+	{ "auto part repair grey", T_AUTO_PART, true, false, EBC_MODE_PART,
+	  T_EXPL },
+	{ "plane and auto part two-level", T_PLANE_AUTO_PART, false, true,
+	  T_DU_MODE, T_AUTO_DU },
+	{ "plane and auto part grey", T_PLANE_AUTO_PART, false, false,
+	  EBC_MODE_FULL, T_EXPL },
+	/* An explicit mode merged in: the rank's mode, as before. */
+	{ "plane and DU two-level", T_PLANE_DU, false, true, EBC_MODE_FULL,
+	  T_EXPL },
+	{ "auto part and DU two-level", T_AUTO_PART_DU, false, true,
+	  EBC_MODE_PART, T_EXPL },
+	{ "auto part and DU grey", T_AUTO_PART_DU, false, false,
+	  EBC_MODE_PART, T_EXPL },
+	{ "mxcfb full two-level", T_MXCFB_FULL, false, true, EBC_MODE_FULL,
+	  T_EXPL },
+	{ "mxcfb full repair", T_MXCFB_FULL, true, true, EBC_MODE_FULL,
+	  T_EXPL },
+	/* The policy never picks A2, and never touches an explicit mode. */
+	{ "A2 two-level", T_A2, false, true, EBC_MODE_A2, T_EXPL },
+	{ "A2 repair", T_A2, true, true, EBC_MODE_PART, T_FLOOR },
+	{ "DU two-level", T_DU, false, true, T_DU_MODE, T_EXPL },
+	{ "DU repair", T_DU, true, true, EBC_MODE_PART, T_FLOOR },
+	{ "RESET", T_RESET, false, true, EBC_MODE_RESET, T_EXPL },
+};
+
+KUNIT_ARRAY_PARAM_DESC(t_resolve, t_resolve_cases, desc);
+
+static void ebc_test_resolve_mode(struct kunit *test)
+{
+	const struct t_resolve *c = test->param_value;
+	enum rk3026_ebc_reason reason = EBC_REASON_REPAIR_FLOOR + 1;
+	struct rk3026_ebc_set part;
+	u32 scan_mode;
+
+	t_kind_part(c->kind, &part);
+	scan_mode = rk3026_ebc_scan_mode(&part, c->repair);
+	KUNIT_EXPECT_EQ(test,
+			rk3026_ebc_resolve_mode(&part, scan_mode, c->two_level,
+						c->repair, &reason),
+			c->mode);
+	KUNIT_EXPECT_EQ(test, reason, c->reason);
+}
+
+static void ebc_test_pending_auto_ok(struct kunit *test)
+{
+	struct rk3026_ebc_pending p = {};
+	struct rk3026_ebc_set part;
+
+	/* A plane update alone; an mxcfb auto send alone. */
+	t_add_auto(&p, &t_panel, EBC_MODE_FULL, EBC_SOURCE_PLANE);
+	rk3026_ebc_pending_take(&p, &part);
+	KUNIT_EXPECT_TRUE(test, part.auto_ok);
+	KUNIT_EXPECT_TRUE(test, part.has_plane);
+	t_add_auto(&p, &t_panel, EBC_MODE_PART, EBC_SOURCE_MXCFB);
+	rk3026_ebc_pending_take(&p, &part);
+	KUNIT_EXPECT_TRUE(test, part.auto_ok);
+	KUNIT_EXPECT_FALSE(test, part.has_plane);
+
+	/* AUTO + PART with an explicit DU: PART by rank, no longer auto. */
+	t_add_auto(&p, &t_panel, EBC_MODE_PART, EBC_SOURCE_MXCFB);
+	t_add(&p, &t_panel, EBC_MODE_BLACK_WHITE, EBC_SOURCE_MXCFB);
+	rk3026_ebc_pending_take(&p, &part);
+	KUNIT_EXPECT_EQ(test, part.mode, EBC_MODE_PART);
+	KUNIT_EXPECT_FALSE(test, part.auto_ok);
+
+	/* Whichever comes first, and whatever follows. */
+	t_add(&p, &t_panel, EBC_MODE_BLACK_WHITE, EBC_SOURCE_MXCFB);
+	t_add_auto(&p, &t_panel, EBC_MODE_FULL, EBC_SOURCE_PLANE);
+	t_add_auto(&p, &t_panel, EBC_MODE_FULL, EBC_SOURCE_PLANE);
+	rk3026_ebc_pending_take(&p, &part);
+	KUNIT_EXPECT_EQ(test, part.mode, EBC_MODE_FULL);
+	KUNIT_EXPECT_FALSE(test, part.auto_ok);
+	KUNIT_EXPECT_TRUE(test, part.has_plane);
+
+	/* A taken set does not leak into the next: it starts auto again. */
+	t_add_auto(&p, &t_panel, EBC_MODE_FULL, EBC_SOURCE_PLANE);
+	rk3026_ebc_pending_take(&p, &part);
+	KUNIT_EXPECT_TRUE(test, part.auto_ok);
+
+	/* An identical AUTO + PART part is partial class: it still skips. */
+	t_add_auto(&p, &t_panel, EBC_MODE_PART, EBC_SOURCE_MXCFB);
+	rk3026_ebc_pending_take(&p, &part);
+	KUNIT_EXPECT_EQ(test, part.mode, EBC_MODE_PART);
+	KUNIT_EXPECT_FALSE(test, part.has_mxcfb_full);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_should_skip(&part, false, true));
+}
+
+/* The RESET barrier keeps each side's own flag; the RESET has none. */
+static void ebc_test_pending_auto_ok_reset(struct kunit *test)
+{
+	struct rk3026_ebc_pending p = {};
+	struct rk3026_ebc_set part;
+
+	t_add_auto(&p, &t_panel, EBC_MODE_FULL, EBC_SOURCE_PLANE);
+	t_add(&p, &t_panel, EBC_MODE_RESET, EBC_SOURCE_ENABLE);
+	t_add(&p, &t_panel, EBC_MODE_PART, EBC_SOURCE_MXCFB);
+	t_add(&p, &t_panel, EBC_MODE_RESET, EBC_SOURCE_MXCFB);
+	t_add_auto(&p, &t_panel, EBC_MODE_FULL, EBC_SOURCE_PLANE);
+
+	rk3026_ebc_pending_take(&p, &part);
+	KUNIT_EXPECT_EQ(test, part.mode, EBC_MODE_FULL);
+	KUNIT_EXPECT_TRUE(test, part.auto_ok);
+	/* The second RESET absorbed the explicit post; the one after is auto. */
+	rk3026_ebc_pending_take(&p, &part);
+	KUNIT_EXPECT_EQ(test, part.mode, EBC_MODE_RESET);
+	KUNIT_EXPECT_FALSE(test, part.auto_ok);
+	KUNIT_EXPECT_FALSE(test, part.has_plane);
+	rk3026_ebc_pending_take(&p, &part);
+	KUNIT_EXPECT_EQ(test, part.mode, EBC_MODE_FULL);
+	KUNIT_EXPECT_TRUE(test, part.auto_ok);
+	KUNIT_EXPECT_TRUE(test, part.has_plane);
+
+	/* post -> pre keeps an explicit post's flag too. */
+	t_add(&p, &t_panel, EBC_MODE_RESET, EBC_SOURCE_ENABLE);
+	t_add(&p, &t_panel, EBC_MODE_PART, EBC_SOURCE_MXCFB);
+	t_add_auto(&p, &t_panel, EBC_MODE_FULL, EBC_SOURCE_PLANE);
+	rk3026_ebc_pending_take(&p, &part);
+	KUNIT_EXPECT_EQ(test, part.mode, EBC_MODE_RESET);
+	rk3026_ebc_pending_take(&p, &part);
+	KUNIT_EXPECT_EQ(test, part.mode, EBC_MODE_FULL);
+	KUNIT_EXPECT_FALSE(test, part.auto_ok);
+	KUNIT_EXPECT_TRUE(test, part.has_plane);
+}
+
+/* A carried part is drawn in its plain mode: the carry clears the flag. */
+static void ebc_test_pending_auto_ok_carry(struct kunit *test)
+{
+	static const enum rk3026_ebc_outcome outcomes[] = {
+		EBC_OUTCOME_NO_RAILS, EBC_OUTCOME_NO_LUT,
+		EBC_OUTCOME_NO_WAVEFORM,
+	};
+	static const enum rk3026_ebc_repair repairs[] = {
+		EBC_REPAIR_NONE, EBC_REPAIR_DONE,
+	};
+	struct drm_rect r = DRM_RECT_INIT(2, 1, 4, 2);
+	unsigned int i, j;
+
+	for (i = 0; i < ARRAY_SIZE(outcomes); i++)
+		for (j = 0; j < ARRAY_SIZE(repairs); j++) {
+			struct t_ctx *c = t_ctx_alloc(test);
+			struct rk3026_ebc_set part;
+
+			t_add_auto(&c->p, &r, EBC_MODE_FULL, EBC_SOURCE_PLANE);
+			rk3026_ebc_pending_take(&c->p, &part);
+			KUNIT_EXPECT_TRUE(test, part.auto_ok);
+			rk3026_ebc_scan_finish(&c->sh, &c->p, &part,
+					       outcomes[i], repairs[j]);
+			KUNIT_EXPECT_TRUE(test, c->p.carry.merged);
+			KUNIT_EXPECT_EQ(test, c->p.carry.mode, EBC_MODE_FULL);
+			KUNIT_EXPECT_FALSE(test, c->p.carry.auto_ok);
+			KUNIT_EXPECT_TRUE(test, c->p.carry.has_plane);
+			KUNIT_EXPECT_FALSE(test, c->p.carry.has_mxcfb_full);
+
+			/* The next auto part takes it in, and is not auto. */
+			t_add_auto(&c->p, &r, EBC_MODE_FULL, EBC_SOURCE_PLANE);
+			rk3026_ebc_pending_take(&c->p, &part);
+			KUNIT_EXPECT_FALSE(test, part.auto_ok);
+			KUNIT_EXPECT_TRUE(test, part.has_plane);
+			KUNIT_EXPECT_FALSE(test, c->p.carry.merged);
+		}
+
+	/* A repair cut short carries an mxcfb auto part the same way. */
+	for (i = 0; i < 2; i++) {
+		struct t_ctx *c = t_ctx_alloc(test);
+		struct rk3026_ebc_set part;
+
+		t_add_auto(&c->p, &r, EBC_MODE_PART, EBC_SOURCE_MXCFB);
+		rk3026_ebc_pending_take(&c->p, &part);
+		rk3026_ebc_scan_finish(&c->sh, &c->p, &part,
+				       i ? EBC_OUTCOME_ABANDONED :
+				       EBC_OUTCOME_TIMEOUT, EBC_REPAIR_FAILED);
+		KUNIT_EXPECT_EQ(test, c->p.carry.mode, EBC_MODE_PART);
+		KUNIT_EXPECT_FALSE(test, c->p.carry.auto_ok);
+		KUNIT_EXPECT_FALSE(test, c->p.carry.has_plane);
+	}
+}
+
 static struct kunit_case rk3026_ebc_core_test_cases[] = {
 	KUNIT_CASE(ebc_test_dsp_ctrl_mode),
 	KUNIT_CASE(ebc_test_rank_order),
@@ -1279,6 +1549,10 @@ static struct kunit_case rk3026_ebc_core_test_cases[] = {
 	KUNIT_CASE(ebc_test_snapshot_a2_over_grey),
 	KUNIT_CASE(ebc_test_skip),
 	KUNIT_CASE(ebc_test_scan_mode),
+	KUNIT_CASE_PARAM(ebc_test_resolve_mode, t_resolve_gen_params),
+	KUNIT_CASE(ebc_test_pending_auto_ok),
+	KUNIT_CASE(ebc_test_pending_auto_ok_reset),
+	KUNIT_CASE(ebc_test_pending_auto_ok_carry),
 	KUNIT_CASE(ebc_test_seq_barrier),
 	KUNIT_CASE(ebc_test_seq_reset_pending_twice),
 	KUNIT_CASE(ebc_test_seq_merged_markers),
@@ -2174,6 +2448,156 @@ static void ebc_test_glue_plane_update(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, drm_rect_equals(&ebc->pending.pre.box, &t_panel));
 	KUNIT_EXPECT_EQ(test, ebc->pending.pre.mode, EBC_MODE_FULL);
 	KUNIT_EXPECT_EQ(test, ebc->pending.pre.source, EBC_SOURCE_PLANE);
+	/* An auto update: the content may pick DU. */
+	KUNIT_EXPECT_TRUE(test, ebc->pending.pre.auto_ok);
+	KUNIT_EXPECT_TRUE(test, ebc->pending.pre.has_plane);
+}
+
+/*
+ * The mode policy end to end, on a white glass: a plane update whose changes
+ * are all black or white resolves DU, one with a grey stays FULL, one that
+ * changes nothing is skipped in its own mode. With the rails counted as up
+ * and a waveform that has only a RESET, each stops at its missing LUT.
+ */
+static u32 *t_plane_fb(struct kunit *test, u32 xrgb)
+{
+	u32 *fb = kunit_kcalloc(test, T_W * T_H, sizeof(*fb), GFP_KERNEL);
+	int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, fb);
+	for (i = 0; i < T_W * T_H; i++)
+		fb[i] = xrgb;
+	return fb;
+}
+
+static struct rk3026_ebc *t_policy_ebc(struct kunit *test)
+{
+	static const struct t_rkf_seg seg = { T_RKF_RESET, 5 };
+	struct rk3026_ebc *ebc = t_ebc_alloc(test);
+
+	ebc->waveform = t_rkf_wf(test, ebc->dev, &seg, 1, 0);
+	ebc->next_virt = t_img_alloc(test, 15);
+	ebc->epd_on = true;
+	return ebc;
+}
+
+static void ebc_test_glue_auto_du(struct kunit *test)
+{
+	struct rk3026_ebc *ebc = t_policy_ebc(test);
+	u32 *black = t_plane_fb(test, 0);
+	struct rk3026_ebc_last last;
+	struct rk3026_ebc_set *carry = &ebc->pending.carry;
+
+	/* Black over white: two-level, DU. */
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.asked_mode, EBC_MODE_FULL);
+	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_BLACK_WHITE);
+	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_AUTO_DU);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_NO_LUT);
+	KUNIT_EXPECT_EQ(test, ebc->last.reason, EBC_REASON_AUTO_DU);
+	/* The snapshot as FULL built it: every pixel black, no threshold. */
+	KUNIT_EXPECT_EQ(test, ebc->shadows.scan[0], 0);
+	KUNIT_EXPECT_EQ(test, ebc->shadows.scan[T_SIZE - 1], 0);
+	t_expect_guard(test, ebc->shadows.scan);
+
+	/* Carried in its plain mode, the auto flag cleared. */
+	KUNIT_EXPECT_TRUE(test, carry->merged);
+	KUNIT_EXPECT_EQ(test, carry->mode, EBC_MODE_FULL);
+	KUNIT_EXPECT_TRUE(test, drm_rect_equals(&carry->box, &t_panel));
+	KUNIT_EXPECT_FALSE(test, carry->auto_ok);
+	KUNIT_EXPECT_TRUE(test, carry->has_plane);
+	KUNIT_EXPECT_FALSE(test, carry->has_mxcfb_full);
+	KUNIT_EXPECT_FALSE(test, ebc->shadows.prev_unknown);
+
+	/* The next plane part takes the carry in: FULL, as it was asked. */
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_FULL);
+	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_EXPLICIT);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_NO_LUT);
+	KUNIT_EXPECT_FALSE(test, carry->auto_ok);
+	KUNIT_EXPECT_EQ(test, ebc->stats.dropped, 2);
+}
+
+static void ebc_test_glue_auto_grey(struct kunit *test)
+{
+	struct rk3026_ebc *ebc = t_policy_ebc(test);
+	/* Luma 128: grey 8, not two-level. */
+	u32 *grey = t_plane_fb(test, 0x808080);
+	struct rk3026_ebc_last last;
+
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, grey, T_W * 4));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.asked_mode, EBC_MODE_FULL);
+	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_FULL);
+	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_EXPLICIT);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_NO_LUT);
+	KUNIT_EXPECT_EQ(test, ebc->shadows.scan[0], 0x88);
+}
+
+/*
+ * White over the white glass: skipped, in the part's own mode. A part that
+ * changes nothing is never two-level, so the policy would keep its mode
+ * too; the checks pin the record of a skip, not the order of skip and
+ * policy.
+ */
+static void ebc_test_glue_auto_skipped(struct kunit *test)
+{
+	struct rk3026_ebc *ebc = t_policy_ebc(test);
+	u32 *white = t_plane_fb(test, 0xffffff);
+	struct rk3026_ebc_last last;
+
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, white, T_W * 4));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_SKIPPED);
+	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_FULL);
+	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_EXPLICIT);
+	KUNIT_EXPECT_FALSE(test, ebc->pending.carry.merged);
+}
+
+/*
+ * A send that names its mode is driven in it: an mxcfb FULL over the white
+ * glass whose pixels are all black stays FULL.
+ */
+static void ebc_test_glue_explicit_full(struct kunit *test)
+{
+	struct rk3026_ebc *ebc = t_policy_ebc(test);
+	struct rk3026_ebc_last last;
+
+	t_img_fill(ebc->next_shadow, 0);
+	t_send(ebc, &t_panel, EBC_MODE_FULL, 1, EBC_SOURCE_MXCFB);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_FULL);
+	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_EXPLICIT);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_NO_LUT);
+	KUNIT_EXPECT_FALSE(test, ebc->pending.carry.has_plane);
+	KUNIT_EXPECT_TRUE(test, ebc->pending.carry.has_mxcfb_full);
+}
+
+/*
+ * An explicit A2 over a grey glass: the snapshot raises it to DU, and the
+ * policy leaves that as it is, reason explicit, though the content is
+ * two-level. It stops at the missing DU LUT and is carried as the A2 it
+ * was asked as.
+ */
+static void ebc_test_glue_a2_over_grey(struct kunit *test)
+{
+	struct rk3026_ebc *ebc = t_policy_ebc(test);
+	struct rk3026_ebc_last last;
+
+	t_img_fill(ebc->shadows.prev, 8);
+	t_img_fill(ebc->next_shadow, 0);
+	t_send(ebc, &t_panel, EBC_MODE_A2, 0, EBC_SOURCE_MXCFB);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.asked_mode, EBC_MODE_A2);
+	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_BLACK_WHITE);
+	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_EXPLICIT);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_NO_LUT);
+	KUNIT_EXPECT_EQ(test, ebc->shadows.scan[0], 0);
+	KUNIT_EXPECT_TRUE(test, ebc->pending.carry.merged);
+	KUNIT_EXPECT_EQ(test, ebc->pending.carry.mode, EBC_MODE_A2);
+	KUNIT_EXPECT_FALSE(test, ebc->pending.carry.auto_ok);
 }
 
 static struct kunit_case rk3026_ebc_glue_test_cases[] = {
@@ -2186,6 +2610,11 @@ static struct kunit_case rk3026_ebc_glue_test_cases[] = {
 	KUNIT_CASE(ebc_test_glue_wait_barrier),
 	KUNIT_CASE(ebc_test_glue_wait_timeout),
 	KUNIT_CASE(ebc_test_glue_plane_update),
+	KUNIT_CASE(ebc_test_glue_auto_du),
+	KUNIT_CASE(ebc_test_glue_auto_grey),
+	KUNIT_CASE(ebc_test_glue_auto_skipped),
+	KUNIT_CASE(ebc_test_glue_explicit_full),
+	KUNIT_CASE(ebc_test_glue_a2_over_grey),
 	{}
 };
 

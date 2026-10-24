@@ -161,11 +161,18 @@
  * Front light: PWM0 on GPIO0_D2, duty proportional to brightness, no
  * enable GPIO. The stock driver runs it at 1 kHz (PWM_APB_PRE_DIV 1000,
  * prescaler 2) with 256 linear steps; boot leaves it dark.
+ *
+ * The LED boost runs from the system rail, so that is its supply.
+ * Without a supply pwm_bl keeps the PWM enabled at duty 0 for
+ * brightness 0, and the RK v1 PWM then leaves a faint glow after any
+ * non-zero level. With a supply pwm_bl disables the PWM at 0, which is
+ * dark on this board.
  */
 / {
 	backlight: backlight {
 		compatible = "pwm-backlight";
 		pwms = <&pwm0 0 1000000 0>;
+		power-supply = <&vcc_sys>;
 		brightness-levels = <0 255>;
 		num-interpolated-steps = <255>;
 		default-brightness-level = <0>;

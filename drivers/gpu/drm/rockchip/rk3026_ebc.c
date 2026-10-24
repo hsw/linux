@@ -826,6 +826,7 @@ void rk3026_ebc_blit_xrgb8888(struct rk3026_ebc *ebc, const void *src,
 		}
 	}
 }
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_blit_xrgb8888);
 
 static void ebc_program_regs(struct rk3026_ebc *ebc);
 static int ebc_rails_off(struct rk3026_ebc *ebc);

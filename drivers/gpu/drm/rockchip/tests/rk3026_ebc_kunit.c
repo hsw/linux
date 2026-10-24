@@ -2,7 +2,9 @@
 /*
  * KUnit tests for the RK3026 EBC refresh bookkeeping (rk3026_ebc_core.c),
  * the waveform container bounds (rk3026_ebc_waveform.c), the mxcfb waveform
- * map (rk3026_ebc_mxcfb.c) and the refresh thread's glue (rk3026_ebc.c).
+ * map (rk3026_ebc_mxcfb.c), the refresh thread's glue (rk3026_ebc.c), and
+ * the snapshot and the blit against the per-pixel references of
+ * rk3026_ebc_kunit_ref.c.
  */
 
 #include <kunit/device.h>
@@ -11,8 +13,11 @@
 #include <linux/err.h>
 #include <linux/jiffies.h>
 #include <linux/limits.h>
+#include <linux/math.h>
+#include <linux/minmax.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/prandom.h>
 #include <linux/string.h>
 #include <linux/unaligned.h>
 #include <linux/wait.h>
@@ -20,6 +25,7 @@
 
 #include "../rk3026_ebc.h"
 #include "../rk3026_ebc_mxcfb.h"
+#include "rk3026_ebc_kunit_ref.h"
 
 /* A 16x6 panel: 8 bytes per line, two pixels per byte, low nibble first. */
 #define T_W		16
@@ -2182,6 +2188,660 @@ static struct kunit_suite rk3026_ebc_glue_test_suite = {
 };
 
 kunit_test_suite(rk3026_ebc_glue_test_suite);
+
+/* --- the conversion: fixtures and generators --- */
+
+/*
+ * The snapshot and the blit on wider images than the 16x6 panel: 256 px x
+ * 16 rows (the 4096 set fills it once) and the line width of a 1448x1072
+ * panel, 1448 px, over 4 rows. An image has T_GUARD bytes of 0xa5 in front
+ * and behind.
+ */
+struct t_fix {
+	const char *name;
+	int w;
+	int h;
+};
+
+static const struct t_fix t_fixes[] = {
+	{ "16x6", T_W, T_H },
+	{ "256x16", 256, 16 },
+	{ "1448x4", 1448, 4 },
+};
+
+static u32 t_fix_pitch(const struct t_fix *f)
+{
+	return f->w / 2;
+}
+
+static size_t t_fix_size(const struct t_fix *f)
+{
+	return (size_t)t_fix_pitch(f) * f->h;
+}
+
+/*
+ * @r widened to whole bytes, an even x on both edges, and clamped to @f, as
+ * the driver widens a clip, into @w; false if nothing of it is left. The
+ * tests' own copy, so the references do not share the driver's code.
+ */
+static bool t_widen(const struct t_fix *f, const struct drm_rect *r,
+		    struct drm_rect *w)
+{
+	w->x1 = max(r->x1, 0) & ~1;
+	w->x2 = min_t(int, round_up(r->x2, 2), f->w);
+	w->y1 = max(r->y1, 0);
+	w->y2 = min_t(int, r->y2, f->h);
+	return w->x1 < w->x2 && w->y1 < w->y2;
+}
+
+static u8 *t_fix_img(struct kunit *test, const struct t_fix *f)
+{
+	u8 *buf = kunit_kmalloc(test, t_fix_size(f) + 2 * T_GUARD, GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, buf);
+	memset(buf, 0xa5, t_fix_size(f) + 2 * T_GUARD);
+	return buf + T_GUARD;
+}
+
+/*
+ * The first byte, guards included, where @a and @b differ, as an offset
+ * from the image start; INT_MAX if they are the same.
+ */
+static int t_fix_diff(const struct t_fix *f, const u8 *a, const u8 *b)
+{
+	int i, end = t_fix_size(f) + T_GUARD;
+
+	for (i = -T_GUARD; i < end; i++)
+		if (a[i] != b[i])
+			return i;
+	return INT_MAX;
+}
+
+static bool t_fix_guard_ok(const struct t_fix *f, const u8 *img)
+{
+	int i;
+
+	for (i = 1; i <= T_GUARD; i++)
+		if (img[-i] != 0xa5 || img[t_fix_size(f) + i - 1] != 0xa5)
+			return false;
+	return true;
+}
+
+/*
+ * Clips and boxes for @f: whole, odd edges, one pixel, word-misaligned
+ * starts, tails of 2, 4 and 6 pixels, out of range, empty, inverted, and
+ * T_CLIPS_RANDOM random ones (empty ones among them). Returns the count.
+ */
+#define T_CLIPS_RANDOM	8
+#define T_CLIPS_MAX	(16 + T_CLIPS_RANDOM)
+
+static int t_fix_clips(const struct t_fix *f, struct rnd_state *rs,
+		       struct drm_rect *c)
+{
+	int w = f->w, h = f->h, n = 0, i;
+
+	c[n++] = DRM_RECT_INIT(0, 0, w, h);
+	c[n++] = DRM_RECT_INIT(1, 0, w - 2, h);
+	c[n++] = DRM_RECT_INIT(3, 1, w - 8, h - 1);
+	c[n++] = DRM_RECT_INIT(5, 0, 1, 1);
+	c[n++] = DRM_RECT_INIT(w - 1, h - 1, 1, 1);
+	c[n++] = DRM_RECT_INIT(0, 0, 1, h);
+	c[n++] = DRM_RECT_INIT(2, 0, w - 2, h);
+	c[n++] = DRM_RECT_INIT(4, 0, w - 6, h);
+	c[n++] = DRM_RECT_INIT(6, 1, w - 10, h - 1);
+	c[n++] = DRM_RECT_INIT(9, 0, 17, h);
+	c[n++] = DRM_RECT_INIT(0, 0, 10, h);
+	c[n++] = DRM_RECT_INIT(-5, -3, w + 12, h + 5);
+	c[n++] = DRM_RECT_INIT(4, 2, 0, h);
+	c[n++] = (struct drm_rect){ .x1 = 10, .y1 = 3, .x2 = 5, .y2 = 4 };
+	c[n++] = DRM_RECT_INIT(0, h, w, 3);
+	c[n++] = DRM_RECT_INIT(w, 0, 4, h);
+	for (i = 0; i < T_CLIPS_RANDOM; i++) {
+		int x1 = prandom_u32_state(rs) % (w + 8) - 4;
+		int x2 = prandom_u32_state(rs) % (w + 8) - 4;
+		int y1 = prandom_u32_state(rs) % (h + 4) - 2;
+		int y2 = prandom_u32_state(rs) % (h + 4) - 2;
+
+		c[n++] = (struct drm_rect){
+			.x1 = min(x1, x2), .y1 = min(y1, y2),
+			.x2 = max(x1, x2), .y2 = max(y1, y2),
+		};
+	}
+	return n;
+}
+
+/* XRGB8888 sources; the X byte is random in all of them. */
+enum t_src_kind {
+	T_SRC_4096,	/* the 16^3 colours with the low 4 bits of R, G, B zero */
+	T_SRC_GREY256,	/* R = G = B = v, v = 0..255 */
+	T_SRC_RANDOM,	/* random colours */
+	T_SRC_BLOCKS,	/* runs of 8-px blocks of mixed content */
+	T_SRC_COUNT,
+};
+
+/*
+ * The blocks of T_SRC_BLOCKS, page content in small: white and black, greys
+ * that pack to 0 or 15 and ones that do not, colour, white or black blocks
+ * with one pixel off (black, or one bit short of white or black), and
+ * pixels whose R, G and B share only the high nibble.
+ */
+enum t_block {
+	T_BLK_WHITE,
+	T_BLK_BLACK,
+	T_BLK_GREY_LO,		/* 0x08: packs to 0 */
+	T_BLK_GREY_HI,		/* 0xf7: packs to 15 */
+	T_BLK_GREY_MID,		/* 0x80 */
+	T_BLK_GREYS,		/* a random grey per pixel */
+	T_BLK_NIBBLE,		/* one high nibble, random low nibbles */
+	T_BLK_COLOUR,
+	T_BLK_DOT,		/* white with one black pixel */
+	T_BLK_NEAR_WHITE,	/* white with one 0xfffeff pixel */
+	T_BLK_NEAR_BLACK,	/* black with one 0x000100 pixel */
+	T_BLK_COUNT,
+};
+
+/*
+ * Row 0 of a T_SRC_BLOCKS image: a fixed sequence that puts every kind next
+ * to several others; the other rows take runs of random kinds.
+ */
+static const u8 t_block_seq[] = {
+	T_BLK_WHITE, T_BLK_WHITE, T_BLK_GREY_MID, T_BLK_GREY_MID,
+	T_BLK_GREY_LO, T_BLK_WHITE, T_BLK_BLACK, T_BLK_COLOUR, T_BLK_COLOUR,
+	T_BLK_GREY_HI, T_BLK_WHITE, T_BLK_DOT, T_BLK_NEAR_WHITE, T_BLK_BLACK,
+	T_BLK_NEAR_BLACK, T_BLK_NIBBLE, T_BLK_NIBBLE, T_BLK_GREYS,
+	T_BLK_GREY_LO, T_BLK_BLACK, T_BLK_GREY_HI, T_BLK_WHITE, T_BLK_COLOUR,
+	T_BLK_BLACK,
+};
+
+/* Pixel @i of a block of @kind; @pos is the odd pixel of DOT and NEAR_*. */
+static u32 t_block_px(enum t_block kind, int i, int pos, struct rnd_state *rs)
+{
+	u32 r = prandom_u32_state(rs), hi = r & 0xf0;
+
+	switch (kind) {
+	case T_BLK_WHITE:
+		return 0xffffff;
+	case T_BLK_BLACK:
+		return 0;
+	case T_BLK_GREY_LO:
+		return 0x080808;
+	case T_BLK_GREY_HI:
+		return 0xf7f7f7;
+	case T_BLK_GREY_MID:
+		return 0x808080;
+	case T_BLK_GREYS:
+		return (r & 0xff) * 0x010101;
+	case T_BLK_NIBBLE:
+		return (hi | (r >> 8 & 0xf)) << 16 | (hi | (r >> 12 & 0xf)) << 8 |
+		       hi | (r >> 16 & 0xf);
+	case T_BLK_DOT:
+		return i == pos ? 0 : 0xffffff;
+	case T_BLK_NEAR_WHITE:
+		return i == pos ? 0xfffeff : 0xffffff;
+	case T_BLK_NEAR_BLACK:
+		return i == pos ? 0x000100 : 0;
+	default:
+		return r & 0xffffff;
+	}
+}
+
+static u32 t_col_4096(u32 i)
+{
+	return ((i >> 8) & 15) << 20 | ((i >> 4) & 15) << 12 | (i & 15) << 4;
+}
+
+/*
+ * Fill the @f->w x @f->h pixels of @src, @src_pitch bytes per row (at least
+ * 4 * @f->w; the callers pass it dense and with 4 bytes of padding), with
+ * @kind from @seed.
+ */
+static void t_src_fill(u8 *src, unsigned int src_pitch, const struct t_fix *f,
+		       enum t_src_kind kind, u32 seed)
+{
+	struct rnd_state rs;
+	int x, y, k = 0;
+
+	prandom_seed_state(&rs, seed);
+	for (y = 0; y < f->h; y++) {
+		enum t_block blk = T_BLK_WHITE;
+		int run = 0, pos = 0;
+
+		for (x = 0; x < f->w; x++, k++) {
+			u32 px;
+
+			if (kind == T_SRC_BLOCKS && !(x & 7)) {
+				if (!y) {
+					blk = t_block_seq[(x / 8) %
+							  ARRAY_SIZE(t_block_seq)];
+				} else if (!run) {
+					blk = prandom_u32_state(&rs) % T_BLK_COUNT;
+					run = 1 + prandom_u32_state(&rs) % 3;
+				}
+				run = max(run - 1, 0);
+				pos = 1 + prandom_u32_state(&rs) % 7;
+			}
+			switch (kind) {
+			case T_SRC_4096:
+				px = t_col_4096((k + seed * 977) % 4096);
+				break;
+			case T_SRC_GREY256:
+				px = ((k + seed) & 0xff) * 0x010101;
+				break;
+			case T_SRC_RANDOM:
+				px = prandom_u32_state(&rs) & 0xffffff;
+				break;
+			default:
+				px = t_block_px(blk, x & 7, pos, &rs);
+				break;
+			}
+			px |= prandom_u32_state(&rs) & 0xff000000;
+			put_unaligned_le32(px, src + (size_t)y * src_pitch + x * 4);
+		}
+	}
+}
+
+/* prev and next images for the snapshot */
+enum t_img_kind {
+	T_IMG_RANDOM,		/* random greys */
+	T_IMG_TWO_LEVEL,	/* random 0 and 15 */
+	T_IMG_SOME,		/* @base with about a quarter of it random */
+	T_IMG_SOME_TWO_LEVEL,	/* @base with about a quarter of it 0 or 15 */
+	T_IMG_SAME,		/* @base */
+};
+
+static void t_img_gen(u8 *img, const struct t_fix *f, const u8 *base,
+		      enum t_img_kind kind, struct rnd_state *rs)
+{
+	size_t i, size = t_fix_size(f);
+
+	for (i = 0; i < size; i++) {
+		u32 r = prandom_u32_state(rs);
+		u8 lo = r & 0xf, hi = r >> 4 & 0xf;
+
+		switch (kind) {
+		case T_IMG_RANDOM:
+			img[i] = r;
+			break;
+		case T_IMG_TWO_LEVEL:
+			img[i] = (r & 1 ? 0x0f : 0) | (r & 2 ? 0xf0 : 0);
+			break;
+		case T_IMG_SAME:
+			img[i] = base[i];
+			break;
+		default:
+			if (kind == T_IMG_SOME_TWO_LEVEL) {
+				lo = lo & 1 ? 0xf : 0;
+				hi = hi & 1 ? 0xf : 0;
+			}
+			img[i] = base[i];
+			if (!(r >> 8 & 3))
+				img[i] = (img[i] & 0xf0) | lo;
+			if (!(r >> 10 & 3))
+				img[i] = (img[i] & 0x0f) | hi << 4;
+			break;
+		}
+	}
+}
+
+static const u32 t_snap_modes[] = {
+	EBC_MODE_PART, EBC_MODE_FULL, EBC_MODE_BLACK_WHITE, EBC_MODE_A2,
+};
+
+/* prev and next kinds of the snapshot cases */
+static const u8 t_snap_imgs[][2] = {
+	{ T_IMG_RANDOM, T_IMG_RANDOM },
+	{ T_IMG_RANDOM, T_IMG_SOME },
+	{ T_IMG_RANDOM, T_IMG_SOME_TWO_LEVEL },
+	{ T_IMG_RANDOM, T_IMG_SAME },
+	{ T_IMG_TWO_LEVEL, T_IMG_RANDOM },
+	{ T_IMG_TWO_LEVEL, T_IMG_SOME },
+	{ T_IMG_TWO_LEVEL, T_IMG_SOME_TWO_LEVEL },
+	{ T_IMG_TWO_LEVEL, T_IMG_SAME },
+};
+
+/* --- the conversion: the per-pixel references against the driver --- */
+
+struct t_snap_count {
+	int raised;
+	int moved;
+	int still;
+};
+
+/*
+ * Every mode and box on one prev/next pair: the reference and the driver
+ * write the same scan image over the same junk, guards included, return
+ * the same and give the same mode. False after the first difference.
+ */
+static bool t_ref_snapshot_pair(struct kunit *test, const struct t_fix *f,
+				u8 *prev, const u8 *next, u8 *scan_ref,
+				u8 *scan, const struct drm_rect *clips, int n,
+				struct rnd_state *rs, struct t_snap_count *cnt)
+{
+	struct rk3026_ebc_shadows sh = {
+		.prev = prev, .pitch = t_fix_pitch(f), .height = f->h,
+	};
+	unsigned int mi;
+	int c;
+
+	for (mi = 0; mi < ARRAY_SIZE(t_snap_modes); mi++) {
+		for (c = 0; c < n; c++) {
+			u32 mode_ref = t_snap_modes[mi], mode = mode_ref;
+			bool ret_ref, ret;
+			int diff;
+
+			prandom_bytes_state(rs, scan_ref, t_fix_size(f));
+			memcpy(scan, scan_ref, t_fix_size(f));
+			sh.scan = scan_ref;
+			ret_ref = rk3026_ebc_ref_snapshot(&sh, next, &clips[c],
+							  &mode_ref);
+			sh.scan = scan;
+			ret = rk3026_ebc_build_snapshot(&sh, next, &clips[c],
+							&mode);
+			diff = t_fix_diff(f, scan_ref, scan);
+			if (ret != ret_ref || mode != mode_ref ||
+			    diff != INT_MAX) {
+				KUNIT_FAIL(test,
+					   "%s mode %u box " DRM_RECT_FMT
+					   ": ret %d/%d mode %u/%u byte %d",
+					   f->name, t_snap_modes[mi],
+					   DRM_RECT_ARG(&clips[c]), ret, ret_ref,
+					   mode, mode_ref, diff);
+				return false;
+			}
+			cnt->raised += mode_ref != t_snap_modes[mi];
+			cnt->moved += ret_ref;
+			cnt->still += !ret_ref;
+		}
+	}
+	return true;
+}
+
+/*
+ * rk3026_ebc_build_snapshot() equals rk3026_ebc_ref_snapshot() on every
+ * fixture, image pair, mode and box. The cases reach a move, no move and
+ * the A2-over-grey raise.
+ */
+static void ebc_test_ref_snapshot(struct kunit *test)
+{
+	struct t_snap_count cnt = { 0 };
+	unsigned int fi, ii;
+	u32 seed;
+
+	for (fi = 0; fi < ARRAY_SIZE(t_fixes); fi++) {
+		const struct t_fix *f = &t_fixes[fi];
+		u8 *prev = t_fix_img(test, f), *next = t_fix_img(test, f);
+		u8 *scan_ref = t_fix_img(test, f), *scan = t_fix_img(test, f);
+		struct drm_rect clips[T_CLIPS_MAX];
+		struct rnd_state rs;
+		int n;
+
+		for (ii = 0; ii < ARRAY_SIZE(t_snap_imgs); ii++) {
+			for (seed = 1; seed <= 2; seed++) {
+				prandom_seed_state(&rs, seed * 131 + ii);
+				t_img_gen(prev, f, NULL, t_snap_imgs[ii][0], &rs);
+				t_img_gen(next, f, prev, t_snap_imgs[ii][1], &rs);
+				n = t_fix_clips(f, &rs, clips);
+				if (!t_ref_snapshot_pair(test, f, prev, next,
+							 scan_ref, scan, clips,
+							 n, &rs, &cnt)) {
+					kunit_info(test, "images %u seed %u\n",
+						   ii, seed);
+					return;
+				}
+			}
+		}
+		KUNIT_EXPECT_TRUE(test, t_fix_guard_ok(f, scan));
+	}
+	KUNIT_EXPECT_GT(test, cnt.raised, 0);
+	KUNIT_EXPECT_GT(test, cnt.moved, 0);
+	KUNIT_EXPECT_GT(test, cnt.still, 0);
+}
+
+/* Pixel (@x, @y) of an image of fixture @f. */
+static u8 t_px_w(const u8 *img, const struct t_fix *f, int x, int y)
+{
+	u8 b = img[(size_t)y * t_fix_pitch(f) + x / 2];
+
+	return x & 1 ? b >> 4 : b & 0xf;
+}
+
+static void t_px_set_w(u8 *img, const struct t_fix *f, int x, int y, u8 grey)
+{
+	u8 *b = &img[(size_t)y * t_fix_pitch(f) + x / 2];
+
+	if (x & 1)
+		*b = (*b & 0x0f) | grey << 4;
+	else
+		*b = (*b & 0xf0) | grey;
+}
+
+/*
+ * One snapshot of @box in @mode by the reference and the driver over the
+ * same junk; *@mode_out is the driver's mode. False, with a failure, if
+ * they differ.
+ */
+static bool t_snap_vs_ref(struct kunit *test, const struct t_fix *f,
+			  u8 *prev, const u8 *next, u8 *scan_ref,
+			  u8 *scan, const struct drm_rect *box, u32 mode,
+			  u32 *mode_out, struct rnd_state *rs)
+{
+	struct rk3026_ebc_shadows sh = {
+		.prev = prev, .pitch = t_fix_pitch(f), .height = f->h,
+	};
+	u32 mode_ref = mode;
+	bool ret_ref, ret;
+	int diff;
+
+	prandom_bytes_state(rs, scan_ref, t_fix_size(f));
+	memcpy(scan, scan_ref, t_fix_size(f));
+	sh.scan = scan_ref;
+	ret_ref = rk3026_ebc_ref_snapshot(&sh, next, box, &mode_ref);
+	sh.scan = scan;
+	*mode_out = mode;
+	ret = rk3026_ebc_build_snapshot(&sh, next, box, mode_out);
+	diff = t_fix_diff(f, scan_ref, scan);
+	if (ret == ret_ref && *mode_out == mode_ref && diff == INT_MAX)
+		return true;
+	KUNIT_FAIL(test, "%s mode %u box " DRM_RECT_FMT
+		   ": ret %d/%d mode %u/%u byte %d", f->name, mode,
+		   DRM_RECT_ARG(box), ret, ret_ref, *mode_out, mode_ref, diff);
+	return false;
+}
+
+/*
+ * Every prev/next pair of levels (256) at every pixel of a word (8): row y
+ * of the 256 x 16 fixture holds pair (x + y) % 256 at pixel x, prev's level
+ * in the high four bits of the pair. Every mode, the whole image and boxes
+ * with odd edges, against the reference.
+ */
+static void ebc_test_snapshot_nibble_pairs(struct kunit *test)
+{
+	const struct t_fix *f = &t_fixes[1];
+	u8 *prev = t_fix_img(test, f), *next = t_fix_img(test, f);
+	u8 *scan_ref = t_fix_img(test, f), *scan = t_fix_img(test, f);
+	const struct drm_rect boxes[] = {
+		DRM_RECT_INIT(0, 0, f->w, f->h),
+		DRM_RECT_INIT(1, 0, f->w - 2, 8),
+		DRM_RECT_INIT(3, 2, 77, 9),
+		DRM_RECT_INIT(7, 8, 1, 8),
+	};
+	struct rnd_state rs;
+	unsigned int mi, bi;
+	int x, y;
+	u32 mode;
+
+	for (y = 0; y < f->h; y++) {
+		for (x = 0; x < f->w; x++) {
+			u8 q = x + y;
+
+			t_px_set_w(prev, f, x, y, q >> 4);
+			t_px_set_w(next, f, x, y, q & 0xf);
+		}
+	}
+	prandom_seed_state(&rs, 29);
+	for (mi = 0; mi < ARRAY_SIZE(t_snap_modes); mi++)
+		for (bi = 0; bi < ARRAY_SIZE(boxes); bi++)
+			if (!t_snap_vs_ref(test, f, prev, next, scan_ref, scan,
+					   &boxes[bi], t_snap_modes[mi], &mode,
+					   &rs))
+				return;
+	KUNIT_EXPECT_TRUE(test, t_fix_guard_ok(f, scan));
+}
+
+/*
+ * The A2-over-grey raise at every pixel of three words: on a black and
+ * white prev, one grey at pixel @j of a row. An A2 scan that changes pixel
+ * @j runs DU; one that changes only the pixel next to it, or changes @j on
+ * a prev without the grey, stays A2.
+ */
+static void ebc_test_snapshot_a2_guard_positions(struct kunit *test)
+{
+	const struct t_fix *f = &t_fixes[1];
+	u8 *prev = t_fix_img(test, f), *next = t_fix_img(test, f);
+	u8 *scan_ref = t_fix_img(test, f), *scan = t_fix_img(test, f);
+	const struct drm_rect box = DRM_RECT_INIT(0, 0, f->w, f->h);
+	struct rnd_state rs;
+	int j, g, nb;
+	u32 mode;
+
+	prandom_seed_state(&rs, 31);
+	for (j = 0; j < 24; j++) {
+		for (g = 0; g < 16; g++) {
+			for (nb = -1; nb <= 1; nb++) {
+				int x = j + nb, y = 3;
+				bool grey = g != 0 && g != 15;
+				u8 lvl;
+
+				if (x < 0)
+					continue;
+				t_img_gen(prev, f, NULL, T_IMG_TWO_LEVEL, &rs);
+				t_px_set_w(prev, f, j, y, g);
+				memcpy(next, prev, t_fix_size(f));
+				lvl = t_px_w(prev, f, x, y);
+				t_px_set_w(next, f, x, y, lvl >= 8 ? 0 : 15);
+				if (!t_snap_vs_ref(test, f, prev, next,
+						   scan_ref, scan, &box,
+						   EBC_MODE_A2, &mode, &rs))
+					return;
+				KUNIT_EXPECT_EQ_MSG(test, mode,
+						    !nb && grey ?
+						    EBC_MODE_BLACK_WHITE :
+						    EBC_MODE_A2,
+						    "pixel %d grey %d at %d",
+						    j, g, x);
+			}
+		}
+	}
+}
+
+/* A bare struct rk3026_ebc for rk3026_ebc_blit_xrgb8888() on @f. */
+static struct rk3026_ebc *t_blit_ebc(struct kunit *test, const struct t_fix *f)
+{
+	struct rk3026_ebc *ebc = kunit_kzalloc(test, sizeof(*ebc), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, ebc);
+	mutex_init(&ebc->image_lock);
+	ebc->width = f->w;
+	ebc->height = f->h;
+	ebc->next_shadow = t_fix_img(test, f);
+	return ebc;
+}
+
+/*
+ * Every clip on one source: the reference rows on the clip widened as the
+ * driver widens it and rk3026_ebc_blit_xrgb8888() write the same target
+ * over the same junk, guards included. False after the first difference.
+ */
+static bool t_ref_blit_src(struct kunit *test, const struct t_fix *f,
+			   struct rk3026_ebc *ebc, u8 *ref, const u8 *src,
+			   unsigned int pitch, const struct drm_rect *clips,
+			   int n, struct rnd_state *rs)
+{
+	int c;
+
+	for (c = 0; c < n; c++) {
+		const struct drm_rect *r = &clips[c];
+		struct drm_rect w;
+		int diff;
+
+		prandom_bytes_state(rs, ref, t_fix_size(f));
+		memcpy(ebc->next_shadow, ref, t_fix_size(f));
+		if (t_widen(f, r, &w))
+			rk3026_ebc_ref_blit_rows(ref, src, pitch, w.x1, w.x2,
+						 w.y1, w.y2, f->w);
+		mutex_lock(&ebc->image_lock);
+		rk3026_ebc_blit_xrgb8888(ebc, src, pitch, r);
+		mutex_unlock(&ebc->image_lock);
+		diff = t_fix_diff(f, ref, ebc->next_shadow);
+		if (diff != INT_MAX) {
+			KUNIT_FAIL(test, "%s pitch %u clip " DRM_RECT_FMT
+				   ": byte %d", f->name, pitch,
+				   DRM_RECT_ARG(r), diff);
+			return false;
+		}
+	}
+	return true;
+}
+
+/*
+ * rk3026_ebc_blit_xrgb8888() equals rk3026_ebc_ref_blit_rows() on every
+ * fixture, source set, dense and padded source pitch, and clip.
+ */
+static void ebc_test_ref_blit(struct kunit *test)
+{
+	unsigned int fi, pad, kind;
+	u32 seed;
+
+	for (fi = 0; fi < ARRAY_SIZE(t_fixes); fi++) {
+		const struct t_fix *f = &t_fixes[fi];
+		struct rk3026_ebc *ebc = t_blit_ebc(test, f);
+		u8 *ref = t_fix_img(test, f);
+		struct drm_rect clips[T_CLIPS_MAX];
+		struct rnd_state rs;
+		u8 *src;
+		int n;
+
+		src = kunit_kmalloc(test, (size_t)(f->w * 4 + 4) * f->h,
+				    GFP_KERNEL);
+		KUNIT_ASSERT_NOT_NULL(test, src);
+
+		for (pad = 0; pad <= 4; pad += 4) {
+			unsigned int pitch = f->w * 4 + pad;
+
+			for (kind = 0; kind < T_SRC_COUNT; kind++) {
+				for (seed = 1; seed <= 2; seed++) {
+					t_src_fill(src, pitch, f, kind, seed);
+					prandom_seed_state(&rs, seed * 7 + kind);
+					n = t_fix_clips(f, &rs, clips);
+					if (!t_ref_blit_src(test, f, ebc, ref,
+							    src, pitch, clips,
+							    n, &rs)) {
+						kunit_info(test,
+							   "source %u seed %u\n",
+							   kind, seed);
+						return;
+					}
+				}
+			}
+		}
+		KUNIT_EXPECT_TRUE(test, t_fix_guard_ok(f, ebc->next_shadow));
+	}
+}
+
+static struct kunit_case rk3026_ebc_conv_test_cases[] = {
+	KUNIT_CASE(ebc_test_ref_snapshot),
+	KUNIT_CASE(ebc_test_snapshot_nibble_pairs),
+	KUNIT_CASE(ebc_test_snapshot_a2_guard_positions),
+	KUNIT_CASE(ebc_test_ref_blit),
+	{}
+};
+
+static struct kunit_suite rk3026_ebc_conv_test_suite = {
+	.name = "rk3026_ebc_conv",
+	.test_cases = rk3026_ebc_conv_test_cases,
+};
+
+kunit_test_suite(rk3026_ebc_conv_test_suite);
 
 MODULE_DESCRIPTION("KUnit tests for the RK3026 EBC driver");
 MODULE_LICENSE("GPL");

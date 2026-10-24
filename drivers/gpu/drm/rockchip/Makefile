@@ -27,6 +27,8 @@ rk3026-ebc-$(CONFIG_DRM_RK3026_EBC_MXCFB) += rk3026_ebc_mxcfb.o
 rk3026-ebc-$(CONFIG_DEBUG_FS) += rk3026_ebc_debugfs.o
 
 obj-$(CONFIG_DRM_RK3026_EBC) += rk3026-ebc.o
-obj-$(CONFIG_DRM_RK3026_EBC_KUNIT_TEST) += tests/rk3026_ebc_kunit.o
+tests/rk3026_ebc_kunit_test-y := tests/rk3026_ebc_kunit.o \
+				 tests/rk3026_ebc_kunit_ref.o
+obj-$(CONFIG_DRM_RK3026_EBC_KUNIT_TEST) += tests/rk3026_ebc_kunit_test.o
 # rk3026_ebc_trace.h, for <trace/define_trace.h>
 CFLAGS_rk3026_ebc.o := -I$(src)

@@ -30,6 +30,7 @@ TRACE_DEFINE_ENUM(EBC_REASON_CLEANUP_BIG);
 TRACE_DEFINE_ENUM(EBC_REASON_AUTO_PART);
 TRACE_DEFINE_ENUM(EBC_REASON_CLEANUP_CEILING);
 TRACE_DEFINE_ENUM(EBC_REASON_CLEANUP_IDLE);
+TRACE_DEFINE_ENUM(EBC_REASON_AUTO_A2);
 
 #define ebc_trace_mode(m)						\
 	__print_symbolic(m,						\
@@ -107,7 +108,8 @@ TRACE_EVENT(rk3026_ebc_update_queue,
 			 { EBC_REASON_CLEANUP_BIG,	"cleanup_big" },\
 			 { EBC_REASON_AUTO_PART,	"auto_part" },	\
 			 { EBC_REASON_CLEANUP_CEILING,	"cleanup_ceiling" },\
-			 { EBC_REASON_CLEANUP_IDLE,	"cleanup_idle" })
+			 { EBC_REASON_CLEANUP_IDLE,	"cleanup_idle" },\
+			 { EBC_REASON_AUTO_A2,		"auto_a2" })
 
 /*
  * One waveform starts. @reason is why the part is driven in its mode

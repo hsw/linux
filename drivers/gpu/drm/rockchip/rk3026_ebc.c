@@ -127,8 +127,9 @@ static void ebc_rails_rearm(struct rk3026_ebc *ebc)
  * Such an update is sent with @auto_mode, and the content picks its waveform
  * (rk3026_ebc_resolve_mode()): when every pixel it changes becomes black or
  * white, the part is driven in DU, which drives those pixels fully and does
- * not flash; with a grey among them, in PART, which moves only the changed
- * pixels, to all 16 levels. FULL is what a part keeps when the content does
+ * not flash (in A2 when it is small and a2_max_area allows it); with a grey
+ * among them, in PART, which moves only the changed pixels, to all 16
+ * levels. FULL is what a part keeps when the content does
  * not decide: behind a repair, merged with a send that names its mode,
  * carried, or as a cleanup of the DU budget (a big part once it is spent,
  * any part once it reaches its ceiling). The idle cleanup the refresh
@@ -1218,6 +1219,30 @@ static void ebc_publish(struct rk3026_ebc *ebc, struct rk3026_ebc_last *last,
 }
 
 /*
+ * Whether the waveform has an A2 table of its own at the temperature @part
+ * is likely drawn at (rk3026_ebc_resolve_mode()), under @image_lock. The
+ * sensor is read only after the lock is dropped, so the temperature is the
+ * part's own if it brings one, else the one the last driven part was drawn
+ * at; with neither, no A2. Should the sensor then say otherwise, the A2
+ * fetch falls back to the DU table (rk3026_ebc_waveform_lut()): the part is
+ * drawn as DU, in the class A2 and DU share, and is never carried for it.
+ */
+static bool ebc_a2_lut(struct rk3026_ebc *ebc,
+		       const struct rk3026_ebc_set *part)
+{
+	int temp;
+
+	if (part->temp_valid)
+		temp = part->temp > EBC_TEMP_MAX ? EBC_TEMP_FALLBACK :
+						   part->temp;
+	else if (ebc->last_driven.temp_read)
+		temp = ebc->last_driven.temp;
+	else
+		return false;
+	return rk3026_ebc_waveform_has_a2(ebc->waveform, temp);
+}
+
+/*
  * Take the next part and drive it onto the panel, if anything is pending.
  * Runs only on the refresh thread.
  *
@@ -1246,6 +1271,7 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 	ktime_t start = ktime_get(), snap_start;
 	enum rk3026_ebc_reason reason;
 	struct rk3026_ebc_du_budget budget;
+	struct rk3026_ebc_a2 a2 = { 0 };
 	struct rk3026_ebc_set part;
 	bool repair_due, identical, prev_changed, two_level;
 	u32 frames, mode, scan_mode, resolved, lut_mode;
@@ -1312,7 +1338,7 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 	snap_start = ktime_get();
 	identical = !rk3026_ebc_build_snapshot(sh, target, &part.box,
 					       &scan_mode, &two_level,
-					       &changed_px);
+					       &a2.over_grey, &changed_px);
 	last->snap_us = ebc_us_since(snap_start);
 	if (debug_scan)
 		ebc_report_image(ebc);
@@ -1377,19 +1403,23 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 
 	/*
 	 * The content's choice for a part of auto updates: DU when every
-	 * changed pixel becomes black or white, else PART for a plane part,
-	 * unless the plane parts' DU budget makes it the cleanup FULL (a big
-	 * part once it is spent, any part at its ceiling). The idle cleanup
-	 * keeps its FULL. It comes after the skip, which stays on the part's
-	 * own mode, and before force_mode.
+	 * changed pixel becomes black or white (A2 for a small plane part, if
+	 * a2_max_area allows it), else PART for a plane part, unless the plane
+	 * parts' DU budget makes it the cleanup FULL (a big part once it is
+	 * spent, any part at its ceiling). The idle cleanup keeps its FULL.
+	 * It comes after the skip, which stays on the part's own mode, and
+	 * before force_mode.
 	 */
 	budget.area = ebc->du_area;
 	budget.limit = READ_ONCE(ebc->du_cleanup_area);
 	budget.big_area = READ_ONCE(ebc->du_cleanup_big_area);
 	budget.ceiling = READ_ONCE(ebc->du_cleanup_ceiling);
+	a2.max_area = READ_ONCE(ebc->a2_max_area);
+	if (a2.max_area)
+		a2.lut = ebc_a2_lut(ebc, &part);
 	resolved = rk3026_ebc_resolve_mode(&part, scan_mode, two_level,
 					   changed_px, repair_due, &budget,
-					   &reason);
+					   &a2, &reason);
 	last->reason = reason;
 
 	/* DIAGNOSTIC: drive a different mode class with the same data and scan. */
@@ -2571,6 +2601,8 @@ static int ebc_probe(struct platform_device *pdev)
 	ebc->du_cleanup_ceiling = 4 * ebc->du_cleanup_area;
 	/* And it is cleaned up once the plane is idle this long. */
 	ebc->du_cleanup_idle_ms = EBC_DU_CLEANUP_IDLE_MS;
+	/* No A2 for plane parts until its ghosting is measured. */
+	ebc->a2_max_area = 0;
 
 	/* E Ink GDCK_STA / LGONL; no display-timing binding covers them. */
 	if (of_property_read_u32(dev->of_node, "rockchip,gdck-sta",

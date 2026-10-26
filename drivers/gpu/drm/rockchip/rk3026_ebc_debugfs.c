@@ -15,6 +15,9 @@
  *                    read-write; probe sets half the panel's area.
  *   du_cleanup_ceiling  the budget at which any part takes the cleanup
  *                    FULL, read-write; 0: none. Probe sets four panels.
+ *   du_cleanup_idle_ms  how long the plane must be idle before a spent
+ *                    budget is cleaned up, read-write; 0: no idle cleanup.
+ *                    Probe sets 2000.
  *   timing  text, the blit and snapshot times of the last part and the last
  *           driven one (rk3026_ebc_timing_show())
  *
@@ -118,6 +121,7 @@ static const char *const ebc_source_names[] = {
 	[EBC_SOURCE_PLANE]	= "plane",
 	[EBC_SOURCE_MXCFB]	= "mxcfb",
 	[EBC_SOURCE_ENABLE]	= "enable",
+	[EBC_SOURCE_IDLE]	= "idle",
 };
 
 static const char *const ebc_outcome_names[] = {
@@ -234,16 +238,21 @@ DEFINE_SHOW_ATTRIBUTE(rk3026_ebc_state);
  * rk3026_ebc_du_budget). cleanup_due is 1 when the budget is spent, so the
  * next big auto plane part, two-level or grey, will be driven FULL, and
  * ceiling_due 1 when it has reached its ceiling, so any will
- * (rk3026_ebc_du_cleanup()).
+ * (rk3026_ebc_du_cleanup()). du_cleanup_idle_ms is the knob of that name;
+ * idle_armed is 1 from a plane update until the refresh thread's look at
+ * the idle cleanup after the delay (rk3026_ebc_idle_tick()), which queues
+ * it if cleanup_due is 1 then.
  */
 static int rk3026_ebc_du_state_show(struct seq_file *m, void *unused)
 {
 	struct rk3026_ebc *ebc = m->private;
 	struct rk3026_ebc_du_budget b, small;
 	enum rk3026_ebc_reason reason;
+	bool idle_armed;
 
 	mutex_lock(&ebc->image_lock);
 	b.area = ebc->du_area;
+	idle_armed = ebc->idle_armed;
 	mutex_unlock(&ebc->image_lock);
 	b.limit = READ_ONCE(ebc->du_cleanup_area);
 	b.big_area = READ_ONCE(ebc->du_cleanup_big_area);
@@ -261,6 +270,9 @@ static int rk3026_ebc_du_state_show(struct seq_file *m, void *unused)
 		   rk3026_ebc_du_cleanup(&b, U32_MAX, &reason));
 	seq_printf(m, "ceiling_due %d\n",
 		   rk3026_ebc_du_cleanup(&small, 0, &reason));
+	seq_printf(m, "du_cleanup_idle_ms %u\n",
+		   READ_ONCE(ebc->du_cleanup_idle_ms));
+	seq_printf(m, "idle_armed %d\n", idle_armed);
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(rk3026_ebc_du_state);
@@ -310,6 +322,8 @@ void rk3026_ebc_debugfs_init(struct rk3026_ebc *ebc)
 			   &ebc->du_cleanup_big_area);
 	debugfs_create_u32("du_cleanup_ceiling", 0644, dir,
 			   &ebc->du_cleanup_ceiling);
+	debugfs_create_u32("du_cleanup_idle_ms", 0644, dir,
+			   &ebc->du_cleanup_idle_ms);
 	debugfs_create_file("timing", 0444, dir, ebc, &rk3026_ebc_timing_fops);
 }
 

@@ -17,6 +17,7 @@
 TRACE_DEFINE_ENUM(EBC_SOURCE_PLANE);
 TRACE_DEFINE_ENUM(EBC_SOURCE_MXCFB);
 TRACE_DEFINE_ENUM(EBC_SOURCE_ENABLE);
+TRACE_DEFINE_ENUM(EBC_SOURCE_IDLE);
 TRACE_DEFINE_ENUM(EBC_OUTCOME_SKIPPED);
 TRACE_DEFINE_ENUM(EBC_OUTCOME_CRTC_OFF);
 TRACE_DEFINE_ENUM(EBC_OUTCOME_NO_WAVEFORM);
@@ -28,6 +29,7 @@ TRACE_DEFINE_ENUM(EBC_REASON_REPAIR_FLOOR);
 TRACE_DEFINE_ENUM(EBC_REASON_CLEANUP_BIG);
 TRACE_DEFINE_ENUM(EBC_REASON_AUTO_PART);
 TRACE_DEFINE_ENUM(EBC_REASON_CLEANUP_CEILING);
+TRACE_DEFINE_ENUM(EBC_REASON_CLEANUP_IDLE);
 
 #define ebc_trace_mode(m)						\
 	__print_symbolic(m,						\
@@ -49,7 +51,8 @@ TRACE_DEFINE_ENUM(EBC_REASON_CLEANUP_CEILING);
 	__print_symbolic(s,						\
 			 { EBC_SOURCE_PLANE,	"plane" },		\
 			 { EBC_SOURCE_MXCFB,	"mxcfb" },		\
-			 { EBC_SOURCE_ENABLE,	"enable" })
+			 { EBC_SOURCE_ENABLE,	"enable" },		\
+			 { EBC_SOURCE_IDLE,	"idle" })
 
 #define ebc_trace_outcome(o)						\
 	__print_symbolic(o,						\
@@ -103,7 +106,8 @@ TRACE_EVENT(rk3026_ebc_update_queue,
 			 { EBC_REASON_REPAIR_FLOOR,	"repair_floor" },\
 			 { EBC_REASON_CLEANUP_BIG,	"cleanup_big" },\
 			 { EBC_REASON_AUTO_PART,	"auto_part" },	\
-			 { EBC_REASON_CLEANUP_CEILING,	"cleanup_ceiling" })
+			 { EBC_REASON_CLEANUP_CEILING,	"cleanup_ceiling" },\
+			 { EBC_REASON_CLEANUP_IDLE,	"cleanup_idle" })
 
 /*
  * One waveform starts. @reason is why the part is driven in its mode

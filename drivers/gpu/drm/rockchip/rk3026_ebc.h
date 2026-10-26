@@ -249,7 +249,7 @@ enum rk3026_ebc_reason {
 	EBC_REASON_EXPLICIT,	/* the part's own mode, as asked or by default */
 	EBC_REASON_AUTO_DU,	/* an auto part whose changes are all 0 or 15 */
 	EBC_REASON_REPAIR_FLOOR, /* raised to PART after a repair RESET */
-	EBC_REASON_CLEANUP_BIG,	/* spent: a big auto plane part kept FULL */
+	EBC_REASON_CLEANUP_BIG,	/* a big auto plane part kept FULL: spent, or spent by it */
 	EBC_REASON_AUTO_PART,	/* an auto plane part with a grey change */
 	EBC_REASON_CLEANUP_CEILING, /* ceiling: any auto plane part FULL */
 	EBC_REASON_CLEANUP_IDLE, /* the idle cleanup's own FULL */
@@ -269,6 +269,14 @@ struct rk3026_ebc_du_budget {
 	u32	big_area;
 	u32	ceiling;
 };
+
+/*
+ * The idle delay before the cleanup FULL of a spent DU budget
+ * (rk3026_ebc_idle_tick()): long enough that a pause between keystrokes or
+ * pointer moves does not flash the panel, short enough that the glass is
+ * clean when the user looks at it. debugfs du_cleanup_idle_ms changes it.
+ */
+#define EBC_DU_CLEANUP_IDLE_MS	2000
 
 /*
  * What rk3026_ebc_resolve_mode() needs to drive a two-level auto plane part
@@ -659,8 +667,8 @@ struct rk3026_ebc {
 	 * one cleanup. Both under @image_lock, written with WRITE_ONCE(): the
 	 * thread also reads them without the lock, for the deadline of its
 	 * wait alone, and decides under the lock. @du_cleanup_idle_ms is the
-	 * delay (0: none); probe sets 2000, debugfs may change it, and the
-	 * thread reads it with READ_ONCE().
+	 * delay (0: none); probe sets EBC_DU_CLEANUP_IDLE_MS, debugfs may
+	 * change it, and the thread reads it with READ_ONCE().
 	 */
 	unsigned long		idle_last_plane;
 	bool			idle_armed;

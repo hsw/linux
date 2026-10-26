@@ -560,13 +560,11 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_du_cleanup);
  * Otherwise a part with a plane update in it is driven in PART. Like DU, it
  * moves only the pixels that change, so the box flashes and the rest of the
  * panel does not; unlike DU, it drives them to all 16 levels, a full
- * black/white transition included. A camera run on this panel drew a grey
- * ramp from white in PART as FULL drew it, solid black included; the old
- * rule that a plane part never goes PART, for fear of a washed-out black,
- * rested on one whole-frame observation that the run did not reproduce. The
- * snapshot stands here too: a plane update's own mode is FULL, so
- * @scan_mode is a 16-level one and nothing was thresholded. A part of
- * mxcfb sends alone keeps @scan_mode, its client's default.
+ * black/white transition included (why a plane part may go PART: see
+ * EBC_MODE_DEFAULT in rk3026_ebc.c). The snapshot stands here too: a plane
+ * update's own mode is FULL, so @scan_mode is a 16-level one and nothing
+ * was thresholded. A part of mxcfb sends alone keeps @scan_mode, its
+ * client's default.
  *
  * DU leaves the ghosts of what it draws over, and @budget counts them. An
  * auto part with a plane update in it, two-level or grey, keeps

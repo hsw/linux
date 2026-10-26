@@ -3,27 +3,31 @@
  * debugfs of the RK3026 EBC: what the driver believes is on the glass.
  *
  * <debugfs>/rk3026-ebc/
- *   panel   the on-panel image (@shadows.prev), read-only binary
- *   target  the target image the senders write (@next_shadow); a scan draws
- *           the part of it its updates cover, read-only binary
- *   state   text, one "key value" line per item (rk3026_ebc_state_show())
+ *   panel            the on-panel image (@shadows.prev), read-only binary
+ *   target           the target image the senders write (@next_shadow); a
+ *                    scan draws the part of it its updates cover, read-only
+ *                    binary
+ *   state            text, one "key value" line per item
+ *                    (rk3026_ebc_state_show())
  *   du_state         text, the DU cleanup budget (rk3026_ebc_du_state_show())
  *   du_cleanup_area  the budget's limit in pixels, read-write; 0: no
  *                    cleanup FULL. A diagnostic: probe sets one panel's area.
- *   du_cleanup_big_area  the changed pixels that make a part big enough
- *                    for the cleanup FULL once the budget is spent or the
- *                    part would spend it,
- *                    read-write; probe sets half the panel's area.
- *   du_cleanup_ceiling  the budget at which any part takes the cleanup
- *                    FULL, read-write; 0: none. Probe sets four panels.
- *   du_cleanup_idle_ms  how long the plane must be idle before a spent
- *                    budget is cleaned up, read-write; 0: no idle cleanup.
- *                    Probe sets 2000.
- *   a2_max_area  the most pixels a two-level auto plane part may change to
- *                    be driven in A2, read-write; 0: no A2, as probe sets
+ *   du_cleanup_big_area
+ *                    the changed pixels that make a part big enough for the
+ *                    cleanup FULL once the budget is spent or the part would
+ *                    spend it, read-write; probe sets half the panel's area.
+ *   du_cleanup_ceiling
+ *                    the budget at which any part takes the cleanup FULL,
+ *                    read-write; 0: none. Probe sets four panels.
+ *   du_cleanup_idle_ms
+ *                    how long the plane must be idle before a spent budget
+ *                    is cleaned up, read-write; 0: no idle cleanup. Probe
+ *                    sets EBC_DU_CLEANUP_IDLE_MS.
+ *   a2_max_area      the most pixels a two-level auto plane part may change
+ *                    to be driven in A2, read-write; 0: no A2, as probe sets
  *                    it.
- *   timing  text, the blit and snapshot times of the last part and the last
- *           driven one (rk3026_ebc_timing_show())
+ *   timing           text, the blit and snapshot times of the last part and
+ *                    the last driven one (rk3026_ebc_timing_show())
  *
  * Both images are @img_size = width * height / 2 bytes: 4 bpp, two pixels per
  * byte with the LEFT pixel in the LOW nibble, rows of width / 2 bytes, top row

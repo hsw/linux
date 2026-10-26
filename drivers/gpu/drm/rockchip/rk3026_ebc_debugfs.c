@@ -11,7 +11,8 @@
  *   du_cleanup_area  the budget's limit in pixels, read-write; 0: no
  *                    cleanup FULL. A diagnostic: probe sets one panel's area.
  *   du_cleanup_big_area  the changed pixels that make a part big enough
- *                    for the cleanup FULL once the budget is spent,
+ *                    for the cleanup FULL once the budget is spent or the
+ *                    part would spend it,
  *                    read-write; probe sets half the panel's area.
  *   du_cleanup_ceiling  the budget at which any part takes the cleanup
  *                    FULL, read-write; 0: none. Probe sets four panels.
@@ -238,9 +239,10 @@ DEFINE_SHOW_ATTRIBUTE(rk3026_ebc_state);
  * the pixels plane parts changed in DU or A2 since the glass was last
  * cleared (rk3026_ebc_du_account()); du_cleanup_area, du_cleanup_big_area and
  * du_cleanup_ceiling are the knobs of the same names (struct
- * rk3026_ebc_du_budget). cleanup_due is 1 when the budget is spent, so the
- * next big auto plane part, two-level or grey, will be driven FULL, and
- * ceiling_due 1 when it has reached its ceiling, so any will
+ * rk3026_ebc_du_budget). cleanup_due is 1 when the budget is spent
+ * (rk3026_ebc_du_spent()), so the next big auto plane part, two-level or
+ * grey, will be driven FULL, and ceiling_due 1 when it has reached its
+ * ceiling (rk3026_ebc_du_at_ceiling()), so any will
  * (rk3026_ebc_du_cleanup()). du_cleanup_idle_ms is the knob of that name;
  * idle_armed is 1 from a plane update until the refresh thread's look at
  * the idle cleanup after the delay (rk3026_ebc_idle_tick()), which queues
@@ -249,8 +251,7 @@ DEFINE_SHOW_ATTRIBUTE(rk3026_ebc_state);
 static int rk3026_ebc_du_state_show(struct seq_file *m, void *unused)
 {
 	struct rk3026_ebc *ebc = m->private;
-	struct rk3026_ebc_du_budget b, small;
-	enum rk3026_ebc_reason reason;
+	struct rk3026_ebc_du_budget b;
 	bool idle_armed;
 
 	mutex_lock(&ebc->image_lock);
@@ -261,18 +262,12 @@ static int rk3026_ebc_du_state_show(struct seq_file *m, void *unused)
 	b.big_area = READ_ONCE(ebc->du_cleanup_big_area);
 	b.ceiling = READ_ONCE(ebc->du_cleanup_ceiling);
 
-	/* No part is big for @small: only the ceiling cleans it up. */
-	small = b;
-	small.big_area = U32_MAX;
-
 	seq_printf(m, "du_area %u\n", b.area);
 	seq_printf(m, "du_cleanup_area %u\n", b.limit);
 	seq_printf(m, "du_cleanup_big_area %u\n", b.big_area);
 	seq_printf(m, "du_cleanup_ceiling %u\n", b.ceiling);
-	seq_printf(m, "cleanup_due %d\n",
-		   rk3026_ebc_du_cleanup(&b, U32_MAX, &reason));
-	seq_printf(m, "ceiling_due %d\n",
-		   rk3026_ebc_du_cleanup(&small, 0, &reason));
+	seq_printf(m, "cleanup_due %d\n", rk3026_ebc_du_spent(&b));
+	seq_printf(m, "ceiling_due %d\n", rk3026_ebc_du_at_ceiling(&b));
 	seq_printf(m, "du_cleanup_idle_ms %u\n",
 		   READ_ONCE(ebc->du_cleanup_idle_ms));
 	seq_printf(m, "idle_armed %d\n", idle_armed);

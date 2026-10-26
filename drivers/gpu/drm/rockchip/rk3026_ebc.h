@@ -638,10 +638,11 @@ struct rk3026_ebc {
 	 * The DU cleanup budget (rk3026_ebc_du_account()). @du_area counts the
 	 * pixels plane parts changed in DU or A2 since the glass was last
 	 * cleared; the refresh thread alone writes it, under @image_lock;
-	 * PART parts leave it. Once it reaches @du_cleanup_area (spent), an
-	 * auto plane part, two-level or grey, that changes at least
-	 * @du_cleanup_big_area pixels is driven FULL instead of DU, A2 or
-	 * PART; once it reaches @du_cleanup_ceiling, any auto plane part is
+	 * PART parts leave it. Once it reaches @du_cleanup_area (spent), or
+	 * would reach it with the part, an auto plane part, two-level or
+	 * grey, that changes at least @du_cleanup_big_area pixels is driven
+	 * FULL instead of DU, A2 or PART; once it reaches
+	 * @du_cleanup_ceiling, any auto plane part is
 	 * (rk3026_ebc_resolve_mode()). Probe sets the limit to one panel's
 	 * area, a big part to half of it and the ceiling to four panels;
 	 * debugfs may change each (a limit of 0: no cleanup; a ceiling of 0:
@@ -792,8 +793,11 @@ bool rk3026_ebc_build_snapshot(const struct rk3026_ebc_shadows *sh,
 bool rk3026_ebc_should_skip(const struct rk3026_ebc_set *part,
 			    bool prev_unknown, bool identical);
 u32 rk3026_ebc_scan_mode(const struct rk3026_ebc_set *part, bool repaired);
+bool rk3026_ebc_du_spent(const struct rk3026_ebc_du_budget *budget);
+bool rk3026_ebc_du_at_ceiling(const struct rk3026_ebc_du_budget *budget);
 bool rk3026_ebc_du_cleanup(const struct rk3026_ebc_du_budget *budget,
-			   u32 changed_px, enum rk3026_ebc_reason *reason);
+			   u32 changed_px, u32 added_px,
+			   enum rk3026_ebc_reason *reason);
 u32 rk3026_ebc_resolve_mode(const struct rk3026_ebc_set *part, u32 scan_mode,
 			    bool two_level, u32 changed_px, bool repair_due,
 			    const struct rk3026_ebc_du_budget *budget,

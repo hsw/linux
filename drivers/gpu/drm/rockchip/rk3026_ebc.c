@@ -131,10 +131,10 @@ static void ebc_rails_rearm(struct rk3026_ebc *ebc)
  * among them, in PART, which moves only the changed pixels, to all 16
  * levels. FULL is what a part keeps when the content does
  * not decide: behind a repair, merged with a send that names its mode,
- * carried, or as a cleanup of the DU budget (a big part once it is spent,
- * any part once it reaches its ceiling). The idle cleanup the refresh
- * thread queues on a spent budget is a FULL of its own
- * (rk3026_ebc_idle_tick()).
+ * carried, or as a cleanup of the DU budget (a big part once it is spent
+ * or when it would spend it, any part once it reaches its ceiling). The
+ * idle cleanup the refresh thread queues on a spent budget is a FULL of
+ * its own (rk3026_ebc_idle_tick()).
  *
  * An early version defaulted to PART and rendered washed grey where
  * force_mode=1 rendered solid black (docs/PENDING.md P18), and plane parts
@@ -1406,9 +1406,9 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 	 * changed pixel becomes black or white (A2 for a small plane part, if
 	 * a2_max_area allows it), else PART for a plane part, unless the plane
 	 * parts' DU budget makes it the cleanup FULL (a big part once it is
-	 * spent, any part at its ceiling). The idle cleanup keeps its FULL.
-	 * It comes after the skip, which stays on the part's own mode, and
-	 * before force_mode.
+	 * spent or when it would spend it, any part at its ceiling). The
+	 * idle cleanup keeps its FULL. It comes after the skip, which stays
+	 * on the part's own mode, and before force_mode.
 	 */
 	budget.area = ebc->du_area;
 	budget.limit = READ_ONCE(ebc->du_cleanup_area);

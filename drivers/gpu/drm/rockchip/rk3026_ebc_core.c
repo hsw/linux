@@ -547,14 +547,15 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_du_cleanup);
  * Such a part with a plane update in it, a pointer move or a key typed,
  * is driven in A2 instead when it is small, at most @a2->max_area changed
  * pixels: A2 is the shorter waveform, so the next move comes sooner, and
- * leaves more of a ghost. It needs an A2 table of the waveform's own
- * (@a2->lut), and no changed pixel over a grey of the glass
- * (@a2->over_grey): A2 drives only black and white and does not move a
- * grey at all. Without either the part stays DU, which has its table and
- * drives every level; it is never carried into a mode that is not the
- * content's. A max_area of 0 is no A2: the default, until its ghosting is
- * measured on the panel. A part of mxcfb sends alone stays DU: such a
- * client names A2 itself when it wants it.
+ * leaves more of a ghost. It needs no changed pixel over a grey of the
+ * glass (@a2->over_grey): A2 drives only black and white and does not move
+ * a grey at all, so such a part stays DU, which drives every level. A
+ * waveform without an A2 table at the temperature hands out the DU table
+ * for A2 (rk3026_ebc_waveform_lut()): the part is then drawn as DU, in the
+ * DSP_CTRL class the two share, and never carried for it. A max_area of 0
+ * is no A2: the default, until its ghosting is measured on the panel. A
+ * part of mxcfb sends alone stays DU: such a client names A2 itself when
+ * it wants it.
  *
  * Otherwise a part with a plane update in it is driven in PART. Like DU, it
  * moves only the pixels that change, so the box flashes and the rest of the
@@ -610,7 +611,7 @@ u32 rk3026_ebc_resolve_mode(const struct rk3026_ebc_set *part, u32 scan_mode,
 		return scan_mode;
 	if (two_level) {
 		if (part->has_plane && a2->max_area &&
-		    changed_px <= a2->max_area && a2->lut && !a2->over_grey) {
+		    changed_px <= a2->max_area && !a2->over_grey) {
 			*reason = EBC_REASON_AUTO_A2;
 			return EBC_MODE_A2;
 		}

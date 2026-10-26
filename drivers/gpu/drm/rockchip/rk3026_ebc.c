@@ -137,8 +137,8 @@ static void ebc_rails_rearm(struct rk3026_ebc *ebc)
  * its own (rk3026_ebc_idle_tick()).
  *
  * An early version defaulted to PART and rendered washed grey where
- * force_mode=1 rendered solid black (docs/PENDING.md P18), and plane parts
- * were kept off PART since. A later camera run on this panel did not
+ * force_mode=1 rendered solid black, in one whole-frame observation, and
+ * plane parts were kept off PART since. A later camera run on this panel did not
  * reproduce that: PART drew a grey ramp from white as FULL drew it, solid
  * black included, so a grey plane part goes PART now.
  */
@@ -1219,30 +1219,6 @@ static void ebc_publish(struct rk3026_ebc *ebc, struct rk3026_ebc_last *last,
 }
 
 /*
- * Whether the waveform has an A2 table of its own at the temperature @part
- * is likely drawn at (rk3026_ebc_resolve_mode()), under @image_lock. The
- * sensor is read only after the lock is dropped, so the temperature is the
- * part's own if it brings one, else the one the last driven part was drawn
- * at; with neither, no A2. Should the sensor then say otherwise, the A2
- * fetch falls back to the DU table (rk3026_ebc_waveform_lut()): the part is
- * drawn as DU, in the class A2 and DU share, and is never carried for it.
- */
-static bool ebc_a2_lut(struct rk3026_ebc *ebc,
-		       const struct rk3026_ebc_set *part)
-{
-	int temp;
-
-	if (part->temp_valid)
-		temp = part->temp > EBC_TEMP_MAX ? EBC_TEMP_FALLBACK :
-						   part->temp;
-	else if (ebc->last_driven.temp_read)
-		temp = ebc->last_driven.temp;
-	else
-		return false;
-	return rk3026_ebc_waveform_has_a2(ebc->waveform, temp);
-}
-
-/*
  * Take the next part and drive it onto the panel, if anything is pending.
  * Runs only on the refresh thread.
  *
@@ -1415,8 +1391,6 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 	budget.big_area = READ_ONCE(ebc->du_cleanup_big_area);
 	budget.ceiling = READ_ONCE(ebc->du_cleanup_ceiling);
 	a2.max_area = READ_ONCE(ebc->a2_max_area);
-	if (a2.max_area)
-		a2.lut = ebc_a2_lut(ebc, &part);
 	resolved = rk3026_ebc_resolve_mode(&part, scan_mode, two_level,
 					   changed_px, repair_due, &budget,
 					   &a2, &reason);
@@ -2006,9 +1980,10 @@ static void ebc_plane_atomic_update(struct drm_plane *plane,
 	 * snapshot lays the box over the prev image, which holds what the
 	 * glass shows (rk3026_ebc_scan_finish()), so the pixels outside it are
 	 * driven from their old level to the same level in FULL, and left
-	 * alone in DU and PART. The waveform is chosen as for a whole-panel
-	 * update: DU when every changed pixel ends black or white, else PART,
-	 * and FULL for a cleanup of the DU budget (rk3026_ebc_resolve_mode()).
+	 * alone in DU, A2 and PART. The waveform is chosen as for a
+	 * whole-panel update: DU when every changed pixel ends black or white
+	 * (A2 for a small part when a2_max_area allows it), else PART, and
+	 * FULL for a cleanup of the DU budget (rk3026_ebc_resolve_mode()).
 	 */
 	if (!rk3026_ebc_plane_box(old_state, new_state, ebc->width,
 				  ebc->height, &box))

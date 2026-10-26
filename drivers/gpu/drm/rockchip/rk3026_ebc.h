@@ -275,14 +275,11 @@ struct rk3026_ebc_du_budget {
  * in A2 rather than DU:
  *
  * @max_area: the most pixels such a part may change (0: never A2);
- * @lut: the waveform has an A2 table of its own at the temperature the
- *	part is drawn at (rk3026_ebc_waveform_has_a2());
  * @over_grey: some pixel the part changes is grey on the glass
  *	(rk3026_ebc_build_snapshot()).
  */
 struct rk3026_ebc_a2 {
 	u32	max_area;
-	bool	lut;
 	bool	over_grey;
 };
 
@@ -830,7 +827,6 @@ struct ebc_waveform *rk3026_ebc_waveform_parse(struct device *dev,
 					       const u8 *buf, size_t len);
 const u8 *rk3026_ebc_waveform_lut(struct ebc_waveform *wf, u32 mode, int temp,
 				  u32 *frames);
-bool rk3026_ebc_waveform_has_a2(struct ebc_waveform *wf, int temp);
 #if IS_ENABLED(CONFIG_KUNIT)
 int rk3026_ebc_rkf_decode(const s16 *left, const s16 *right, int root,
 			  u8 *dst, size_t dst_len, size_t n, const u8 *src,

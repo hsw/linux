@@ -1469,13 +1469,12 @@ enum t_a2 {
 	T_A2_ON,	/* max_area 10: the part is at the edge */
 	T_A2_ONE_SHORT,	/* max_area 9: the part is one pixel over */
 	T_A2_GREY,	/* max_area 10, a changed pixel over a grey */
-	T_A2_NO_LUT,	/* max_area 10, no A2 table at the temperature */
 	T_A2_ALL,	/* max_area U32_MAX */
 };
 
 static void t_a2_of(enum t_a2 kind, struct rk3026_ebc_a2 *a2)
 {
-	*a2 = (struct rk3026_ebc_a2){ .max_area = 10, .lut = true };
+	*a2 = (struct rk3026_ebc_a2){ .max_area = 10 };
 	switch (kind) {
 	case T_A2_OFF:
 		a2->max_area = 0;
@@ -1487,9 +1486,6 @@ static void t_a2_of(enum t_a2 kind, struct rk3026_ebc_a2 *a2)
 		break;
 	case T_A2_GREY:
 		a2->over_grey = true;
-		break;
-	case T_A2_NO_LUT:
-		a2->lut = false;
 		break;
 	case T_A2_ALL:
 		a2->max_area = U32_MAX;
@@ -1690,13 +1686,11 @@ static const struct t_resolve t_resolve_cases[] = {
 	  T_AUTO_A2, T_FRESH, T_A2_ON },
 	{ "A2 on plane and auto part two-level", T_PLANE_AUTO_PART, false,
 	  true, EBC_MODE_A2, T_AUTO_A2, T_FRESH, T_A2_ON },
-	/* One pixel over max_area, a grey under a change, no table: DU. */
+	/* One pixel over max_area, a grey under a change: DU. */
 	{ "A2 on plane two-level one over", T_PLANE, false, true, T_DU_MODE,
 	  T_AUTO_DU, T_FRESH, T_A2_ONE_SHORT },
 	{ "A2 on plane two-level over grey", T_PLANE, false, true, T_DU_MODE,
 	  T_AUTO_DU, T_FRESH, T_A2_GREY },
-	{ "A2 on plane two-level no LUT", T_PLANE, false, true, T_DU_MODE,
-	  T_AUTO_DU, T_FRESH, T_A2_NO_LUT },
 	/* A big part on a budget not spent: A2 if max_area allows it. */
 	{ "A2 on plane two-level big", T_PLANE, false, true, EBC_MODE_A2,
 	  T_AUTO_A2, T_FRESH_BIG, T_A2_ALL },
@@ -1768,10 +1762,8 @@ static void ebc_test_resolve_mode(struct kunit *test)
 
 	if (c->a2 != T_A2_OFF)
 		return;
-	for (i = 0; i < 4; i++) {
-		a2 = (struct rk3026_ebc_a2){
-			.max_area = 0, .lut = i & 1, .over_grey = i & 2,
-		};
+	for (i = 0; i < 2; i++) {
+		a2 = (struct rk3026_ebc_a2){ .max_area = 0, .over_grey = i };
 		reason = T_NO_REASON;
 		KUNIT_EXPECT_EQ(test,
 				rk3026_ebc_resolve_mode(&part, scan_mode,
@@ -2651,9 +2643,7 @@ static u32 t_mxcfb_resolve(struct kunit *test, u32 waveform, u32 update_mode,
 	static const struct rk3026_ebc_du_budget budget = {
 		.area = U32_MAX, .limit = 1, .big_area = 0, .ceiling = 1,
 	};
-	static const struct rk3026_ebc_a2 a2 = {
-		.max_area = U32_MAX, .lut = true,
-	};
+	static const struct rk3026_ebc_a2 a2 = { .max_area = U32_MAX };
 	struct rk3026_ebc_pending p = {};
 	struct rk3026_ebc_update upd;
 	struct rk3026_ebc_set part;
@@ -3053,52 +3043,6 @@ static void ebc_test_rkf_fallbacks(struct kunit *test)
 }
 
 /*
- * An A2 table of the container's own, which the GRAY2 fallback of the A2
- * fetch hides: present at every temperature (one bucket here), absent
- * with GRAY2 alone though the fetch then succeeds, present with a stream
- * cut short (the header alone is looked at; the fetch falls back), absent
- * with no frames or a header past the container end.
- */
-static void ebc_test_rkf_has_a2(struct kunit *test)
-{
-	struct device *dev = t_rkf_dev(test);
-	static const struct t_rkf_seg both[] = {
-		{ T_RKF_GRAY2, 3 }, { T_RKF_GRAYA2, 2 },
-	};
-	static const struct t_rkf_seg empty[] = {
-		{ T_RKF_GRAY2, 3 }, { T_RKF_GRAYA2, 0 },
-	};
-	static const int temps[] = { -10, 0, 25, 49, 50, 1000 };
-	size_t size = T_RKF_PAYLOAD + T_RKF_SEG;
-	struct ebc_waveform *wf;
-	unsigned int i;
-	u8 *buf;
-
-	wf = t_rkf_wf(test, dev, both, 2, 0);
-	for (i = 0; i < ARRAY_SIZE(temps); i++)
-		KUNIT_EXPECT_TRUE(test,
-				  rk3026_ebc_waveform_has_a2(wf, temps[i]));
-
-	wf = t_rkf_wf(test, dev, both, 1, 0);
-	KUNIT_EXPECT_FALSE(test, rk3026_ebc_waveform_has_a2(wf, 25));
-	KUNIT_EXPECT_EQ(test, t_rkf_frames(wf, EBC_MODE_A2), 3);
-
-	wf = t_rkf_wf(test, dev, both, 2, 1);
-	KUNIT_EXPECT_TRUE(test, rk3026_ebc_waveform_has_a2(wf, 25));
-	KUNIT_EXPECT_EQ(test, t_rkf_frames(wf, EBC_MODE_A2), 3);
-
-	wf = t_rkf_wf(test, dev, empty, 2, 0);
-	KUNIT_EXPECT_FALSE(test, rk3026_ebc_waveform_has_a2(wf, 25));
-
-	buf = t_rkf_container(test, size, T_RKF_PAYLOAD);
-	put_unaligned_le32(size - 2, buf + T_RKF_GRAYA2);
-	t_rkf_seal(buf, size);
-	wf = rk3026_ebc_waveform_parse(dev, buf, size + 4);
-	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, wf);
-	KUNIT_EXPECT_FALSE(test, rk3026_ebc_waveform_has_a2(wf, 25));
-}
-
-/*
  * AUTO overlays GRAY2 onto GRAY16: an absent overlay or a longer one is
  * skipped, a damaged one fails the LUT.
  */
@@ -3183,7 +3127,6 @@ static struct kunit_case rk3026_ebc_waveform_test_cases[] = {
 	KUNIT_CASE(ebc_test_rkf_modes),
 	KUNIT_CASE(ebc_test_rkf_truncated_modes),
 	KUNIT_CASE(ebc_test_rkf_fallbacks),
-	KUNIT_CASE(ebc_test_rkf_has_a2),
 	KUNIT_CASE(ebc_test_rkf_auto_overlay),
 	KUNIT_CASE(ebc_test_rkf_parse_bounds),
 	{}
@@ -4101,11 +4044,10 @@ static void ebc_test_glue_du_ceiling(struct kunit *test)
  * The policy fixture with rk3026_ebc_drive() stubbed (t_driven_ebc()) and a
  * waveform that has, with @a2_table, an A2 table of its own of 2 frames
  * next to the gray2 (DU) table of 1, so the frames driven tell the two
- * apart. The last driven part was drawn at 25 degrees, unless
- * @no_temp: then no temperature is known yet.
+ * apart.
  */
 static struct rk3026_ebc *t_a2_ebc(struct kunit *test, struct t_drives *d,
-				   bool a2_table, bool no_temp)
+				   bool a2_table)
 {
 	static const struct t_rkf_seg segs[] = {
 		{ T_RKF_RESET, 5 }, { T_RKF_GRAY16, 1 }, { T_RKF_GRAY2, 1 },
@@ -4116,60 +4058,69 @@ static struct rk3026_ebc *t_a2_ebc(struct kunit *test, struct t_drives *d,
 	if (a2_table)
 		ebc->waveform = t_rkf_wf(test, ebc->dev, segs,
 					 ARRAY_SIZE(segs), 0);
-	ebc->last_driven.temp = 25;
-	ebc->last_driven.temp_read = !no_temp;
 	return ebc;
 }
 
 /*
- * A black box of 4 x 2 pixels on the white glass, one plane update: A2 on
- * or off, it is driven DU unless every condition for A2 holds.
+ * A black box of 4 x 2 pixels on the white glass, one plane update, with
+ * A2 on for @max_area pixels; returns the record.
  */
-static void t_a2_box_du(struct kunit *test, bool a2_table, bool no_temp,
-			u32 max_area)
+static void t_a2_box(struct kunit *test, struct rk3026_ebc *ebc, u32 max_area,
+		     struct rk3026_ebc_last *last)
 {
-	struct t_drives d;
-	struct rk3026_ebc *ebc = t_a2_ebc(test, &d, a2_table, no_temp);
+	struct drm_rect r = DRM_RECT_INIT(4, 2, 4, 2);
 	u32 *box = t_plane_fb(test, 0xffffff);
-	struct rk3026_ebc_last last;
 
 	t_fb_box(box, 4, 2, 8, 4, 0);
 	ebc->a2_max_area = max_area;
 	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, box, T_W * 4,
-							&t_panel));
-	rk3026_ebc_do_refresh(ebc, &last);
-	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+							&r));
+	rk3026_ebc_do_refresh(ebc, last);
+	KUNIT_EXPECT_EQ(test, last->outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_EXPECT_EQ(test, ebc->du_area, 8);
+	KUNIT_EXPECT_FALSE(test, ebc->pending.carry.merged);
+}
+
+/*
+ * A2 off, as probe leaves it: the small two-level plane part is driven DU,
+ * as before A2, with an A2 table in the waveform.
+ */
+static void ebc_test_glue_a2_off(struct kunit *test)
+{
+	struct t_drives d;
+	struct rk3026_ebc *ebc = t_a2_ebc(test, &d, true);
+	struct rk3026_ebc_last last;
+
+	t_a2_box(test, ebc, 0, &last);
 	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_BLACK_WHITE);
 	KUNIT_EXPECT_EQ(test, last.lut_mode, EBC_MODE_BLACK_WHITE);
 	KUNIT_EXPECT_EQ(test, last.frames, 1);
 	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_AUTO_DU);
-	KUNIT_EXPECT_EQ(test, ebc->du_area, 8);
 	KUNIT_EXPECT_EQ(test, d.n, 1);
 	KUNIT_EXPECT_EQ(test, d.mode[0], EBC_MODE_BLACK_WHITE);
 }
 
 /*
- * A2 off, as probe leaves it: the small two-level plane part is driven DU,
- * as before A2, with an A2 table in the waveform and the temperature known.
- */
-static void ebc_test_glue_a2_off(struct kunit *test)
-{
-	t_a2_box_du(test, true, false, 0);
-}
-
-/*
- * A2 on, and the part well within it: still DU without an A2 table of the
- * waveform's own.
+ * A2 on, and the part well within it, with a waveform that has no A2 table
+ * of its own: the part is A2, the A2 fetch hands out the DU table (1
+ * frame), and it is drawn in the DSP_CTRL class A2 and DU share, never
+ * carried for it.
  */
 static void ebc_test_glue_a2_no_table(struct kunit *test)
 {
-	t_a2_box_du(test, false, false, U32_MAX);
-}
+	struct t_drives d;
+	struct rk3026_ebc *ebc = t_a2_ebc(test, &d, false);
+	struct rk3026_ebc_last last;
 
-/* The same before any temperature is known, with the A2 table there. */
-static void ebc_test_glue_a2_no_temp(struct kunit *test)
-{
-	t_a2_box_du(test, true, true, U32_MAX);
+	t_a2_box(test, ebc, U32_MAX, &last);
+	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_A2);
+	KUNIT_EXPECT_EQ(test, last.lut_mode, EBC_MODE_A2);
+	KUNIT_EXPECT_EQ(test, last.frames, 1);
+	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_AUTO_A2);
+	KUNIT_EXPECT_EQ(test, d.n, 1);
+	KUNIT_EXPECT_EQ(test, d.mode[0], EBC_MODE_A2);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_dsp_ctrl_mode(EBC_MODE_A2),
+			rk3026_ebc_dsp_ctrl_mode(EBC_MODE_BLACK_WHITE));
 }
 
 /*
@@ -4200,7 +4151,7 @@ static void t_a2_draw(struct kunit *test, struct rk3026_ebc *ebc, u32 *fb,
 static void ebc_test_glue_a2_driven(struct kunit *test)
 {
 	struct t_drives d;
-	struct rk3026_ebc *ebc = t_a2_ebc(test, &d, true, false);
+	struct rk3026_ebc *ebc = t_a2_ebc(test, &d, true);
 	u32 *fb = t_plane_fb(test, 0xffffff);
 	struct rk3026_ebc_last last;
 
@@ -4248,7 +4199,7 @@ static void ebc_test_glue_a2_driven(struct kunit *test)
 static void ebc_test_glue_a2_spent(struct kunit *test)
 {
 	struct t_drives d;
-	struct rk3026_ebc *ebc = t_a2_ebc(test, &d, true, false);
+	struct rk3026_ebc *ebc = t_a2_ebc(test, &d, true);
 	u32 *fb = t_plane_fb(test, 0xffffff);
 	struct rk3026_ebc_last last;
 
@@ -5091,7 +5042,6 @@ static struct kunit_case rk3026_ebc_glue_test_cases[] = {
 	KUNIT_CASE(ebc_test_glue_du_ceiling),
 	KUNIT_CASE(ebc_test_glue_a2_off),
 	KUNIT_CASE(ebc_test_glue_a2_no_table),
-	KUNIT_CASE(ebc_test_glue_a2_no_temp),
 	KUNIT_CASE(ebc_test_glue_a2_driven),
 	KUNIT_CASE(ebc_test_glue_a2_spent),
 	KUNIT_CASE(ebc_test_glue_idle_cleanup),

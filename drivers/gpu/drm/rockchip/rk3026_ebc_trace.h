@@ -26,6 +26,7 @@ TRACE_DEFINE_ENUM(EBC_REASON_EXPLICIT);
 TRACE_DEFINE_ENUM(EBC_REASON_AUTO_DU);
 TRACE_DEFINE_ENUM(EBC_REASON_REPAIR_FLOOR);
 TRACE_DEFINE_ENUM(EBC_REASON_CLEANUP);
+TRACE_DEFINE_ENUM(EBC_REASON_AUTO_PART);
 
 #define ebc_trace_mode(m)						\
 	__print_symbolic(m,						\
@@ -99,7 +100,8 @@ TRACE_EVENT(rk3026_ebc_update_queue,
 			 { EBC_REASON_EXPLICIT,		"explicit" },	\
 			 { EBC_REASON_AUTO_DU,		"auto_du" },	\
 			 { EBC_REASON_REPAIR_FLOOR,	"repair_floor" },\
-			 { EBC_REASON_CLEANUP,		"cleanup" })
+			 { EBC_REASON_CLEANUP,		"cleanup" },	\
+			 { EBC_REASON_AUTO_PART,	"auto_part" })
 
 /*
  * One waveform starts. @reason is why the part is driven in its mode

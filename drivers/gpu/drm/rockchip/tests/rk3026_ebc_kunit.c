@@ -1354,11 +1354,13 @@ struct t_resolve {
 #define T_AUTO_DU	EBC_REASON_AUTO_DU
 #define T_FLOOR		EBC_REASON_REPAIR_FLOOR
 #define T_CLEANUP	EBC_REASON_CLEANUP
+#define T_AUTO_GREY	EBC_REASON_AUTO_PART
 
 static const struct t_resolve t_resolve_cases[] = {
 	{ "plane two-level", T_PLANE, false, true, T_DU_MODE, T_AUTO_DU },
-	{ "plane grey", T_PLANE, false, false, EBC_MODE_FULL, T_EXPL },
-	/* A repair keeps FULL: a PART floor would under-saturate black/white. */
+	/* A grey plane part: PART, only the changed pixels flash. */
+	{ "plane grey", T_PLANE, false, false, EBC_MODE_PART, T_AUTO_GREY },
+	/* A repair keeps FULL: the floor raises a mode, never lowers one. */
 	{ "plane repair two-level", T_PLANE, true, true, EBC_MODE_FULL,
 	  T_EXPL },
 	{ "plane repair grey", T_PLANE, true, false, EBC_MODE_FULL, T_EXPL },
@@ -1372,9 +1374,13 @@ static const struct t_resolve t_resolve_cases[] = {
 	{ "plane and auto part two-level", T_PLANE_AUTO_PART, false, true,
 	  T_DU_MODE, T_AUTO_DU },
 	{ "plane and auto part grey", T_PLANE_AUTO_PART, false, false,
+	  EBC_MODE_PART, T_AUTO_GREY },
+	{ "plane and auto part repair grey", T_PLANE_AUTO_PART, true, false,
 	  EBC_MODE_FULL, T_EXPL },
 	/* An explicit mode merged in: the rank's mode, as before. */
 	{ "plane and DU two-level", T_PLANE_DU, false, true, EBC_MODE_FULL,
+	  T_EXPL },
+	{ "plane and DU grey", T_PLANE_DU, false, false, EBC_MODE_FULL,
 	  T_EXPL },
 	{ "auto part and DU two-level", T_AUTO_PART_DU, false, true,
 	  EBC_MODE_PART, T_EXPL },
@@ -1390,16 +1396,23 @@ static const struct t_resolve t_resolve_cases[] = {
 	{ "DU two-level", T_DU, false, true, T_DU_MODE, T_EXPL },
 	{ "DU repair", T_DU, true, true, EBC_MODE_PART, T_FLOOR },
 	{ "RESET", T_RESET, false, true, EBC_MODE_RESET, T_EXPL },
-	/* The DU budget is spent: a part with a plane update keeps FULL. */
+	/*
+	 * The DU budget is spent: an auto part with a plane update keeps
+	 * FULL, two-level or grey.
+	 */
 	{ "plane two-level cleanup", T_PLANE, false, true, EBC_MODE_FULL,
 	  T_CLEANUP, true },
-	{ "plane grey cleanup", T_PLANE, false, false, EBC_MODE_FULL, T_EXPL,
-	  true },
+	{ "plane grey cleanup", T_PLANE, false, false, EBC_MODE_FULL,
+	  T_CLEANUP, true },
 	{ "plane repair two-level cleanup", T_PLANE, true, true,
 	  EBC_MODE_FULL, T_EXPL, true },
 	{ "plane and auto part two-level cleanup", T_PLANE_AUTO_PART, false,
 	  true, EBC_MODE_FULL, T_CLEANUP, true },
+	{ "plane and auto part grey cleanup", T_PLANE_AUTO_PART, false,
+	  false, EBC_MODE_FULL, T_CLEANUP, true },
 	{ "plane and DU two-level cleanup", T_PLANE_DU, false, true,
+	  EBC_MODE_FULL, T_EXPL, true },
+	{ "plane and DU grey cleanup", T_PLANE_DU, false, false,
 	  EBC_MODE_FULL, T_EXPL, true },
 	/* An mxcfb client runs its own fulls: its auto parts stay DU. */
 	{ "auto part two-level cleanup", T_AUTO_PART, false, true, T_DU_MODE,
@@ -1417,7 +1430,7 @@ KUNIT_ARRAY_PARAM_DESC(t_resolve, t_resolve_cases, desc);
 static void ebc_test_resolve_mode(struct kunit *test)
 {
 	const struct t_resolve *c = test->param_value;
-	enum rk3026_ebc_reason reason = EBC_REASON_CLEANUP + 1;
+	enum rk3026_ebc_reason reason = EBC_REASON_AUTO_PART + 1;
 	struct rk3026_ebc_set part;
 	u32 scan_mode;
 
@@ -1654,6 +1667,34 @@ static void ebc_test_du_account_driven(struct kunit *test)
 }
 
 /*
+ * A grey plane part resolved PART (rk3026_ebc_resolve_mode()) drives only
+ * its changed pixels, with a 16-level waveform: it adds no DU ghost and
+ * clears none of the others, so the budget stays as it was, spent or not,
+ * whatever its waveform's outcome.
+ */
+static void ebc_test_du_account_part(struct kunit *test)
+{
+	static const u32 areas[] = { 0, 100, T_W * T_H, U32_MAX };
+	static const enum t_kind kinds[] = { T_PLANE, T_PLANE_AUTO_PART };
+	struct rk3026_ebc_set part;
+	unsigned int i, j, k;
+
+	for (k = 0; k < ARRAY_SIZE(kinds); k++) {
+		t_kind_part(kinds[k], &part);
+		KUNIT_ASSERT_TRUE(test, part.has_plane);
+		KUNIT_ASSERT_TRUE(test, part.auto_ok);
+		for (i = 0; i < ARRAY_SIZE(t_waveform_outcomes); i++)
+			for (j = 0; j < ARRAY_SIZE(areas); j++)
+				KUNIT_EXPECT_EQ(test,
+						t_du(areas[j], &part,
+						     EBC_MODE_PART, 28,
+						     t_waveform_outcomes[i],
+						     EBC_REPAIR_NONE),
+						areas[j]);
+	}
+}
+
+/*
  * Nothing driven, nothing counted: a skip, a drop, a carry (no rails, LUT or
  * waveform) or a repair cut short leave the budget as it is, so a part that
  * is carried counts once, when it is drawn. A repair that ran to its end
@@ -1728,6 +1769,7 @@ static struct kunit_case rk3026_ebc_core_test_cases[] = {
 	KUNIT_CASE(ebc_test_pending_auto_ok_reset),
 	KUNIT_CASE(ebc_test_pending_auto_ok_carry),
 	KUNIT_CASE(ebc_test_du_account_driven),
+	KUNIT_CASE(ebc_test_du_account_part),
 	KUNIT_CASE(ebc_test_du_account_undriven),
 	KUNIT_CASE(ebc_test_du_account_reset),
 	KUNIT_CASE(ebc_test_seq_barrier),
@@ -2758,7 +2800,7 @@ static void ebc_test_glue_plane_update(struct kunit *test)
 
 /*
  * The mode policy end to end, on a white glass: a plane update whose changes
- * are all black or white resolves DU, one with a grey stays FULL, one that
+ * are all black or white resolves DU, one with a grey PART, one that
  * changes nothing is skipped in its own mode. With the rails counted as up
  * and a waveform that has only a RESET, each stops at its missing LUT.
  */
@@ -2836,10 +2878,14 @@ static void ebc_test_glue_auto_grey(struct kunit *test)
 							&t_panel));
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_EQ(test, last.asked_mode, EBC_MODE_FULL);
-	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_FULL);
-	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_EXPLICIT);
+	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_PART);
+	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_AUTO_PART);
 	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_NO_LUT);
 	KUNIT_EXPECT_EQ(test, ebc->shadows.scan[0], 0x88);
+	/* No PART LUT: carried in its plain mode, drawn FULL with the next. */
+	KUNIT_EXPECT_TRUE(test, ebc->pending.carry.merged);
+	KUNIT_EXPECT_EQ(test, ebc->pending.carry.mode, EBC_MODE_FULL);
+	KUNIT_EXPECT_FALSE(test, ebc->pending.carry.auto_ok);
 }
 
 /*
@@ -3102,6 +3148,51 @@ static void ebc_test_glue_du_driven(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, d.mode[1], EBC_MODE_FULL);
 	KUNIT_EXPECT_EQ(test, d.mode[2], EBC_MODE_BLACK_WHITE);
 	KUNIT_EXPECT_EQ(test, ebc->stats.scans, 3);
+}
+
+/*
+ * A grey box of 4 x 2 pixels on the white glass is driven PART and leaves
+ * the budget as it was; with the budget spent, a grey plane update over the
+ * whole panel is driven FULL for the cleanup and clears it.
+ */
+static void ebc_test_glue_part_driven(struct kunit *test)
+{
+	struct t_drives d;
+	struct rk3026_ebc *ebc = t_driven_ebc(test, &d, true);
+	u32 *box = t_plane_fb(test, 0xffffff);
+	u32 *grey = t_plane_fb(test, 0x404040);
+	struct rk3026_ebc_last last;
+	int x, y;
+
+	for (y = 2; y < 4; y++)
+		for (x = 4; x < 8; x++)
+			box[y * T_W + x] = 0x808080;
+
+	ebc->du_area = 50;
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, box, T_W * 4,
+							&t_panel));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_EXPECT_EQ(test, last.asked_mode, EBC_MODE_FULL);
+	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_PART);
+	KUNIT_EXPECT_EQ(test, last.lut_mode, EBC_MODE_PART);
+	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_AUTO_PART);
+	KUNIT_EXPECT_EQ(test, ebc->du_area, 50);
+	KUNIT_EXPECT_EQ(test, t_px(ebc->shadows.prev, 4, 2), 8);
+	KUNIT_EXPECT_EQ(test, t_px(ebc->shadows.prev, 3, 2), 15);
+
+	ebc->du_area = ebc->du_cleanup_area;
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, grey, T_W * 4,
+							&t_panel));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_FULL);
+	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_CLEANUP);
+	KUNIT_EXPECT_EQ(test, ebc->du_area, 0);
+
+	KUNIT_EXPECT_EQ(test, d.n, 2);
+	KUNIT_EXPECT_EQ(test, d.mode[0], EBC_MODE_PART);
+	KUNIT_EXPECT_EQ(test, d.mode[1], EBC_MODE_FULL);
 }
 
 /*
@@ -3602,7 +3693,7 @@ static void ebc_test_glue_plane_resync(struct kunit *test)
 
 /*
  * The policy does not change with the box: a damaged plane part whose
- * changes are all black or white goes DU, one with a grey FULL. The
+ * changes are all black or white goes DU, one with a grey PART. The
  * snapshot lays the box alone over the white glass.
  */
 static void ebc_test_glue_plane_box_du(struct kunit *test)
@@ -3633,8 +3724,8 @@ static void ebc_test_glue_plane_box_grey(struct kunit *test)
 	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, grey, T_W * 4,
 							&box));
 	rk3026_ebc_do_refresh(ebc, &last);
-	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_FULL);
-	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_EXPLICIT);
+	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_PART);
+	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_AUTO_PART);
 	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_NO_LUT);
 	t_expect_box_img(test, ebc->shadows.scan, &box, 8, 15);
 }
@@ -3660,6 +3751,7 @@ static struct kunit_case rk3026_ebc_glue_test_cases[] = {
 	KUNIT_CASE(ebc_test_glue_du_skipped),
 	KUNIT_CASE(ebc_test_glue_du_reset),
 	KUNIT_CASE(ebc_test_glue_du_driven),
+	KUNIT_CASE(ebc_test_glue_part_driven),
 	KUNIT_CASE(ebc_test_glue_du_repaired),
 #if IS_ENABLED(CONFIG_DRM_RK3026_EBC_MXCFB)
 	KUNIT_CASE(ebc_test_glue_mxcfb_send),

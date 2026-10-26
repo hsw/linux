@@ -122,18 +122,21 @@ static void ebc_rails_rearm(struct rk3026_ebc *ebc)
 }
 
 /*
- * Refresh mode used when nothing annotates the update.
+ * Refresh mode used when nothing annotates the update: FULL.
  *
- * FULL, not PART. EBC_MODE_PART is a partial waveform: it under-saturates a
- * full black/white transition by construction, which is CONFIRMED on hardware
- * as the reason contrast was poor -- force_mode=1 renders solid black where the
- * default rendered washed grey (docs/PENDING.md P18). A partial waveform is an
- * optimisation for small incremental changes, and this driver has no business
- * defaulting to one before it can render a full frame at all.
+ * Such an update is sent with @auto_mode, and the content picks its waveform
+ * (rk3026_ebc_resolve_mode()): when every pixel it changes becomes black or
+ * white, the part is driven in DU, which drives those pixels fully and does
+ * not flash; with a grey among them, in PART, which moves only the changed
+ * pixels, to all 16 levels. FULL is what a part keeps when the content does
+ * not decide: behind a repair, merged with a send that names its mode,
+ * carried, or as the cleanup once the DU budget is spent.
  *
- * Such an update is sent with @auto_mode: when every pixel it changes becomes
- * black or white, the part is driven in DU instead, which drives those pixels
- * fully and does not flash (rk3026_ebc_resolve_mode()). Never PART.
+ * An early version defaulted to PART and rendered washed grey where
+ * force_mode=1 rendered solid black (docs/PENDING.md P18), and plane parts
+ * were kept off PART since. A later camera run on this panel did not
+ * reproduce that: PART drew a grey ramp from white as FULL drew it, solid
+ * black included, so a grey plane part goes PART now.
  */
 #define EBC_MODE_DEFAULT	EBC_MODE_FULL
 
@@ -1358,9 +1361,9 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 
 	/*
 	 * The content's choice for a part of auto updates: DU when every
-	 * changed pixel becomes black or white, until the plane parts' DU
-	 * budget is spent. It comes after the skip, which stays on the part's
-	 * own mode, and before force_mode.
+	 * changed pixel becomes black or white, else PART for a plane part,
+	 * until the plane parts' DU budget is spent. It comes after the skip,
+	 * which stays on the part's own mode, and before force_mode.
 	 */
 	limit = READ_ONCE(ebc->du_cleanup_area);
 	cleanup_due = limit && ebc->du_area >= limit;
@@ -1438,8 +1441,8 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 	 * is carried in its plain mode (rk3026_ebc_scan_finish()). A carry
 	 * alone is no work for the thread, so such a part waits for the next
 	 * update and is drawn with it, in the stronger of the two plain modes:
-	 * an auto plane part without a DU LUT ends up FULL, as before the
-	 * policy.
+	 * an auto plane part without a DU or PART LUT ends up FULL, as before
+	 * the policy.
 	 */
 	lut_mode = mode;
 	lut = rk3026_ebc_waveform_lut(ebc->waveform, mode, temp, &frames);
@@ -1771,9 +1774,9 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_plane_box);
 /*
  * A plane update: the box of the framebuffer into @next_shadow and to the
  * thread in the default mode, as an auto update (DU if every changed pixel
- * becomes black or white, see EBC_MODE_DEFAULT), unless an mxcfb client
- * drives the panel. Such a client annotates its own updates with a waveform
- * mode, so its pixels are left alone rather than refreshed twice.
+ * becomes black or white, else PART; see EBC_MODE_DEFAULT), unless an mxcfb
+ * client drives the panel. Such a client annotates its own updates with a
+ * waveform mode, so its pixels are left alone rather than refreshed twice.
  *
  * @box is the damage (rk3026_ebc_plane_box()), inside the panel. After
  * another source wrote @next_shadow (@plane_resync) the whole panel is
@@ -1836,10 +1839,10 @@ static void ebc_plane_atomic_update(struct drm_plane *plane,
 	 * work and nothing else: the EBC still scans the whole panel, and the
 	 * snapshot lays the box over the prev image, which holds what the
 	 * glass shows (rk3026_ebc_scan_finish()), so the pixels outside it are
-	 * driven from their old level to the same level. The waveform is
-	 * chosen as for a whole-panel update: FULL, or DU when every changed
-	 * pixel ends black or white, never a partial waveform, which
-	 * under-saturates a full black/white transition.
+	 * driven from their old level to the same level in FULL, and left
+	 * alone in DU and PART. The waveform is chosen as for a whole-panel
+	 * update: DU when every changed pixel ends black or white, else PART,
+	 * and FULL once the DU budget is spent (rk3026_ebc_resolve_mode()).
 	 */
 	if (!rk3026_ebc_plane_box(old_state, new_state, ebc->width,
 				  ebc->height, &box))

@@ -432,17 +432,26 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_scan_mode);
  * @reason: returns why the part is driven in the returned mode
  *
  * Only a part made of auto updates alone (@part->auto_ok) is the content's
- * to decide: if some pixel changes and every changed pixel becomes black or
+ * to decide. If some pixel changes and every changed pixel becomes black or
  * white, it is driven in DU, which moves exactly those pixels and leaves the
  * rest of the glass alone. The snapshot built for @scan_mode stands as it
- * is: no changed pixel needs the two-level threshold. Otherwise it keeps
- * @scan_mode: FULL for a plane part (never PART, which under-saturates a
- * full black/white transition), the client's default for the others.
+ * is: no changed pixel needs the two-level threshold.
+ *
+ * Otherwise a part with a plane update in it is driven in PART. Like DU, it
+ * moves only the pixels that change, so the box flashes and the rest of the
+ * panel does not; unlike DU, it drives them to all 16 levels, a full
+ * black/white transition included. A camera run on this panel drew a grey
+ * ramp from white in PART as FULL drew it, solid black included; the old
+ * rule that a plane part never goes PART, for fear of a washed-out black,
+ * rested on one whole-frame observation that the run did not reproduce. The
+ * snapshot stands here too: a plane update's own mode is FULL, so
+ * @scan_mode is a 16-level one and nothing was thresholded. A part of
+ * mxcfb sends alone keeps @scan_mode, its client's default.
  *
  * DU leaves the ghosts of what it draws over; once the plane parts' DU
- * budget is spent (@cleanup_due), a two-level part with a plane update in
- * it keeps @scan_mode, FULL, which clears the glass. A part of mxcfb sends
- * alone still goes DU: such a client runs its own fulls.
+ * budget is spent (@cleanup_due), an auto part with a plane update in it,
+ * two-level or grey, keeps @scan_mode, FULL, which clears the glass. A part
+ * of mxcfb sends alone is not cleaned up: such a client runs its own fulls.
  *
  * A part that has a mode of its own keeps @scan_mode, and so does one
  * behind a repair: the glass is white then outside the box, and only a
@@ -458,14 +467,21 @@ u32 rk3026_ebc_resolve_mode(const struct rk3026_ebc_set *part, u32 scan_mode,
 			*reason = EBC_REASON_REPAIR_FLOOR;
 		return scan_mode;
 	}
-	if (!part->auto_ok || !two_level)
+	if (!part->auto_ok)
 		return scan_mode;
 	if (cleanup_due && part->has_plane) {
 		*reason = EBC_REASON_CLEANUP;
 		return scan_mode;
 	}
-	*reason = EBC_REASON_AUTO_DU;
-	return EBC_MODE_BLACK_WHITE;
+	if (two_level) {
+		*reason = EBC_REASON_AUTO_DU;
+		return EBC_MODE_BLACK_WHITE;
+	}
+	if (part->has_plane) {
+		*reason = EBC_REASON_AUTO_PART;
+		return EBC_MODE_PART;
+	}
+	return scan_mode;
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_resolve_mode);
 
@@ -485,6 +501,9 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_resolve_mode);
  * - a DU part with a plane update in it adds @changed_px (saturating);
  * - a FULL part clears it, whoever sent it: the controller scans the whole
  *   frame, and GC16 drives every pixel, unchanged ones too;
+ * - a PART part leaves it, a grey plane part too: it drives only the pixels
+ *   that change, to all 16 levels, so it adds no DU ghost and clears none
+ *   of the others;
  * - a RESET part clears it whatever its outcome: one that was not driven
  *   leaves the glass unknown, and the next draw repairs it first;
  * - a repair RESET that ran to its end clears it too, whatever became of

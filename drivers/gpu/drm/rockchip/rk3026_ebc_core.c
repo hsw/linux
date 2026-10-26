@@ -631,8 +631,8 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_resolve_mode);
  * @idle: the state at @now (struct rk3026_ebc_idle)
  * @now: the time of the look, in jiffies
  * @expired: returns true when this look uses the arming up: armed, and the
- *	delay over since the last plane update (or no delay at all), whether
- *	the cleanup is due or not
+ *	delay over since the last plane update (at once with no delay),
+ *	whether the cleanup is due or not
  *
  * A small part on a spent budget stays DU or PART (rk3026_ebc_du_cleanup()),
  * so the glass keeps its DU ghosts until a big part or the ceiling comes.
@@ -642,10 +642,11 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_resolve_mode);
  * and only on a spent budget: a budget merely above zero (a keystroke and
  * a pause) would flash more often than the budget alone does.
  *
- * Not while anything else holds the glass: a part pending (it is drawn
- * first; a RESET clears the glass anyway), the CRTC off, an mxcfb client in
- * front (it runs its own fulls), or a repair due (the RESET of the next
- * draw clears the glass). A look that finds the delay over disarms the
+ * Not while anything else holds the glass (@idle->busy): a part pending
+ * (it is drawn first; a RESET clears the glass anyway) or a carry waiting
+ * for one, the CRTC off, an mxcfb client in front (it runs its own fulls),
+ * or a repair due (the RESET of the next draw clears the glass). A delay
+ * of 0 is no idle cleanup. A look that finds the delay over disarms the
  * cleanup whether it is due or not, so a cleanup that was not driven, or
  * did not clear the budget, does not fire again until the next plane
  * update arms it; and the thread, whose wait ends at the idle deadline,
@@ -657,14 +658,8 @@ bool rk3026_ebc_idle_cleanup_due(const struct rk3026_ebc_idle *idle,
 				 unsigned long now, bool *expired)
 {
 	*expired = idle->armed &&
-		   (!idle->delay ||
-		    time_after_eq(now, idle->last_plane + idle->delay));
-	if (!*expired || !idle->delay)
-		return false;
-	if (!idle->limit || idle->area < idle->limit)
-		return false;
-	return !idle->pending && !idle->blanked && !idle->mxcfb_active &&
-	       !idle->repair_due;
+		   time_after_eq(now, idle->last_plane + idle->delay);
+	return *expired && idle->delay && idle->spent && !idle->busy;
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_idle_cleanup_due);
 
@@ -770,12 +765,23 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_du_account);
  * A part not driven is carried in its plain mode: the carry's @auto_ok is
  * cleared, which is conservative (rk3026_ebc_resolve_mode() keeps the mode
  * as it is).
+ *
+ * The idle cleanup alone (@cleanup_idle, one update) is not carried: it
+ * draws nothing of its own, and carried it would turn the next part, a
+ * pointer move as a rule, into a whole-panel FULL; with no FULL table at
+ * the temperature every later part would merge into it and none be drawn.
+ * The budget stays spent, so the next plane update arms the cleanup again.
+ * Updates that joined it are carried, in the whole panel's box and FULL as
+ * they were merged, but no longer as the cleanup.
  */
 static void ebc_carry(struct rk3026_ebc_pending *p,
 		      const struct rk3026_ebc_set *part)
 {
+	if (part->cleanup_idle && part->merged == 1)
+		return;
 	ebc_set_merge(&p->carry, !p->carry.merged, part);
 	p->carry.auto_ok = false;
+	p->carry.cleanup_idle = false;
 	p->carry.merged = 1;
 }
 
@@ -801,10 +807,11 @@ static void ebc_carry(struct rk3026_ebc_pending *p,
  *   image has it. @prev_unknown says whether every frame ran.
  * - SKIPPED: nothing differs.
  * - NO_RAILS, NO_LUT, NO_WAVEFORM: nothing was driven, so the part is
- *   carried into the next one. A RESET is not carried: @prev_unknown makes
- *   the next draw repair the glass. If a repair did run (EBC_REPAIR_DONE),
- *   the glass is white now: @prev is too, and the whole panel is carried,
- *   at least as PART.
+ *   carried into the next one, except the idle cleanup alone (see
+ *   ebc_carry()). A RESET is not carried: @prev_unknown makes the next draw
+ *   repair the glass. If a repair did run (EBC_REPAIR_DONE), the glass is
+ *   white now: @prev is too, and the whole panel is carried, at least as
+ *   PART, the idle cleanup alone too: the white glass must be drawn.
  * - CRTC_OFF: dropped; the RESET of the next CRTC enable clears the glass.
  *
  * Returns true if @prev changed, so the scanned prev image must follow it.
@@ -854,6 +861,7 @@ bool rk3026_ebc_scan_finish(struct rk3026_ebc_shadows *sh,
 		whole = *part;
 		whole.box = DRM_RECT_INIT(0, 0, sh->pitch * 2, sh->height);
 		whole.mode = ebc_mode_max(part->mode, EBC_MODE_PART);
+		whole.cleanup_idle = false;
 		ebc_carry(p, &whole);
 		memset(sh->prev, 0xff, size);
 		sh->prev_unknown = false;

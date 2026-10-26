@@ -288,29 +288,24 @@ struct rk3026_ebc_a2 {
 
 /*
  * The idle cleanup as rk3026_ebc_idle_cleanup_due() reads it, at one look
- * of the refresh thread under @image_lock:
+ * of the refresh thread under @image_lock (rk3026_ebc_idle_tick()):
  *
- * @armed: a plane update was queued since the last look that found the
- *	delay over (struct rk3026_ebc, @idle_armed);
- * @last_plane: when the newest plane update was queued, in jiffies;
+ * @armed: a plane update was queued or drawn since the last look that
+ *	found the delay over (struct rk3026_ebc, @idle_armed);
+ * @last_plane: when the newest plane update was queued or drawn, in
+ *	jiffies;
  * @delay: the idle delay in jiffies, 0: no idle cleanup;
- * @area, @limit: the DU budget spent and its limit (0: no budget);
- * @pending: a part is pending (a RESET included);
- * @blanked: the CRTC is off;
- * @mxcfb_active: an mxcfb client drives the panel;
- * @repair_due: the glass is not known (@shadows.prev_unknown), so the next
- *	draw repairs it with a RESET.
+ * @spent: the DU budget is spent (rk3026_ebc_du_spent());
+ * @busy: something else holds the glass: a part pending (a RESET
+ *	included) or a carry waiting, the CRTC off, an mxcfb client in
+ *	front, or a repair due (@shadows.prev_unknown).
  */
 struct rk3026_ebc_idle {
 	unsigned long	last_plane;
 	unsigned long	delay;
-	u32		area;
-	u32		limit;
 	bool		armed;
-	bool		pending;
-	bool		blanked;
-	bool		mxcfb_active;
-	bool		repair_due;
+	bool		spent;
+	bool		busy;
 };
 
 /*
@@ -398,9 +393,12 @@ struct rk3026_ebc_stats {
  * and so does a carry. @mode and its rank stay the plain modes' either way.
  *
  * @cleanup_idle: the idle cleanup (EBC_SOURCE_IDLE) is in the set. Updates
- * that join it and a carry merged into it keep it, so the part is still
- * the cleanup FULL: never skipped (rk3026_ebc_should_skip()), and driven
- * in its scan mode for the reason EBC_REASON_CLEANUP_IDLE.
+ * that join it keep it, so the part is still the cleanup FULL: never
+ * skipped (rk3026_ebc_should_skip()), and driven in its scan mode for the
+ * reason EBC_REASON_CLEANUP_IDLE. A carry never has it
+ * (rk3026_ebc_scan_finish()), and the cleanup is not queued while a carry
+ * waits (rk3026_ebc_idle_tick()), so a part that has it and one update is
+ * the cleanup alone.
  */
 struct rk3026_ebc_set {
 	struct drm_rect	box;
@@ -657,13 +655,15 @@ struct rk3026_ebc {
 	 * The idle cleanup (rk3026_ebc_idle_tick()): with the budget spent and
 	 * no plane update for @du_cleanup_idle_ms, the refresh thread queues a
 	 * whole-panel FULL. A queued plane update arms it and stamps
-	 * @idle_last_plane (jiffies); the thread's first look after the delay
-	 * disarms it, and queues the cleanup if it is due then, so one arming
-	 * makes at most one cleanup. Both under @image_lock, written with
-	 * WRITE_ONCE(): the thread also reads them without the lock, for the
-	 * deadline of its wait alone, and decides under the lock.
-	 * @du_cleanup_idle_ms is the delay (0: none); probe sets 2000, debugfs
-	 * may change it, and the thread reads it with READ_ONCE().
+	 * @idle_last_plane (jiffies), and so does the end of the scan of a
+	 * part with a plane update in it, so the delay runs from the later of
+	 * the two; the thread's first look after the delay disarms it, and
+	 * queues the cleanup if it is due then, so one arming makes at most
+	 * one cleanup. Both under @image_lock, written with WRITE_ONCE(): the
+	 * thread also reads them without the lock, for the deadline of its
+	 * wait alone, and decides under the lock. @du_cleanup_idle_ms is the
+	 * delay (0: none); probe sets 2000, debugfs may change it, and the
+	 * thread reads it with READ_ONCE().
 	 */
 	unsigned long		idle_last_plane;
 	bool			idle_armed;

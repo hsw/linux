@@ -1543,6 +1543,16 @@ finish:
 	ebc->du_area = rk3026_ebc_du_account(ebc->du_area, &part, last->mode,
 					     changed_px, last->outcome,
 					     repair_result);
+	/*
+	 * A part with a plane update in it arms the idle cleanup again at its
+	 * end, so the idle delay runs from the end of the scan, not from the
+	 * queue; and a look that disarmed it while the part was pending does
+	 * not leave it unarmed.
+	 */
+	if (part.has_plane) {
+		WRITE_ONCE(ebc->idle_last_plane, jiffies);
+		WRITE_ONCE(ebc->idle_armed, true);
+	}
 	ebc_publish(ebc, last, start);
 	mutex_unlock(&ebc->image_lock);
 
@@ -1575,13 +1585,17 @@ static void ebc_idle_rails_off(struct rk3026_ebc *ebc)
 /*
  * The idle cleanup's deadline, read without @image_lock: for the wait of
  * the refresh thread alone, which decides under the lock
- * (rk3026_ebc_idle_tick()). Returns whether the cleanup is armed.
+ * (rk3026_ebc_idle_tick()). Returns whether the cleanup is armed and has
+ * a delay: with du_cleanup_idle_ms 0 there is nothing to look at, and the
+ * thread does not wake for it. A write to that knob does not wake the
+ * thread either: a new delay counts from the next wake.
  */
 static bool ebc_idle_at(struct rk3026_ebc *ebc, unsigned long *at)
 {
-	*at = READ_ONCE(ebc->idle_last_plane) +
-	      msecs_to_jiffies(READ_ONCE(ebc->du_cleanup_idle_ms));
-	return READ_ONCE(ebc->idle_armed);
+	u32 delay_ms = READ_ONCE(ebc->du_cleanup_idle_ms);
+
+	*at = READ_ONCE(ebc->idle_last_plane) + msecs_to_jiffies(delay_ms);
+	return READ_ONCE(ebc->idle_armed) && delay_ms;
 }
 
 /**
@@ -1604,6 +1618,13 @@ static bool ebc_idle_at(struct rk3026_ebc *ebc, unsigned long *at)
  * A plane update that arrived after the lockless read moved the deadline:
  * the look under the lock sees it, and leaves the cleanup armed.
  *
+ * Between the queue here and the take in rk3026_ebc_do_refresh() the
+ * thread drops @image_lock for a moment, and an update sent in that
+ * window joins the cleanup and is drawn in its whole-panel FULL. A first
+ * mxcfb send gets a full flash it did not ask for then, once; such a
+ * client runs its own fulls, and the window is the thread's own unlock
+ * and lock.
+ *
  * Return: true if the cleanup was queued.
  */
 VISIBLE_IF_KUNIT bool rk3026_ebc_idle_tick(struct rk3026_ebc *ebc,
@@ -1615,20 +1636,22 @@ VISIBLE_IF_KUNIT bool rk3026_ebc_idle_tick(struct rk3026_ebc *ebc,
 		.source	= EBC_SOURCE_IDLE,
 	};
 	u32 delay_ms = READ_ONCE(ebc->du_cleanup_idle_ms);
+	struct rk3026_ebc_du_budget budget = { 0 };
 	struct rk3026_ebc_idle idle;
 	bool due, expired;
 
 	mutex_lock(&ebc->image_lock);
+	budget.area = ebc->du_area;
+	budget.limit = READ_ONCE(ebc->du_cleanup_area);
 	idle = (struct rk3026_ebc_idle) {
 		.armed		= ebc->idle_armed,
 		.last_plane	= ebc->idle_last_plane,
 		.delay		= msecs_to_jiffies(delay_ms),
-		.area		= ebc->du_area,
-		.limit		= READ_ONCE(ebc->du_cleanup_area),
-		.pending	= !rk3026_ebc_pending_empty(&ebc->pending),
-		.blanked	= !ebc->crtc_on,
-		.mxcfb_active	= ebc->mxcfb_active,
-		.repair_due	= ebc->shadows.prev_unknown,
+		.spent		= rk3026_ebc_du_spent(&budget),
+		.busy		= !rk3026_ebc_pending_empty(&ebc->pending) ||
+				  ebc->pending.carry.merged || !ebc->crtc_on ||
+				  ebc->mxcfb_active ||
+				  ebc->shadows.prev_unknown,
 	};
 	due = rk3026_ebc_idle_cleanup_due(&idle, now, &expired);
 	if (expired)
@@ -1926,7 +1949,8 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_plane_box);
  *
  * A queued update arms the idle cleanup and stamps its time, in the same
  * section (rk3026_ebc_idle_tick()); the wake of rk3026_ebc_add_update()
- * makes the thread take the new deadline.
+ * makes the thread take the new deadline. The end of its scan stamps it
+ * again (rk3026_ebc_do_refresh()).
  *
  * Returns true if the update was queued.
  */

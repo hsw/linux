@@ -130,7 +130,8 @@ static void ebc_rails_rearm(struct rk3026_ebc *ebc)
  * not flash; with a grey among them, in PART, which moves only the changed
  * pixels, to all 16 levels. FULL is what a part keeps when the content does
  * not decide: behind a repair, merged with a send that names its mode,
- * carried, or as the cleanup once the DU budget is spent.
+ * carried, or as a cleanup of the DU budget (a big part once it is spent,
+ * any part once it reaches its ceiling).
  *
  * An early version defaulted to PART and rendered washed grey where
  * force_mode=1 rendered solid black (docs/PENDING.md P18), and plane parts
@@ -1234,9 +1235,10 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 	struct rk3026_ebc_shadows *sh = &ebc->shadows;
 	ktime_t start = ktime_get(), snap_start;
 	enum rk3026_ebc_reason reason;
+	struct rk3026_ebc_du_budget budget;
 	struct rk3026_ebc_set part;
-	bool repair_due, identical, prev_changed, two_level, cleanup_due;
-	u32 frames, mode, scan_mode, resolved, lut_mode, limit;
+	bool repair_due, identical, prev_changed, two_level;
+	u32 frames, mode, scan_mode, resolved, lut_mode;
 	u32 changed_px = 0;
 	const u8 *lut, *target;
 	int temp;
@@ -1362,13 +1364,17 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 	/*
 	 * The content's choice for a part of auto updates: DU when every
 	 * changed pixel becomes black or white, else PART for a plane part,
-	 * until the plane parts' DU budget is spent. It comes after the skip,
-	 * which stays on the part's own mode, and before force_mode.
+	 * unless the plane parts' DU budget makes it the cleanup FULL (a big
+	 * part once it is spent, any part at its ceiling). It comes after the
+	 * skip, which stays on the part's own mode, and before force_mode.
 	 */
-	limit = READ_ONCE(ebc->du_cleanup_area);
-	cleanup_due = limit && ebc->du_area >= limit;
+	budget.area = ebc->du_area;
+	budget.limit = READ_ONCE(ebc->du_cleanup_area);
+	budget.big_area = READ_ONCE(ebc->du_cleanup_big_area);
+	budget.ceiling = READ_ONCE(ebc->du_cleanup_ceiling);
 	resolved = rk3026_ebc_resolve_mode(&part, scan_mode, two_level,
-					   repair_due, cleanup_due, &reason);
+					   changed_px, repair_due, &budget,
+					   &reason);
 	last->reason = reason;
 
 	/* DIAGNOSTIC: drive a different mode class with the same data and scan. */
@@ -1842,7 +1848,7 @@ static void ebc_plane_atomic_update(struct drm_plane *plane,
 	 * driven from their old level to the same level in FULL, and left
 	 * alone in DU and PART. The waveform is chosen as for a whole-panel
 	 * update: DU when every changed pixel ends black or white, else PART,
-	 * and FULL once the DU budget is spent (rk3026_ebc_resolve_mode()).
+	 * and FULL for a cleanup of the DU budget (rk3026_ebc_resolve_mode()).
 	 */
 	if (!rk3026_ebc_plane_box(old_state, new_state, ebc->width,
 				  ebc->height, &box))
@@ -2449,8 +2455,14 @@ static int ebc_probe(struct platform_device *pdev)
 	ebc->height = ebc->timing.vactive.typ;
 	if (ebc->width % 8 || ebc->height % 2)
 		return dev_err_probe(dev, -EINVAL, "unsupported panel size\n");
-	/* One panel's worth of DU-changed pixels before a cleanup FULL. */
+	/*
+	 * One panel's worth of DU-changed pixels spends the budget; a part
+	 * that changes half the panel takes the cleanup FULL then, and any
+	 * part does at four panels' worth (rk3026_ebc_du_cleanup()).
+	 */
 	ebc->du_cleanup_area = ebc->width * ebc->height;
+	ebc->du_cleanup_big_area = ebc->du_cleanup_area / 2;
+	ebc->du_cleanup_ceiling = 4 * ebc->du_cleanup_area;
 
 	/* E Ink GDCK_STA / LGONL; no display-timing binding covers them. */
 	if (of_property_read_u32(dev->of_node, "rockchip,gdck-sta",

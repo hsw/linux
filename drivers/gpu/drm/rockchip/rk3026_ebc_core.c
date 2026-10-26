@@ -313,6 +313,7 @@ static __always_inline void ebc_snap_rows(u8 *dst, const u8 *prev,
  *	draws the snapshot
  * @two_level: returns true if some pixel changes and every changed pixel
  *	of @next is 0 or 15
+ * @over_grey: returns true if some pixel that changes is grey in @prev
  * @changed_px: returns the number of pixels where @next differs from @prev
  *
  * @prev (@sh->prev, the image on the glass) with @next laid over it inside
@@ -336,18 +337,21 @@ static __always_inline void ebc_snap_rows(u8 *dst, const u8 *prev,
  * level to black or white and thresholds the same way, so the snapshot
  * stands.
  *
- * @two_level and @changed_px describe the update, not the scan: they are
- * taken on @next before the threshold and on the pixels where it differs
- * from @prev, the widened edges included; greys that do not change do not
- * count. A two-level update can be driven in DU with the same snapshot,
- * as no changed pixel needs the threshold.
+ * @two_level, @over_grey and @changed_px describe the update, not the
+ * scan: they are taken on @next before the threshold, on @prev, and on the
+ * pixels where the two differ, the widened edges included; greys that do
+ * not change do not count. A two-level update can be driven in DU with the
+ * same snapshot, as no changed pixel needs the threshold, and in A2 when
+ * @over_grey is false too: @over_grey is the test that raises an A2 scan,
+ * returned for every mode, so the caller can tell whether A2 would stand.
  *
  * Returns true if the snapshot differs from @prev, false if the scan would
  * move nothing.
  */
 bool rk3026_ebc_build_snapshot(const struct rk3026_ebc_shadows *sh,
 			       const u8 *next, const struct drm_rect *box,
-			       u32 *mode, bool *two_level, u32 *changed_px)
+			       u32 *mode, bool *two_level, bool *over_grey,
+			       u32 *changed_px)
 {
 	const u8 *prev = sh->prev;
 	u32 pitch = sh->pitch, height = sh->height;
@@ -358,6 +362,7 @@ bool rk3026_ebc_build_snapshot(const struct rk3026_ebc_shadows *sh,
 	int y;
 
 	*two_level = false;
+	*over_grey = false;
 	*changed_px = 0;
 	if (!rk3026_ebc_widen_clip(&r, pitch * 2, height)) {
 		memcpy(dst, prev, (size_t)pitch * height);
@@ -381,6 +386,7 @@ bool rk3026_ebc_build_snapshot(const struct rk3026_ebc_shadows *sh,
 	if (acc.over_grey && *mode == EBC_MODE_A2)
 		*mode = EBC_MODE_BLACK_WHITE;
 	*two_level = acc.count && !acc.grey_new;
+	*over_grey = acc.over_grey != 0;
 	*changed_px = acc.count;
 	return acc.moves != 0;
 }
@@ -483,6 +489,7 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_du_cleanup);
  * @changed_px: the pixels the snapshot changes
  * @repair_due: a repair RESET runs before it
  * @budget: the plane parts' DU cleanup budget (rk3026_ebc_du_account())
+ * @a2: what a two-level plane part needs for A2 (struct rk3026_ebc_a2)
  * @reason: returns why the part is driven in the returned mode
  *
  * Only a part made of auto updates alone (@part->auto_ok) is the content's
@@ -490,6 +497,18 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_du_cleanup);
  * white, it is driven in DU, which moves exactly those pixels and leaves the
  * rest of the glass alone. The snapshot built for @scan_mode stands as it
  * is: no changed pixel needs the two-level threshold.
+ *
+ * Such a part with a plane update in it, a pointer move or a key typed,
+ * is driven in A2 instead when it is small, at most @a2->max_area changed
+ * pixels: A2 is the shorter waveform, so the next move comes sooner, and
+ * leaves more of a ghost. It needs an A2 table of the waveform's own
+ * (@a2->lut), and no changed pixel over a grey of the glass
+ * (@a2->over_grey): A2 drives only black and white and does not move a
+ * grey at all. Without either the part stays DU, which has its table and
+ * drives every level; it is never carried into a mode that is not the
+ * content's. A max_area of 0 is no A2: the default, until its ghosting is
+ * measured on the panel. A part of mxcfb sends alone stays DU: such a
+ * client names A2 itself when it wants it.
  *
  * Otherwise a part with a plane update in it is driven in PART. Like DU, it
  * moves only the pixels that change, so the box flashes and the rest of the
@@ -523,6 +542,7 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_du_cleanup);
 u32 rk3026_ebc_resolve_mode(const struct rk3026_ebc_set *part, u32 scan_mode,
 			    bool two_level, u32 changed_px, bool repair_due,
 			    const struct rk3026_ebc_du_budget *budget,
+			    const struct rk3026_ebc_a2 *a2,
 			    enum rk3026_ebc_reason *reason)
 {
 	if (part->cleanup_idle) {
@@ -541,6 +561,11 @@ u32 rk3026_ebc_resolve_mode(const struct rk3026_ebc_set *part, u32 scan_mode,
 	    rk3026_ebc_du_cleanup(budget, changed_px, reason))
 		return scan_mode;
 	if (two_level) {
+		if (part->has_plane && a2->max_area &&
+		    changed_px <= a2->max_area && a2->lut && !a2->over_grey) {
+			*reason = EBC_REASON_AUTO_A2;
+			return EBC_MODE_A2;
+		}
 		*reason = EBC_REASON_AUTO_DU;
 		return EBC_MODE_BLACK_WHITE;
 	}
@@ -630,7 +655,8 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_thread_deadline);
 
 /**
  * rk3026_ebc_du_account - the DU cleanup budget after one part
- * @du_area: the pixels plane parts changed in DU since the glass was cleared
+ * @du_area: the pixels plane parts changed in DU or A2 since the glass was
+ *	cleared
  * @part: the part, as rk3026_ebc_pending_take() gave it
  * @mode: the mode it was driven in (force_mode included)
  * @changed_px: the pixels its snapshot changed (rk3026_ebc_build_snapshot())
@@ -641,7 +667,9 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_thread_deadline);
  * part whose waveform was entered (DRIVEN, TIMEOUT, ABANDONED), and for a
  * RESET:
  *
- * - a DU part with a plane update in it adds @changed_px (saturating);
+ * - a DU or A2 part with a plane update in it adds @changed_px
+ *   (saturating): both leave a ghost of what they draw over, A2 the
+ *   stronger one, counted the same for now;
  * - a FULL part clears it, whoever sent it, the idle cleanup too: the
  *   controller scans the whole frame, and GC16 drives every pixel,
  *   unchanged ones too;
@@ -682,7 +710,7 @@ u32 rk3026_ebc_du_account(u32 du_area, const struct rk3026_ebc_set *part,
 
 	if (mode == EBC_MODE_FULL)
 		return 0;
-	if (mode != EBC_MODE_BLACK_WHITE || !part->has_plane)
+	if (!ebc_mode_two_level(mode) || !part->has_plane)
 		return du_area;
 	if (check_add_overflow(du_area, changed_px, &du_area))
 		return U32_MAX;

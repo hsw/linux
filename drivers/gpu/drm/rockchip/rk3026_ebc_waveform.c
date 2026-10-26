@@ -497,6 +497,28 @@ const u8 *rk3026_ebc_waveform_lut(struct ebc_waveform *wf, u32 mode, int temp,
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_waveform_lut);
 
 /**
+ * rk3026_ebc_waveform_has_a2 - whether the container has an A2 table
+ * @wf: parsed container
+ * @temp: panel temperature in degrees Celsius
+ *
+ * rk3026_ebc_waveform_lut() hands out the GRAY2 (DU) table for A2 when the
+ * container has no GRAYA2 table at @temp; this tells the two apart, so the
+ * policy picks A2 only where it is A2 (rk3026_ebc_resolve_mode()). It looks
+ * at the segment header alone and decodes nothing, so the fetched LUT stays
+ * as it is: a table whose stream turns out damaged still falls back at the
+ * fetch.
+ *
+ * Return: true when the GRAYA2 table of @temp's bucket is present.
+ */
+bool rk3026_ebc_waveform_has_a2(struct ebc_waveform *wf, int temp)
+{
+	u32 frames;
+
+	return !IS_ERR(rkf_segment(wf, RKF_LUT_GRAYA2, temp, &frames));
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_waveform_has_a2);
+
+/**
  * rk3026_ebc_waveform_parse - validate a container and build its Huffman tree
  * @dev: device to allocate against and to log through
  * @buf: container bytes, including the trailing CRC32 word

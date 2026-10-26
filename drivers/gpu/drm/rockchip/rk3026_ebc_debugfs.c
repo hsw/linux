@@ -18,6 +18,9 @@
  *   du_cleanup_idle_ms  how long the plane must be idle before a spent
  *                    budget is cleaned up, read-write; 0: no idle cleanup.
  *                    Probe sets 2000.
+ *   a2_max_area  the most pixels a two-level auto plane part may change to
+ *                    be driven in A2, read-write; 0: no A2, as probe sets
+ *                    it.
  *   timing  text, the blit and snapshot times of the last part and the last
  *           driven one (rk3026_ebc_timing_show())
  *
@@ -232,8 +235,8 @@ DEFINE_SHOW_ATTRIBUTE(rk3026_ebc_state);
 
 /*
  * "du_state", apart from "state" so that file keeps its version: du_area is
- * the pixels plane parts changed in DU since the glass was last cleared
- * (rk3026_ebc_du_account()); du_cleanup_area, du_cleanup_big_area and
+ * the pixels plane parts changed in DU or A2 since the glass was last
+ * cleared (rk3026_ebc_du_account()); du_cleanup_area, du_cleanup_big_area and
  * du_cleanup_ceiling are the knobs of the same names (struct
  * rk3026_ebc_du_budget). cleanup_due is 1 when the budget is spent, so the
  * next big auto plane part, two-level or grey, will be driven FULL, and
@@ -324,6 +327,7 @@ void rk3026_ebc_debugfs_init(struct rk3026_ebc *ebc)
 			   &ebc->du_cleanup_ceiling);
 	debugfs_create_u32("du_cleanup_idle_ms", 0644, dir,
 			   &ebc->du_cleanup_idle_ms);
+	debugfs_create_u32("a2_max_area", 0644, dir, &ebc->a2_max_area);
 	debugfs_create_file("timing", 0444, dir, ebc, &rk3026_ebc_timing_fops);
 }
 

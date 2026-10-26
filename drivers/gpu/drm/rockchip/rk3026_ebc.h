@@ -253,6 +253,7 @@ enum rk3026_ebc_reason {
 	EBC_REASON_AUTO_PART,	/* an auto plane part with a grey change */
 	EBC_REASON_CLEANUP_CEILING, /* ceiling: any auto plane part FULL */
 	EBC_REASON_CLEANUP_IDLE, /* the idle cleanup's own FULL */
+	EBC_REASON_AUTO_A2,	/* a small two-level auto plane part, in A2 */
 };
 
 /*
@@ -267,6 +268,22 @@ struct rk3026_ebc_du_budget {
 	u32	limit;
 	u32	big_area;
 	u32	ceiling;
+};
+
+/*
+ * What rk3026_ebc_resolve_mode() needs to drive a two-level auto plane part
+ * in A2 rather than DU:
+ *
+ * @max_area: the most pixels such a part may change (0: never A2);
+ * @lut: the waveform has an A2 table of its own at the temperature the
+ *	part is drawn at (rk3026_ebc_waveform_has_a2());
+ * @over_grey: some pixel the part changes is grey on the glass
+ *	(rk3026_ebc_build_snapshot()).
+ */
+struct rk3026_ebc_a2 {
+	u32	max_area;
+	bool	lut;
+	bool	over_grey;
 };
 
 /*
@@ -619,12 +636,12 @@ struct rk3026_ebc {
 
 	/*
 	 * The DU cleanup budget (rk3026_ebc_du_account()). @du_area counts the
-	 * pixels plane parts changed in DU since the glass was last cleared;
-	 * the refresh thread alone writes it, under @image_lock; PART parts
-	 * leave it. Once it reaches @du_cleanup_area (spent), an auto plane
-	 * part, two-level or grey, that changes at least @du_cleanup_big_area
-	 * pixels is driven FULL instead of DU or PART; once it reaches
-	 * @du_cleanup_ceiling, any auto plane part is
+	 * pixels plane parts changed in DU or A2 since the glass was last
+	 * cleared; the refresh thread alone writes it, under @image_lock;
+	 * PART parts leave it. Once it reaches @du_cleanup_area (spent), an
+	 * auto plane part, two-level or grey, that changes at least
+	 * @du_cleanup_big_area pixels is driven FULL instead of DU, A2 or
+	 * PART; once it reaches @du_cleanup_ceiling, any auto plane part is
 	 * (rk3026_ebc_resolve_mode()). Probe sets the limit to one panel's
 	 * area, a big part to half of it and the ceiling to four panels;
 	 * debugfs may change each (a limit of 0: no cleanup; a ceiling of 0:
@@ -650,6 +667,15 @@ struct rk3026_ebc {
 	unsigned long		idle_last_plane;
 	bool			idle_armed;
 	u32			du_cleanup_idle_ms;
+
+	/*
+	 * A two-level auto plane part that changes at most @a2_max_area
+	 * pixels, none of them over a grey of the glass, is driven in A2
+	 * (rk3026_ebc_resolve_mode()). Probe sets 0, which is never: A2 stays
+	 * off until its ghosting is measured on the panel. debugfs may change
+	 * it, and the thread reads it with READ_ONCE().
+	 */
+	u32			a2_max_area;
 
 	/* Write-only registers the controller does not read back. */
 	u32			dsp_start;
@@ -761,7 +787,8 @@ bool rk3026_ebc_pending_take(struct rk3026_ebc_pending *p,
 			     struct rk3026_ebc_set *part);
 bool rk3026_ebc_build_snapshot(const struct rk3026_ebc_shadows *sh,
 			       const u8 *next, const struct drm_rect *box,
-			       u32 *mode, bool *two_level, u32 *changed_px);
+			       u32 *mode, bool *two_level, bool *over_grey,
+			       u32 *changed_px);
 bool rk3026_ebc_should_skip(const struct rk3026_ebc_set *part,
 			    bool prev_unknown, bool identical);
 u32 rk3026_ebc_scan_mode(const struct rk3026_ebc_set *part, bool repaired);
@@ -770,6 +797,7 @@ bool rk3026_ebc_du_cleanup(const struct rk3026_ebc_du_budget *budget,
 u32 rk3026_ebc_resolve_mode(const struct rk3026_ebc_set *part, u32 scan_mode,
 			    bool two_level, u32 changed_px, bool repair_due,
 			    const struct rk3026_ebc_du_budget *budget,
+			    const struct rk3026_ebc_a2 *a2,
 			    enum rk3026_ebc_reason *reason);
 bool rk3026_ebc_idle_cleanup_due(const struct rk3026_ebc_idle *idle,
 				 unsigned long now, bool *expired);
@@ -798,6 +826,7 @@ struct ebc_waveform *rk3026_ebc_waveform_parse(struct device *dev,
 					       const u8 *buf, size_t len);
 const u8 *rk3026_ebc_waveform_lut(struct ebc_waveform *wf, u32 mode, int temp,
 				  u32 *frames);
+bool rk3026_ebc_waveform_has_a2(struct ebc_waveform *wf, int temp);
 #if IS_ENABLED(CONFIG_KUNIT)
 int rk3026_ebc_rkf_decode(const s16 *left, const s16 *right, int root,
 			  u8 *dst, size_t dst_len, size_t n, const u8 *src,

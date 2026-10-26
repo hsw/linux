@@ -338,11 +338,11 @@ static bool t_snapshot(u8 *dst, u8 *prev, const u8 *next,
 	const struct rk3026_ebc_shadows sh = {
 		.prev = prev, .scan = dst, .pitch = T_PITCH, .height = T_H,
 	};
-	bool two_level;
+	bool two_level, over_grey;
 	u32 changed;
 
 	return rk3026_ebc_build_snapshot(&sh, next, box, &mode, &two_level,
-					 &changed);
+					 &over_grey, &changed);
 }
 
 static void ebc_test_snapshot_outside_box(struct kunit *test)
@@ -524,7 +524,8 @@ static void ebc_test_snapshot_moves(struct kunit *test)
 
 /*
  * A2 does not move a pixel off a grey, DU does: an A2 scan that lays a pixel
- * over a grey of prev runs DU, with the same thresholded snapshot.
+ * over a grey of prev runs DU, with the same thresholded snapshot. The
+ * over-grey result says so in every mode, and only A2 is raised for it.
  */
 static void ebc_test_snapshot_a2_over_grey(struct kunit *test)
 {
@@ -541,7 +542,7 @@ static void ebc_test_snapshot_a2_over_grey(struct kunit *test)
 		.prev = prev, .scan = dst, .pitch = T_PITCH, .height = T_H,
 	};
 	unsigned int i;
-	bool two_level;
+	bool two_level, over_grey;
 	u32 mode, changed;
 
 	/* 0 and 15 under every laid-over pixel: A2 stays. */
@@ -556,8 +557,10 @@ static void ebc_test_snapshot_a2_over_grey(struct kunit *test)
 	mode = EBC_MODE_A2;
 	KUNIT_EXPECT_TRUE(test, rk3026_ebc_build_snapshot(&sh, next, &box,
 							  &mode, &two_level,
+							  &over_grey,
 							  &changed));
 	KUNIT_EXPECT_EQ(test, mode, EBC_MODE_A2);
+	KUNIT_EXPECT_FALSE(test, over_grey);
 	KUNIT_EXPECT_EQ(test, t_px(dst, 3, 1), 0);
 	KUNIT_EXPECT_EQ(test, t_px(dst, 4, 2), 15);
 	KUNIT_EXPECT_EQ(test, t_px(dst, 5, 1), 7);
@@ -567,20 +570,34 @@ static void ebc_test_snapshot_a2_over_grey(struct kunit *test)
 	t_px_set(next, 2, 2, 12);
 	KUNIT_EXPECT_TRUE(test, rk3026_ebc_build_snapshot(&sh, next, &box,
 							  &mode, &two_level,
+							  &over_grey,
 							  &changed));
 	KUNIT_EXPECT_EQ(test, mode, EBC_MODE_BLACK_WHITE);
+	KUNIT_EXPECT_TRUE(test, over_grey);
 	KUNIT_EXPECT_EQ(test, t_px(dst, 2, 2), 15);
 	KUNIT_EXPECT_EQ(test, t_px(dst, 5, 1), 7);
 	t_snapshot(du, prev, next, &box, EBC_MODE_BLACK_WHITE);
 	KUNIT_EXPECT_EQ(test, memcmp(dst, du, T_SIZE), 0);
 	t_expect_guard(test, dst);
 
-	/* No other mode is raised. */
+	/* No other mode is raised; each reports the grey all the same. */
 	for (i = 0; i < ARRAY_SIZE(kept); i++) {
 		mode = kept[i];
+		over_grey = false;
 		rk3026_ebc_build_snapshot(&sh, next, &box, &mode, &two_level,
-					  &changed);
+					  &over_grey, &changed);
 		KUNIT_EXPECT_EQ(test, mode, kept[i]);
+		KUNIT_EXPECT_TRUE(test, over_grey);
+	}
+
+	/* The grey left as it is: no mode finds a change over a grey. */
+	t_px_set(next, 2, 2, 6);
+	for (i = 0; i < ARRAY_SIZE(kept); i++) {
+		mode = kept[i];
+		over_grey = true;
+		rk3026_ebc_build_snapshot(&sh, next, &box, &mode, &two_level,
+					  &over_grey, &changed);
+		KUNIT_EXPECT_FALSE(test, over_grey);
 	}
 }
 
@@ -1411,6 +1428,44 @@ static void t_budget_of(enum t_budget kind, struct rk3026_ebc_du_budget *b,
 	}
 }
 
+/*
+ * The A2 inputs a resolve row runs with (struct rk3026_ebc_a2), for its
+ * part of 10 changed pixels (50 if big). T_A2_OFF, the default, is the
+ * probe's max_area of 0, with a table and no grey: A2 off whatever else.
+ */
+enum t_a2 {
+	T_A2_OFF,	/* max_area 0 */
+	T_A2_ON,	/* max_area 10: the part is at the edge */
+	T_A2_ONE_SHORT,	/* max_area 9: the part is one pixel over */
+	T_A2_GREY,	/* max_area 10, a changed pixel over a grey */
+	T_A2_NO_LUT,	/* max_area 10, no A2 table at the temperature */
+	T_A2_ALL,	/* max_area U32_MAX */
+};
+
+static void t_a2_of(enum t_a2 kind, struct rk3026_ebc_a2 *a2)
+{
+	*a2 = (struct rk3026_ebc_a2){ .max_area = 10, .lut = true };
+	switch (kind) {
+	case T_A2_OFF:
+		a2->max_area = 0;
+		break;
+	case T_A2_ON:
+		break;
+	case T_A2_ONE_SHORT:
+		a2->max_area = 9;
+		break;
+	case T_A2_GREY:
+		a2->over_grey = true;
+		break;
+	case T_A2_NO_LUT:
+		a2->lut = false;
+		break;
+	case T_A2_ALL:
+		a2->max_area = U32_MAX;
+		break;
+	}
+}
+
 struct t_resolve {
 	const char		*desc;
 	enum t_kind		kind;
@@ -1419,6 +1474,7 @@ struct t_resolve {
 	u32			mode;
 	enum rk3026_ebc_reason	reason;
 	enum t_budget		budget;
+	enum t_a2		a2;
 };
 
 #define T_DU_MODE	EBC_MODE_BLACK_WHITE
@@ -1429,8 +1485,9 @@ struct t_resolve {
 #define T_CEILING	EBC_REASON_CLEANUP_CEILING
 #define T_AUTO_GREY	EBC_REASON_AUTO_PART
 #define T_IDLE_CLEAN	EBC_REASON_CLEANUP_IDLE
+#define T_AUTO_A2	EBC_REASON_AUTO_A2
 /* Not a reason: what a test starts its result with. */
-#define T_NO_REASON	(EBC_REASON_CLEANUP_IDLE + 1)
+#define T_NO_REASON	(EBC_REASON_AUTO_A2 + 1)
 
 static const struct t_resolve t_resolve_cases[] = {
 	{ "plane two-level", T_PLANE, false, true, T_DU_MODE, T_AUTO_DU },
@@ -1559,27 +1616,99 @@ static const struct t_resolve t_resolve_cases[] = {
 	  EBC_MODE_FULL, T_IDLE_CLEAN },
 	{ "idle cleanup and plane grey", T_IDLE_PLANE, false, false,
 	  EBC_MODE_FULL, T_IDLE_CLEAN },
+	/*
+	 * A2 on: a small two-level plane part, at most max_area changed
+	 * pixels, none over a grey, with an A2 table, goes A2.
+	 */
+	{ "A2 on plane two-level", T_PLANE, false, true, EBC_MODE_A2,
+	  T_AUTO_A2, T_FRESH, T_A2_ON },
+	{ "A2 on plane and auto part two-level", T_PLANE_AUTO_PART, false,
+	  true, EBC_MODE_A2, T_AUTO_A2, T_FRESH, T_A2_ON },
+	/* One pixel over max_area, a grey under a change, no table: DU. */
+	{ "A2 on plane two-level one over", T_PLANE, false, true, T_DU_MODE,
+	  T_AUTO_DU, T_FRESH, T_A2_ONE_SHORT },
+	{ "A2 on plane two-level over grey", T_PLANE, false, true, T_DU_MODE,
+	  T_AUTO_DU, T_FRESH, T_A2_GREY },
+	{ "A2 on plane two-level no LUT", T_PLANE, false, true, T_DU_MODE,
+	  T_AUTO_DU, T_FRESH, T_A2_NO_LUT },
+	/* A big part on a budget not spent: A2 if max_area allows it. */
+	{ "A2 on plane two-level big", T_PLANE, false, true, EBC_MODE_A2,
+	  T_AUTO_A2, T_FRESH_BIG, T_A2_ALL },
+	{ "A2 on plane two-level big over max", T_PLANE, false, true,
+	  T_DU_MODE, T_AUTO_DU, T_FRESH_BIG, T_A2_ON },
+	/* A grey part, a repair, an explicit mode merged in: as before. */
+	{ "A2 on plane grey", T_PLANE, false, false, EBC_MODE_PART,
+	  T_AUTO_GREY, T_FRESH, T_A2_ALL },
+	{ "A2 on plane repair two-level", T_PLANE, true, true, EBC_MODE_FULL,
+	  T_EXPL, T_FRESH, T_A2_ALL },
+	{ "A2 on plane and DU two-level", T_PLANE_DU, false, true,
+	  EBC_MODE_FULL, T_EXPL, T_FRESH, T_A2_ALL },
+	/* An mxcfb client names A2 itself: its auto parts stay DU. */
+	{ "A2 on auto part two-level", T_AUTO_PART, false, true, T_DU_MODE,
+	  T_AUTO_DU, T_FRESH, T_A2_ALL },
+	{ "A2 on A2 two-level", T_A2, false, true, EBC_MODE_A2, T_EXPL,
+	  T_FRESH, T_A2_ALL },
+	{ "A2 on DU two-level", T_DU, false, true, T_DU_MODE, T_EXPL,
+	  T_FRESH, T_A2_ALL },
+	/* A spent budget: a small part stays A2, a big one cleans up. */
+	{ "A2 on plane two-level spent", T_PLANE, false, true, EBC_MODE_A2,
+	  T_AUTO_A2, T_SPENT, T_A2_ON },
+	{ "A2 on plane two-level spent big", T_PLANE, false, true,
+	  EBC_MODE_FULL, T_BIG, T_SPENT_BIG, T_A2_ALL },
+	{ "A2 on plane two-level ceiling", T_PLANE, false, true,
+	  EBC_MODE_FULL, T_CEILING, T_CEIL, T_A2_ON },
+	{ "A2 on plane two-level no budget", T_PLANE, false, true,
+	  EBC_MODE_A2, T_AUTO_A2, T_NO_BUDGET, T_A2_ALL },
+	/* The idle cleanup stays FULL. */
+	{ "A2 on idle cleanup two-level", T_IDLE, false, true, EBC_MODE_FULL,
+	  T_IDLE_CLEAN, T_FRESH, T_A2_ALL },
+	{ "A2 on idle cleanup and plane two-level", T_IDLE_PLANE, false, true,
+	  EBC_MODE_FULL, T_IDLE_CLEAN, T_FRESH, T_A2_ALL },
 };
 
 KUNIT_ARRAY_PARAM_DESC(t_resolve, t_resolve_cases, desc);
 
+/*
+ * Each row as it is. A row with A2 off (max_area 0) is run with every
+ * other A2 input as well and gives the same: with the probe's default
+ * the policy is the one before A2, whatever the waveform and the glass.
+ */
 static void ebc_test_resolve_mode(struct kunit *test)
 {
 	const struct t_resolve *c = test->param_value;
 	enum rk3026_ebc_reason reason = T_NO_REASON;
 	struct rk3026_ebc_du_budget budget;
 	struct rk3026_ebc_set part;
+	struct rk3026_ebc_a2 a2;
 	u32 scan_mode, changed_px;
+	unsigned int i;
 
 	t_kind_part(c->kind, &part);
 	t_budget_of(c->budget, &budget, &changed_px);
+	t_a2_of(c->a2, &a2);
 	scan_mode = rk3026_ebc_scan_mode(&part, c->repair);
 	KUNIT_EXPECT_EQ(test,
 			rk3026_ebc_resolve_mode(&part, scan_mode, c->two_level,
 						changed_px, c->repair, &budget,
-						&reason),
+						&a2, &reason),
 			c->mode);
 	KUNIT_EXPECT_EQ(test, reason, c->reason);
+
+	if (c->a2 != T_A2_OFF)
+		return;
+	for (i = 0; i < 4; i++) {
+		a2 = (struct rk3026_ebc_a2){
+			.max_area = 0, .lut = i & 1, .over_grey = i & 2,
+		};
+		reason = T_NO_REASON;
+		KUNIT_EXPECT_EQ(test,
+				rk3026_ebc_resolve_mode(&part, scan_mode,
+							c->two_level,
+							changed_px, c->repair,
+							&budget, &a2, &reason),
+				c->mode);
+		KUNIT_EXPECT_EQ(test, reason, c->reason);
+	}
 }
 
 /*
@@ -1990,7 +2119,10 @@ static u32 t_du(u32 area, const struct rk3026_ebc_set *part, u32 mode,
 				     repair);
 }
 
-/* A driven plane DU part grows the budget, a FULL of anyone's clears it. */
+/*
+ * A driven plane DU or A2 part grows the budget, a FULL of anyone's clears
+ * it.
+ */
 static void ebc_test_du_account_driven(struct kunit *test)
 {
 	struct rk3026_ebc_set plane, mxcfb;
@@ -2035,8 +2167,12 @@ static void ebc_test_du_account_driven(struct kunit *test)
 			KUNIT_EXPECT_EQ(test,
 					t_du(100, &plane, EBC_MODE_PART, 28, o,
 					     r), left);
+			/* A2 leaves a ghost too: it counts as DU does. */
 			KUNIT_EXPECT_EQ(test,
 					t_du(100, &plane, EBC_MODE_A2, 28, o,
+					     r), left + 28);
+			KUNIT_EXPECT_EQ(test,
+					t_du(100, &mxcfb, EBC_MODE_A2, 28, o,
 					     r), left);
 			KUNIT_EXPECT_EQ(test,
 					t_du(100, &plane, EBC_MODE_OED_PART, 28,
@@ -2053,6 +2189,9 @@ static void ebc_test_du_account_driven(struct kunit *test)
 			     EBC_OUTCOME_DRIVEN, EBC_REPAIR_NONE), U32_MAX);
 	KUNIT_EXPECT_EQ(test,
 			t_du(U32_MAX, &plane, T_DU_MODE, 1,
+			     EBC_OUTCOME_DRIVEN, EBC_REPAIR_NONE), U32_MAX);
+	KUNIT_EXPECT_EQ(test,
+			t_du(U32_MAX - 5, &plane, EBC_MODE_A2, 10,
 			     EBC_OUTCOME_DRIVEN, EBC_REPAIR_NONE), U32_MAX);
 }
 
@@ -2092,7 +2231,7 @@ static void ebc_test_du_account_part(struct kunit *test)
  */
 static void ebc_test_du_account_undriven(struct kunit *test)
 {
-	static const u32 modes[] = { T_DU_MODE, EBC_MODE_FULL };
+	static const u32 modes[] = { T_DU_MODE, EBC_MODE_A2, EBC_MODE_FULL };
 	struct rk3026_ebc_set plane;
 	unsigned int i, j, k;
 
@@ -2337,9 +2476,15 @@ static u32 t_mxcfb_resolve(struct kunit *test, u32 waveform, u32 update_mode,
 			   u32 flags, bool two_level,
 			   enum rk3026_ebc_reason *reason)
 {
-	/* Past the ceiling, and the part big: a plane part would clean up. */
+	/*
+	 * Past the ceiling, and the part big: a plane part would clean up.
+	 * A2 on for any part: a two-level plane part would go A2.
+	 */
 	static const struct rk3026_ebc_du_budget budget = {
 		.area = U32_MAX, .limit = 1, .big_area = 0, .ceiling = 1,
+	};
+	static const struct rk3026_ebc_a2 a2 = {
+		.max_area = U32_MAX, .lut = true,
 	};
 	struct rk3026_ebc_pending p = {};
 	struct rk3026_ebc_update upd;
@@ -2358,14 +2503,14 @@ static u32 t_mxcfb_resolve(struct kunit *test, u32 waveform, u32 update_mode,
 	KUNIT_EXPECT_FALSE(test, part.has_plane);
 	return rk3026_ebc_resolve_mode(&part,
 				       rk3026_ebc_scan_mode(&part, false),
-				       two_level, U32_MAX, false, &budget,
+				       two_level, U32_MAX, false, &budget, &a2,
 				       reason);
 }
 
 /*
  * AUTO + PARTIAL goes DU when the content is two-level, else PART, even
- * with the plane's DU budget past its ceiling and the part big; AUTO +
- * FULL and a named waveform keep their mode.
+ * with the plane's DU budget past its ceiling and the part big, and with
+ * A2 on for any part; AUTO + FULL and a named waveform keep their mode.
  */
 static void ebc_test_mxcfb_auto_resolve(struct kunit *test)
 {
@@ -2740,6 +2885,52 @@ static void ebc_test_rkf_fallbacks(struct kunit *test)
 }
 
 /*
+ * An A2 table of the container's own, which the GRAY2 fallback of the A2
+ * fetch hides: present at every temperature (one bucket here), absent
+ * with GRAY2 alone though the fetch then succeeds, present with a stream
+ * cut short (the header alone is looked at; the fetch falls back), absent
+ * with no frames or a header past the container end.
+ */
+static void ebc_test_rkf_has_a2(struct kunit *test)
+{
+	struct device *dev = t_rkf_dev(test);
+	static const struct t_rkf_seg both[] = {
+		{ T_RKF_GRAY2, 3 }, { T_RKF_GRAYA2, 2 },
+	};
+	static const struct t_rkf_seg empty[] = {
+		{ T_RKF_GRAY2, 3 }, { T_RKF_GRAYA2, 0 },
+	};
+	static const int temps[] = { -10, 0, 25, 49, 50, 1000 };
+	size_t size = T_RKF_PAYLOAD + T_RKF_SEG;
+	struct ebc_waveform *wf;
+	unsigned int i;
+	u8 *buf;
+
+	wf = t_rkf_wf(test, dev, both, 2, 0);
+	for (i = 0; i < ARRAY_SIZE(temps); i++)
+		KUNIT_EXPECT_TRUE(test,
+				  rk3026_ebc_waveform_has_a2(wf, temps[i]));
+
+	wf = t_rkf_wf(test, dev, both, 1, 0);
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_waveform_has_a2(wf, 25));
+	KUNIT_EXPECT_EQ(test, t_rkf_frames(wf, EBC_MODE_A2), 3);
+
+	wf = t_rkf_wf(test, dev, both, 2, 1);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_waveform_has_a2(wf, 25));
+	KUNIT_EXPECT_EQ(test, t_rkf_frames(wf, EBC_MODE_A2), 3);
+
+	wf = t_rkf_wf(test, dev, empty, 2, 0);
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_waveform_has_a2(wf, 25));
+
+	buf = t_rkf_container(test, size, T_RKF_PAYLOAD);
+	put_unaligned_le32(size - 2, buf + T_RKF_GRAYA2);
+	t_rkf_seal(buf, size);
+	wf = rk3026_ebc_waveform_parse(dev, buf, size + 4);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, wf);
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_waveform_has_a2(wf, 25));
+}
+
+/*
  * AUTO overlays GRAY2 onto GRAY16: an absent overlay or a longer one is
  * skipped, a damaged one fails the LUT.
  */
@@ -2824,6 +3015,7 @@ static struct kunit_case rk3026_ebc_waveform_test_cases[] = {
 	KUNIT_CASE(ebc_test_rkf_modes),
 	KUNIT_CASE(ebc_test_rkf_truncated_modes),
 	KUNIT_CASE(ebc_test_rkf_fallbacks),
+	KUNIT_CASE(ebc_test_rkf_has_a2),
 	KUNIT_CASE(ebc_test_rkf_auto_overlay),
 	KUNIT_CASE(ebc_test_rkf_parse_bounds),
 	{}
@@ -2871,6 +3063,8 @@ static struct rk3026_ebc *t_ebc_alloc(struct kunit *test)
 	ebc->du_cleanup_big_area = T_W * T_H / 2;
 	ebc->du_cleanup_ceiling = 4 * T_W * T_H;
 	ebc->du_cleanup_idle_ms = 2000;
+	/* A2 off for plane parts. */
+	ebc->a2_max_area = 0;
 	/*
 	 * plane_resync stays false: after probe it is true (the probe RESET
 	 * is a non-plane update), but here the target and the framebuffers
@@ -3453,7 +3647,7 @@ static void ebc_test_glue_du_reset(struct kunit *test)
 /* The waveforms the static stub of rk3026_ebc_drive() was asked for. */
 struct t_drives {
 	unsigned int	n;
-	u32		mode[4];
+	u32		mode[8];
 };
 
 /*
@@ -3698,6 +3892,175 @@ static void ebc_test_glue_du_ceiling(struct kunit *test)
 
 	KUNIT_EXPECT_EQ(test, d.n, 2);
 	KUNIT_EXPECT_EQ(test, d.mode[0], EBC_MODE_BLACK_WHITE);
+	KUNIT_EXPECT_EQ(test, d.mode[1], EBC_MODE_FULL);
+}
+
+/*
+ * The policy fixture with rk3026_ebc_drive() stubbed (t_driven_ebc()) and a
+ * waveform that has, with @a2_table, an A2 table of its own of 2 frames
+ * next to the gray2 (DU) table of 1, so the frames driven tell the two
+ * apart. The last driven part was drawn at 25 degrees, unless
+ * @no_temp: then no temperature is known yet.
+ */
+static struct rk3026_ebc *t_a2_ebc(struct kunit *test, struct t_drives *d,
+				   bool a2_table, bool no_temp)
+{
+	static const struct t_rkf_seg segs[] = {
+		{ T_RKF_RESET, 5 }, { T_RKF_GRAY16, 1 }, { T_RKF_GRAY2, 1 },
+		{ T_RKF_GRAYA2, 2 },
+	};
+	struct rk3026_ebc *ebc = t_driven_ebc(test, d, true);
+
+	if (a2_table)
+		ebc->waveform = t_rkf_wf(test, ebc->dev, segs,
+					 ARRAY_SIZE(segs), 0);
+	ebc->last_driven.temp = 25;
+	ebc->last_driven.temp_read = !no_temp;
+	return ebc;
+}
+
+/*
+ * A black box of 4 x 2 pixels on the white glass, one plane update: A2 on
+ * or off, it is driven DU unless every condition for A2 holds.
+ */
+static void t_a2_box_du(struct kunit *test, bool a2_table, bool no_temp,
+			u32 max_area)
+{
+	struct t_drives d;
+	struct rk3026_ebc *ebc = t_a2_ebc(test, &d, a2_table, no_temp);
+	u32 *box = t_plane_fb(test, 0xffffff);
+	struct rk3026_ebc_last last;
+
+	t_fb_box(box, 4, 2, 8, 4, 0);
+	ebc->a2_max_area = max_area;
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, box, T_W * 4,
+							&t_panel));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_BLACK_WHITE);
+	KUNIT_EXPECT_EQ(test, last.lut_mode, EBC_MODE_BLACK_WHITE);
+	KUNIT_EXPECT_EQ(test, last.frames, 1);
+	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_AUTO_DU);
+	KUNIT_EXPECT_EQ(test, ebc->du_area, 8);
+	KUNIT_EXPECT_EQ(test, d.n, 1);
+	KUNIT_EXPECT_EQ(test, d.mode[0], EBC_MODE_BLACK_WHITE);
+}
+
+/*
+ * A2 off, as probe leaves it: the small two-level plane part is driven DU,
+ * as before A2, with an A2 table in the waveform and the temperature known.
+ */
+static void ebc_test_glue_a2_off(struct kunit *test)
+{
+	t_a2_box_du(test, true, false, 0);
+}
+
+/*
+ * A2 on, and the part well within it: still DU without an A2 table of the
+ * waveform's own.
+ */
+static void ebc_test_glue_a2_no_table(struct kunit *test)
+{
+	t_a2_box_du(test, false, false, U32_MAX);
+}
+
+/* The same before any temperature is known, with the A2 table there. */
+static void ebc_test_glue_a2_no_temp(struct kunit *test)
+{
+	t_a2_box_du(test, true, true, U32_MAX);
+}
+
+/* Draw the box of @fb as one whole-panel plane update; returns the record. */
+static void t_a2_draw(struct kunit *test, struct rk3026_ebc *ebc, u32 *fb,
+		      struct rk3026_ebc_last *last)
+{
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, fb, T_W * 4,
+							&t_panel));
+	rk3026_ebc_do_refresh(ebc, last);
+	KUNIT_EXPECT_EQ(test, last->outcome, EBC_OUTCOME_DRIVEN);
+}
+
+/*
+ * A2 on for 8 pixels, each step one plane update on the glass the one
+ * before left:
+ *  - a black box of 8 pixels on white is driven A2, with the A2 table (2
+ *    frames), reason auto_a2, and adds its 8 pixels to the budget;
+ *  - one of 9 pixels is one over: DU;
+ *  - a grey box of 4 pixels is driven PART, and leaves the budget;
+ *  - the same 4 pixels made black are over a grey: DU, though small.
+ */
+static void ebc_test_glue_a2_driven(struct kunit *test)
+{
+	struct t_drives d;
+	struct rk3026_ebc *ebc = t_a2_ebc(test, &d, true, false);
+	u32 *fb = t_plane_fb(test, 0xffffff);
+	struct rk3026_ebc_last last;
+
+	ebc->a2_max_area = 8;
+
+	t_fb_box(fb, 0, 0, 4, 2, 0);
+	t_a2_draw(test, ebc, fb, &last);
+	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_A2);
+	KUNIT_EXPECT_EQ(test, last.lut_mode, EBC_MODE_A2);
+	KUNIT_EXPECT_EQ(test, last.frames, 2);
+	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_AUTO_A2);
+	KUNIT_EXPECT_EQ(test, ebc->du_area, 8);
+	KUNIT_EXPECT_EQ(test, t_px(ebc->shadows.prev, 3, 1), 0);
+
+	t_fb_box(fb, 8, 0, 11, 3, 0);
+	t_a2_draw(test, ebc, fb, &last);
+	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_BLACK_WHITE);
+	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_AUTO_DU);
+	KUNIT_EXPECT_EQ(test, ebc->du_area, 17);
+
+	t_fb_box(fb, 12, 4, 14, 6, 0x808080);
+	t_a2_draw(test, ebc, fb, &last);
+	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_PART);
+	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_AUTO_PART);
+	KUNIT_EXPECT_EQ(test, ebc->du_area, 17);
+
+	t_fb_box(fb, 12, 4, 14, 6, 0);
+	t_a2_draw(test, ebc, fb, &last);
+	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_BLACK_WHITE);
+	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_AUTO_DU);
+	KUNIT_EXPECT_EQ(test, ebc->du_area, 21);
+	KUNIT_EXPECT_EQ(test, t_px(ebc->shadows.prev, 13, 5), 0);
+
+	KUNIT_EXPECT_EQ(test, d.n, 4);
+	KUNIT_EXPECT_EQ(test, d.mode[0], EBC_MODE_A2);
+	KUNIT_EXPECT_EQ(test, d.mode[1], EBC_MODE_BLACK_WHITE);
+	KUNIT_EXPECT_EQ(test, d.mode[2], EBC_MODE_PART);
+	KUNIT_EXPECT_EQ(test, d.mode[3], EBC_MODE_BLACK_WHITE);
+}
+
+/*
+ * A2 on, the budget spent: a small part is still A2, and a big one takes
+ * the cleanup FULL however far A2 reaches.
+ */
+static void ebc_test_glue_a2_spent(struct kunit *test)
+{
+	struct t_drives d;
+	struct rk3026_ebc *ebc = t_a2_ebc(test, &d, true, false);
+	u32 *fb = t_plane_fb(test, 0xffffff);
+	struct rk3026_ebc_last last;
+
+	ebc->a2_max_area = U32_MAX;
+	ebc->du_area = ebc->du_cleanup_area;
+
+	t_fb_box(fb, 0, 0, 4, 2, 0);
+	t_a2_draw(test, ebc, fb, &last);
+	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_A2);
+	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_AUTO_A2);
+	KUNIT_EXPECT_EQ(test, ebc->du_area, ebc->du_cleanup_area + 8);
+
+	t_fb_box(fb, 0, 0, T_W, T_H, 0);
+	t_a2_draw(test, ebc, fb, &last);
+	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_FULL);
+	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_CLEANUP_BIG);
+	KUNIT_EXPECT_EQ(test, ebc->du_area, 0);
+
+	KUNIT_EXPECT_EQ(test, d.n, 2);
+	KUNIT_EXPECT_EQ(test, d.mode[0], EBC_MODE_A2);
 	KUNIT_EXPECT_EQ(test, d.mode[1], EBC_MODE_FULL);
 }
 
@@ -4433,6 +4796,11 @@ static struct kunit_case rk3026_ebc_glue_test_cases[] = {
 	KUNIT_CASE(ebc_test_glue_part_driven),
 	KUNIT_CASE(ebc_test_glue_du_big),
 	KUNIT_CASE(ebc_test_glue_du_ceiling),
+	KUNIT_CASE(ebc_test_glue_a2_off),
+	KUNIT_CASE(ebc_test_glue_a2_no_table),
+	KUNIT_CASE(ebc_test_glue_a2_no_temp),
+	KUNIT_CASE(ebc_test_glue_a2_driven),
+	KUNIT_CASE(ebc_test_glue_a2_spent),
 	KUNIT_CASE(ebc_test_glue_idle_cleanup),
 	KUNIT_CASE(ebc_test_glue_idle_not_due),
 	KUNIT_CASE(ebc_test_glue_idle_carried),
@@ -4795,32 +5163,36 @@ struct t_snap_count {
 	int moved;
 	int still;
 	int two_level;
+	int over_grey;
 };
 
 /*
- * The two-level result and the changed count pixel by pixel: on @box
- * clipped and widened to whole bytes as the driver does, the pixels where
- * @next differs from @prev, and whether every one of them is 0 or 15 in
- * @next.
+ * The two-level result, the over-grey result and the changed count pixel
+ * by pixel: on @box clipped and widened to whole bytes as the driver does,
+ * the pixels where @next differs from @prev, whether every one of them is 0
+ * or 15 in @next, and whether one of them is grey in @prev.
  */
 static bool t_ref_two_level(const struct t_fix *f, const u8 *prev,
 			    const u8 *next, const struct drm_rect *box,
-			    u32 *changed_px)
+			    bool *over_grey, u32 *changed_px)
 {
 	struct drm_rect w;
 	bool grey = false;
 	u32 n = 0;
 	int x, y;
 
+	*over_grey = false;
 	t_widen(f, box, &w);
 	for (y = w.y1; y < w.y2; y++) {
 		for (x = w.x1; x < w.x2; x++) {
 			u8 lvl = t_px_w(next, f, x, y);
+			u8 old = t_px_w(prev, f, x, y);
 
-			if (lvl == t_px_w(prev, f, x, y))
+			if (lvl == old)
 				continue;
 			n++;
 			grey |= lvl != 0 && lvl != 15;
+			*over_grey |= old != 0 && old != 15;
 		}
 	}
 	*changed_px = n;
@@ -4830,8 +5202,9 @@ static bool t_ref_two_level(const struct t_fix *f, const u8 *prev,
 /*
  * Every mode and box on one prev/next pair: the reference and the driver
  * write the same scan image over the same junk, guards included, return
- * the same and give the same mode; the two-level result and the changed
- * count are t_ref_two_level()'s. False after the first difference.
+ * the same and give the same mode; the two-level and over-grey results and
+ * the changed count are t_ref_two_level()'s. False after the first
+ * difference.
  */
 static bool t_ref_snapshot_pair(struct kunit *test, const struct t_fix *f,
 				u8 *prev, const u8 *next, u8 *scan_ref,
@@ -4847,7 +5220,7 @@ static bool t_ref_snapshot_pair(struct kunit *test, const struct t_fix *f,
 	for (mi = 0; mi < ARRAY_SIZE(t_snap_modes); mi++) {
 		for (c = 0; c < n; c++) {
 			u32 mode_ref = t_snap_modes[mi], mode = mode_ref;
-			bool ret_ref, ret, tl_ref, tl;
+			bool ret_ref, ret, tl_ref, tl, og_ref, og;
 			u32 chg_ref, chg;
 			int diff;
 
@@ -4857,26 +5230,28 @@ static bool t_ref_snapshot_pair(struct kunit *test, const struct t_fix *f,
 			ret_ref = rk3026_ebc_ref_snapshot(&sh, next, &clips[c],
 							  &mode_ref);
 			tl_ref = t_ref_two_level(f, prev, next, &clips[c],
-						 &chg_ref);
+						 &og_ref, &chg_ref);
 			sh.scan = scan;
 			ret = rk3026_ebc_build_snapshot(&sh, next, &clips[c],
-							&mode, &tl, &chg);
+							&mode, &tl, &og, &chg);
 			diff = t_fix_diff(f, scan_ref, scan);
 			if (ret != ret_ref || mode != mode_ref ||
-			    diff != INT_MAX || tl != tl_ref || chg != chg_ref) {
+			    diff != INT_MAX || tl != tl_ref || og != og_ref ||
+			    chg != chg_ref) {
 				KUNIT_FAIL(test,
 					   "%s mode %u box " DRM_RECT_FMT
-					   ": ret %d/%d mode %u/%u byte %d two-level %d/%d changed %u/%u",
+					   ": ret %d/%d mode %u/%u byte %d two-level %d/%d over-grey %d/%d changed %u/%u",
 					   f->name, t_snap_modes[mi],
 					   DRM_RECT_ARG(&clips[c]), ret, ret_ref,
 					   mode, mode_ref, diff, tl, tl_ref,
-					   chg, chg_ref);
+					   og, og_ref, chg, chg_ref);
 				return false;
 			}
 			cnt->raised += mode_ref != t_snap_modes[mi];
 			cnt->moved += ret_ref;
 			cnt->still += !ret_ref;
 			cnt->two_level += tl_ref;
+			cnt->over_grey += og_ref;
 		}
 	}
 	return true;
@@ -4885,7 +5260,7 @@ static bool t_ref_snapshot_pair(struct kunit *test, const struct t_fix *f,
 /*
  * rk3026_ebc_build_snapshot() equals rk3026_ebc_ref_snapshot() on every
  * fixture, image pair, mode and box. The cases reach a move, no move, the
- * A2-over-grey raise and a two-level update.
+ * A2-over-grey raise, a two-level update and a change over a grey.
  */
 static void ebc_test_ref_snapshot(struct kunit *test)
 {
@@ -4922,42 +5297,45 @@ static void ebc_test_ref_snapshot(struct kunit *test)
 	KUNIT_EXPECT_GT(test, cnt.moved, 0);
 	KUNIT_EXPECT_GT(test, cnt.still, 0);
 	KUNIT_EXPECT_GT(test, cnt.two_level, 0);
+	KUNIT_EXPECT_GT(test, cnt.over_grey, 0);
 }
 
 /*
  * One snapshot of @box in @mode by the reference and the driver over the
- * same junk; *@mode_out is the driver's mode. The two-level result and the
- * changed count are checked against t_ref_two_level(). False, with a
- * failure, if anything differs.
+ * same junk; *@mode_out is the driver's mode, *@og_out its over-grey
+ * result. The two-level and over-grey results and the changed count are
+ * checked against t_ref_two_level(). False, with a failure, if anything
+ * differs.
  */
 static bool t_snap_vs_ref(struct kunit *test, const struct t_fix *f,
 			  u8 *prev, const u8 *next, u8 *scan_ref,
 			  u8 *scan, const struct drm_rect *box, u32 mode,
-			  u32 *mode_out, struct rnd_state *rs)
+			  u32 *mode_out, bool *og_out, struct rnd_state *rs)
 {
 	struct rk3026_ebc_shadows sh = {
 		.prev = prev, .pitch = t_fix_pitch(f), .height = f->h,
 	};
 	u32 mode_ref = mode, chg_ref, chg;
-	bool ret_ref, ret, tl_ref, tl;
+	bool ret_ref, ret, tl_ref, tl, og_ref;
 	int diff;
 
 	prandom_bytes_state(rs, scan_ref, t_fix_size(f));
 	memcpy(scan, scan_ref, t_fix_size(f));
 	sh.scan = scan_ref;
 	ret_ref = rk3026_ebc_ref_snapshot(&sh, next, box, &mode_ref);
-	tl_ref = t_ref_two_level(f, prev, next, box, &chg_ref);
+	tl_ref = t_ref_two_level(f, prev, next, box, &og_ref, &chg_ref);
 	sh.scan = scan;
 	*mode_out = mode;
-	ret = rk3026_ebc_build_snapshot(&sh, next, box, mode_out, &tl, &chg);
+	ret = rk3026_ebc_build_snapshot(&sh, next, box, mode_out, &tl, og_out,
+					&chg);
 	diff = t_fix_diff(f, scan_ref, scan);
 	if (ret == ret_ref && *mode_out == mode_ref && diff == INT_MAX &&
-	    tl == tl_ref && chg == chg_ref)
+	    tl == tl_ref && *og_out == og_ref && chg == chg_ref)
 		return true;
 	KUNIT_FAIL(test, "%s mode %u box " DRM_RECT_FMT
-		   ": ret %d/%d mode %u/%u byte %d two-level %d/%d changed %u/%u",
+		   ": ret %d/%d mode %u/%u byte %d two-level %d/%d over-grey %d/%d changed %u/%u",
 		   f->name, mode, DRM_RECT_ARG(box), ret, ret_ref, *mode_out,
-		   mode_ref, diff, tl, tl_ref, chg, chg_ref);
+		   mode_ref, diff, tl, tl_ref, *og_out, og_ref, chg, chg_ref);
 	return false;
 }
 
@@ -4980,6 +5358,7 @@ static void ebc_test_snapshot_nibble_pairs(struct kunit *test)
 	};
 	struct rnd_state rs;
 	unsigned int mi, bi;
+	bool og;
 	int x, y;
 	u32 mode;
 
@@ -4996,7 +5375,7 @@ static void ebc_test_snapshot_nibble_pairs(struct kunit *test)
 		for (bi = 0; bi < ARRAY_SIZE(boxes); bi++)
 			if (!t_snap_vs_ref(test, f, prev, next, scan_ref, scan,
 					   &boxes[bi], t_snap_modes[mi], &mode,
-					   &rs))
+					   &og, &rs))
 				return;
 	KUNIT_EXPECT_TRUE(test, t_fix_guard_ok(f, scan));
 }
@@ -5005,7 +5384,9 @@ static void ebc_test_snapshot_nibble_pairs(struct kunit *test)
  * The A2-over-grey raise at every pixel of three words: on a black and
  * white prev, one grey at pixel @j of a row. An A2 scan that changes pixel
  * @j runs DU; one that changes only the pixel next to it, or changes @j on
- * a prev without the grey, stays A2.
+ * a prev without the grey, stays A2. The over-grey result follows the same
+ * pixels, in A2 and in FULL (a plane part's scan mode), which it does not
+ * raise.
  */
 static void ebc_test_snapshot_a2_guard_positions(struct kunit *test)
 {
@@ -5015,6 +5396,7 @@ static void ebc_test_snapshot_a2_guard_positions(struct kunit *test)
 	const struct drm_rect box = DRM_RECT_INIT(0, 0, f->w, f->h);
 	struct rnd_state rs;
 	int j, g, nb;
+	bool og;
 	u32 mode;
 
 	prandom_seed_state(&rs, 31);
@@ -5034,7 +5416,8 @@ static void ebc_test_snapshot_a2_guard_positions(struct kunit *test)
 				t_px_set_w(next, f, x, y, lvl >= 8 ? 0 : 15);
 				if (!t_snap_vs_ref(test, f, prev, next,
 						   scan_ref, scan, &box,
-						   EBC_MODE_A2, &mode, &rs))
+						   EBC_MODE_A2, &mode, &og,
+						   &rs))
 					return;
 				KUNIT_EXPECT_EQ_MSG(test, mode,
 						    !nb && grey ?
@@ -5042,6 +5425,14 @@ static void ebc_test_snapshot_a2_guard_positions(struct kunit *test)
 						    EBC_MODE_A2,
 						    "pixel %d grey %d at %d",
 						    j, g, x);
+				KUNIT_EXPECT_EQ(test, og, !nb && grey);
+				if (!t_snap_vs_ref(test, f, prev, next,
+						   scan_ref, scan, &box,
+						   EBC_MODE_FULL, &mode, &og,
+						   &rs))
+					return;
+				KUNIT_EXPECT_EQ(test, mode, EBC_MODE_FULL);
+				KUNIT_EXPECT_EQ(test, og, !nb && grey);
 			}
 		}
 	}
@@ -5056,9 +5447,10 @@ static bool t_snap_tl(const struct t_fix *f, u8 *prev, const u8 *next,
 		.prev = prev, .scan = scan, .pitch = t_fix_pitch(f),
 		.height = f->h,
 	};
+	bool over_grey;
 
 	return rk3026_ebc_build_snapshot(&sh, next, box, &mode, two_level,
-					 changed_px);
+					 &over_grey, changed_px);
 }
 
 /*
@@ -5177,7 +5569,7 @@ static void ebc_test_snapshot_two_level_positions(struct kunit *test)
 	struct rnd_state rs;
 	unsigned int bi;
 	int j, g, w;
-	bool tl;
+	bool tl, og;
 	u32 mode, chg;
 
 	prandom_seed_state(&rs, 41);
@@ -5192,8 +5584,10 @@ static void ebc_test_snapshot_two_level_positions(struct kunit *test)
 				t_px_set_w(next, f, j, 3, g);
 				if (!t_snap_vs_ref(test, f, prev, next,
 						   scan_ref, scan, &boxes[bi],
-						   EBC_MODE_PART, &mode, &rs))
+						   EBC_MODE_PART, &mode, &og,
+						   &rs))
 					return;
+				KUNIT_EXPECT_FALSE(test, og);
 				t_snap_tl(f, prev, next, scan, &boxes[bi],
 					  EBC_MODE_BLACK_WHITE, &tl, &chg);
 				KUNIT_EXPECT_EQ_MSG(test, tl, g == 0 || g == 15,

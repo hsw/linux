@@ -1462,7 +1462,7 @@ static void t_budget_of(enum t_budget kind, struct rk3026_ebc_du_budget *b,
 /*
  * The A2 inputs a resolve row runs with (struct rk3026_ebc_a2), for its
  * part of 10 changed pixels (50 if big). T_A2_OFF, the default, is the
- * probe's max_area of 0, with a table and no grey: A2 off whatever else.
+ * probe's max_area of 0 and no grey: A2 off whatever else.
  */
 enum t_a2 {
 	T_A2_OFF,	/* max_area 0 */
@@ -1514,7 +1514,7 @@ struct t_resolve {
 #define T_IDLE_CLEAN	EBC_REASON_CLEANUP_IDLE
 #define T_AUTO_A2	EBC_REASON_AUTO_A2
 /* Not a reason: what a test starts its result with. */
-#define T_NO_REASON	(EBC_REASON_AUTO_A2 + 1)
+#define T_NO_REASON	((enum rk3026_ebc_reason)-1)
 
 static const struct t_resolve t_resolve_cases[] = {
 	{ "plane two-level", T_PLANE, false, true, T_DU_MODE, T_AUTO_DU },
@@ -1680,7 +1680,7 @@ static const struct t_resolve t_resolve_cases[] = {
 	  EBC_MODE_FULL, T_IDLE_CLEAN },
 	/*
 	 * A2 on: a small two-level plane part, at most max_area changed
-	 * pixels, none over a grey, with an A2 table, goes A2.
+	 * pixels, none over a grey, goes A2.
 	 */
 	{ "A2 on plane two-level", T_PLANE, false, true, EBC_MODE_A2,
 	  T_AUTO_A2, T_FRESH, T_A2_ON },
@@ -3173,7 +3173,7 @@ static struct rk3026_ebc *t_ebc_alloc(struct kunit *test)
 	ebc->du_cleanup_area = T_W * T_H;
 	ebc->du_cleanup_big_area = T_W * T_H / 2;
 	ebc->du_cleanup_ceiling = 4 * T_W * T_H;
-	ebc->du_cleanup_idle_ms = 2000;
+	ebc->du_cleanup_idle_ms = EBC_DU_CLEANUP_IDLE_MS;
 	/* A2 off for plane parts. */
 	ebc->a2_max_area = 0;
 	/*
@@ -3522,6 +3522,16 @@ static u32 *t_plane_fb(struct kunit *test, u32 xrgb)
 	return fb;
 }
 
+/* Fill the box @x1,@y1 - @x2,@y2 (exclusive) of a plane framebuffer. */
+static void t_fb_box(u32 *fb, int x1, int y1, int x2, int y2, u32 xrgb)
+{
+	int x, y;
+
+	for (y = y1; y < y2; y++)
+		for (x = x1; x < x2; x++)
+			fb[y * T_W + x] = xrgb;
+}
+
 static struct rk3026_ebc *t_policy_ebc(struct kunit *test)
 {
 	static const struct t_rkf_seg seg = { T_RKF_RESET, 5 };
@@ -3698,11 +3708,8 @@ static void t_du_budget_left(struct kunit *test, u32 limit, u32 area)
 	struct drm_rect r = DRM_RECT_INIT(4, 2, 4, 2);
 	u32 *box = t_plane_fb(test, 0xffffff);
 	struct rk3026_ebc_last last;
-	int x, y;
 
-	for (y = r.y1; y < r.y2; y++)
-		for (x = r.x1; x < r.x2; x++)
-			box[y * T_W + x] = 0;
+	t_fb_box(box, r.x1, r.y1, r.x2, r.y2, 0);
 	ebc->du_cleanup_area = limit;
 	ebc->du_area = area;
 	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, box, T_W * 4,
@@ -3833,11 +3840,8 @@ static void ebc_test_glue_du_driven(struct kunit *test)
 	u32 *white = t_plane_fb(test, 0xffffff);
 	u32 *box = t_plane_fb(test, 0xffffff);
 	struct rk3026_ebc_last last;
-	int x, y;
 
-	for (y = 2; y < 4; y++)
-		for (x = 4; x < 8; x++)
-			box[y * T_W + x] = 0;
+	t_fb_box(box, 4, 2, 8, 4, 0);
 
 	ebc->du_cleanup_area = 2 * T_W * T_H;
 	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
@@ -3884,11 +3888,8 @@ static void ebc_test_glue_part_driven(struct kunit *test)
 	u32 *box = t_plane_fb(test, 0xffffff);
 	u32 *grey = t_plane_fb(test, 0x404040);
 	struct rk3026_ebc_last last;
-	int x, y;
 
-	for (y = 2; y < 4; y++)
-		for (x = 4; x < 8; x++)
-			box[y * T_W + x] = 0x808080;
+	t_fb_box(box, 4, 2, 8, 4, 0x808080);
 
 	ebc->du_area = 50;
 	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, box, T_W * 4,
@@ -3915,16 +3916,6 @@ static void ebc_test_glue_part_driven(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, d.n, 2);
 	KUNIT_EXPECT_EQ(test, d.mode[0], EBC_MODE_PART);
 	KUNIT_EXPECT_EQ(test, d.mode[1], EBC_MODE_FULL);
-}
-
-/* Fill the box @x1,@y1 - @x2,@y2 (exclusive) of a plane framebuffer. */
-static void t_fb_box(u32 *fb, int x1, int y1, int x2, int y2, u32 xrgb)
-{
-	int x, y;
-
-	for (y = y1; y < y2; y++)
-		for (x = x1; x < x2; x++)
-			fb[y * T_W + x] = xrgb;
 }
 
 /*

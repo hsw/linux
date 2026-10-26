@@ -138,19 +138,11 @@ static void ebc_rails_rearm(struct rk3026_ebc *ebc)
  *
  * An early version defaulted to PART and rendered washed grey where
  * force_mode=1 rendered solid black, in one whole-frame observation, and
- * plane parts were kept off PART since. A later camera run on this panel did not
- * reproduce that: PART drew a grey ramp from white as FULL drew it, solid
- * black included, so a grey plane part goes PART now.
+ * plane parts were kept off PART since. A later camera run on this panel
+ * did not reproduce that: PART drew a grey ramp from white as FULL drew it,
+ * solid black included, so a grey plane part goes PART now.
  */
 #define EBC_MODE_DEFAULT	EBC_MODE_FULL
-
-/*
- * The idle delay before the cleanup FULL of a spent DU budget
- * (rk3026_ebc_idle_tick()): long enough that a pause between keystrokes or
- * pointer moves does not flash the panel, short enough that the glass is
- * clean when the user looks at it. debugfs du_cleanup_idle_ms changes it.
- */
-#define EBC_DU_CLEANUP_IDLE_MS	2000
 
 static inline void ebc_write(struct rk3026_ebc *ebc, u32 reg, u32 val)
 {

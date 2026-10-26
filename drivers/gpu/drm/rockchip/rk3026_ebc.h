@@ -218,6 +218,7 @@ enum rk3026_ebc_source {
 	EBC_SOURCE_PLANE,	/* a plane update: fbcon or a KMS client */
 	EBC_SOURCE_MXCFB,	/* MXCFB_SEND_UPDATE */
 	EBC_SOURCE_ENABLE,	/* the RESET of a CRTC enable */
+	EBC_SOURCE_IDLE,	/* the idle cleanup the refresh thread queues */
 };
 
 /* What became of one part (the updates one scan takes). */
@@ -251,6 +252,7 @@ enum rk3026_ebc_reason {
 	EBC_REASON_CLEANUP_BIG,	/* spent: a big auto plane part kept FULL */
 	EBC_REASON_AUTO_PART,	/* an auto plane part with a grey change */
 	EBC_REASON_CLEANUP_CEILING, /* ceiling: any auto plane part FULL */
+	EBC_REASON_CLEANUP_IDLE, /* the idle cleanup's own FULL */
 };
 
 /*
@@ -265,6 +267,33 @@ struct rk3026_ebc_du_budget {
 	u32	limit;
 	u32	big_area;
 	u32	ceiling;
+};
+
+/*
+ * The idle cleanup as rk3026_ebc_idle_cleanup_due() reads it, at one look
+ * of the refresh thread under @image_lock:
+ *
+ * @armed: a plane update was queued since the last look that found the
+ *	delay over (struct rk3026_ebc, @idle_armed);
+ * @last_plane: when the newest plane update was queued, in jiffies;
+ * @delay: the idle delay in jiffies, 0: no idle cleanup;
+ * @area, @limit: the DU budget spent and its limit (0: no budget);
+ * @pending: a part is pending (a RESET included);
+ * @blanked: the CRTC is off;
+ * @mxcfb_active: an mxcfb client drives the panel;
+ * @repair_due: the glass is not known (@shadows.prev_unknown), so the next
+ *	draw repairs it with a RESET.
+ */
+struct rk3026_ebc_idle {
+	unsigned long	last_plane;
+	unsigned long	delay;
+	u32		area;
+	u32		limit;
+	bool		armed;
+	bool		pending;
+	bool		blanked;
+	bool		mxcfb_active;
+	bool		repair_due;
 };
 
 /*
@@ -350,6 +379,11 @@ struct rk3026_ebc_stats {
  * @auto_ok: every update in the set has @auto_mode, so the content may pick
  * the mode (rk3026_ebc_resolve_mode()); one that names its mode clears it,
  * and so does a carry. @mode and its rank stay the plain modes' either way.
+ *
+ * @cleanup_idle: the idle cleanup (EBC_SOURCE_IDLE) is in the set. Updates
+ * that join it and a carry merged into it keep it, so the part is still
+ * the cleanup FULL: never skipped (rk3026_ebc_should_skip()), and driven
+ * in its scan mode for the reason EBC_REASON_CLEANUP_IDLE.
  */
 struct rk3026_ebc_set {
 	struct drm_rect	box;
@@ -364,6 +398,7 @@ struct rk3026_ebc_set {
 	bool		has_mxcfb_full;
 	bool		auto_ok;
 	bool		has_plane;	/* a plane update is in the set */
+	bool		cleanup_idle;
 	u8		source;		/* the newest update's */
 };
 
@@ -600,6 +635,22 @@ struct rk3026_ebc {
 	u32			du_cleanup_big_area;
 	u32			du_cleanup_ceiling;
 
+	/*
+	 * The idle cleanup (rk3026_ebc_idle_tick()): with the budget spent and
+	 * no plane update for @du_cleanup_idle_ms, the refresh thread queues a
+	 * whole-panel FULL. A queued plane update arms it and stamps
+	 * @idle_last_plane (jiffies); the thread's first look after the delay
+	 * disarms it, and queues the cleanup if it is due then, so one arming
+	 * makes at most one cleanup. Both under @image_lock, written with
+	 * WRITE_ONCE(): the thread also reads them without the lock, for the
+	 * deadline of its wait alone, and decides under the lock.
+	 * @du_cleanup_idle_ms is the delay (0: none); probe sets 2000, debugfs
+	 * may change it, and the thread reads it with READ_ONCE().
+	 */
+	unsigned long		idle_last_plane;
+	bool			idle_armed;
+	u32			du_cleanup_idle_ms;
+
 	/* Write-only registers the controller does not read back. */
 	u32			dsp_start;
 	u32			dsp_ctrl;
@@ -691,6 +742,7 @@ bool rk3026_ebc_plane_box(const struct drm_plane_state *old_state,
 			  struct drm_rect *box);
 bool rk3026_ebc_plane_update(struct rk3026_ebc *ebc, const void *src,
 			     unsigned int src_pitch, const struct drm_rect *box);
+bool rk3026_ebc_idle_tick(struct rk3026_ebc *ebc, unsigned long now);
 #endif
 
 /* rk3026_ebc_blit.c */
@@ -719,6 +771,11 @@ u32 rk3026_ebc_resolve_mode(const struct rk3026_ebc_set *part, u32 scan_mode,
 			    bool two_level, u32 changed_px, bool repair_due,
 			    const struct rk3026_ebc_du_budget *budget,
 			    enum rk3026_ebc_reason *reason);
+bool rk3026_ebc_idle_cleanup_due(const struct rk3026_ebc_idle *idle,
+				 unsigned long now, bool *expired);
+bool rk3026_ebc_thread_deadline(bool rails_on, unsigned long rails_off_at,
+				bool idle_armed, unsigned long idle_at,
+				unsigned long *deadline);
 u32 rk3026_ebc_du_account(u32 du_area, const struct rk3026_ebc_set *part,
 			  u32 mode, u32 changed_px,
 			  enum rk3026_ebc_outcome outcome,

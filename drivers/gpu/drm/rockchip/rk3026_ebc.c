@@ -131,7 +131,9 @@ static void ebc_rails_rearm(struct rk3026_ebc *ebc)
  * pixels, to all 16 levels. FULL is what a part keeps when the content does
  * not decide: behind a repair, merged with a send that names its mode,
  * carried, or as a cleanup of the DU budget (a big part once it is spent,
- * any part once it reaches its ceiling).
+ * any part once it reaches its ceiling). The idle cleanup the refresh
+ * thread queues on a spent budget is a FULL of its own
+ * (rk3026_ebc_idle_tick()).
  *
  * An early version defaulted to PART and rendered washed grey where
  * force_mode=1 rendered solid black (docs/PENDING.md P18), and plane parts
@@ -140,6 +142,14 @@ static void ebc_rails_rearm(struct rk3026_ebc *ebc)
  * black included, so a grey plane part goes PART now.
  */
 #define EBC_MODE_DEFAULT	EBC_MODE_FULL
+
+/*
+ * The idle delay before the cleanup FULL of a spent DU budget
+ * (rk3026_ebc_idle_tick()): long enough that a pause between keystrokes or
+ * pointer moves does not flash the panel, short enough that the glass is
+ * clean when the user looks at it. debugfs du_cleanup_idle_ms changes it.
+ */
+#define EBC_DU_CLEANUP_IDLE_MS	2000
 
 static inline void ebc_write(struct rk3026_ebc *ebc, u32 reg, u32 val)
 {
@@ -1353,6 +1363,10 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 	 * after a scan that already drew the same pixels would otherwise be
 	 * skipped as identical. Plane updates and partial-class mxcfb sends
 	 * still skip.
+	 *
+	 * ⚠️ The idle cleanup is exempt as well (@cleanup_idle): it redraws the
+	 * glass as it is, so its snapshot is identical as a rule, and the
+	 * flash is what it was queued for (rk3026_ebc_idle_tick()).
 	 */
 	if (rk3026_ebc_should_skip(&part, sh->prev_unknown, identical)) {
 		if (debug_scan)
@@ -1365,8 +1379,9 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 	 * The content's choice for a part of auto updates: DU when every
 	 * changed pixel becomes black or white, else PART for a plane part,
 	 * unless the plane parts' DU budget makes it the cleanup FULL (a big
-	 * part once it is spent, any part at its ceiling). It comes after the
-	 * skip, which stays on the part's own mode, and before force_mode.
+	 * part once it is spent, any part at its ceiling). The idle cleanup
+	 * keeps its FULL. It comes after the skip, which stays on the part's
+	 * own mode, and before force_mode.
 	 */
 	budget.area = ebc->du_area;
 	budget.limit = READ_ONCE(ebc->du_cleanup_area);
@@ -1527,6 +1542,74 @@ static void ebc_idle_rails_off(struct rk3026_ebc *ebc)
 	mutex_unlock(&ebc->rails_lock);
 }
 
+/*
+ * The idle cleanup's deadline, read without @image_lock: for the wait of
+ * the refresh thread alone, which decides under the lock
+ * (rk3026_ebc_idle_tick()). Returns whether the cleanup is armed.
+ */
+static bool ebc_idle_at(struct rk3026_ebc *ebc, unsigned long *at)
+{
+	*at = READ_ONCE(ebc->idle_last_plane) +
+	      msecs_to_jiffies(READ_ONCE(ebc->du_cleanup_idle_ms));
+	return READ_ONCE(ebc->idle_armed);
+}
+
+/**
+ * rk3026_ebc_idle_tick - the refresh thread's look at the idle cleanup
+ * @ebc: controller
+ * @now: the time of the look, in jiffies
+ *
+ * Called by the refresh thread between parts, once the deadline of the
+ * armed cleanup has passed by its lockless read (ebc_idle_at()). Under
+ * @image_lock it reads the state again and asks
+ * rk3026_ebc_idle_cleanup_due(): a look that finds the delay over disarms
+ * the cleanup, and if it is due, queues it as an update of its own
+ * (EBC_SOURCE_IDLE): the whole panel, FULL, not auto. It goes through
+ * rk3026_ebc_add_update() like a send, so it has a real seq, which
+ * rk3026_ebc_scan_finish() moves @pending.done_seq to (a part made by hand
+ * with no seq would move it backwards), and it is counted and traced like
+ * any update. It writes no pixel: the scan draws the target as it is,
+ * which is the glass, plus whatever joins the part before it is taken.
+ *
+ * A plane update that arrived after the lockless read moved the deadline:
+ * the look under the lock sees it, and leaves the cleanup armed.
+ *
+ * Return: true if the cleanup was queued.
+ */
+VISIBLE_IF_KUNIT bool rk3026_ebc_idle_tick(struct rk3026_ebc *ebc,
+					   unsigned long now)
+{
+	struct rk3026_ebc_update upd = {
+		.clip	= DRM_RECT_INIT(0, 0, ebc->width, ebc->height),
+		.mode	= EBC_MODE_FULL,
+		.source	= EBC_SOURCE_IDLE,
+	};
+	u32 delay_ms = READ_ONCE(ebc->du_cleanup_idle_ms);
+	struct rk3026_ebc_idle idle;
+	bool due, expired;
+
+	mutex_lock(&ebc->image_lock);
+	idle = (struct rk3026_ebc_idle) {
+		.armed		= ebc->idle_armed,
+		.last_plane	= ebc->idle_last_plane,
+		.delay		= msecs_to_jiffies(delay_ms),
+		.area		= ebc->du_area,
+		.limit		= READ_ONCE(ebc->du_cleanup_area),
+		.pending	= !rk3026_ebc_pending_empty(&ebc->pending),
+		.blanked	= !ebc->crtc_on,
+		.mxcfb_active	= ebc->mxcfb_active,
+		.repair_due	= ebc->shadows.prev_unknown,
+	};
+	due = rk3026_ebc_idle_cleanup_due(&idle, now, &expired);
+	if (expired)
+		WRITE_ONCE(ebc->idle_armed, false);
+	if (due)
+		rk3026_ebc_add_update(ebc, &upd);
+	mutex_unlock(&ebc->image_lock);
+	return due;
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_idle_tick);
+
 static int ebc_refresh_thread(void *data)
 {
 	struct rk3026_ebc *ebc = data;
@@ -1534,6 +1617,8 @@ static int ebc_refresh_thread(void *data)
 	while (!kthread_should_stop()) {
 		struct rk3026_ebc_last last;
 		long timeout = MAX_SCHEDULE_TIMEOUT;
+		unsigned long now = jiffies, deadline, rails_at, idle_at;
+		bool rails_on, idle_armed;
 
 		/*
 		 * With the rails up, drop them at the deadline. Checked on every
@@ -1541,16 +1626,30 @@ static int ebc_refresh_thread(void *data)
 		 * skipped updates keeps the thread busy and must not keep the
 		 * rails up.
 		 */
-		if (READ_ONCE(ebc->rails_on)) {
-			timeout = (long)(READ_ONCE(ebc->rails_off_at) - jiffies);
-			if (timeout <= 0) {
-				ebc_idle_rails_off(ebc);
-				continue;
-			}
+		rails_on = READ_ONCE(ebc->rails_on);
+		rails_at = READ_ONCE(ebc->rails_off_at);
+		if (rails_on && time_after_eq(now, rails_at)) {
+			ebc_idle_rails_off(ebc);
+			continue;
 		}
+		/*
+		 * The idle cleanup, at its deadline: the look disarms it, and
+		 * queues it if it is due, which the wait below then takes.
+		 */
+		idle_armed = ebc_idle_at(ebc, &idle_at);
+		if (idle_armed && time_after_eq(now, idle_at)) {
+			rk3026_ebc_idle_tick(ebc, now);
+			continue;
+		}
+		if (rk3026_ebc_thread_deadline(rails_on, rails_at, idle_armed,
+					       idle_at, &deadline))
+			timeout = (long)(deadline - now);
 		/*
 		 * The wait cannot take @image_lock; the thread asks between
 		 * parts, where rk3026_ebc_work_pending() means a part to take.
+		 * Both deadlines are ahead here, so @timeout is positive; a
+		 * plane update that arms or moves the idle one wakes the wait
+		 * (rk3026_ebc_add_update()), and the next pass takes it.
 		 */
 		wait_event_interruptible_timeout(ebc->update_wq,
 						 rk3026_ebc_work_pending(&ebc->pending) ||
@@ -1652,9 +1751,10 @@ static void ebc_wait_finished(struct rk3026_ebc *ebc, u32 seq)
  * second RESET finds the split made: @pending.pre is still the part
  * before the first.
  *
- * Any update that is not a plane update sets @plane_resync: plane updates
- * blit only their damage, and the target now holds pixels outside it that
- * the plane's framebuffer may not.
+ * An mxcfb send and a RESET set @plane_resync: plane updates blit only
+ * their damage, and the target now holds pixels outside it that the
+ * plane's framebuffer may not. The idle cleanup writes no pixel, so it
+ * does not.
  *
  * Returns the update's seq, for rk3026_ebc_wait_seq().
  */
@@ -1673,7 +1773,7 @@ u32 rk3026_ebc_add_update(struct rk3026_ebc *ebc,
 		}
 		memset(ebc->next_shadow, 0xff, ebc->img_size);
 	}
-	if (upd->source != EBC_SOURCE_PLANE)
+	if (upd->source != EBC_SOURCE_PLANE && upd->source != EBC_SOURCE_IDLE)
 		ebc->plane_resync = true;
 	merged = rk3026_ebc_pending_add(&ebc->pending, upd, &seq);
 	rk3026_ebc_marker_seq_record(&ebc->markers, upd->marker, seq);
@@ -1794,6 +1894,10 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_plane_box);
  * after a send that claimed the panel, overwrite the send's pixels in
  * @next_shadow and queue a refresh with it.
  *
+ * A queued update arms the idle cleanup and stamps its time, in the same
+ * section (rk3026_ebc_idle_tick()); the wake of rk3026_ebc_add_update()
+ * makes the thread take the new deadline.
+ *
  * Returns true if the update was queued.
  */
 VISIBLE_IF_KUNIT bool rk3026_ebc_plane_update(struct rk3026_ebc *ebc,
@@ -1817,6 +1921,8 @@ VISIBLE_IF_KUNIT bool rk3026_ebc_plane_update(struct rk3026_ebc *ebc,
 		ebc->plane_resync = false;
 		upd.blit_us = rk3026_ebc_blit_xrgb8888(ebc, src, src_pitch,
 						       &upd.clip);
+		WRITE_ONCE(ebc->idle_last_plane, jiffies);
+		WRITE_ONCE(ebc->idle_armed, true);
 		rk3026_ebc_add_update(ebc, &upd);
 	}
 	mutex_unlock(&ebc->image_lock);
@@ -2463,6 +2569,8 @@ static int ebc_probe(struct platform_device *pdev)
 	ebc->du_cleanup_area = ebc->width * ebc->height;
 	ebc->du_cleanup_big_area = ebc->du_cleanup_area / 2;
 	ebc->du_cleanup_ceiling = 4 * ebc->du_cleanup_area;
+	/* And it is cleaned up once the plane is idle this long. */
+	ebc->du_cleanup_idle_ms = EBC_DU_CLEANUP_IDLE_MS;
 
 	/* E Ink GDCK_STA / LGONL; no display-timing binding covers them. */
 	if (of_property_read_u32(dev->of_node, "rockchip,gdck-sta",

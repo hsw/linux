@@ -10,6 +10,7 @@
 
 #include <linux/compiler.h>
 #include <linux/export.h>
+#include <linux/jiffies.h>
 #include <linux/minmax.h>
 #include <linux/overflow.h>
 #include <linux/string.h>
@@ -100,9 +101,9 @@ static void ebc_box_union(struct drm_rect *dst, const struct drm_rect *src)
 
 /*
  * Merge the box, the mode and the flags of @src into @set: the bounding box,
- * the stronger mode, either full-class or plane flag, and @auto_ok only if
- * both have it. An @empty set takes the box, the mode and @auto_ok of @src
- * as they are.
+ * the stronger mode, either full-class, plane or idle cleanup flag, and
+ * @auto_ok only if both have it. An @empty set takes the box, the mode and
+ * @auto_ok of @src as they are.
  */
 static void ebc_set_merge(struct rk3026_ebc_set *set, bool empty,
 			  const struct rk3026_ebc_set *src)
@@ -118,6 +119,7 @@ static void ebc_set_merge(struct rk3026_ebc_set *set, bool empty,
 	}
 	set->has_mxcfb_full |= src->has_mxcfb_full;
 	set->has_plane |= src->has_plane;
+	set->cleanup_idle |= src->cleanup_idle;
 }
 
 static void ebc_set_add(struct rk3026_ebc_set *set,
@@ -137,6 +139,7 @@ static void ebc_set_add(struct rk3026_ebc_set *set,
 				  DSP_DISPLAY_MODE,
 		.auto_ok	= upd->auto_mode,
 		.has_plane	= upd->source == EBC_SOURCE_PLANE,
+		.cleanup_idle	= upd->source == EBC_SOURCE_IDLE,
 	};
 
 	ebc_set_merge(set, !set->merged, &one);
@@ -393,12 +396,15 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_build_snapshot);
  * wear, and fbdev commits every update twice. But a RESET is never skipped
  * (it must make the glass white, not assume it), an unknown prev proves
  * nothing, and an mxcfb full-class send is the flash its client asked for.
+ * Nor is the idle cleanup (@part->cleanup_idle): that flash is the point
+ * of it, and it redraws the glass as it is, so its snapshot is identical
+ * as a rule.
  */
 bool rk3026_ebc_should_skip(const struct rk3026_ebc_set *part,
 			    bool prev_unknown, bool identical)
 {
 	return identical && !prev_unknown && part->mode != EBC_MODE_RESET &&
-	       !part->has_mxcfb_full;
+	       !part->has_mxcfb_full && !part->cleanup_idle;
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_should_skip);
 
@@ -507,12 +513,22 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_du_cleanup);
  * A part that has a mode of its own keeps @scan_mode, and so does one
  * behind a repair: the glass is white then outside the box, and only a
  * 16-level scan draws the old greys back.
+ *
+ * The idle cleanup (@part->cleanup_idle, queued by the refresh thread when
+ * the budget is spent and the plane has been idle) keeps @scan_mode, FULL,
+ * whatever its content, its budget or a repair before it, for the reason
+ * EBC_REASON_CLEANUP_IDLE; updates sent before it was taken join it and
+ * are drawn in the same FULL.
  */
 u32 rk3026_ebc_resolve_mode(const struct rk3026_ebc_set *part, u32 scan_mode,
 			    bool two_level, u32 changed_px, bool repair_due,
 			    const struct rk3026_ebc_du_budget *budget,
 			    enum rk3026_ebc_reason *reason)
 {
+	if (part->cleanup_idle) {
+		*reason = EBC_REASON_CLEANUP_IDLE;
+		return scan_mode;
+	}
 	*reason = EBC_REASON_EXPLICIT;
 	if (repair_due) {
 		if (scan_mode != part->mode)
@@ -537,6 +553,82 @@ u32 rk3026_ebc_resolve_mode(const struct rk3026_ebc_set *part, u32 scan_mode,
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_resolve_mode);
 
 /**
+ * rk3026_ebc_idle_cleanup_due - whether the refresh thread queues the idle
+ *	cleanup
+ * @idle: the state at @now (struct rk3026_ebc_idle)
+ * @now: the time of the look, in jiffies
+ * @expired: returns true when this look uses the arming up: armed, and the
+ *	delay over since the last plane update (or no delay at all), whether
+ *	the cleanup is due or not
+ *
+ * A small part on a spent budget stays DU or PART (rk3026_ebc_du_cleanup()),
+ * so the glass keeps its DU ghosts until a big part or the ceiling comes.
+ * When the plane goes idle first, the cleanup FULL is free to land: nobody
+ * is drawing, and the next update starts on a clean glass. It is due once
+ * the plane has been idle for @idle->delay since the update that armed it,
+ * and only on a spent budget: a budget merely above zero (a keystroke and
+ * a pause) would flash more often than the budget alone does.
+ *
+ * Not while anything else holds the glass: a part pending (it is drawn
+ * first; a RESET clears the glass anyway), the CRTC off, an mxcfb client in
+ * front (it runs its own fulls), or a repair due (the RESET of the next
+ * draw clears the glass). A look that finds the delay over disarms the
+ * cleanup whether it is due or not, so a cleanup that was not driven, or
+ * did not clear the budget, does not fire again until the next plane
+ * update arms it; and the thread, whose wait ends at the idle deadline,
+ * never wakes for it twice.
+ *
+ * Return: true when the cleanup is due.
+ */
+bool rk3026_ebc_idle_cleanup_due(const struct rk3026_ebc_idle *idle,
+				 unsigned long now, bool *expired)
+{
+	*expired = idle->armed &&
+		   (!idle->delay ||
+		    time_after_eq(now, idle->last_plane + idle->delay));
+	if (!*expired || !idle->delay)
+		return false;
+	if (!idle->limit || idle->area < idle->limit)
+		return false;
+	return !idle->pending && !idle->blanked && !idle->mxcfb_active &&
+	       !idle->repair_due;
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_idle_cleanup_due);
+
+/**
+ * rk3026_ebc_thread_deadline - when the refresh thread's wait ends
+ * @rails_on: the panel rails are up
+ * @rails_off_at: their off deadline, in jiffies; only meaningful with
+ *	@rails_on
+ * @idle_armed: the idle cleanup is armed
+ * @idle_at: its deadline, in jiffies; only meaningful with @idle_armed
+ * @deadline: returns the earlier of the two that apply
+ *
+ * The thread waits for work until the next of its deadlines: the rails go
+ * off at one, and it looks at the idle cleanup at the other. Both are
+ * jiffies, so they are compared with time_after(), across a wrap too.
+ *
+ * Return: false, @deadline left alone, when neither applies: the wait has
+ * no timeout.
+ */
+bool rk3026_ebc_thread_deadline(bool rails_on, unsigned long rails_off_at,
+				bool idle_armed, unsigned long idle_at,
+				unsigned long *deadline)
+{
+	if (rails_on && idle_armed)
+		*deadline = time_after(rails_off_at, idle_at) ? idle_at :
+								rails_off_at;
+	else if (rails_on)
+		*deadline = rails_off_at;
+	else if (idle_armed)
+		*deadline = idle_at;
+	else
+		return false;
+	return true;
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_thread_deadline);
+
+/**
  * rk3026_ebc_du_account - the DU cleanup budget after one part
  * @du_area: the pixels plane parts changed in DU since the glass was cleared
  * @part: the part, as rk3026_ebc_pending_take() gave it
@@ -550,8 +642,9 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_resolve_mode);
  * RESET:
  *
  * - a DU part with a plane update in it adds @changed_px (saturating);
- * - a FULL part clears it, whoever sent it: the controller scans the whole
- *   frame, and GC16 drives every pixel, unchanged ones too;
+ * - a FULL part clears it, whoever sent it, the idle cleanup too: the
+ *   controller scans the whole frame, and GC16 drives every pixel,
+ *   unchanged ones too;
  * - a PART part leaves it, a grey plane part too: it drives only the pixels
  *   that change, to all 16 levels, so it adds no DU ghost and clears none
  *   of the others;

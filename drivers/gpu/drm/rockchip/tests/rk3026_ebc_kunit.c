@@ -122,6 +122,18 @@ static u32 t_add(struct rk3026_ebc_pending *p, const struct drm_rect *clip,
 	return seq;
 }
 
+/* An auto update, as a plane update or an mxcfb AUTO send makes it. */
+static u32 t_add_auto(struct rk3026_ebc_pending *p, const struct drm_rect *clip,
+		      u32 mode, enum rk3026_ebc_source source)
+{
+	struct rk3026_ebc_update upd = t_upd(clip, mode, 0, source);
+	u32 seq;
+
+	upd.auto_mode = true;
+	rk3026_ebc_pending_add(p, &upd, &seq);
+	return seq;
+}
+
 /* A send as the driver makes it: the update, then its marker's seq. */
 static u32 t_add_marked(struct rk3026_ebc_pending *p,
 			struct rk3026_ebc_marker_ring *ring,
@@ -599,6 +611,20 @@ static void ebc_test_skip(struct kunit *test)
 	t_add(&p, &t_panel, EBC_MODE_RESET, EBC_SOURCE_ENABLE);
 	rk3026_ebc_pending_take(&p, &part);
 	KUNIT_EXPECT_EQ(test, part.mode, EBC_MODE_RESET);
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_should_skip(&part, false, true));
+
+	/*
+	 * Nor is the idle cleanup: it redraws the glass as it is, so its
+	 * snapshot is identical as a rule. A plane update merged into it does
+	 * not make it skip either.
+	 */
+	t_add(&p, &t_panel, EBC_MODE_FULL, EBC_SOURCE_IDLE);
+	rk3026_ebc_pending_take(&p, &part);
+	KUNIT_EXPECT_TRUE(test, part.cleanup_idle);
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_should_skip(&part, false, true));
+	t_add(&p, &t_panel, EBC_MODE_FULL, EBC_SOURCE_IDLE);
+	t_add_auto(&p, &t_panel, EBC_MODE_FULL, EBC_SOURCE_PLANE);
+	rk3026_ebc_pending_take(&p, &part);
 	KUNIT_EXPECT_FALSE(test, rk3026_ebc_should_skip(&part, false, true));
 }
 
@@ -1274,18 +1300,6 @@ static void ebc_test_marker_eviction(struct kunit *test)
 
 /* --- the mode policy --- */
 
-/* An auto update, as a plane update or an mxcfb AUTO send makes it. */
-static u32 t_add_auto(struct rk3026_ebc_pending *p, const struct drm_rect *clip,
-		      u32 mode, enum rk3026_ebc_source source)
-{
-	struct rk3026_ebc_update upd = t_upd(clip, mode, 0, source);
-	u32 seq;
-
-	upd.auto_mode = true;
-	rk3026_ebc_pending_add(p, &upd, &seq);
-	return seq;
-}
-
 /* The parts of the resolve table, as their updates make them. */
 enum t_kind {
 	T_PLANE,		/* plane updates only */
@@ -1297,6 +1311,8 @@ enum t_kind {
 	T_A2,			/* an explicit A2 */
 	T_DU,			/* an explicit DU */
 	T_RESET,
+	T_IDLE,			/* the idle cleanup alone */
+	T_IDLE_PLANE,		/* the idle cleanup, a plane update joined */
 };
 
 static void t_kind_part(enum t_kind kind, struct rk3026_ebc_set *part)
@@ -1334,6 +1350,13 @@ static void t_kind_part(enum t_kind kind, struct rk3026_ebc_set *part)
 		break;
 	case T_RESET:
 		t_add(&p, &t_panel, EBC_MODE_RESET, EBC_SOURCE_ENABLE);
+		break;
+	case T_IDLE:
+		t_add(&p, &t_panel, EBC_MODE_FULL, EBC_SOURCE_IDLE);
+		break;
+	case T_IDLE_PLANE:
+		t_add(&p, &t_panel, EBC_MODE_FULL, EBC_SOURCE_IDLE);
+		t_add_auto(&p, &t_panel, EBC_MODE_FULL, EBC_SOURCE_PLANE);
 		break;
 	}
 	rk3026_ebc_pending_take(&p, part);
@@ -1405,8 +1428,9 @@ struct t_resolve {
 #define T_BIG		EBC_REASON_CLEANUP_BIG
 #define T_CEILING	EBC_REASON_CLEANUP_CEILING
 #define T_AUTO_GREY	EBC_REASON_AUTO_PART
+#define T_IDLE_CLEAN	EBC_REASON_CLEANUP_IDLE
 /* Not a reason: what a test starts its result with. */
-#define T_NO_REASON	(EBC_REASON_CLEANUP_CEILING + 1)
+#define T_NO_REASON	(EBC_REASON_CLEANUP_IDLE + 1)
 
 static const struct t_resolve t_resolve_cases[] = {
 	{ "plane two-level", T_PLANE, false, true, T_DU_MODE, T_AUTO_DU },
@@ -1518,6 +1542,23 @@ static const struct t_resolve t_resolve_cases[] = {
 	  T_EXPL, T_CEIL },
 	{ "RESET ceiling", T_RESET, false, true, EBC_MODE_RESET, T_EXPL,
 	  T_CEIL },
+	/*
+	 * The idle cleanup is FULL whatever its content, the budget or a
+	 * repair: its own reason, also with a plane update joined.
+	 */
+	{ "idle cleanup", T_IDLE, false, false, EBC_MODE_FULL, T_IDLE_CLEAN },
+	{ "idle cleanup two-level", T_IDLE, false, true, EBC_MODE_FULL,
+	  T_IDLE_CLEAN },
+	{ "idle cleanup repair", T_IDLE, true, false, EBC_MODE_FULL,
+	  T_IDLE_CLEAN },
+	{ "idle cleanup spent big", T_IDLE, false, true, EBC_MODE_FULL,
+	  T_IDLE_CLEAN, T_SPENT_BIG },
+	{ "idle cleanup ceiling", T_IDLE, false, true, EBC_MODE_FULL,
+	  T_IDLE_CLEAN, T_CEIL },
+	{ "idle cleanup and plane two-level", T_IDLE_PLANE, false, true,
+	  EBC_MODE_FULL, T_IDLE_CLEAN },
+	{ "idle cleanup and plane grey", T_IDLE_PLANE, false, false,
+	  EBC_MODE_FULL, T_IDLE_CLEAN },
 };
 
 KUNIT_ARRAY_PARAM_DESC(t_resolve, t_resolve_cases, desc);
@@ -1606,6 +1647,190 @@ static void ebc_test_du_cleanup(struct kunit *test)
 			c->reason != T_NO_REASON);
 	/* Left alone when no cleanup is due. */
 	KUNIT_EXPECT_EQ(test, reason, c->reason);
+}
+
+/* --- the idle cleanup --- */
+
+/*
+ * One look of the refresh thread at the idle cleanup
+ * (rk3026_ebc_idle_cleanup_due()): armed by a plane update at @last_plane,
+ * a @delay in jiffies, @area spent of @limit, a part @pending, the CRTC
+ * off (@blanked), an mxcfb client in front, a repair due; @due says whether
+ * it queues the cleanup, @expired whether the look disarms it.
+ */
+struct t_idle {
+	const char	*desc;
+	bool		armed;
+	unsigned long	last_plane;
+	unsigned long	delay;
+	unsigned long	now;
+	u32		area;
+	u32		limit;
+	bool		pending;
+	bool		blanked;
+	bool		mxcfb_active;
+	bool		repair_due;
+	bool		due;
+	bool		expired;
+};
+
+#define T_LONG_AGO	(ULONG_MAX - 99)
+
+static const struct t_idle t_idle_cases[] = {
+	{ "due", true, 1000, 200, 1200, 100, 100, .due = true,
+	  .expired = true },
+	{ "one jiffy short", true, 1000, 200, 1199, 100, 100 },
+	{ "long after", true, 1000, 200, 900000, 100, 100, .due = true,
+	  .expired = true },
+	{ "not armed", false, 1000, 200, 1200, 100, 100 },
+	/* Only a spent budget cleans up: a keystroke and a pause do not. */
+	{ "one short of the limit", true, 1000, 200, 1200, 99, 100,
+	  .expired = true },
+	{ "nothing spent", true, 1000, 200, 1200, 0, 100, .expired = true },
+	{ "over the limit", true, 1000, 200, 1200, U32_MAX, 100, .due = true,
+	  .expired = true },
+	{ "no budget", true, 1000, 200, 1200, U32_MAX, 0, .expired = true },
+	/* A delay of 0: no idle cleanup, and the arming is used up at once. */
+	{ "off", true, 1000, 0, 1000, 100, 100, .expired = true },
+	{ "off, later", true, 1000, 0, 5000, U32_MAX, 100, .expired = true },
+	{ "pending", true, 1000, 200, 1200, 100, 100, .pending = true,
+	  .expired = true },
+	{ "blanked", true, 1000, 200, 1200, 100, 100, .blanked = true,
+	  .expired = true },
+	{ "mxcfb active", true, 1000, 200, 1200, 100, 100,
+	  .mxcfb_active = true, .expired = true },
+	{ "repair due", true, 1000, 200, 1200, 100, 100, .repair_due = true,
+	  .expired = true },
+	/* jiffies wrap between the plane update and the deadline. */
+	{ "wrap, before it", true, T_LONG_AGO, 200, ULONG_MAX, 100, 100 },
+	{ "wrap, one jiffy short", true, T_LONG_AGO, 200, 99, 100, 100 },
+	{ "wrap, due", true, T_LONG_AGO, 200, 100, 100, 100, .due = true,
+	  .expired = true },
+	{ "wrap, not armed", false, T_LONG_AGO, 200, 100, 100, 100 },
+};
+
+KUNIT_ARRAY_PARAM_DESC(t_idle, t_idle_cases, desc);
+
+static void ebc_test_idle_cleanup_due(struct kunit *test)
+{
+	const struct t_idle *c = test->param_value;
+	const struct rk3026_ebc_idle idle = {
+		.armed = c->armed, .last_plane = c->last_plane,
+		.delay = c->delay, .area = c->area, .limit = c->limit,
+		.pending = c->pending, .blanked = c->blanked,
+		.mxcfb_active = c->mxcfb_active, .repair_due = c->repair_due,
+	};
+	bool expired = !c->expired;
+
+	KUNIT_EXPECT_EQ(test,
+			rk3026_ebc_idle_cleanup_due(&idle, c->now, &expired),
+			c->due);
+	KUNIT_EXPECT_EQ(test, expired, c->expired);
+}
+
+/*
+ * The deadline of the refresh thread's wait
+ * (rk3026_ebc_thread_deadline()): the rails-off one while the rails are
+ * on, the idle one while the cleanup is armed, the earlier of the two, or
+ * none (@has false).
+ */
+struct t_deadline {
+	const char	*desc;
+	bool		rails_on;
+	unsigned long	rails_off_at;
+	bool		idle_armed;
+	unsigned long	idle_at;
+	bool		has;
+	unsigned long	deadline;
+};
+
+static const struct t_deadline t_deadline_cases[] = {
+	{ "neither", false, 1000, false, 2000, false },
+	{ "rails", true, 1000, false, 500, true, 1000 },
+	{ "idle", false, 500, true, 2000, true, 2000 },
+	{ "rails first", true, 1000, true, 2000, true, 1000 },
+	{ "idle first", true, 3000, true, 2000, true, 2000 },
+	{ "same", true, 2000, true, 2000, true, 2000 },
+	/* time_after(), not a plain compare: the later one wrapped. */
+	{ "rails wrapped", true, 5, true, ULONG_MAX - 5, true, ULONG_MAX - 5 },
+	{ "idle wrapped", true, ULONG_MAX - 5, true, 5, true, ULONG_MAX - 5 },
+};
+
+KUNIT_ARRAY_PARAM_DESC(t_deadline, t_deadline_cases, desc);
+
+static void ebc_test_thread_deadline(struct kunit *test)
+{
+	const struct t_deadline *c = test->param_value;
+	unsigned long deadline = 12345;
+
+	KUNIT_EXPECT_EQ(test,
+			rk3026_ebc_thread_deadline(c->rails_on, c->rails_off_at,
+						   c->idle_armed, c->idle_at,
+						   &deadline),
+			c->has);
+	if (c->has)
+		KUNIT_EXPECT_EQ(test, deadline, c->deadline);
+}
+
+/*
+ * The idle cleanup's flag survives what may join the part before it is
+ * taken: updates on either side of it, and a carry, also when the cleanup
+ * itself is the carry (not driven: no rails, no LUT).
+ */
+static void ebc_test_pending_cleanup_idle(struct kunit *test)
+{
+	struct drm_rect r = DRM_RECT_INIT(2, 1, 4, 2);
+	struct t_ctx *c = t_ctx_alloc(test);
+	struct rk3026_ebc_set part;
+
+	t_add(&c->p, &t_panel, EBC_MODE_FULL, EBC_SOURCE_IDLE);
+	rk3026_ebc_pending_take(&c->p, &part);
+	KUNIT_EXPECT_TRUE(test, part.cleanup_idle);
+	KUNIT_EXPECT_EQ(test, part.mode, EBC_MODE_FULL);
+	KUNIT_EXPECT_FALSE(test, part.auto_ok);
+	KUNIT_EXPECT_FALSE(test, part.has_plane);
+	KUNIT_EXPECT_TRUE(test, drm_rect_equals(&part.box, &t_panel));
+
+	/* A plane update after it, and one before it. */
+	t_add(&c->p, &t_panel, EBC_MODE_FULL, EBC_SOURCE_IDLE);
+	t_add_auto(&c->p, &r, EBC_MODE_FULL, EBC_SOURCE_PLANE);
+	rk3026_ebc_pending_take(&c->p, &part);
+	KUNIT_EXPECT_TRUE(test, part.cleanup_idle);
+	KUNIT_EXPECT_FALSE(test, part.auto_ok);
+	KUNIT_EXPECT_TRUE(test, part.has_plane);
+	t_add_auto(&c->p, &r, EBC_MODE_FULL, EBC_SOURCE_PLANE);
+	t_add(&c->p, &t_panel, EBC_MODE_FULL, EBC_SOURCE_IDLE);
+	rk3026_ebc_pending_take(&c->p, &part);
+	KUNIT_EXPECT_TRUE(test, part.cleanup_idle);
+	KUNIT_EXPECT_TRUE(test, drm_rect_equals(&part.box, &t_panel));
+
+	/* Other parts do not have it. */
+	t_add_auto(&c->p, &r, EBC_MODE_FULL, EBC_SOURCE_PLANE);
+	rk3026_ebc_pending_take(&c->p, &part);
+	KUNIT_EXPECT_FALSE(test, part.cleanup_idle);
+
+	/* Carried, then merged into the next part. */
+	t_add(&c->p, &t_panel, EBC_MODE_FULL, EBC_SOURCE_IDLE);
+	rk3026_ebc_pending_take(&c->p, &part);
+	rk3026_ebc_scan_finish(&c->sh, &c->p, &part, EBC_OUTCOME_NO_RAILS,
+			       EBC_REPAIR_NONE);
+	KUNIT_EXPECT_TRUE(test, c->p.carry.cleanup_idle);
+	t_add_auto(&c->p, &r, EBC_MODE_FULL, EBC_SOURCE_PLANE);
+	rk3026_ebc_pending_take(&c->p, &part);
+	KUNIT_EXPECT_TRUE(test, part.cleanup_idle);
+	KUNIT_EXPECT_TRUE(test, drm_rect_equals(&part.box, &t_panel));
+	KUNIT_EXPECT_FALSE(test, c->p.carry.merged);
+
+	/* A plane part carried into the cleanup. */
+	t_add_auto(&c->p, &r, EBC_MODE_FULL, EBC_SOURCE_PLANE);
+	rk3026_ebc_pending_take(&c->p, &part);
+	rk3026_ebc_scan_finish(&c->sh, &c->p, &part, EBC_OUTCOME_NO_LUT,
+			       EBC_REPAIR_NONE);
+	KUNIT_EXPECT_FALSE(test, c->p.carry.cleanup_idle);
+	t_add(&c->p, &t_panel, EBC_MODE_FULL, EBC_SOURCE_IDLE);
+	rk3026_ebc_pending_take(&c->p, &part);
+	KUNIT_EXPECT_TRUE(test, part.cleanup_idle);
+	KUNIT_EXPECT_TRUE(test, part.has_plane);
 }
 
 static void ebc_test_pending_auto_ok(struct kunit *test)
@@ -1931,6 +2156,9 @@ static struct kunit_case rk3026_ebc_core_test_cases[] = {
 	KUNIT_CASE(ebc_test_scan_mode),
 	KUNIT_CASE_PARAM(ebc_test_resolve_mode, t_resolve_gen_params),
 	KUNIT_CASE_PARAM(ebc_test_du_cleanup, t_du_cleanup_gen_params),
+	KUNIT_CASE_PARAM(ebc_test_idle_cleanup_due, t_idle_gen_params),
+	KUNIT_CASE_PARAM(ebc_test_thread_deadline, t_deadline_gen_params),
+	KUNIT_CASE(ebc_test_pending_cleanup_idle),
 	KUNIT_CASE(ebc_test_pending_auto_ok),
 	KUNIT_CASE(ebc_test_pending_auto_ok_reset),
 	KUNIT_CASE(ebc_test_pending_auto_ok_carry),
@@ -2642,6 +2870,7 @@ static struct rk3026_ebc *t_ebc_alloc(struct kunit *test)
 	ebc->du_cleanup_area = T_W * T_H;
 	ebc->du_cleanup_big_area = T_W * T_H / 2;
 	ebc->du_cleanup_ceiling = 4 * T_W * T_H;
+	ebc->du_cleanup_idle_ms = 2000;
 	/*
 	 * plane_resync stays false: after probe it is true (the probe RESET
 	 * is a non-plane update), but here the target and the framebuffers
@@ -3472,6 +3701,179 @@ static void ebc_test_glue_du_ceiling(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, d.mode[1], EBC_MODE_FULL);
 }
 
+/* The deadline of the idle cleanup the last plane update armed. */
+static unsigned long t_idle_at(struct rk3026_ebc *ebc)
+{
+	return ebc->idle_last_plane + msecs_to_jiffies(ebc->du_cleanup_idle_ms);
+}
+
+/*
+ * The idle cleanup end to end. A black plane update over the white glass
+ * is driven DU, spends the budget and arms the cleanup. One jiffy short of
+ * the delay the thread's look does nothing; at the delay it queues the
+ * cleanup, a whole-panel FULL with a seq of its own, and disarms it. The
+ * cleanup's snapshot is identical to the glass, and it is driven all the
+ * same: FULL, reason cleanup_idle, the budget cleared. A later look finds
+ * it disarmed: one arming, one cleanup.
+ */
+static void ebc_test_glue_idle_cleanup(struct kunit *test)
+{
+	struct t_drives d;
+	struct rk3026_ebc *ebc = t_driven_ebc(test, &d, true);
+	struct rk3026_ebc_set *pre = &ebc->pending.pre;
+	u32 *black = t_plane_fb(test, 0);
+	struct rk3026_ebc_last last;
+	unsigned long at;
+	u32 seq;
+
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
+							&t_panel));
+	KUNIT_EXPECT_TRUE(test, ebc->idle_armed);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_BLACK_WHITE);
+	KUNIT_EXPECT_EQ(test, ebc->du_area, T_W * T_H);
+
+	at = t_idle_at(ebc);
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_idle_tick(ebc, at - 1));
+	KUNIT_EXPECT_TRUE(test, ebc->idle_armed);
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_work_pending(&ebc->pending));
+
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_idle_tick(ebc, at));
+	KUNIT_EXPECT_FALSE(test, ebc->idle_armed);
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_work_pending(&ebc->pending));
+	KUNIT_EXPECT_TRUE(test, pre->cleanup_idle);
+	KUNIT_EXPECT_EQ(test, pre->mode, EBC_MODE_FULL);
+	KUNIT_EXPECT_FALSE(test, pre->auto_ok);
+	KUNIT_EXPECT_TRUE(test, drm_rect_equals(&pre->box, &t_panel));
+	seq = ebc->pending.queued_seq;
+	KUNIT_EXPECT_EQ(test, pre->seq, seq);
+	KUNIT_EXPECT_EQ(test, ebc->stats.updates, 2);
+	/* It wrote no pixel: plane updates need no whole-panel resync. */
+	KUNIT_EXPECT_FALSE(test, ebc->plane_resync);
+
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.source, EBC_SOURCE_IDLE);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_FULL);
+	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_CLEANUP_IDLE);
+	KUNIT_EXPECT_EQ(test, ebc->du_area, 0);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_seq_finished(&ebc->pending, seq));
+	KUNIT_EXPECT_EQ(test, ebc->shadows.prev[0], 0);
+	KUNIT_EXPECT_EQ(test, ebc->stats.skips, 0);
+
+	/* Disarmed: no second cleanup, however long the glass stays idle. */
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_idle_tick(ebc, at + 100000));
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_work_pending(&ebc->pending));
+	KUNIT_EXPECT_EQ(test, d.n, 2);
+	KUNIT_EXPECT_EQ(test, d.mode[0], EBC_MODE_BLACK_WHITE);
+	KUNIT_EXPECT_EQ(test, d.mode[1], EBC_MODE_FULL);
+}
+
+/*
+ * At the delay a look that finds no cleanup due disarms it all the same:
+ * a budget not spent (a small box typed), an mxcfb client in front, the
+ * CRTC off. Only the next plane update arms it again, and an update the
+ * mxcfb client blocks does not.
+ */
+static void ebc_test_glue_idle_not_due(struct kunit *test)
+{
+	struct t_drives d;
+	struct rk3026_ebc *ebc = t_driven_ebc(test, &d, true);
+	u32 *box = t_plane_fb(test, 0xffffff);
+	struct rk3026_ebc_last last;
+
+	t_fb_box(box, 4, 2, 8, 4, 0);
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, box, T_W * 4,
+							&t_panel));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, ebc->du_area, 8);
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_idle_tick(ebc, t_idle_at(ebc)));
+	KUNIT_EXPECT_FALSE(test, ebc->idle_armed);
+
+	/* Spent, then an mxcfb client takes the panel. */
+	ebc->du_area = ebc->du_cleanup_area;
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, box, T_W * 4,
+							&t_panel));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_SKIPPED);
+	KUNIT_EXPECT_TRUE(test, ebc->idle_armed);
+	ebc->mxcfb_active = true;
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_idle_tick(ebc, t_idle_at(ebc)));
+	KUNIT_EXPECT_FALSE(test, ebc->idle_armed);
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_plane_update(ebc, box, T_W * 4,
+							 &t_panel));
+	KUNIT_EXPECT_FALSE(test, ebc->idle_armed);
+
+	/* The client gone, the CRTC off. */
+	ebc->mxcfb_active = false;
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, box, T_W * 4,
+							&t_panel));
+	rk3026_ebc_do_refresh(ebc, &last);
+	ebc->crtc_on = false;
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_idle_tick(ebc, t_idle_at(ebc)));
+	KUNIT_EXPECT_FALSE(test, ebc->idle_armed);
+
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_work_pending(&ebc->pending));
+	KUNIT_EXPECT_EQ(test, ebc->du_area, ebc->du_cleanup_area);
+	KUNIT_EXPECT_EQ(test, d.n, 1);
+}
+
+/*
+ * An idle cleanup that is not driven (here: no gray16 LUT) is carried and
+ * leaves the budget spent, and it does not fire again on its own: the look
+ * that queued it disarmed it. The next plane update arms it and takes the
+ * carry in, so that part is the cleanup: driven FULL once the LUT is back,
+ * reason cleanup_idle, the budget cleared, and the next look finds nothing
+ * due.
+ */
+static void ebc_test_glue_idle_carried(struct kunit *test)
+{
+	static const struct t_rkf_seg reset = { T_RKF_RESET, 5 };
+	struct t_drives d;
+	struct rk3026_ebc *ebc = t_driven_ebc(test, &d, true);
+	struct ebc_waveform *wf = ebc->waveform;
+	u32 *black = t_plane_fb(test, 0);
+	u32 *box = t_plane_fb(test, 0);
+	struct rk3026_ebc_last last;
+	unsigned long at;
+
+	t_fb_box(box, 4, 2, 8, 4, 0xffffff);
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
+							&t_panel));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, ebc->du_area, T_W * T_H);
+
+	at = t_idle_at(ebc);
+	ebc->waveform = t_rkf_wf(test, ebc->dev, &reset, 1, 0);
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_idle_tick(ebc, at));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_FULL);
+	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_CLEANUP_IDLE);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_NO_LUT);
+	KUNIT_EXPECT_EQ(test, ebc->du_area, T_W * T_H);
+	KUNIT_EXPECT_TRUE(test, ebc->pending.carry.cleanup_idle);
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_idle_tick(ebc, at + 100000));
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_work_pending(&ebc->pending));
+
+	ebc->waveform = wf;
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, box, T_W * 4,
+							&t_panel));
+	KUNIT_EXPECT_TRUE(test, ebc->idle_armed);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_FULL);
+	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_CLEANUP_IDLE);
+	KUNIT_EXPECT_EQ(test, ebc->du_area, 0);
+	KUNIT_EXPECT_EQ(test, t_px(ebc->shadows.prev, 4, 2), 15);
+	KUNIT_EXPECT_FALSE(test, ebc->pending.carry.merged);
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_idle_tick(ebc, t_idle_at(ebc)));
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_work_pending(&ebc->pending));
+
+	KUNIT_EXPECT_EQ(test, d.n, 2);
+	KUNIT_EXPECT_EQ(test, d.mode[0], EBC_MODE_BLACK_WHITE);
+	KUNIT_EXPECT_EQ(test, d.mode[1], EBC_MODE_FULL);
+}
+
 /*
  * A repair RESET that runs to its end whitens the glass: the budget is
  * cleared even though the part after it is not driven (no gray16 LUT).
@@ -4031,6 +4433,9 @@ static struct kunit_case rk3026_ebc_glue_test_cases[] = {
 	KUNIT_CASE(ebc_test_glue_part_driven),
 	KUNIT_CASE(ebc_test_glue_du_big),
 	KUNIT_CASE(ebc_test_glue_du_ceiling),
+	KUNIT_CASE(ebc_test_glue_idle_cleanup),
+	KUNIT_CASE(ebc_test_glue_idle_not_due),
+	KUNIT_CASE(ebc_test_glue_idle_carried),
 	KUNIT_CASE(ebc_test_glue_du_repaired),
 #if IS_ENABLED(CONFIG_DRM_RK3026_EBC_MXCFB)
 	KUNIT_CASE(ebc_test_glue_mxcfb_send),

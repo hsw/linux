@@ -434,10 +434,41 @@ u32 rk3026_ebc_scan_mode(const struct rk3026_ebc_set *part, bool repaired)
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_scan_mode);
 
 /**
+ * rk3026_ebc_du_spent - whether the DU budget is spent
+ * @budget: the DU budget (struct rk3026_ebc_du_budget)
+ *
+ * Return: true once @budget->area reaches @budget->limit; never with a
+ * limit of 0, which is no budget.
+ */
+bool rk3026_ebc_du_spent(const struct rk3026_ebc_du_budget *budget)
+{
+	return budget->limit && budget->area >= budget->limit;
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_du_spent);
+
+/**
+ * rk3026_ebc_du_at_ceiling - whether the DU budget reached its ceiling
+ * @budget: the DU budget (struct rk3026_ebc_du_budget)
+ *
+ * Return: true when the budget is spent (rk3026_ebc_du_spent()) and
+ * @budget->area reached @budget->ceiling, a ceiling of 0 being none. A
+ * ceiling below the limit so acts as the limit.
+ */
+bool rk3026_ebc_du_at_ceiling(const struct rk3026_ebc_du_budget *budget)
+{
+	return rk3026_ebc_du_spent(budget) && budget->ceiling &&
+	       budget->area >= budget->ceiling;
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_du_at_ceiling);
+
+/**
  * rk3026_ebc_du_cleanup - whether an auto plane part takes the cleanup FULL
  * @budget: the DU budget at the take (struct rk3026_ebc_du_budget)
  * @changed_px: the pixels the part's snapshot changes
  *	(rk3026_ebc_build_snapshot())
+ * @added_px: the pixels the part adds to the budget when it is driven as
+ *	its content asks: @changed_px if two-level (DU or A2), else 0 (PART
+ *	adds nothing; rk3026_ebc_du_account())
  * @reason: returns which cleanup, if one is due; left alone if not
  *
  * The budget is spent once @budget->area reaches @budget->limit. A spent
@@ -448,11 +479,25 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_scan_mode);
  * opened or closed, a page scrolled, where the user expects the panel to
  * change anyway. A big_area of 0 makes every part big.
  *
+ * Big is counted in changed pixels, not by the part's box: the box bounds
+ * every damage clip of a commit and every update merged into the part, so
+ * a pointer that jumps far, or two small changes far apart, would make a
+ * big box of a few changed pixels. Changed pixels are what leaves ghosts:
+ * a window opened over white that changes few of them adds few, and needs
+ * no cleanup of its own; the idle cleanup clears them once the budget is
+ * spent.
+ *
+ * A big part takes the FULL when the budget is spent before it, and also
+ * when the part itself would spend it (@budget->area + @added_px, which
+ * saturates, reaching the limit): driven DU, it would leave the budget
+ * spent, and the cleanup would follow it as a second refresh for one
+ * change.
+ *
  * A session that only ever draws small parts would never clean up, so
- * @budget->ceiling stops that: once @budget->area reaches it, any part
- * takes the FULL (EBC_REASON_CLEANUP_CEILING). A ceiling below the limit
- * acts as the limit; 0 is none. A big part at the ceiling is reported big:
- * it would have taken the FULL anyway.
+ * the ceiling stops that: once the budget reaches it
+ * (rk3026_ebc_du_at_ceiling()), any part takes the FULL
+ * (EBC_REASON_CLEANUP_CEILING). A big part at the ceiling is reported
+ * big: it would have taken the FULL anyway.
  *
  * A limit of 0 means no budget, and so no cleanup of any kind, the
  * ceiling included.
@@ -460,19 +505,20 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_scan_mode);
  * Return: true when the part is driven FULL for a cleanup.
  */
 bool rk3026_ebc_du_cleanup(const struct rk3026_ebc_du_budget *budget,
-			   u32 changed_px, enum rk3026_ebc_reason *reason)
+			   u32 changed_px, u32 added_px,
+			   enum rk3026_ebc_reason *reason)
 {
-	u32 ceiling = budget->ceiling;
+	u32 after;
 
-	if (!budget->limit || budget->area < budget->limit)
+	if (!budget->limit)
 		return false;
-	if (changed_px >= budget->big_area) {
+	if (changed_px >= budget->big_area &&
+	    (check_add_overflow(budget->area, added_px, &after) ||
+	     after >= budget->limit)) {
 		*reason = EBC_REASON_CLEANUP_BIG;
 		return true;
 	}
-	if (ceiling && ceiling < budget->limit)
-		ceiling = budget->limit;
-	if (ceiling && budget->area >= ceiling) {
+	if (rk3026_ebc_du_at_ceiling(budget)) {
 		*reason = EBC_REASON_CLEANUP_CEILING;
 		return true;
 	}
@@ -524,10 +570,11 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_du_cleanup);
  * DU leaves the ghosts of what it draws over, and @budget counts them. An
  * auto part with a plane update in it, two-level or grey, keeps
  * @scan_mode, FULL, which clears the glass, when rk3026_ebc_du_cleanup()
- * says a cleanup is due: a big part once the budget is spent, any part at
- * its ceiling. A small part on a spent budget stays DU or PART, so the
- * flash does not land on a pointer move. A part of mxcfb sends alone is not
- * cleaned up: such a client runs its own fulls.
+ * says a cleanup is due: a big part (by its changed pixels) once the
+ * budget is spent or when it would spend it, any part at its ceiling. A
+ * small part on a spent budget stays DU or PART, so the flash does not
+ * land on a pointer move. A part of mxcfb sends alone is not cleaned up:
+ * such a client runs its own fulls.
  *
  * A part that has a mode of its own keeps @scan_mode, and so does one
  * behind a repair: the glass is white then outside the box, and only a
@@ -558,7 +605,8 @@ u32 rk3026_ebc_resolve_mode(const struct rk3026_ebc_set *part, u32 scan_mode,
 	if (!part->auto_ok)
 		return scan_mode;
 	if (part->has_plane &&
-	    rk3026_ebc_du_cleanup(budget, changed_px, reason))
+	    rk3026_ebc_du_cleanup(budget, changed_px,
+				  two_level ? changed_px : 0, reason))
 		return scan_mode;
 	if (two_level) {
 		if (part->has_plane && a2->max_area &&

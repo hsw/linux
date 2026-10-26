@@ -225,8 +225,8 @@ DEFINE_SHOW_ATTRIBUTE(rk3026_ebc_state);
  * "du_state", apart from "state" so that file keeps its version: du_area is
  * the pixels plane parts changed in DU since the glass was last cleared
  * (rk3026_ebc_du_account()), du_cleanup_area the limit (0: none), and
- * cleanup_due 1 when the next two-level plane part will be driven FULL
- * (rk3026_ebc_resolve_mode()).
+ * cleanup_due 1 when the next auto plane part, two-level or grey, will be
+ * driven FULL (rk3026_ebc_resolve_mode()).
  */
 static int rk3026_ebc_du_state_show(struct seq_file *m, void *unused)
 {

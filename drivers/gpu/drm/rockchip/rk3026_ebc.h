@@ -248,7 +248,8 @@ enum rk3026_ebc_reason {
 	EBC_REASON_EXPLICIT,	/* the part's own mode, as asked or by default */
 	EBC_REASON_AUTO_DU,	/* an auto part whose changes are all 0 or 15 */
 	EBC_REASON_REPAIR_FLOOR, /* raised to PART after a repair RESET */
-	EBC_REASON_CLEANUP,	/* a two-level plane part kept FULL: DU budget */
+	EBC_REASON_CLEANUP,	/* an auto plane part kept FULL: DU budget */
+	EBC_REASON_AUTO_PART,	/* an auto plane part with a grey change */
 };
 
 /*
@@ -569,9 +570,10 @@ struct rk3026_ebc {
 	/*
 	 * The DU cleanup budget (rk3026_ebc_du_account()). @du_area counts the
 	 * pixels plane parts changed in DU since the glass was last cleared;
-	 * the refresh thread alone writes it, under @image_lock. Once it
-	 * reaches @du_cleanup_area, a two-level plane part is driven FULL
-	 * instead (rk3026_ebc_resolve_mode()). @du_cleanup_area is one panel's
+	 * the refresh thread alone writes it, under @image_lock; PART parts
+	 * leave it. Once it reaches @du_cleanup_area, an auto plane part,
+	 * two-level or grey, is driven FULL instead of DU or PART
+	 * (rk3026_ebc_resolve_mode()). @du_cleanup_area is one panel's
 	 * area from probe on; debugfs may change it (0: never), and the thread
 	 * reads it with READ_ONCE().
 	 */

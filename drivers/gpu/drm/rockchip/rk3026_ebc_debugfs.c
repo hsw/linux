@@ -10,6 +10,11 @@
  *   du_state         text, the DU cleanup budget (rk3026_ebc_du_state_show())
  *   du_cleanup_area  the budget's limit in pixels, read-write; 0: no
  *                    cleanup FULL. A diagnostic: probe sets one panel's area.
+ *   du_cleanup_big_area  the changed pixels that make a part big enough
+ *                    for the cleanup FULL once the budget is spent,
+ *                    read-write; probe sets half the panel's area.
+ *   du_cleanup_ceiling  the budget at which any part takes the cleanup
+ *                    FULL, read-write; 0: none. Probe sets four panels.
  *   timing  text, the blit and snapshot times of the last part and the last
  *           driven one (rk3026_ebc_timing_show())
  *
@@ -224,23 +229,38 @@ DEFINE_SHOW_ATTRIBUTE(rk3026_ebc_state);
 /*
  * "du_state", apart from "state" so that file keeps its version: du_area is
  * the pixels plane parts changed in DU since the glass was last cleared
- * (rk3026_ebc_du_account()), du_cleanup_area the limit (0: none), and
- * cleanup_due 1 when the next auto plane part, two-level or grey, will be
- * driven FULL (rk3026_ebc_resolve_mode()).
+ * (rk3026_ebc_du_account()); du_cleanup_area, du_cleanup_big_area and
+ * du_cleanup_ceiling are the knobs of the same names (struct
+ * rk3026_ebc_du_budget). cleanup_due is 1 when the budget is spent, so the
+ * next big auto plane part, two-level or grey, will be driven FULL, and
+ * ceiling_due 1 when it has reached its ceiling, so any will
+ * (rk3026_ebc_du_cleanup()).
  */
 static int rk3026_ebc_du_state_show(struct seq_file *m, void *unused)
 {
 	struct rk3026_ebc *ebc = m->private;
-	u32 area, limit;
+	struct rk3026_ebc_du_budget b, small;
+	enum rk3026_ebc_reason reason;
 
 	mutex_lock(&ebc->image_lock);
-	area = ebc->du_area;
+	b.area = ebc->du_area;
 	mutex_unlock(&ebc->image_lock);
-	limit = READ_ONCE(ebc->du_cleanup_area);
+	b.limit = READ_ONCE(ebc->du_cleanup_area);
+	b.big_area = READ_ONCE(ebc->du_cleanup_big_area);
+	b.ceiling = READ_ONCE(ebc->du_cleanup_ceiling);
 
-	seq_printf(m, "du_area %u\n", area);
-	seq_printf(m, "du_cleanup_area %u\n", limit);
-	seq_printf(m, "cleanup_due %d\n", limit && area >= limit);
+	/* No part is big for @small: only the ceiling cleans it up. */
+	small = b;
+	small.big_area = U32_MAX;
+
+	seq_printf(m, "du_area %u\n", b.area);
+	seq_printf(m, "du_cleanup_area %u\n", b.limit);
+	seq_printf(m, "du_cleanup_big_area %u\n", b.big_area);
+	seq_printf(m, "du_cleanup_ceiling %u\n", b.ceiling);
+	seq_printf(m, "cleanup_due %d\n",
+		   rk3026_ebc_du_cleanup(&b, U32_MAX, &reason));
+	seq_printf(m, "ceiling_due %d\n",
+		   rk3026_ebc_du_cleanup(&small, 0, &reason));
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(rk3026_ebc_du_state);
@@ -286,6 +306,10 @@ void rk3026_ebc_debugfs_init(struct rk3026_ebc *ebc)
 	debugfs_create_file("du_state", 0444, dir, ebc,
 			    &rk3026_ebc_du_state_fops);
 	debugfs_create_u32("du_cleanup_area", 0644, dir, &ebc->du_cleanup_area);
+	debugfs_create_u32("du_cleanup_big_area", 0644, dir,
+			   &ebc->du_cleanup_big_area);
+	debugfs_create_u32("du_cleanup_ceiling", 0644, dir,
+			   &ebc->du_cleanup_ceiling);
 	debugfs_create_file("timing", 0444, dir, ebc, &rk3026_ebc_timing_fops);
 }
 

@@ -422,13 +422,61 @@ u32 rk3026_ebc_scan_mode(const struct rk3026_ebc_set *part, bool repaired)
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_scan_mode);
 
 /**
+ * rk3026_ebc_du_cleanup - whether an auto plane part takes the cleanup FULL
+ * @budget: the DU budget at the take (struct rk3026_ebc_du_budget)
+ * @changed_px: the pixels the part's snapshot changes
+ *	(rk3026_ebc_build_snapshot())
+ * @reason: returns which cleanup, if one is due; left alone if not
+ *
+ * The budget is spent once @budget->area reaches @budget->limit. A spent
+ * budget alone does not make the next part a FULL: that part is usually
+ * small (a pointer move, a key typed), and a whole-panel flash on it is
+ * the one the user notices most. It falls on a big part, one that changes
+ * at least @budget->big_area pixels (EBC_REASON_CLEANUP_BIG): a window
+ * opened or closed, a page scrolled, where the user expects the panel to
+ * change anyway. A big_area of 0 makes every part big.
+ *
+ * A session that only ever draws small parts would never clean up, so
+ * @budget->ceiling stops that: once @budget->area reaches it, any part
+ * takes the FULL (EBC_REASON_CLEANUP_CEILING). A ceiling below the limit
+ * acts as the limit; 0 is none. A big part at the ceiling is reported big:
+ * it would have taken the FULL anyway.
+ *
+ * A limit of 0 means no budget, and so no cleanup of any kind, the
+ * ceiling included.
+ *
+ * Return: true when the part is driven FULL for a cleanup.
+ */
+bool rk3026_ebc_du_cleanup(const struct rk3026_ebc_du_budget *budget,
+			   u32 changed_px, enum rk3026_ebc_reason *reason)
+{
+	u32 ceiling = budget->ceiling;
+
+	if (!budget->limit || budget->area < budget->limit)
+		return false;
+	if (changed_px >= budget->big_area) {
+		*reason = EBC_REASON_CLEANUP_BIG;
+		return true;
+	}
+	if (ceiling && ceiling < budget->limit)
+		ceiling = budget->limit;
+	if (ceiling && budget->area >= ceiling) {
+		*reason = EBC_REASON_CLEANUP_CEILING;
+		return true;
+	}
+	return false;
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_du_cleanup);
+
+/**
  * rk3026_ebc_resolve_mode - the mode the content picks for a part
  * @part: the part
  * @scan_mode: its scan mode (rk3026_ebc_scan_mode()), as the snapshot
  *	returned it
  * @two_level: the snapshot's two-level result (rk3026_ebc_build_snapshot())
+ * @changed_px: the pixels the snapshot changes
  * @repair_due: a repair RESET runs before it
- * @cleanup_due: the DU cleanup budget is spent (rk3026_ebc_du_account())
+ * @budget: the plane parts' DU cleanup budget (rk3026_ebc_du_account())
  * @reason: returns why the part is driven in the returned mode
  *
  * Only a part made of auto updates alone (@part->auto_ok) is the content's
@@ -448,17 +496,21 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_scan_mode);
  * @scan_mode is a 16-level one and nothing was thresholded. A part of
  * mxcfb sends alone keeps @scan_mode, its client's default.
  *
- * DU leaves the ghosts of what it draws over; once the plane parts' DU
- * budget is spent (@cleanup_due), an auto part with a plane update in it,
- * two-level or grey, keeps @scan_mode, FULL, which clears the glass. A part
- * of mxcfb sends alone is not cleaned up: such a client runs its own fulls.
+ * DU leaves the ghosts of what it draws over, and @budget counts them. An
+ * auto part with a plane update in it, two-level or grey, keeps
+ * @scan_mode, FULL, which clears the glass, when rk3026_ebc_du_cleanup()
+ * says a cleanup is due: a big part once the budget is spent, any part at
+ * its ceiling. A small part on a spent budget stays DU or PART, so the
+ * flash does not land on a pointer move. A part of mxcfb sends alone is not
+ * cleaned up: such a client runs its own fulls.
  *
  * A part that has a mode of its own keeps @scan_mode, and so does one
  * behind a repair: the glass is white then outside the box, and only a
  * 16-level scan draws the old greys back.
  */
 u32 rk3026_ebc_resolve_mode(const struct rk3026_ebc_set *part, u32 scan_mode,
-			    bool two_level, bool repair_due, bool cleanup_due,
+			    bool two_level, u32 changed_px, bool repair_due,
+			    const struct rk3026_ebc_du_budget *budget,
 			    enum rk3026_ebc_reason *reason)
 {
 	*reason = EBC_REASON_EXPLICIT;
@@ -469,10 +521,9 @@ u32 rk3026_ebc_resolve_mode(const struct rk3026_ebc_set *part, u32 scan_mode,
 	}
 	if (!part->auto_ok)
 		return scan_mode;
-	if (cleanup_due && part->has_plane) {
-		*reason = EBC_REASON_CLEANUP;
+	if (part->has_plane &&
+	    rk3026_ebc_du_cleanup(budget, changed_px, reason))
 		return scan_mode;
-	}
 	if (two_level) {
 		*reason = EBC_REASON_AUTO_DU;
 		return EBC_MODE_BLACK_WHITE;

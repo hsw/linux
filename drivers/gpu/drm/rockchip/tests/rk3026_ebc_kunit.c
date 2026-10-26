@@ -1339,6 +1339,55 @@ static void t_kind_part(enum t_kind kind, struct rk3026_ebc_set *part)
 	rk3026_ebc_pending_take(&p, part);
 }
 
+/*
+ * The DU budget a resolve row runs with, and the pixels its part changes:
+ * a limit of 100, a big part of 50, a ceiling of 400.
+ */
+enum t_budget {
+	T_FRESH,	/* nothing spent, a small part */
+	T_FRESH_BIG,	/* nothing spent, a big part */
+	T_SPENT,	/* spent, a small part */
+	T_SPENT_BIG,	/* spent, a big part */
+	T_CEIL,		/* at the ceiling, a small part */
+	T_LOW_CEIL,	/* spent, a ceiling below the limit, a small part */
+	T_NO_BUDGET,	/* a limit of 0, a ceiling of 1, a big part */
+};
+
+static void t_budget_of(enum t_budget kind, struct rk3026_ebc_du_budget *b,
+			u32 *changed_px)
+{
+	*b = (struct rk3026_ebc_du_budget){ .area = 0, .limit = 100,
+					    .big_area = 50, .ceiling = 400 };
+	*changed_px = 10;
+	switch (kind) {
+	case T_FRESH:
+		break;
+	case T_FRESH_BIG:
+		*changed_px = 50;
+		break;
+	case T_SPENT:
+		b->area = 100;
+		break;
+	case T_SPENT_BIG:
+		b->area = 100;
+		*changed_px = 50;
+		break;
+	case T_CEIL:
+		b->area = 400;
+		break;
+	case T_LOW_CEIL:
+		b->area = 100;
+		b->ceiling = 10;
+		break;
+	case T_NO_BUDGET:
+		b->area = U32_MAX;
+		b->limit = 0;
+		b->ceiling = 1;
+		*changed_px = U32_MAX;
+		break;
+	}
+}
+
 struct t_resolve {
 	const char		*desc;
 	enum t_kind		kind;
@@ -1346,15 +1395,18 @@ struct t_resolve {
 	bool			two_level;
 	u32			mode;
 	enum rk3026_ebc_reason	reason;
-	bool			cleanup;
+	enum t_budget		budget;
 };
 
 #define T_DU_MODE	EBC_MODE_BLACK_WHITE
 #define T_EXPL		EBC_REASON_EXPLICIT
 #define T_AUTO_DU	EBC_REASON_AUTO_DU
 #define T_FLOOR		EBC_REASON_REPAIR_FLOOR
-#define T_CLEANUP	EBC_REASON_CLEANUP
+#define T_BIG		EBC_REASON_CLEANUP_BIG
+#define T_CEILING	EBC_REASON_CLEANUP_CEILING
 #define T_AUTO_GREY	EBC_REASON_AUTO_PART
+/* Not a reason: what a test starts its result with. */
+#define T_NO_REASON	(EBC_REASON_CLEANUP_CEILING + 1)
 
 static const struct t_resolve t_resolve_cases[] = {
 	{ "plane two-level", T_PLANE, false, true, T_DU_MODE, T_AUTO_DU },
@@ -1396,33 +1448,76 @@ static const struct t_resolve t_resolve_cases[] = {
 	{ "DU two-level", T_DU, false, true, T_DU_MODE, T_EXPL },
 	{ "DU repair", T_DU, true, true, EBC_MODE_PART, T_FLOOR },
 	{ "RESET", T_RESET, false, true, EBC_MODE_RESET, T_EXPL },
+	/* A big part on a budget not spent is no cleanup. */
+	{ "plane two-level big", T_PLANE, false, true, T_DU_MODE, T_AUTO_DU,
+	  T_FRESH_BIG },
+	{ "plane grey big", T_PLANE, false, false, EBC_MODE_PART,
+	  T_AUTO_GREY, T_FRESH_BIG },
 	/*
-	 * The DU budget is spent: an auto part with a plane update keeps
-	 * FULL, two-level or grey.
+	 * The DU budget is spent: a small auto part with a plane update
+	 * stays DU or PART, so the flash does not land on a pointer move.
 	 */
-	{ "plane two-level cleanup", T_PLANE, false, true, EBC_MODE_FULL,
-	  T_CLEANUP, true },
-	{ "plane grey cleanup", T_PLANE, false, false, EBC_MODE_FULL,
-	  T_CLEANUP, true },
-	{ "plane repair two-level cleanup", T_PLANE, true, true,
-	  EBC_MODE_FULL, T_EXPL, true },
-	{ "plane and auto part two-level cleanup", T_PLANE_AUTO_PART, false,
-	  true, EBC_MODE_FULL, T_CLEANUP, true },
-	{ "plane and auto part grey cleanup", T_PLANE_AUTO_PART, false,
-	  false, EBC_MODE_FULL, T_CLEANUP, true },
-	{ "plane and DU two-level cleanup", T_PLANE_DU, false, true,
-	  EBC_MODE_FULL, T_EXPL, true },
-	{ "plane and DU grey cleanup", T_PLANE_DU, false, false,
-	  EBC_MODE_FULL, T_EXPL, true },
+	{ "plane two-level spent", T_PLANE, false, true, T_DU_MODE,
+	  T_AUTO_DU, T_SPENT },
+	{ "plane grey spent", T_PLANE, false, false, EBC_MODE_PART,
+	  T_AUTO_GREY, T_SPENT },
+	{ "plane and auto part two-level spent", T_PLANE_AUTO_PART, false,
+	  true, T_DU_MODE, T_AUTO_DU, T_SPENT },
+	{ "plane and auto part grey spent", T_PLANE_AUTO_PART, false, false,
+	  EBC_MODE_PART, T_AUTO_GREY, T_SPENT },
+	/* A big one keeps FULL, two-level or grey. */
+	{ "plane two-level spent big", T_PLANE, false, true, EBC_MODE_FULL,
+	  T_BIG, T_SPENT_BIG },
+	{ "plane grey spent big", T_PLANE, false, false, EBC_MODE_FULL,
+	  T_BIG, T_SPENT_BIG },
+	{ "plane repair two-level spent big", T_PLANE, true, true,
+	  EBC_MODE_FULL, T_EXPL, T_SPENT_BIG },
+	{ "plane and auto part two-level spent big", T_PLANE_AUTO_PART, false,
+	  true, EBC_MODE_FULL, T_BIG, T_SPENT_BIG },
+	{ "plane and auto part grey spent big", T_PLANE_AUTO_PART, false,
+	  false, EBC_MODE_FULL, T_BIG, T_SPENT_BIG },
+	{ "plane and DU two-level spent big", T_PLANE_DU, false, true,
+	  EBC_MODE_FULL, T_EXPL, T_SPENT_BIG },
+	{ "plane and DU grey spent big", T_PLANE_DU, false, false,
+	  EBC_MODE_FULL, T_EXPL, T_SPENT_BIG },
+	/* At the ceiling any auto plane part keeps FULL, a small one too. */
+	{ "plane two-level ceiling", T_PLANE, false, true, EBC_MODE_FULL,
+	  T_CEILING, T_CEIL },
+	{ "plane grey ceiling", T_PLANE, false, false, EBC_MODE_FULL,
+	  T_CEILING, T_CEIL },
+	{ "plane and auto part two-level ceiling", T_PLANE_AUTO_PART, false,
+	  true, EBC_MODE_FULL, T_CEILING, T_CEIL },
+	{ "plane and auto part grey ceiling", T_PLANE_AUTO_PART, false, false,
+	  EBC_MODE_FULL, T_CEILING, T_CEIL },
+	{ "plane repair grey ceiling", T_PLANE, true, false, EBC_MODE_FULL,
+	  T_EXPL, T_CEIL },
+	{ "plane and DU two-level ceiling", T_PLANE_DU, false, true,
+	  EBC_MODE_FULL, T_EXPL, T_CEIL },
+	/* A ceiling below the limit acts as the limit. */
+	{ "plane two-level low ceiling", T_PLANE, false, true, EBC_MODE_FULL,
+	  T_CEILING, T_LOW_CEIL },
+	/* No budget (a limit of 0): no cleanup, the ceiling ignored. */
+	{ "plane two-level no budget", T_PLANE, false, true, T_DU_MODE,
+	  T_AUTO_DU, T_NO_BUDGET },
+	{ "plane grey no budget", T_PLANE, false, false, EBC_MODE_PART,
+	  T_AUTO_GREY, T_NO_BUDGET },
 	/* An mxcfb client runs its own fulls: its auto parts stay DU. */
-	{ "auto part two-level cleanup", T_AUTO_PART, false, true, T_DU_MODE,
-	  T_AUTO_DU, true },
-	{ "auto part grey cleanup", T_AUTO_PART, false, false, EBC_MODE_PART,
-	  T_EXPL, true },
-	{ "DU two-level cleanup", T_DU, false, true, T_DU_MODE, T_EXPL, true },
-	{ "mxcfb full cleanup", T_MXCFB_FULL, false, true, EBC_MODE_FULL,
-	  T_EXPL, true },
-	{ "RESET cleanup", T_RESET, false, true, EBC_MODE_RESET, T_EXPL, true },
+	{ "auto part two-level spent big", T_AUTO_PART, false, true,
+	  T_DU_MODE, T_AUTO_DU, T_SPENT_BIG },
+	{ "auto part grey spent big", T_AUTO_PART, false, false,
+	  EBC_MODE_PART, T_EXPL, T_SPENT_BIG },
+	{ "auto part two-level ceiling", T_AUTO_PART, false, true, T_DU_MODE,
+	  T_AUTO_DU, T_CEIL },
+	{ "auto part grey ceiling", T_AUTO_PART, false, false, EBC_MODE_PART,
+	  T_EXPL, T_CEIL },
+	{ "DU two-level spent big", T_DU, false, true, T_DU_MODE, T_EXPL,
+	  T_SPENT_BIG },
+	{ "DU two-level ceiling", T_DU, false, true, T_DU_MODE, T_EXPL,
+	  T_CEIL },
+	{ "mxcfb full ceiling", T_MXCFB_FULL, false, true, EBC_MODE_FULL,
+	  T_EXPL, T_CEIL },
+	{ "RESET ceiling", T_RESET, false, true, EBC_MODE_RESET, T_EXPL,
+	  T_CEIL },
 };
 
 KUNIT_ARRAY_PARAM_DESC(t_resolve, t_resolve_cases, desc);
@@ -1430,16 +1525,86 @@ KUNIT_ARRAY_PARAM_DESC(t_resolve, t_resolve_cases, desc);
 static void ebc_test_resolve_mode(struct kunit *test)
 {
 	const struct t_resolve *c = test->param_value;
-	enum rk3026_ebc_reason reason = EBC_REASON_AUTO_PART + 1;
+	enum rk3026_ebc_reason reason = T_NO_REASON;
+	struct rk3026_ebc_du_budget budget;
 	struct rk3026_ebc_set part;
-	u32 scan_mode;
+	u32 scan_mode, changed_px;
 
 	t_kind_part(c->kind, &part);
+	t_budget_of(c->budget, &budget, &changed_px);
 	scan_mode = rk3026_ebc_scan_mode(&part, c->repair);
 	KUNIT_EXPECT_EQ(test,
 			rk3026_ebc_resolve_mode(&part, scan_mode, c->two_level,
-						c->repair, c->cleanup, &reason),
+						changed_px, c->repair, &budget,
+						&reason),
 			c->mode);
+	KUNIT_EXPECT_EQ(test, reason, c->reason);
+}
+
+/*
+ * The cleanup rule alone, at the edges of its knobs: rk3026_ebc_du_cleanup()
+ * with @area spent of @limit, a big part of @big_area pixels, a @ceiling,
+ * and a part that changes @changed_px.
+ */
+struct t_du_cleanup {
+	const char		*desc;
+	u32			area;
+	u32			limit;
+	u32			big_area;
+	u32			ceiling;
+	u32			changed_px;
+	enum rk3026_ebc_reason	reason;		/* T_NO_REASON: not due */
+};
+
+static const struct t_du_cleanup t_du_cleanup_cases[] = {
+	{ "nothing spent", 0, 100, 50, 400, U32_MAX, T_NO_REASON },
+	{ "one short of the limit", 99, 100, 50, 400, U32_MAX, T_NO_REASON },
+	{ "spent, one short of big", 100, 100, 50, 400, 49, T_NO_REASON },
+	{ "spent, big", 100, 100, 50, 400, 50, T_BIG },
+	{ "over the limit, big", 399, 100, 50, 400, 50, T_BIG },
+	{ "one short of the ceiling", 399, 100, 50, 400, 0, T_NO_REASON },
+	{ "at the ceiling", 400, 100, 50, 400, 0, T_CEILING },
+	{ "past the ceiling", U32_MAX, 100, 50, 400, 49, T_CEILING },
+	/* A big part at the ceiling is reported big. */
+	{ "at the ceiling, big", 400, 100, 50, 400, 50, T_BIG },
+	/* A ceiling of 0: none, only big parts clean up. */
+	{ "no ceiling", U32_MAX, 100, 50, 0, 49, T_NO_REASON },
+	{ "no ceiling, big", U32_MAX, 100, 50, 0, 50, T_BIG },
+	/* A ceiling below the limit acts as the limit. */
+	{ "ceiling below the limit", 100, 100, 50, 10, 0, T_CEILING },
+	{ "ceiling below the limit, not spent", 99, 100, 50, 10, 0,
+	  T_NO_REASON },
+	{ "ceiling at the limit", 100, 100, 50, 100, 0, T_CEILING },
+	/* A big part of 0 pixels: every part is big once spent (E2). */
+	{ "big of 0", 100, 100, 0, 0, 0, T_BIG },
+	{ "big of 0, not spent", 99, 100, 0, 0, U32_MAX, T_NO_REASON },
+	/* A limit of 0: no budget, no cleanup of any kind. */
+	{ "no budget", U32_MAX, 0, 0, 1, U32_MAX, T_NO_REASON },
+	{ "no budget, nothing spent", 0, 0, 0, 0, 0, T_NO_REASON },
+	/* The probe defaults for an area of 480000: area / 2, 4 * area. */
+	{ "probe defaults, spent, small", 480000, 480000, 240000, 1920000,
+	  239999, T_NO_REASON },
+	{ "probe defaults, spent, big", 480000, 480000, 240000, 1920000,
+	  240000, T_BIG },
+	{ "probe defaults, ceiling", 1920000, 480000, 240000, 1920000, 1,
+	  T_CEILING },
+};
+
+KUNIT_ARRAY_PARAM_DESC(t_du_cleanup, t_du_cleanup_cases, desc);
+
+static void ebc_test_du_cleanup(struct kunit *test)
+{
+	const struct t_du_cleanup *c = test->param_value;
+	const struct rk3026_ebc_du_budget budget = {
+		.area = c->area, .limit = c->limit, .big_area = c->big_area,
+		.ceiling = c->ceiling,
+	};
+	enum rk3026_ebc_reason reason = T_NO_REASON;
+
+	KUNIT_EXPECT_EQ(test,
+			rk3026_ebc_du_cleanup(&budget, c->changed_px, &reason),
+			c->reason != T_NO_REASON);
+	/* Left alone when no cleanup is due. */
 	KUNIT_EXPECT_EQ(test, reason, c->reason);
 }
 
@@ -1765,6 +1930,7 @@ static struct kunit_case rk3026_ebc_core_test_cases[] = {
 	KUNIT_CASE(ebc_test_skip),
 	KUNIT_CASE(ebc_test_scan_mode),
 	KUNIT_CASE_PARAM(ebc_test_resolve_mode, t_resolve_gen_params),
+	KUNIT_CASE_PARAM(ebc_test_du_cleanup, t_du_cleanup_gen_params),
 	KUNIT_CASE(ebc_test_pending_auto_ok),
 	KUNIT_CASE(ebc_test_pending_auto_ok_reset),
 	KUNIT_CASE(ebc_test_pending_auto_ok_carry),
@@ -1943,6 +2109,10 @@ static u32 t_mxcfb_resolve(struct kunit *test, u32 waveform, u32 update_mode,
 			   u32 flags, bool two_level,
 			   enum rk3026_ebc_reason *reason)
 {
+	/* Past the ceiling, and the part big: a plane part would clean up. */
+	static const struct rk3026_ebc_du_budget budget = {
+		.area = U32_MAX, .limit = 1, .big_area = 0, .ceiling = 1,
+	};
 	struct rk3026_ebc_pending p = {};
 	struct rk3026_ebc_update upd;
 	struct rk3026_ebc_set part;
@@ -1960,13 +2130,14 @@ static u32 t_mxcfb_resolve(struct kunit *test, u32 waveform, u32 update_mode,
 	KUNIT_EXPECT_FALSE(test, part.has_plane);
 	return rk3026_ebc_resolve_mode(&part,
 				       rk3026_ebc_scan_mode(&part, false),
-				       two_level, false, true, reason);
+				       two_level, U32_MAX, false, &budget,
+				       reason);
 }
 
 /*
  * AUTO + PARTIAL goes DU when the content is two-level, else PART, even
- * with the plane's DU budget spent; AUTO + FULL and a named waveform keep
- * their mode.
+ * with the plane's DU budget past its ceiling and the part big; AUTO +
+ * FULL and a named waveform keep their mode.
  */
 static void ebc_test_mxcfb_auto_resolve(struct kunit *test)
 {
@@ -2467,8 +2638,10 @@ static struct rk3026_ebc *t_ebc_alloc(struct kunit *test)
 	ebc->shadows.height = T_H;
 	ebc->prev_virt = t_img_alloc(test, 15);
 	ebc->crtc_on = true;
-	/* As probe sets it: one panel's area. */
+	/* As probe sets them: one panel's area, half of it, four panels. */
 	ebc->du_cleanup_area = T_W * T_H;
+	ebc->du_cleanup_big_area = T_W * T_H / 2;
+	ebc->du_cleanup_ceiling = 4 * T_W * T_H;
 	/*
 	 * plane_resync stays false: after probe it is true (the probe RESET
 	 * is a non-plane update), but here the target and the framebuffers
@@ -2954,9 +3127,9 @@ static void ebc_test_glue_a2_over_grey(struct kunit *test)
 }
 
 /*
- * The DU budget spent: the black plane update over white that would be DU
- * is FULL, reason cleanup. It stops at the missing LUT, so the budget stays
- * as it was and the part is carried.
+ * The DU budget spent: the black plane update over the white panel, a big
+ * part, that would be DU is FULL, reason cleanup_big. It stops at the
+ * missing LUT, so the budget stays as it was and the part is carried.
  */
 static void ebc_test_glue_du_cleanup(struct kunit *test)
 {
@@ -2970,7 +3143,7 @@ static void ebc_test_glue_du_cleanup(struct kunit *test)
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_EQ(test, last.asked_mode, EBC_MODE_FULL);
 	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_FULL);
-	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_CLEANUP);
+	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_CLEANUP_BIG);
 	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_NO_LUT);
 	KUNIT_EXPECT_EQ(test, ebc->du_area, ebc->du_cleanup_area);
 	KUNIT_EXPECT_TRUE(test, ebc->pending.carry.merged);
@@ -3101,7 +3274,7 @@ static struct rk3026_ebc *t_driven_ebc(struct kunit *test, struct t_drives *d,
  * The budget follows driven parts with the counts of their own snapshots.
  * A black plane update over the white glass is driven DU and adds every
  * pixel of the panel, which spends the budget; the white one after it,
- * two-level too, is driven FULL for the cleanup and clears it; then a
+ * two-level too and big, is driven FULL for the cleanup and clears it; then a
  * black box of 4 x 2 pixels on white is driven DU and adds its 8 changed
  * pixels (not the mode, not the panel's area).
  */
@@ -3133,7 +3306,7 @@ static void ebc_test_glue_du_driven(struct kunit *test)
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
 	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_FULL);
-	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_CLEANUP);
+	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_CLEANUP_BIG);
 	KUNIT_EXPECT_EQ(test, ebc->du_area, 0);
 
 	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, box, T_W * 4,
@@ -3153,7 +3326,7 @@ static void ebc_test_glue_du_driven(struct kunit *test)
 /*
  * A grey box of 4 x 2 pixels on the white glass is driven PART and leaves
  * the budget as it was; with the budget spent, a grey plane update over the
- * whole panel is driven FULL for the cleanup and clears it.
+ * whole panel, a big part, is driven FULL for the cleanup and clears it.
  */
 static void ebc_test_glue_part_driven(struct kunit *test)
 {
@@ -3187,11 +3360,115 @@ static void ebc_test_glue_part_driven(struct kunit *test)
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
 	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_FULL);
-	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_CLEANUP);
+	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_CLEANUP_BIG);
 	KUNIT_EXPECT_EQ(test, ebc->du_area, 0);
 
 	KUNIT_EXPECT_EQ(test, d.n, 2);
 	KUNIT_EXPECT_EQ(test, d.mode[0], EBC_MODE_PART);
+	KUNIT_EXPECT_EQ(test, d.mode[1], EBC_MODE_FULL);
+}
+
+/* Fill the box @x1,@y1 - @x2,@y2 (exclusive) of a plane framebuffer. */
+static void t_fb_box(u32 *fb, int x1, int y1, int x2, int y2, u32 xrgb)
+{
+	int x, y;
+
+	for (y = y1; y < y2; y++)
+		for (x = x1; x < x2; x++)
+			fb[y * T_W + x] = xrgb;
+}
+
+/*
+ * The budget spent, the cleanup waits for a big part. A black box of
+ * 4 x 2 pixels on the white glass is small: driven DU, it adds its 8
+ * pixels. A grey box of 2 x 2 beside it is small too: driven PART, it
+ * leaves the budget. A grey plane update over the whole panel changes
+ * every pixel, at least half of it: driven FULL for the cleanup, reason
+ * cleanup_big, and the budget is cleared.
+ */
+static void ebc_test_glue_du_big(struct kunit *test)
+{
+	struct t_drives d;
+	struct rk3026_ebc *ebc = t_driven_ebc(test, &d, true);
+	u32 *box = t_plane_fb(test, 0xffffff);
+	u32 *boxes = t_plane_fb(test, 0xffffff);
+	u32 *grey = t_plane_fb(test, 0x404040);
+	struct rk3026_ebc_last last;
+
+	t_fb_box(box, 4, 2, 8, 4, 0);
+	t_fb_box(boxes, 4, 2, 8, 4, 0);
+	t_fb_box(boxes, 10, 4, 12, 6, 0x808080);
+	KUNIT_ASSERT_GE(test, T_W * T_H, ebc->du_cleanup_big_area);
+
+	ebc->du_area = ebc->du_cleanup_area;
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, box, T_W * 4,
+							&t_panel));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_BLACK_WHITE);
+	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_AUTO_DU);
+	KUNIT_EXPECT_EQ(test, ebc->du_area, ebc->du_cleanup_area + 8);
+
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, boxes, T_W * 4,
+							&t_panel));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_PART);
+	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_AUTO_PART);
+	KUNIT_EXPECT_EQ(test, ebc->du_area, ebc->du_cleanup_area + 8);
+
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, grey, T_W * 4,
+							&t_panel));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_FULL);
+	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_CLEANUP_BIG);
+	KUNIT_EXPECT_EQ(test, ebc->du_area, 0);
+
+	KUNIT_EXPECT_EQ(test, d.n, 3);
+	KUNIT_EXPECT_EQ(test, d.mode[0], EBC_MODE_BLACK_WHITE);
+	KUNIT_EXPECT_EQ(test, d.mode[1], EBC_MODE_PART);
+	KUNIT_EXPECT_EQ(test, d.mode[2], EBC_MODE_FULL);
+}
+
+/*
+ * One pixel short of the ceiling, a small black box is driven DU and
+ * takes the budget past it; the next small box is driven FULL for the
+ * cleanup, reason cleanup_ceiling, and the budget is cleared.
+ */
+static void ebc_test_glue_du_ceiling(struct kunit *test)
+{
+	struct t_drives d;
+	struct rk3026_ebc *ebc = t_driven_ebc(test, &d, true);
+	u32 *box = t_plane_fb(test, 0xffffff);
+	u32 *boxes = t_plane_fb(test, 0xffffff);
+	struct rk3026_ebc_last last;
+
+	t_fb_box(box, 4, 2, 8, 4, 0);
+	t_fb_box(boxes, 4, 2, 8, 4, 0);
+	t_fb_box(boxes, 10, 4, 12, 6, 0);
+	KUNIT_ASSERT_GT(test, ebc->du_cleanup_ceiling, ebc->du_cleanup_area);
+
+	ebc->du_area = ebc->du_cleanup_ceiling - 1;
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, box, T_W * 4,
+							&t_panel));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_BLACK_WHITE);
+	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_AUTO_DU);
+	KUNIT_EXPECT_EQ(test, ebc->du_area, ebc->du_cleanup_ceiling + 7);
+
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, boxes, T_W * 4,
+							&t_panel));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_FULL);
+	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_CLEANUP_CEILING);
+	KUNIT_EXPECT_EQ(test, ebc->du_area, 0);
+	KUNIT_EXPECT_EQ(test, t_px(ebc->shadows.prev, 10, 4), 0);
+
+	KUNIT_EXPECT_EQ(test, d.n, 2);
+	KUNIT_EXPECT_EQ(test, d.mode[0], EBC_MODE_BLACK_WHITE);
 	KUNIT_EXPECT_EQ(test, d.mode[1], EBC_MODE_FULL);
 }
 
@@ -3752,6 +4029,8 @@ static struct kunit_case rk3026_ebc_glue_test_cases[] = {
 	KUNIT_CASE(ebc_test_glue_du_reset),
 	KUNIT_CASE(ebc_test_glue_du_driven),
 	KUNIT_CASE(ebc_test_glue_part_driven),
+	KUNIT_CASE(ebc_test_glue_du_big),
+	KUNIT_CASE(ebc_test_glue_du_ceiling),
 	KUNIT_CASE(ebc_test_glue_du_repaired),
 #if IS_ENABLED(CONFIG_DRM_RK3026_EBC_MXCFB)
 	KUNIT_CASE(ebc_test_glue_mxcfb_send),

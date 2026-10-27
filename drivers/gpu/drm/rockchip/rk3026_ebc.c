@@ -106,7 +106,9 @@
  * driven). A short delay keeps a burst of updates (typing, a scrolling
  * console) from cycling the PMIC per update. Only a driven waveform moves
  * the deadline: an update that is skipped (identical image) or has no LUT
- * does not, so a stream of no-op commits cannot keep the rails up. Stock
+ * does not, so a stream of no-op commits cannot keep the rails up; nor do
+ * the rails come up for a part that will not be driven
+ * (rk3026_ebc_do_refresh() looks before it takes). Stock
  * powers off right after each update; leaving the rails and VCOM up between
  * updates holds a DC bias on the panel.
  */
@@ -1166,6 +1168,31 @@ err:
 }
 
 /*
+ * The refresh thread brings the rails up for a part it will drive, before
+ * it takes the part (rk3026_ebc_do_refresh()). Rails already up are left
+ * as they are, their off deadline too: only a driven waveform moves it
+ * (rails_off_ms), and the thread looks at it between parts alone, so the
+ * rails cannot drop between this and the drive.
+ *
+ * KUnit replaces it with a static stub, so that the glue can be run with
+ * the rails down, coming up or failing, without a regulator.
+ *
+ * Returns 0 with both rails up, or ebc_rails_on()'s error.
+ */
+VISIBLE_IF_KUNIT int rk3026_ebc_raise_rails(struct rk3026_ebc *ebc)
+{
+	int ret;
+
+	KUNIT_STATIC_STUB_REDIRECT(rk3026_ebc_raise_rails, ebc);
+
+	mutex_lock(&ebc->rails_lock);
+	ret = ebc_rails_on(ebc);
+	mutex_unlock(&ebc->rails_lock);
+	return ret;
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_raise_rails);
+
+/*
  * Publish the record of a finished part, and count it. Called under
  * @image_lock, in the section of rk3026_ebc_scan_finish(), so a debugfs
  * "panel" snapshot (taken under @image_lock) never shows an image the
@@ -1216,21 +1243,67 @@ static void ebc_publish(struct rk3026_ebc *ebc, struct rk3026_ebc_last *last,
 }
 
 /*
+ * The image the next part is drawn from: @pre_shadow while @pre_split (the
+ * part is the @pending.pre a RESET was sent behind), else @next_shadow.
+ */
+static const u8 *ebc_take_target(struct rk3026_ebc *ebc)
+{
+	return ebc->pre_split ? ebc->pre_shadow : ebc->next_shadow;
+}
+
+/*
+ * Whether @part, the next one (rk3026_ebc_pending_peek()), will be driven:
+ * the CRTC is on, a waveform is loaded, and its scan would move something
+ * or is exempt from the skip (rk3026_ebc_should_skip(), on the target
+ * compared with the glass: rk3026_ebc_target_differs()). Under @image_lock.
+ * A part that will not be driven never raises the rails (rails_off_ms).
+ */
+static bool ebc_part_drives(struct rk3026_ebc *ebc,
+			    const struct rk3026_ebc_set *part)
+{
+	lockdep_assert_held(&ebc->image_lock);
+	if (!ebc->crtc_on || !ebc->waveform)
+		return false;
+	return !rk3026_ebc_should_skip(part, ebc->shadows.prev_unknown,
+				       !rk3026_ebc_target_differs(&ebc->shadows,
+								  ebc_take_target(ebc),
+								  &part->box));
+}
+
+/*
+ * What a part needs before its waveform, without @image_lock: the sensor,
+ * unless an update brought a temperature (@temp_valid), and the rails.
+ * Returns rk3026_ebc_raise_rails()'s result.
+ */
+static int ebc_prepare(struct rk3026_ebc *ebc, bool temp_valid, int *temp)
+{
+	if (!temp_valid)
+		*temp = ebc_read_temp(ebc);
+	return rk3026_ebc_raise_rails(ebc);
+}
+
+/*
  * Take the next part and drive it onto the panel, if anything is pending.
  * Runs only on the refresh thread.
  *
- * Three steps, so that no sender waits for a waveform:
+ * Four steps, so that no sender waits for a waveform:
  *
- *  1. under @image_lock: the part is taken (rk3026_ebc_pending_take(): what
+ *  1. under @image_lock: a look at the next part (rk3026_ebc_pending_peek()).
+ *     One that will be driven (ebc_part_drives()) gets the sensor and the
+ *     rails first, without the lock: what is sent while the rails come up
+ *     joins it, rather than make a part of its own behind it. One that will
+ *     not (CRTC off, no waveform, nothing to move) is taken at once, and
+ *     the rails stay as they are;
+ *  2. under @image_lock: the part is taken (rk3026_ebc_pending_take(): what
  *     was sent before a RESET, then the RESET alone, then what was sent
  *     after it), and its snapshot is built into @shadows.scan from
  *     @shadows.prev and the target (@next_shadow, or @pre_shadow for what
  *     was sent before a pending RESET). Senders may blit into @next_shadow
  *     and add to @pending as soon as the lock is dropped: the snapshot is
  *     what this scan drives, and their updates go to the next part.
- *  2. without it: the sensor, the rails, the snapshot into @next_virt, a
- *     repair if the glass is not known, the waveform;
- *  3. under @image_lock again: rk3026_ebc_scan_finish() says what the glass
+ *  3. without it: the snapshot into @next_virt, a repair if the glass is
+ *     not known, the waveform;
+ *  4. under @image_lock again: rk3026_ebc_scan_finish() says what the glass
  *     shows now and moves @pending.done_seq over the part, the DU cleanup
  *     budget follows it (rk3026_ebc_du_account()), and the record is
  *     published and traced (part_done) with them. The waiters on the part's
@@ -1246,29 +1319,38 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 	struct rk3026_ebc_du_budget budget;
 	struct rk3026_ebc_a2 a2 = { 0 };
 	struct rk3026_ebc_set part;
-	bool repair_due, identical, prev_changed, two_level;
+	bool repair_due, identical, prev_changed, two_level, prepared = false;
 	u32 frames, mode, scan_mode, resolved, lut_mode;
 	u32 changed_px = 0;
 	const u8 *lut, *target;
-	int temp;
-	int ret;
+	int temp = EBC_TEMP_FALLBACK;
+	int rails = 0;
 
 	mutex_lock(&ebc->image_lock);
-	if (!rk3026_ebc_pending_take(&ebc->pending, &part)) {
+	if (!rk3026_ebc_pending_peek(&ebc->pending, &part)) {
 		mutex_unlock(&ebc->image_lock);
 		return;
 	}
+
+	/*
+	 * Only this thread takes, so the part is still pending after the
+	 * unlock; senders may have joined it, which is the point.
+	 */
+	if (ebc_part_drives(ebc, &part)) {
+		mutex_unlock(&ebc->image_lock);
+		rails = ebc_prepare(ebc, part.temp_valid, &temp);
+		prepared = true;
+		mutex_lock(&ebc->image_lock);
+	}
+	rk3026_ebc_pending_take(&ebc->pending, &part);
 
 	/*
 	 * Taken while @pre_split, the part is the @pending.pre a RESET was sent
 	 * behind (it goes first): it is drawn from the image its updates were
 	 * sent into, and that image is the spare again.
 	 */
-	target = ebc->next_shadow;
-	if (ebc->pre_split) {
-		target = ebc->pre_shadow;
-		ebc->pre_split = false;
-	}
+	target = ebc_take_target(ebc);
+	ebc->pre_split = false;
 
 	memset(last, 0, sizeof(*last));
 	last->taken = ktime_get();
@@ -1405,14 +1487,17 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 	mutex_unlock(&ebc->image_lock);
 
 	/*
-	 * The sensor read is only needed when a waveform follows, so it comes
-	 * after the skip, and it is done without @image_lock so that no sender
-	 * waits for it.
+	 * The sensor and the rails came before the take (step 1) for a part
+	 * the look found it would drive. The look and the take see the same
+	 * part under one hold of the lock when it found otherwise, and such a
+	 * part ends above (CRTC off, no waveform, skipped); a part that gets
+	 * here without them gets them now, as before the look. The newest
+	 * temperature an update brought wins over the sensor's.
 	 */
+	if (!prepared)
+		rails = ebc_prepare(ebc, part.temp_valid, &temp);
 	if (part.temp_valid)
 		temp = part.temp;
-	else
-		temp = ebc_read_temp(ebc);
 	if (temp > EBC_TEMP_MAX)
 		temp = EBC_TEMP_FALLBACK;
 	last->temp = temp;
@@ -1420,15 +1505,12 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 
 	/*
 	 * Rails up before anything is driven, the repair below included. If they
-	 * do not come up nothing is driven and the glass is as it was, so the
+	 * did not come up nothing is driven and the glass is as it was, so the
 	 * prev image stays true and the part is carried into the next scan --
 	 * except for a RESET, which is only queued when the glass is not known
 	 * (the boot clear) and so leaves the mark (rk3026_ebc_scan_finish()).
 	 */
-	mutex_lock(&ebc->rails_lock);
-	ret = ebc_rails_on(ebc);
-	mutex_unlock(&ebc->rails_lock);
-	if (ret) {
+	if (rails) {
 		last->outcome = EBC_OUTCOME_NO_RAILS;
 		goto relock;
 	}

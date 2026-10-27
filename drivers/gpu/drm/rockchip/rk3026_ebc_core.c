@@ -219,6 +219,36 @@ bool rk3026_ebc_pending_add(struct rk3026_ebc_pending *p,
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_pending_add);
 
 /**
+ * rk3026_ebc_pending_peek - the part the next take would give
+ * @p: pending state
+ * @part: returns the part, as rk3026_ebc_pending_take() would give it
+ *
+ * @p is left as it is, so the refresh thread can look at the next part
+ * (whether it will be driven, rk3026_ebc_do_refresh()) before it takes it.
+ *
+ * Returns false, with @part cleared, if nothing is pending.
+ */
+bool rk3026_ebc_pending_peek(const struct rk3026_ebc_pending *p,
+			     struct rk3026_ebc_set *part)
+{
+	if (rk3026_ebc_pending_empty(p)) {
+		memset(part, 0, sizeof(*part));
+		return false;
+	}
+
+	if (p->pre.merged) {
+		*part = p->pre;
+		if (p->carry.merged)
+			ebc_set_merge(part, false, &p->carry);
+		return true;
+	}
+
+	*part = p->reset;
+	return true;
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_pending_peek);
+
+/**
  * rk3026_ebc_pending_take - take the next part for one scan, in seq order
  * @p: pending state
  * @part: returns the part
@@ -232,22 +262,15 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_pending_add);
 bool rk3026_ebc_pending_take(struct rk3026_ebc_pending *p,
 			     struct rk3026_ebc_set *part)
 {
-	if (rk3026_ebc_pending_empty(p)) {
-		memset(part, 0, sizeof(*part));
+	if (!rk3026_ebc_pending_peek(p, part))
 		return false;
-	}
 
 	if (p->pre.merged) {
-		*part = p->pre;
 		memset(&p->pre, 0, sizeof(p->pre));
-		if (p->carry.merged) {
-			ebc_set_merge(part, false, &p->carry);
-			memset(&p->carry, 0, sizeof(p->carry));
-		}
+		memset(&p->carry, 0, sizeof(p->carry));
 		return true;
 	}
 
-	*part = p->reset;
 	p->pre = p->post;
 	memset(&p->reset, 0, sizeof(p->reset));
 	memset(&p->post, 0, sizeof(p->post));
@@ -412,6 +435,39 @@ bool rk3026_ebc_build_snapshot(const struct rk3026_ebc_shadows *sh,
 	return acc.moves != 0;
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_build_snapshot);
+
+/**
+ * rk3026_ebc_target_differs - whether a part's target differs from the glass
+ * @sh: the shadow images; only @sh->prev is read
+ * @next: the target image the senders write, laid out like the shadows
+ * @box: the part's bounding box, in pixels
+ *
+ * The bytes of @box, widened as rk3026_ebc_build_snapshot() widens it,
+ * compared between @next and @sh->prev, without building a snapshot. Where
+ * they are equal the snapshot keeps @prev, so false here means the snapshot
+ * would be identical. True does not promise the reverse: a two-level mode
+ * may threshold a change back to what @prev holds.
+ *
+ * Return: true if some byte of the widened box differs.
+ */
+bool rk3026_ebc_target_differs(const struct rk3026_ebc_shadows *sh,
+			       const u8 *next, const struct drm_rect *box)
+{
+	struct drm_rect r = *box;
+	int y;
+
+	if (!rk3026_ebc_widen_clip(&r, sh->pitch * 2, sh->height))
+		return false;
+
+	for (y = r.y1; y < r.y2; y++) {
+		size_t off = (size_t)y * sh->pitch + r.x1 / 2;
+
+		if (memcmp(next + off, sh->prev + off, (r.x2 - r.x1) / 2))
+			return true;
+	}
+	return false;
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_target_differs);
 
 /**
  * rk3026_ebc_should_skip - whether a part's scan would drive nothing

@@ -343,8 +343,9 @@ struct rk3026_ebc_update {
  * "timing") are rounded up and at least 1 when measured; 0 means none.
  *
  * @taken is when the part was taken; a scan_start event reports the time
- * from it to the waveform (the sensor, the rails, a repair RESET before the
- * part). @du_area is the plane parts' DU budget spent at the take, before
+ * from it to the waveform (the snapshot, a repair RESET before the part;
+ * the sensor and the rails come before the take, rk3026_ebc_do_refresh()).
+ * @du_area is the plane parts' DU budget spent at the take, before
  * the part is accounted (rk3026_ebc_du_account()). @gap_us and @tries are
  * the time the take waited for the senders to go quiet and the retries of
  * a carried part; @gave_up says the retries ended without a drive.
@@ -790,6 +791,7 @@ bool rk3026_ebc_plane_box(const struct drm_plane_state *old_state,
 bool rk3026_ebc_plane_update(struct rk3026_ebc *ebc, const void *src,
 			     unsigned int src_pitch, const struct drm_rect *box);
 bool rk3026_ebc_idle_tick(struct rk3026_ebc *ebc, unsigned long now);
+int rk3026_ebc_raise_rails(struct rk3026_ebc *ebc);
 u32 rk3026_ebc_setup_us(struct rk3026_ebc *ebc,
 			const struct rk3026_ebc_last *last);
 #endif
@@ -807,12 +809,16 @@ u32 rk3026_ebc_dsp_ctrl_mode(u32 mode);
 u32 rk3026_ebc_us_between(ktime_t start, ktime_t end);
 bool rk3026_ebc_pending_add(struct rk3026_ebc_pending *p,
 			    const struct rk3026_ebc_update *upd, u32 *seq);
+bool rk3026_ebc_pending_peek(const struct rk3026_ebc_pending *p,
+			     struct rk3026_ebc_set *part);
 bool rk3026_ebc_pending_take(struct rk3026_ebc_pending *p,
 			     struct rk3026_ebc_set *part);
 bool rk3026_ebc_build_snapshot(const struct rk3026_ebc_shadows *sh,
 			       const u8 *next, const struct drm_rect *box,
 			       u32 *mode, bool *two_level, bool *over_grey,
 			       u32 *changed_px);
+bool rk3026_ebc_target_differs(const struct rk3026_ebc_shadows *sh,
+			       const u8 *next, const struct drm_rect *box);
 bool rk3026_ebc_should_skip(const struct rk3026_ebc_set *part,
 			    bool prev_unknown, bool identical);
 u32 rk3026_ebc_scan_mode(const struct rk3026_ebc_set *part, bool repaired);

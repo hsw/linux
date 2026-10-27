@@ -351,6 +351,64 @@ static void ebc_test_pending_mxcfb_full(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, t_full_flag(EBC_MODE_FULL, EBC_SOURCE_PLANE));
 }
 
+/*
+ * A peek gives the part the take then gives and leaves the pending state
+ * as it was: @pre with the carry merged in (no longer auto), then the RESET
+ * alone, then what was sent after it. Nothing pending gives nothing.
+ */
+static void ebc_test_pending_peek(struct kunit *test)
+{
+	struct drm_rect a = DRM_RECT_INIT(0, 0, 4, 2);
+	struct drm_rect b = DRM_RECT_INIT(8, 2, 4, 2);
+	struct rk3026_ebc_pending p = {};
+	struct rk3026_ebc_set peek, part;
+	u32 s2, s3, s4;
+
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_pending_peek(&p, &peek));
+	KUNIT_EXPECT_EQ(test, peek.merged, 0);
+
+	t_add_auto(&p, &a, EBC_MODE_FULL, EBC_SOURCE_PLANE);
+	s2 = t_add_auto(&p, &a, EBC_MODE_FULL, EBC_SOURCE_PLANE);
+	s3 = t_add(&p, &t_panel, EBC_MODE_RESET, EBC_SOURCE_ENABLE);
+	s4 = t_add(&p, &b, EBC_MODE_PART, EBC_SOURCE_MXCFB);
+	p.carry = (struct rk3026_ebc_set) {
+		.box = b, .mode = EBC_MODE_PART, .merged = 1,
+	};
+
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_pending_peek(&p, &peek));
+	KUNIT_EXPECT_EQ(test, peek.seq, s2);
+	KUNIT_EXPECT_EQ(test, peek.merged, 2);
+	KUNIT_EXPECT_FALSE(test, peek.auto_ok);
+	KUNIT_EXPECT_EQ(test, peek.box.x2, 12);
+	KUNIT_EXPECT_EQ(test, peek.box.y2, 4);
+	/* Left as it was. */
+	KUNIT_EXPECT_EQ(test, p.pre.merged, 2);
+	KUNIT_EXPECT_TRUE(test, p.pre.auto_ok);
+	KUNIT_EXPECT_EQ(test, p.pre.box.x2, 4);
+	KUNIT_EXPECT_EQ(test, p.carry.merged, 1);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_pending_parts(&p), 3);
+
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_pending_take(&p, &part));
+	KUNIT_EXPECT_EQ(test, part.seq, peek.seq);
+	KUNIT_EXPECT_EQ(test, part.merged, peek.merged);
+	KUNIT_EXPECT_EQ(test, part.auto_ok, peek.auto_ok);
+	KUNIT_EXPECT_TRUE(test, drm_rect_equals(&part.box, &peek.box));
+	KUNIT_EXPECT_FALSE(test, p.carry.merged);
+
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_pending_peek(&p, &peek));
+	KUNIT_EXPECT_EQ(test, peek.mode, EBC_MODE_RESET);
+	KUNIT_EXPECT_EQ(test, peek.seq, s3);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_pending_parts(&p), 2);
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_pending_take(&p, &part));
+	KUNIT_EXPECT_EQ(test, part.seq, s3);
+
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_pending_peek(&p, &peek));
+	KUNIT_EXPECT_EQ(test, peek.seq, s4);
+	KUNIT_EXPECT_TRUE(test, drm_rect_equals(&peek.box, &b));
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_pending_take(&p, &part));
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_pending_peek(&p, &peek));
+}
+
 /* --- the snapshot --- */
 
 /*
@@ -624,6 +682,46 @@ static void ebc_test_snapshot_a2_over_grey(struct kunit *test)
 					  &over_grey, &changed);
 		KUNIT_EXPECT_FALSE(test, over_grey);
 	}
+}
+
+/*
+ * The target compared with the glass over the box, widened to whole bytes
+ * as the snapshot widens it: a change outside the box is not seen, one on
+ * the widened edge is; where it finds none the snapshot moves nothing.
+ */
+static void ebc_test_target_differs(struct kunit *test)
+{
+	u8 *prev = t_img_alloc(test, 15);
+	u8 *next = t_img_alloc(test, 15);
+	u8 *dst = t_img_alloc(test, 15);
+	const struct rk3026_ebc_shadows sh = {
+		.prev = prev, .pitch = T_PITCH, .height = T_H,
+	};
+	/* x 5..9, widened to 4..10. */
+	struct drm_rect box = DRM_RECT_INIT(5, 2, 4, 2);
+	struct drm_rect off = DRM_RECT_INIT(T_W, 0, 4, 2);
+
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_target_differs(&sh, next, &box));
+
+	t_px_set(next, 12, 3, 0);
+	t_px_set(next, 6, 1, 0);
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_target_differs(&sh, next, &box));
+	KUNIT_EXPECT_FALSE(test, t_snapshot(dst, prev, next, &box,
+					    EBC_MODE_FULL));
+
+	t_px_set(next, 4, 2, 0);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_target_differs(&sh, next, &box));
+
+	t_img_fill(next, 15);
+	t_px_set(next, 8, 3, 7);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_target_differs(&sh, next, &box));
+	t_px_set(next, 8, 3, 15);
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_target_differs(&sh, next, &box));
+
+	t_img_fill(next, 0);
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_target_differs(&sh, next, &off));
+	t_expect_guard(test, prev);
+	t_expect_guard(test, next);
 }
 
 /* --- skip and scan mode --- */
@@ -2469,6 +2567,7 @@ static struct kunit_case rk3026_ebc_core_test_cases[] = {
 	KUNIT_CASE(ebc_test_pending_add),
 	KUNIT_CASE(ebc_test_pending_temp_newest),
 	KUNIT_CASE(ebc_test_pending_mxcfb_full),
+	KUNIT_CASE(ebc_test_pending_peek),
 	KUNIT_CASE(ebc_test_snapshot_outside_box),
 	KUNIT_CASE(ebc_test_snapshot_keeps_equal),
 	KUNIT_CASE(ebc_test_snapshot_two_level),
@@ -2476,6 +2575,7 @@ static struct kunit_case rk3026_ebc_core_test_cases[] = {
 	KUNIT_CASE(ebc_test_snapshot_edges),
 	KUNIT_CASE(ebc_test_snapshot_moves),
 	KUNIT_CASE(ebc_test_snapshot_a2_over_grey),
+	KUNIT_CASE(ebc_test_target_differs),
 	KUNIT_CASE(ebc_test_skip),
 	KUNIT_CASE(ebc_test_scan_mode),
 	KUNIT_CASE_PARAM(ebc_test_resolve_mode, t_resolve_gen_params),
@@ -3800,12 +3900,22 @@ static void ebc_test_glue_du_reset(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ebc->du_area, 0);
 }
 
-/* The waveforms the static stub of rk3026_ebc_drive() was asked for. */
+/*
+ * The waveforms the static stub of rk3026_ebc_drive() was asked for, and
+ * what the stub of rk3026_ebc_raise_rails() (t_rails()) does: @rails counts
+ * its calls, @rails_ret is what they return, and with @rails_fb the first
+ * one sends a plane update of @rails_box from it, as a sender would while
+ * the rails come up.
+ */
 struct t_drives {
 	unsigned int	n;
 	u32		mode[8];
 	u32		seq[8];
 	u32		setup_us[8];
+	unsigned int	rails;
+	int		rails_ret;
+	const u32	*rails_fb;
+	struct drm_rect	rails_box;
 };
 
 /*
@@ -4605,6 +4715,161 @@ static void ebc_test_glue_part_record(struct kunit *test)
 	KUNIT_EXPECT_GE(test, d.setup_us[2], d.setup_us[1]);
 }
 
+/* rk3026_ebc_raise_rails() without a regulator, see struct t_drives. */
+static int t_rails(struct rk3026_ebc *ebc)
+{
+	struct t_drives *d = kunit_get_current_test()->priv;
+
+	if (!d->rails++ && d->rails_fb)
+		rk3026_ebc_plane_update(ebc, d->rails_fb, T_W * 4,
+					&d->rails_box);
+	if (d->rails_ret)
+		return d->rails_ret;
+	ebc->epd_on = true;
+	ebc->rails_on = true;
+	return 0;
+}
+
+/* t_driven_ebc() with the rails down and raised by t_rails(). */
+static struct rk3026_ebc *t_rails_ebc(struct kunit *test, struct t_drives *d)
+{
+	struct rk3026_ebc *ebc = t_driven_ebc(test, d, true);
+
+	ebc->epd_on = false;
+	kunit_activate_static_stub(test, rk3026_ebc_raise_rails, t_rails);
+	return ebc;
+}
+
+/*
+ * A part that will not be driven leaves the rails down: skipped (the
+ * target is what the glass shows), dropped with the CRTC off, carried
+ * without a waveform. The next part that will be driven, the carry with
+ * it, brings them up, once.
+ */
+static void ebc_test_glue_rails_not_raised(struct kunit *test)
+{
+	struct t_drives d;
+	struct rk3026_ebc *ebc = t_rails_ebc(test, &d);
+	struct ebc_waveform *wf = ebc->waveform;
+	u32 *white = t_plane_fb(test, 0xffffff);
+	u32 *black = t_plane_fb(test, 0);
+	struct rk3026_ebc_last last;
+
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, white, T_W * 4,
+							&t_panel));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_SKIPPED);
+
+	ebc->crtc_on = false;
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
+							&t_panel));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_CRTC_OFF);
+
+	ebc->crtc_on = true;
+	ebc->waveform = NULL;
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
+							&t_panel));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_NO_WAVEFORM);
+	KUNIT_EXPECT_TRUE(test, ebc->pending.carry.merged);
+
+	KUNIT_EXPECT_EQ(test, d.rails, 0);
+	KUNIT_EXPECT_FALSE(test, ebc->epd_on);
+	KUNIT_EXPECT_FALSE(test, ebc->rails_on);
+	KUNIT_EXPECT_FALSE(test, last.temp_read);
+	KUNIT_EXPECT_EQ(test, d.n, 0);
+
+	ebc->waveform = wf;
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
+							&t_panel));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_EXPECT_EQ(test, d.rails, 1);
+	KUNIT_EXPECT_TRUE(test, ebc->epd_on);
+	KUNIT_EXPECT_EQ(test, d.n, 1);
+	KUNIT_EXPECT_FALSE(test, ebc->pending.carry.merged);
+}
+
+/*
+ * The rails come up before the take: a plane update sent while they come
+ * up joins the part, which is driven once, for the newer seq, over both
+ * boxes. With the rails up the next part is asked for them again (the
+ * real rk3026_ebc_raise_rails() leaves them as they are) and taken alone.
+ */
+static void ebc_test_glue_rails_before_take(struct kunit *test)
+{
+	struct t_drives d;
+	struct rk3026_ebc *ebc = t_rails_ebc(test, &d);
+	struct drm_rect a = DRM_RECT_INIT(0, 0, 4, 2);
+	struct drm_rect c = DRM_RECT_INIT(4, 4, 2, 2);
+	u32 *fb = t_plane_fb(test, 0xffffff);
+	struct rk3026_ebc_last last;
+	u32 first;
+
+	t_fb_box(fb, 0, 0, 4, 2, 0);
+	t_fb_box(fb, 8, 2, 12, 4, 0);
+	d.rails_fb = fb;
+	d.rails_box = DRM_RECT_INIT(8, 2, 4, 2);
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, fb, T_W * 4, &a));
+	first = ebc->pending.queued_seq;
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, d.rails, 1);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_EXPECT_EQ(test, last.merged, 2);
+	KUNIT_EXPECT_EQ(test, last.seq, first + 1);
+	KUNIT_EXPECT_EQ(test, last.clip.x1, 0);
+	KUNIT_EXPECT_EQ(test, last.clip.y1, 0);
+	KUNIT_EXPECT_EQ(test, last.clip.x2, 12);
+	KUNIT_EXPECT_EQ(test, last.clip.y2, 4);
+	KUNIT_EXPECT_EQ(test, last.changed_px, 16);
+	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_BLACK_WHITE);
+	KUNIT_EXPECT_TRUE(test, last.temp_read);
+	KUNIT_ASSERT_EQ(test, d.n, 1);
+	KUNIT_EXPECT_EQ(test, d.seq[0], first + 1);
+	KUNIT_EXPECT_EQ(test, ebc->stats.coalesced, 1);
+	KUNIT_EXPECT_EQ(test, t_px(ebc->shadows.prev, 9, 3), 0);
+	KUNIT_EXPECT_EQ(test, t_px(ebc->shadows.prev, 5, 1), 15);
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_work_pending(&ebc->pending));
+
+	d.rails_fb = NULL;
+	t_fb_box(fb, 4, 4, 6, 6, 0);
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, fb, T_W * 4, &c));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, d.rails, 2);
+	KUNIT_EXPECT_EQ(test, last.merged, 1);
+	KUNIT_EXPECT_TRUE(test, drm_rect_equals(&last.clip, &c));
+	KUNIT_EXPECT_EQ(test, d.n, 2);
+}
+
+/*
+ * Rails that do not come up are asked once for the part: it is taken all
+ * the same, with the sensor read before the take, and carried.
+ */
+static void ebc_test_glue_rails_fail(struct kunit *test)
+{
+	struct t_drives d;
+	struct rk3026_ebc *ebc = t_rails_ebc(test, &d);
+	u32 *black = t_plane_fb(test, 0);
+	struct rk3026_ebc_last last;
+	u32 seq;
+
+	d.rails_ret = -EIO;
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
+							&t_panel));
+	seq = ebc->pending.queued_seq;
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_NO_RAILS);
+	KUNIT_EXPECT_EQ(test, d.rails, 1);
+	KUNIT_EXPECT_EQ(test, d.n, 0);
+	KUNIT_EXPECT_TRUE(test, last.temp_read);
+	KUNIT_EXPECT_EQ(test, last.temp, EBC_TEMP_FALLBACK);
+	KUNIT_EXPECT_TRUE(test, ebc->pending.carry.merged);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_seq_finished(&ebc->pending, seq));
+	KUNIT_EXPECT_EQ(test, ebc->stats.dropped, 1);
+	KUNIT_EXPECT_FALSE(test, ebc->epd_on);
+}
+
 #if IS_ENABLED(CONFIG_DRM_RK3026_EBC_MXCFB)
 /* The part one mxcfb send queued, taken as the refresh thread takes it. */
 static int t_mxcfb_part(struct rk3026_ebc *ebc, const u32 *src,
@@ -5149,6 +5414,9 @@ static struct kunit_case rk3026_ebc_glue_test_cases[] = {
 	KUNIT_CASE(ebc_test_glue_idle_busy),
 	KUNIT_CASE(ebc_test_glue_du_repaired),
 	KUNIT_CASE(ebc_test_glue_part_record),
+	KUNIT_CASE(ebc_test_glue_rails_not_raised),
+	KUNIT_CASE(ebc_test_glue_rails_before_take),
+	KUNIT_CASE(ebc_test_glue_rails_fail),
 #if IS_ENABLED(CONFIG_DRM_RK3026_EBC_MXCFB)
 	KUNIT_CASE(ebc_test_glue_mxcfb_send),
 #endif

@@ -101,14 +101,16 @@
 
 /*
  * The panel's high-voltage rails and VCOM are on only around refreshes: the
- * refresh thread switches them on before it drives a waveform and off this
- * long after the last waveform ended (or after they came up, if none was
- * driven). A short delay keeps a burst of updates (typing, a scrolling
+ * refresh thread switches them on for a part it will drive, before its take
+ * (rk3026_ebc_do_refresh()) or when the take's quiet gap opens for it
+ * (rk3026_ebc_take_ready()), and off this long after the last waveform
+ * ended (or after they came up, if none was driven); while a gap is open
+ * they are held past the deadline (rk3026_ebc_rails_off_due()), at most the
+ * gap's cap. A short delay keeps a burst of updates (typing, a scrolling
  * console) from cycling the PMIC per update. Only a driven waveform moves
  * the deadline: an update that is skipped (identical image) or has no LUT
  * does not, so a stream of no-op commits cannot keep the rails up; nor do
- * the rails come up for a part that will not be driven
- * (rk3026_ebc_do_refresh() looks before it takes). Stock
+ * the rails come up for a part the look finds will not be driven. Stock
  * powers off right after each update; leaving the rails and VCOM up between
  * updates holds a DC bias on the panel.
  */
@@ -242,13 +244,15 @@ static unsigned int ebc_part_max_ms(struct rk3026_ebc *ebc)
 /*
  * Longest a wait on one update blocks (rk3026_ebc_wait_seq():
  * MXCFB_WAIT_FOR_UPDATE_COMPLETE, CRTC enable and disable): EBC_WAIT_PARTS
- * parts at their longest, 164 s with every chunk budget at its 5 s floor.
- * Past this the thread is stuck outside the EBC (an I2C transfer, say), and
- * the waiter goes on without it.
+ * parts at their longest, and the quiet gap its own part may wait in before
+ * the take, at most EBC_TAKE_CAP_MAX_MS: the parts ahead of it are in flight
+ * already or exempt (in front of a RESET, or the RESET). 165 s with every
+ * chunk budget at its 5 s floor. Past this the thread is stuck outside the
+ * EBC (an I2C transfer, say), and the waiter goes on without it.
  */
 VISIBLE_IF_KUNIT unsigned int rk3026_ebc_wait_timeout_ms(struct rk3026_ebc *ebc)
 {
-	return EBC_WAIT_PARTS * ebc_part_max_ms(ebc);
+	return EBC_WAIT_PARTS * ebc_part_max_ms(ebc) + EBC_TAKE_CAP_MAX_MS;
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_wait_timeout_ms);
 
@@ -796,6 +800,19 @@ static int ebc_read_temp(struct rk3026_ebc *ebc)
 	return temp;
 }
 
+/*
+ * The clock of the take's quiet gap: when an update was queued, when a part
+ * finished, the refresh thread's looks (rk3026_ebc_take_ready()). KUnit
+ * replaces it with a static stub, so that the gap can be run on a fake
+ * clock.
+ */
+VISIBLE_IF_KUNIT ktime_t rk3026_ebc_clock(struct rk3026_ebc *ebc)
+{
+	KUNIT_STATIC_STUB_REDIRECT(rk3026_ebc_clock, ebc);
+	return ktime_get();
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_clock);
+
 /* Microseconds since @start, as a record keeps them (rk3026_ebc_us_between()). */
 static u32 ebc_us_since(ktime_t start)
 {
@@ -890,13 +907,14 @@ static void ebc_stop_scan(struct rk3026_ebc *ebc)
 }
 
 /*
- * The time from the take of @last's part to now, for the scan_start event
- * of each of its waveforms (@last->taken).
+ * The time from the take of @last's part to now (rk3026_ebc_clock()), for
+ * the scan_start event of each of its waveforms: the snapshot, and a repair
+ * RESET in front of the part.
  */
 VISIBLE_IF_KUNIT u32 rk3026_ebc_setup_us(struct rk3026_ebc *ebc,
 					 const struct rk3026_ebc_last *last)
 {
-	return rk3026_ebc_us_between(last->taken, ktime_get());
+	return rk3026_ebc_us_between(last->taken, rk3026_ebc_clock(ebc));
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_setup_us);
 
@@ -1169,10 +1187,11 @@ err:
 
 /*
  * The refresh thread brings the rails up for a part it will drive, before
- * it takes the part (rk3026_ebc_do_refresh()). Rails already up are left
- * as they are, their off deadline too: only a driven waveform moves it
- * (rails_off_ms), and the thread looks at it between parts alone, so the
- * rails cannot drop between this and the drive.
+ * it takes the part (rk3026_ebc_do_refresh()), or when the take's gap opens
+ * for it (rk3026_ebc_take_ready()). Rails already up are left as they are,
+ * their off deadline too: only a driven waveform moves it (rails_off_ms),
+ * and the thread looks at it between parts alone, and not while a gap is
+ * open, so the rails cannot drop between this and the drive.
  *
  * KUnit replaces it with a static stub, so that the glue can be run with
  * the rails down, coming up or failing, without a regulator.
@@ -1353,7 +1372,7 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 	ebc->pre_split = false;
 
 	memset(last, 0, sizeof(*last));
-	last->taken = ktime_get();
+	last->taken = rk3026_ebc_clock(ebc);
 	last->seq = part.seq;
 	last->du_area = ebc->du_area;
 	last->clip = part.box;
@@ -1364,6 +1383,9 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 	last->merged = part.merged;
 	last->source = part.source;
 	last->blit_us = part.blit_us;
+	/* The gap the take waited in, if one was open (rk3026_ebc_take_ready()). */
+	last->gap_us = ebc->gap.us;
+	ebc->gap.us = 0;
 
 	/*
 	 * Nothing reaches the panel while the CRTC is off: the rails stay
@@ -1610,6 +1632,8 @@ finish:
 		WRITE_ONCE(ebc->idle_last_plane, jiffies);
 		WRITE_ONCE(ebc->idle_armed, true);
 	}
+	/* The cap of the next take's gap counts from here at the earliest. */
+	ebc->take_done = rk3026_ebc_clock(ebc);
 	ebc_publish(ebc, last, start);
 	trace_rk3026_ebc_part_done(last, ebc->du_area);
 	mutex_unlock(&ebc->image_lock);
@@ -1676,12 +1700,13 @@ static bool ebc_idle_at(struct rk3026_ebc *ebc, unsigned long *at)
  * A plane update that arrived after the lockless read moved the deadline:
  * the look under the lock sees it, and leaves the cleanup armed.
  *
- * Between the queue here and the take in rk3026_ebc_do_refresh() the
- * thread drops @image_lock for a moment, and an update sent in that
- * window joins the cleanup and is drawn in its whole-panel FULL. A first
+ * The cleanup does not wait for the take's quiet gap (exempt,
+ * rk3026_ebc_take_wait()): it is the whole panel already, and nothing
+ * sent after it would make it bigger. An update sent between the queue
+ * here and the take in rk3026_ebc_do_refresh() (the rails coming up, if
+ * they are down) joins it and is drawn in its whole-panel FULL. A first
  * mxcfb send gets a full flash it did not ask for then, once; such a
- * client runs its own fulls, and the window is the thread's own unlock
- * and lock.
+ * client runs its own fulls.
  *
  * Return: true if the cleanup was queued.
  */
@@ -1721,9 +1746,141 @@ VISIBLE_IF_KUNIT bool rk3026_ebc_idle_tick(struct rk3026_ebc *ebc,
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_idle_tick);
 
+/*
+ * The next part as rk3026_ebc_take_wait() reads it (struct
+ * rk3026_ebc_take), from @part, as rk3026_ebc_pending_peek() gave it.
+ * Under @image_lock.
+ */
+static void ebc_take_state(struct rk3026_ebc *ebc,
+			   const struct rk3026_ebc_set *part,
+			   struct rk3026_ebc_take *t)
+{
+	struct rk3026_ebc_du_budget budget = {
+		.area		= ebc->du_area,
+		.limit		= READ_ONCE(ebc->du_cleanup_area),
+		.ceiling	= READ_ONCE(ebc->du_cleanup_ceiling),
+	};
+	u64 area = 0;
+
+	lockdep_assert_held(&ebc->image_lock);
+	if (drm_rect_visible(&part->box))
+		area = (u64)drm_rect_width(&part->box) *
+		       drm_rect_height(&part->box);
+
+	*t = (struct rk3026_ebc_take) {
+		.first		= part->first,
+		.last		= part->last,
+		.prev_done	= ebc->take_done,
+		.count		= part->merged,
+		.area		= min_t(u64, area, U32_MAX),
+		.big_area	= READ_ONCE(ebc->du_cleanup_big_area),
+		.quiet_us	= READ_ONCE(ebc->take_quiet_us),
+		.cap_ms		= READ_ONCE(ebc->take_cap_ms),
+		.full		= force_mode == EBC_MODE_FULL ||
+				  (part->auto_ok && part->has_plane &&
+				   rk3026_ebc_du_at_ceiling(&budget)),
+		.exempt		= part->has_mxcfb || part->cleanup_idle ||
+				  part->mode == EBC_MODE_RESET ||
+				  ebc->pending.reset.merged,
+		.rails_up	= ebc_rails_up(ebc),
+		.open		= ebc->gap.open,
+	};
+}
+
+/* The gap ends at @now, if one is open: its length goes to the next part. */
+static void ebc_gap_close(struct rk3026_ebc *ebc, ktime_t now)
+{
+	if (!ebc->gap.open)
+		return;
+	ebc->gap.us = rk3026_ebc_us_between(ebc->gap.start, now);
+	ebc->gap.open = false;
+}
+
+/**
+ * rk3026_ebc_take_ready - whether the refresh thread takes the next part now
+ * @ebc: controller
+ * @now: the time of the look (rk3026_ebc_clock())
+ *
+ * Called by the refresh thread when a part is pending or a gap is open.
+ * Under @image_lock it looks at the next part and asks
+ * rk3026_ebc_take_wait(), which holds the rules, whether to wait for the
+ * senders to go quiet.
+ *
+ * A gap opens only for a part that will be driven (ebc_part_drives()); the
+ * look cannot tell every part that will be skipped (a two-level change
+ * that thresholds back to the glass, updates that join and restore it),
+ * and such a part raised the rails for nothing, once. Opening the gap
+ * raises the rails at once, without the lock: they take tens of ms, and
+ * updates sent meanwhile join the part. Rails that do not come up end the
+ * gap: the part is taken and carried (rk3026_ebc_do_refresh() asks for
+ * them once more).
+ *
+ * Every look records the newest seq in @gap.seen, for the thread's wait
+ * (rk3026_ebc_gap_woken()). The gap ends at its deadline, when the part
+ * becomes exempt or the gap is switched off, or when the CRTC goes off
+ * (rk3026_ebc_crtc_off()); its length is the next part's @gap_us.
+ *
+ * Return: true to take the next part now; false while the gap is open,
+ * which ends at @gap.at unless a newer update moves it.
+ */
+VISIBLE_IF_KUNIT bool rk3026_ebc_take_ready(struct rk3026_ebc *ebc,
+					    ktime_t now)
+{
+	struct rk3026_ebc_gap *gap = &ebc->gap;
+	struct rk3026_ebc_set part;
+	struct rk3026_ebc_take t;
+	bool raise = false;
+
+	mutex_lock(&ebc->image_lock);
+	gap->seen = ebc->pending.queued_seq;
+	if (!rk3026_ebc_pending_peek(&ebc->pending, &part) || !ebc->crtc_on)
+		goto take;
+	ebc_take_state(ebc, &part, &t);
+	if (!rk3026_ebc_take_wait(&t, now, &gap->at))
+		goto take;
+	if (!gap->open) {
+		if (!ebc_part_drives(ebc, &part))
+			goto take;
+		gap->open = true;
+		gap->start = now;
+		raise = !t.rails_up;
+	}
+	mutex_unlock(&ebc->image_lock);
+
+	if (raise && rk3026_ebc_raise_rails(ebc)) {
+		ebc_gap_close(ebc, rk3026_ebc_clock(ebc));
+		return true;
+	}
+	return false;
+
+take:
+	ebc_gap_close(ebc, now);
+	mutex_unlock(&ebc->image_lock);
+	return true;
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_take_ready);
+
+/*
+ * The refresh thread's wait while the take's gap is open: for an update
+ * newer than its last look, the CRTC going off, or the gap's end. The gap
+ * is a few ms, so the wait runs on an hrtimer, not on jiffies.
+ */
+static void ebc_gap_wait(struct rk3026_ebc *ebc)
+{
+	const struct rk3026_ebc_gap *gap = &ebc->gap;
+
+	wait_event_interruptible_hrtimeout(ebc->update_wq,
+					   rk3026_ebc_gap_woken(&ebc->pending,
+								gap->seen,
+								READ_ONCE(ebc->crtc_on)) ||
+					   kthread_should_stop(),
+					   ktime_sub(gap->at, rk3026_ebc_clock(ebc)));
+}
+
 static int ebc_refresh_thread(void *data)
 {
 	struct rk3026_ebc *ebc = data;
+	struct rk3026_ebc_gap *gap = &ebc->gap;
 
 	while (!kthread_should_stop()) {
 		struct rk3026_ebc_last last;
@@ -1735,21 +1892,36 @@ static int ebc_refresh_thread(void *data)
 		 * With the rails up, drop them at the deadline. Checked on every
 		 * pass, not only when the wait times out: a steady stream of
 		 * skipped updates keeps the thread busy and must not keep the
-		 * rails up.
+		 * rails up. Held while the take's gap is open: that part will
+		 * be driven, and the gap's cap bounds the hold.
 		 */
 		rails_on = READ_ONCE(ebc->rails_on);
 		rails_at = READ_ONCE(ebc->rails_off_at);
-		if (rails_on && time_after_eq(now, rails_at)) {
+		if (rk3026_ebc_rails_off_due(rails_on, rails_at, gap->open, now)) {
 			ebc_idle_rails_off(ebc);
 			continue;
 		}
 		/*
 		 * The idle cleanup, at its deadline: the look disarms it, and
-		 * queues it if it is due, which the wait below then takes.
+		 * queues it if it is due, which the next pass then takes. Not
+		 * while a gap is open: the part pending holds the glass, and
+		 * its end arms the cleanup again.
 		 */
 		idle_armed = ebc_idle_at(ebc, &idle_at);
-		if (idle_armed && time_after_eq(now, idle_at)) {
+		if (!gap->open && idle_armed && time_after_eq(now, idle_at)) {
 			rk3026_ebc_idle_tick(ebc, now);
+			continue;
+		}
+		/*
+		 * A part to take, or a gap open for one: take it now, or wait
+		 * for a newer update or the gap's end (ebc_gap_wait()).
+		 */
+		if (gap->open || rk3026_ebc_work_pending(&ebc->pending)) {
+			if (rk3026_ebc_take_ready(ebc, rk3026_ebc_clock(ebc))) {
+				rk3026_ebc_do_refresh(ebc, &last);
+				continue;
+			}
+			ebc_gap_wait(ebc);
 			continue;
 		}
 		if (rk3026_ebc_thread_deadline(rails_on, rails_at, idle_armed,
@@ -1763,13 +1935,9 @@ static int ebc_refresh_thread(void *data)
 		 * (rk3026_ebc_add_update()), and the next pass takes it.
 		 */
 		wait_event_interruptible_timeout(ebc->update_wq,
-						 rk3026_ebc_work_pending(&ebc->pending) ||
+						 rk3026_ebc_thread_woken(&ebc->pending) ||
 						 kthread_should_stop(),
 						 timeout);
-		if (kthread_should_stop())
-			break;
-
-		rk3026_ebc_do_refresh(ebc, &last);
 	}
 
 	mutex_lock(&ebc->rails_lock);
@@ -1867,15 +2035,20 @@ static void ebc_wait_finished(struct rk3026_ebc *ebc, u32 seq)
  * plane's framebuffer may not. The idle cleanup writes no pixel, so it
  * does not.
  *
+ * The update is stamped with the time it was queued (rk3026_ebc_clock()),
+ * for the take's quiet gap (rk3026_ebc_take_ready()).
+ *
  * Returns the update's seq, for rk3026_ebc_wait_seq().
  */
 u32 rk3026_ebc_add_update(struct rk3026_ebc *ebc,
 			  const struct rk3026_ebc_update *upd)
 {
+	struct rk3026_ebc_update stamped = *upd;
 	bool merged;
 	u32 seq;
 
 	lockdep_assert_held(&ebc->image_lock);
+	stamped.queued = rk3026_ebc_clock(ebc);
 
 	if (upd->mode == EBC_MODE_RESET) {
 		if (ebc->pending.pre.merged && !ebc->pre_split) {
@@ -1886,7 +2059,7 @@ u32 rk3026_ebc_add_update(struct rk3026_ebc *ebc,
 	}
 	if (upd->source != EBC_SOURCE_PLANE && upd->source != EBC_SOURCE_IDLE)
 		ebc->plane_resync = true;
-	merged = rk3026_ebc_pending_add(&ebc->pending, upd, &seq);
+	merged = rk3026_ebc_pending_add(&ebc->pending, &stamped, &seq);
 	rk3026_ebc_marker_seq_record(&ebc->markers, upd->marker, seq);
 	ebc->stats.updates++;
 	if (merged)
@@ -2160,6 +2333,25 @@ static void ebc_crtc_atomic_enable(struct drm_crtc *crtc,
 	ebc_wait_finished(ebc, seq);
 }
 
+/*
+ * The CRTC goes off: no new waveform from here on, the refresh thread drops
+ * what it takes, and mxcfb sends are refused. The thread is woken, so an
+ * open gap ends now, not at its end (rk3026_ebc_gap_woken()). Returns the
+ * newest seq, for the disable's wait.
+ */
+VISIBLE_IF_KUNIT u32 rk3026_ebc_crtc_off(struct rk3026_ebc *ebc)
+{
+	u32 seq;
+
+	mutex_lock(&ebc->image_lock);
+	WRITE_ONCE(ebc->crtc_on, false);
+	seq = ebc->pending.queued_seq;
+	mutex_unlock(&ebc->image_lock);
+	wake_up(&ebc->update_wq);
+	return seq;
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_crtc_off);
+
 static void ebc_crtc_atomic_disable(struct drm_crtc *crtc,
 				    struct drm_atomic_state *state)
 {
@@ -2167,15 +2359,11 @@ static void ebc_crtc_atomic_disable(struct drm_crtc *crtc,
 	u32 seq;
 
 	/*
-	 * No new waveform from here on: the thread drops what it takes while
-	 * the CRTC is off, and mxcfb sends are refused. Let the part in flight
-	 * and those pending finish, then drop the rails now rather than after
-	 * the idle delay: VCOM first, then the high-voltage rails, then logic.
+	 * Let the part in flight and those pending finish, then drop the
+	 * rails now rather than after the idle delay: VCOM first, then the
+	 * high-voltage rails, then logic.
 	 */
-	mutex_lock(&ebc->image_lock);
-	ebc->crtc_on = false;
-	seq = ebc->pending.queued_seq;
-	mutex_unlock(&ebc->image_lock);
+	seq = rk3026_ebc_crtc_off(ebc);
 	/*
 	 * If the thread does not come back, drop the rails under it anyway:
 	 * rk3026_ebc_drive() checks them before every chunk and abandons the
@@ -2686,6 +2874,9 @@ static int ebc_probe(struct platform_device *pdev)
 	ebc->du_cleanup_idle_ms = EBC_DU_CLEANUP_IDLE_MS;
 	/* No A2 for plane parts until its ghosting is measured. */
 	ebc->a2_max_area = 0;
+	/* A burst of updates is taken once it has been quiet this long. */
+	ebc->take_quiet_us = EBC_TAKE_QUIET_US;
+	ebc->take_cap_ms = EBC_TAKE_CAP_MS;
 
 	/* E Ink GDCK_STA / LGONL; no display-timing binding covers them. */
 	if (of_property_read_u32(dev->of_node, "rockchip,gdck-sta",

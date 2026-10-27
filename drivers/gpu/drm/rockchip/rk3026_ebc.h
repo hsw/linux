@@ -315,6 +315,67 @@ struct rk3026_ebc_idle {
 };
 
 /*
+ * The take's quiet gap and its cap as probe sets them; the rules are
+ * rk3026_ebc_take_wait()'s. debugfs take_quiet_us (0: no gap) and
+ * take_cap_ms change them, used up to EBC_TAKE_CAP_MAX_MS for the cap and
+ * the cap for the quiet gap: the rails are held while a gap is open, and
+ * a wait on an update counts one gap (rk3026_ebc_wait_timeout_ms()).
+ */
+#define EBC_TAKE_QUIET_US	10000
+#define EBC_TAKE_CAP_MS		250
+#define EBC_TAKE_CAP_MAX_MS	1000
+
+/*
+ * The next part as rk3026_ebc_take_wait() reads it, under @image_lock:
+ *
+ * @first, @last: when its first and newest update were queued;
+ * @prev_done: when the previous part finished; the cap counts from the
+ *	later of it and @first, so updates queued during a scan do not use
+ *	up the cap of the part they make;
+ * @count: the updates in it; @area: the pixels of its box;
+ * @big_area: the box that makes it big (@du_cleanup_big_area);
+ * @quiet_us: the quiet gap, 0: none; @cap_ms: the longest wait; both as
+ *	debugfs set them, clamped where they are used;
+ * @full: it will be driven FULL, as far as is known before its snapshot:
+ *	force_mode, an auto plane part at the DU ceiling;
+ * @exempt: it never waits: an mxcfb send is in it (its client batches its
+ *	own updates and waits on the marker), it is the idle cleanup (the
+ *	whole panel already), or a RESET is pending (the part is the RESET,
+ *	or the one in front of it, which nothing can join);
+ * @rails_up: the panel rails are up;
+ * @open: a gap is open for it already.
+ */
+struct rk3026_ebc_take {
+	ktime_t		first;
+	ktime_t		last;
+	ktime_t		prev_done;
+	u32		count;
+	u32		area;
+	u32		big_area;
+	u32		quiet_us;
+	u32		cap_ms;
+	bool		full;
+	bool		exempt;
+	bool		rails_up;
+	bool		open;
+};
+
+/*
+ * The take's quiet gap, the refresh thread's alone (rk3026_ebc_take_ready()):
+ * open since @start, until @at unless a new update moves it; @seen is the
+ * newest seq at the last look, so the thread's wait wakes on a newer one
+ * (rk3026_ebc_gap_woken()); @us is the length of the gap that ended at
+ * the last take, for that part's record.
+ */
+struct rk3026_ebc_gap {
+	ktime_t		start;
+	ktime_t		at;
+	u32		seen;
+	u32		us;
+	bool		open;
+};
+
+/*
  * One update as a sender hands it over (rk3026_ebc_add_update()): its region,
  * EBC work mode, MXCFB_WAIT_FOR_UPDATE_COMPLETE marker (0: none), the panel
  * temperature it brings (@temp, if @temp_valid) and who sent it.
@@ -325,9 +386,13 @@ struct rk3026_ebc_idle {
  * mode leaves it false.
  *
  * @blit_us: what its blit took (rk3026_ebc_blit_xrgb8888()), 0 without one.
+ *
+ * @queued: when it was queued (rk3026_ebc_clock()), set by
+ * rk3026_ebc_add_update(), for the take's quiet gap (rk3026_ebc_take_wait()).
  */
 struct rk3026_ebc_update {
 	struct drm_rect	clip;
+	ktime_t		queued;
 	u32		mode;
 	u32		marker;
 	u32		blit_us;
@@ -342,9 +407,10 @@ struct rk3026_ebc_update {
  * refresh thread and published under @image_lock. The _us times (debugfs
  * "timing") are rounded up and at least 1 when measured; 0 means none.
  *
- * @taken is when the part was taken; a scan_start event reports the time
- * from it to the waveform (the snapshot, a repair RESET before the part;
- * the sensor and the rails come before the take, rk3026_ebc_do_refresh()).
+ * @taken is when the part was taken (rk3026_ebc_clock()); a scan_start
+ * event reports the time from it to the waveform (the snapshot, a repair
+ * RESET before the part; the sensor and the rails come before the take,
+ * rk3026_ebc_do_refresh()).
  * @du_area is the plane parts' DU budget spent at the take, before
  * the part is accounted (rk3026_ebc_du_account()). @gap_us and @tries are
  * the time the take waited for the senders to go quiet and the retries of
@@ -420,9 +486,15 @@ struct rk3026_ebc_stats {
  * (rk3026_ebc_scan_finish()), and the cleanup is not queued while a carry
  * waits (rk3026_ebc_idle_tick()), so a part that has it and one update is
  * the cleanup alone.
+ *
+ * @first and @last: when its first and its newest update were queued; a
+ * carry merged in keeps those of the set it joins. @has_mxcfb: an
+ * MXCFB_SEND_UPDATE is in the set, so its take does not wait for a gap.
  */
 struct rk3026_ebc_set {
 	struct drm_rect	box;
+	ktime_t		first;
+	ktime_t		last;
 	u32		mode;
 	u32		seq;		/* the newest update's */
 	u32		marker;		/* the newest update's, or 0 */
@@ -432,6 +504,7 @@ struct rk3026_ebc_set {
 	bool		temp_valid;
 	/* an MXCFB_SEND_UPDATE in a full-class mode: never skipped */
 	bool		has_mxcfb_full;
+	bool		has_mxcfb;
 	bool		auto_ok;
 	bool		has_plane;	/* a plane update is in the set */
 	bool		cleanup_idle;
@@ -532,6 +605,29 @@ static inline bool rk3026_ebc_pending_empty(const struct rk3026_ebc_pending *p)
 static inline bool rk3026_ebc_work_pending(const struct rk3026_ebc_pending *p)
 {
 	return READ_ONCE(p->queued_seq) != READ_ONCE(p->done_seq);
+}
+
+/*
+ * The refresh thread's wait condition between parts, read without the
+ * lock: a part to take (rk3026_ebc_work_pending()).
+ */
+static inline bool rk3026_ebc_thread_woken(const struct rk3026_ebc_pending *p)
+{
+	return rk3026_ebc_work_pending(p);
+}
+
+/*
+ * The refresh thread's wait condition while the take's gap is open, read
+ * without the lock. A part is pending all along, so rk3026_ebc_thread_woken()
+ * would be true and the thread would spin: it wakes on an update newer than
+ * @seen, the newest seq at its last look, or on the CRTC going off
+ * (@crtc_on false), whose look ends the gap; else at the gap's end, the
+ * wait's timeout.
+ */
+static inline bool rk3026_ebc_gap_woken(const struct rk3026_ebc_pending *p,
+					u32 seen, bool crtc_on)
+{
+	return READ_ONCE(p->queued_seq) != seen || !crtc_on;
 }
 
 /* The update queued with @seq has finished. Read without the lock. */
@@ -699,6 +795,19 @@ struct rk3026_ebc {
 	 */
 	u32			a2_max_area;
 
+	/*
+	 * The take's quiet gap (rk3026_ebc_take_ready()): @gap is the refresh
+	 * thread's alone; @take_done, when the last part finished
+	 * (rk3026_ebc_clock()), is written under @image_lock by the thread.
+	 * @take_quiet_us and @take_cap_ms: probe sets EBC_TAKE_QUIET_US and
+	 * EBC_TAKE_CAP_MS, debugfs may change them, and the thread reads them
+	 * with READ_ONCE(); rk3026_ebc_take_wait() clamps them.
+	 */
+	struct rk3026_ebc_gap	gap;
+	ktime_t			take_done;
+	u32			take_quiet_us;
+	u32			take_cap_ms;
+
 	/* Write-only registers the controller does not read back. */
 	u32			dsp_start;
 	u32			dsp_ctrl;
@@ -792,6 +901,9 @@ bool rk3026_ebc_plane_update(struct rk3026_ebc *ebc, const void *src,
 			     unsigned int src_pitch, const struct drm_rect *box);
 bool rk3026_ebc_idle_tick(struct rk3026_ebc *ebc, unsigned long now);
 int rk3026_ebc_raise_rails(struct rk3026_ebc *ebc);
+ktime_t rk3026_ebc_clock(struct rk3026_ebc *ebc);
+bool rk3026_ebc_take_ready(struct rk3026_ebc *ebc, ktime_t now);
+u32 rk3026_ebc_crtc_off(struct rk3026_ebc *ebc);
 u32 rk3026_ebc_setup_us(struct rk3026_ebc *ebc,
 			const struct rk3026_ebc_last *last);
 #endif
@@ -837,6 +949,10 @@ bool rk3026_ebc_idle_cleanup_due(const struct rk3026_ebc_idle *idle,
 bool rk3026_ebc_thread_deadline(bool rails_on, unsigned long rails_off_at,
 				bool idle_armed, unsigned long idle_at,
 				unsigned long *deadline);
+bool rk3026_ebc_rails_off_due(bool rails_on, unsigned long rails_off_at,
+			      bool gap_open, unsigned long now);
+bool rk3026_ebc_take_wait(const struct rk3026_ebc_take *t, ktime_t now,
+			  ktime_t *deadline);
 u32 rk3026_ebc_du_account(u32 du_area, const struct rk3026_ebc_set *part,
 			  u32 mode, u32 changed_px,
 			  enum rk3026_ebc_outcome outcome,

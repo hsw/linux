@@ -815,13 +815,12 @@ static unsigned long ebc_earlier(bool has, unsigned long deadline,
 
 /**
  * rk3026_ebc_thread_deadline - when the refresh thread's wait ends
- * @rails_on: the panel rails are up
- * @rails_off_at: their off deadline, in jiffies; only meaningful with
- *	@rails_on
- * @idle_armed: the idle cleanup is armed
- * @idle_at: its deadline, in jiffies; only meaningful with @idle_armed
- * @retry_armed: a carry waits for its retry (struct rk3026_ebc_retry)
- * @retry_at: its time, in jiffies; only meaningful with @retry_armed
+ * @s: what the pass read: the rails' off deadline while they are up
+ *	(@rails_on, @rails_off_at), the idle cleanup's while it is armed
+ *	(@idle_armed, @idle_at), and whether a carry waits for its retry
+ *	(@retry_armed)
+ * @retry_at: the retry's time, in jiffies (ebc_retry_jiffies()); only
+ *	meaningful with @s->retry_armed
  * @deadline: returns the earliest of those that apply
  *
  * The thread waits for work until the next of its deadlines: the rails go
@@ -832,23 +831,21 @@ static unsigned long ebc_earlier(bool has, unsigned long deadline,
  * Return: false, @deadline left alone, when none applies: the wait has no
  * timeout.
  */
-bool rk3026_ebc_thread_deadline(bool rails_on, unsigned long rails_off_at,
-				bool idle_armed, unsigned long idle_at,
-				bool retry_armed, unsigned long retry_at,
-				unsigned long *deadline)
+bool rk3026_ebc_thread_deadline(const struct rk3026_ebc_pass *s,
+				unsigned long retry_at, unsigned long *deadline)
 {
 	unsigned long d = 0;
 	bool has = false;
 
-	if (rails_on) {
-		d = rails_off_at;
+	if (s->rails_on) {
+		d = s->rails_off_at;
 		has = true;
 	}
-	if (idle_armed) {
-		d = ebc_earlier(has, d, idle_at);
+	if (s->idle_armed) {
+		d = ebc_earlier(has, d, s->idle_at);
 		has = true;
 	}
-	if (retry_armed) {
+	if (s->retry_armed) {
 		d = ebc_earlier(has, d, retry_at);
 		has = true;
 	}
@@ -859,24 +856,73 @@ bool rk3026_ebc_thread_deadline(bool rails_on, unsigned long rails_off_at,
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_thread_deadline);
 
 /**
- * rk3026_ebc_rails_off_due - whether the refresh thread drops the rails now
- * @rails_on: the panel rails are up
- * @rails_off_at: their off deadline, in jiffies
- * @gap_open: the take's quiet gap is open (rk3026_ebc_take_ready())
- * @now: the time of the look, in jiffies
+ * ebc_retry_jiffies - the carry's retry time in jiffies
+ * @now: the pass's time, in jiffies
+ * @clock: rk3026_ebc_clock() of the same pass
+ * @at: the retry's time, on rk3026_ebc_clock()
  *
- * At the deadline, but not while a gap is open: the part taken after it
- * will be driven (a gap opens only for such a part), and the gap's cap
- * bounds the hold. The drive after it moves the deadline.
+ * For the deadline of the refresh thread's wait, whose other deadlines are
+ * jiffies. At least a jiffy after @now, and rounded up: a wait that ends
+ * before the retry finds it not due and waits again, a jiffy at least, so
+ * the thread never spins on it.
  *
- * Return: true when the rails are to be dropped.
+ * Return: the retry's time, in jiffies.
  */
-bool rk3026_ebc_rails_off_due(bool rails_on, unsigned long rails_off_at,
-			      bool gap_open, unsigned long now)
+static unsigned long ebc_retry_jiffies(unsigned long now, ktime_t clock,
+				       ktime_t at)
 {
-	return rails_on && !gap_open && time_after_eq(now, rails_off_at);
+	s64 us = ktime_us_delta(at, clock);
+
+	return now + usecs_to_jiffies(clamp_t(s64, us, 1, U32_MAX));
 }
-EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_rails_off_due);
+
+/**
+ * rk3026_ebc_thread_step - what one pass of the refresh thread does
+ * @s: what the pass read (rk3026_ebc_thread_pass())
+ * @timeout: returns the wait's timeout in jiffies for EBC_STEP_WAIT,
+ *	MAX_SCHEDULE_TIMEOUT without a deadline
+ *
+ * In this order:
+ *
+ * - the rails go off at their deadline, checked on every pass, not only
+ *   when the wait times out: a steady stream of skipped updates keeps the
+ *   thread busy and must not keep the rails up. Not while the take's gap is
+ *   open: the part taken after it will be driven (a gap opens only for
+ *   such a part), and the gap's cap bounds the hold;
+ * - the idle cleanup is looked at, at its deadline (rk3026_ebc_idle_tick()).
+ *   Not while a gap is open: the part pending holds the glass, and its end
+ *   arms the cleanup again;
+ * - the next part is looked at (rk3026_ebc_take_ready()) while a gap is
+ *   open, a part is pending or the carry's retry is due (@s->woken);
+ * - else the thread waits until the earliest of the rails-off, idle and
+ *   retry deadlines (rk3026_ebc_thread_deadline(),
+ *   ebc_retry_jiffies()). Each is at least a jiffy ahead then (the
+ *   two that are due were acted on above, and a gap is closed), so no
+ *   pass spins.
+ *
+ * Return: the step (enum rk3026_ebc_step).
+ */
+enum rk3026_ebc_step rk3026_ebc_thread_step(const struct rk3026_ebc_pass *s,
+					    long *timeout)
+{
+	unsigned long deadline, retry_at = 0;
+
+	*timeout = MAX_SCHEDULE_TIMEOUT;
+	if (s->rails_on && !s->gap_open &&
+	    time_after_eq(s->now, s->rails_off_at))
+		return EBC_STEP_RAILS_OFF;
+	if (s->idle_armed && !s->gap_open && time_after_eq(s->now, s->idle_at))
+		return EBC_STEP_IDLE;
+	if (s->gap_open || s->woken)
+		return EBC_STEP_LOOK;
+
+	if (s->retry_armed)
+		retry_at = ebc_retry_jiffies(s->now, s->clock, s->retry_at);
+	if (rk3026_ebc_thread_deadline(s, retry_at, &deadline))
+		*timeout = (long)(deadline - s->now);
+	return EBC_STEP_WAIT;
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_thread_step);
 
 /**
  * rk3026_ebc_take_wait - whether the take of the next part waits for a gap
@@ -1093,10 +1139,8 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_retry_next);
  * the CRTC off at once, and the take drops it. A retry armed for a carry
  * that a RESET sent has dropped (rk3026_ebc_pending_add()) ends here: the
  * RESET's finish moves @done_seq over its updates.
- *
- * Return: true when the carry is to be taken.
  */
-bool rk3026_ebc_retry_ready(struct rk3026_ebc_pending *p, ktime_t now,
+void rk3026_ebc_retry_ready(struct rk3026_ebc_pending *p, ktime_t now,
 			    bool crtc_on)
 {
 	struct rk3026_ebc_retry *r = &p->retry;
@@ -1106,7 +1150,6 @@ bool rk3026_ebc_retry_ready(struct rk3026_ebc_pending *p, ktime_t now,
 		r->tries = 0;
 	}
 	r->ready = rk3026_ebc_retry_due(r, now, crtc_on);
-	return r->ready;
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_retry_ready);
 

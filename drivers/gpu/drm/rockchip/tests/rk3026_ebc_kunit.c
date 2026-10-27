@@ -1719,8 +1719,8 @@ static void ebc_test_finish_retry_ends(struct kunit *test)
 						      ms_to_ktime(1001), true));
 	KUNIT_EXPECT_TRUE(test, rk3026_ebc_retry_due(&c->p.retry,
 						     ms_to_ktime(1001), false));
-	KUNIT_EXPECT_TRUE(test, rk3026_ebc_retry_ready(&c->p, ms_to_ktime(1001),
-						       false));
+	rk3026_ebc_retry_ready(&c->p, ms_to_ktime(1001), false);
+	KUNIT_EXPECT_TRUE(test, c->p.retry.ready);
 
 	c = t_ctx_alloc(test);
 	c->sh.prev_unknown = true;
@@ -1733,9 +1733,8 @@ static void ebc_test_finish_retry_ends(struct kunit *test)
 
 	s2 = t_add(&c->p, &t_panel, EBC_MODE_RESET, EBC_SOURCE_ENABLE);
 	KUNIT_EXPECT_FALSE(test, c->p.carry.merged);
-	KUNIT_EXPECT_FALSE(test, rk3026_ebc_retry_ready(&c->p,
-							ms_to_ktime(5000),
-							true));
+	rk3026_ebc_retry_ready(&c->p, ms_to_ktime(5000), true);
+	KUNIT_EXPECT_FALSE(test, c->p.retry.ready);
 	KUNIT_EXPECT_FALSE(test, c->p.retry.armed);
 	KUNIT_ASSERT_TRUE(test, rk3026_ebc_pending_take(&c->p, &part));
 	KUNIT_EXPECT_EQ(test, part.mode, EBC_MODE_RESET);
@@ -2609,13 +2608,17 @@ KUNIT_ARRAY_PARAM_DESC(t_deadline, t_deadline_cases, desc);
 static void ebc_test_thread_deadline(struct kunit *test)
 {
 	const struct t_deadline *c = test->param_value;
+	const struct rk3026_ebc_pass s = {
+		.rails_on	= c->rails_on,
+		.rails_off_at	= c->rails_off_at,
+		.idle_armed	= c->idle_armed,
+		.idle_at	= c->idle_at,
+		.retry_armed	= c->retry_armed,
+	};
 	unsigned long deadline = 12345;
 
 	KUNIT_EXPECT_EQ(test,
-			rk3026_ebc_thread_deadline(c->rails_on, c->rails_off_at,
-						   c->idle_armed, c->idle_at,
-						   c->retry_armed, c->retry_at,
-						   &deadline),
+			rk3026_ebc_thread_deadline(&s, c->retry_at, &deadline),
 			c->has);
 	if (c->has)
 		KUNIT_EXPECT_EQ(test, deadline, c->deadline);
@@ -2746,11 +2749,10 @@ static void ebc_test_take_wait(struct kunit *test)
 }
 
 /*
- * The refresh thread's wait condition and rails-off: between parts it
- * wakes on a part to take, or a carry's retry due; while a gap is open, on
- * an update newer than the one it saw, not on the part pending all along,
- * or on the CRTC going off; and the rails are held up while a gap is open,
- * at their deadline too.
+ * The refresh thread's wait condition: between parts it wakes on a part to
+ * take, or a carry's retry due; while a gap is open, on an update newer
+ * than the one it saw, not on the part pending all along, or on the CRTC
+ * going off.
  */
 static void ebc_test_thread_woken(struct kunit *test)
 {
@@ -2795,17 +2797,113 @@ static void ebc_test_thread_woken(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, rk3026_ebc_thread_woken(&c->p,
 							ms_to_ktime(1000),
 							false));
+}
 
-	KUNIT_EXPECT_TRUE(test, rk3026_ebc_rails_off_due(true, 100, false, 100));
-	KUNIT_EXPECT_FALSE(test, rk3026_ebc_rails_off_due(true, 100, false, 99));
-	KUNIT_EXPECT_FALSE(test, rk3026_ebc_rails_off_due(true, 100, true, 100));
-	KUNIT_EXPECT_FALSE(test, rk3026_ebc_rails_off_due(true, 100, true,
-							  100000));
-	KUNIT_EXPECT_FALSE(test, rk3026_ebc_rails_off_due(false, 100, false,
-							  200));
-	/* time_after_eq(), across a wrap too. */
-	KUNIT_EXPECT_TRUE(test, rk3026_ebc_rails_off_due(true, ULONG_MAX - 5,
-							 false, 5));
+/*
+ * One pass of the refresh thread (rk3026_ebc_thread_step()), times in
+ * jiffies, the retry in ns after the pass's clock: the rails go off at
+ * their deadline (time_after_eq(), across a wrap too), on every pass, but
+ * not while a gap is open; the idle cleanup is looked at, at its deadline,
+ * but not while a gap is open; the next part is looked at while a gap is
+ * open or the wait's condition holds; else the wait times out at the
+ * earliest deadline, at least a jiffy ahead: the retry's converted from the
+ * clock and rounded up (@timeout_us, usecs_to_jiffies() of it), or none.
+ */
+struct t_step {
+	const char		*desc;
+	unsigned long		now;
+	bool			rails_on;
+	unsigned long		rails_off_at;
+	bool			idle_armed;
+	unsigned long		idle_at;
+	bool			retry_armed;
+	s64			retry_ns;
+	bool			gap_open;
+	bool			woken;
+	enum rk3026_ebc_step	step;
+	long			timeout;
+	u32			timeout_us;
+};
+
+static const struct t_step t_step_cases[] = {
+	/* now, rails, at, idle, at, retry, ns, gap, woken, step, timeout, us */
+	{ "nothing: no timeout", 1000, false, 0, false, 0, false, 0,
+	  false, false, EBC_STEP_WAIT, MAX_SCHEDULE_TIMEOUT },
+	{ "rails at their deadline: off", 1000, true, 1000, false, 0, false, 0,
+	  false, false, EBC_STEP_RAILS_OFF },
+	{ "rails before it: wait to it", 999, true, 1000, false, 0, false, 0,
+	  false, false, EBC_STEP_WAIT, 1 },
+	{ "rails due, gap open: held, look", 1000, true, 1000, false, 0, false,
+	  0, true, false, EBC_STEP_LOOK },
+	{ "rails due, part pending: off first", 1000, true, 1000, false, 0,
+	  false, 0, false, true, EBC_STEP_RAILS_OFF },
+	{ "rails down: none", 1000, false, 900, false, 0, false, 0,
+	  false, false, EBC_STEP_WAIT, MAX_SCHEDULE_TIMEOUT },
+	{ "rails due across a wrap: off", 5, true, ULONG_MAX - 5, false, 0,
+	  false, 0, false, false, EBC_STEP_RAILS_OFF },
+	{ "rails ahead across a wrap: wait", ULONG_MAX - 5, true, 5, false, 0,
+	  false, 0, false, false, EBC_STEP_WAIT, 11 },
+	{ "idle at its deadline: its look", 2000, false, 0, true, 2000, false,
+	  0, false, false, EBC_STEP_IDLE },
+	{ "idle due, part pending: idle first", 2000, false, 0, true, 2000,
+	  false, 0, false, true, EBC_STEP_IDLE },
+	{ "idle due, gap open: the part's look", 2000, false, 0, true, 2000,
+	  false, 0, true, false, EBC_STEP_LOOK },
+	{ "idle before it: wait to it", 1990, false, 0, true, 2000, false, 0,
+	  false, false, EBC_STEP_WAIT, 10 },
+	{ "rails and idle due: rails first", 2000, true, 2000, true, 1500,
+	  false, 0, false, false, EBC_STEP_RAILS_OFF },
+	{ "part pending: look", 1000, true, 2000, true, 3000, false, 0,
+	  false, true, EBC_STEP_LOOK },
+	{ "gap open: look", 1000, false, 0, false, 0, false, 0,
+	  true, false, EBC_STEP_LOOK },
+	{ "retry due: look", 1000, false, 0, false, 0, true, -1,
+	  false, true, EBC_STEP_LOOK },
+	{ "retry 100 ms ahead", 1000, false, 0, false, 0, true, 100000000,
+	  false, false, EBC_STEP_WAIT, 0, 100000 },
+	{ "retry 1 ns ahead: a jiffy", 1000, false, 0, false, 0, true, 1,
+	  false, false, EBC_STEP_WAIT, 1 },
+	{ "retry 1.5 ms ahead: rounded up", 1000, false, 0, false, 0, true,
+	  1500000, false, false, EBC_STEP_WAIT, 0, 1500 },
+	{ "retry past, not woken: a jiffy", 1000, false, 0, false, 0, true,
+	  -5000000, false, false, EBC_STEP_WAIT, 1 },
+	{ "retry 3 s ahead", 1000, false, 0, false, 0, true, 3000000000LL,
+	  false, false, EBC_STEP_WAIT, 0, 3000000 },
+	{ "retry across a jiffies wrap", ULONG_MAX - 2, false, 0, false, 0,
+	  true, 100000000, false, false, EBC_STEP_WAIT, 0, 100000 },
+	{ "rails before the retry", 1000, true, 1001, false, 0, true,
+	  3000000000LL, false, false, EBC_STEP_WAIT, 1 },
+	{ "retry before rails and idle", 1000, true, 1000000, true, 1000000,
+	  true, 100000000, false, false, EBC_STEP_WAIT, 0, 100000 },
+};
+
+KUNIT_ARRAY_PARAM_DESC(t_step, t_step_cases, desc);
+
+static void ebc_test_thread_step(struct kunit *test)
+{
+	const struct t_step *c = test->param_value;
+	ktime_t clock = ms_to_ktime(5000);
+	const struct rk3026_ebc_pass pass = {
+		.now		= c->now,
+		.rails_off_at	= c->rails_off_at,
+		.idle_at	= c->idle_at,
+		.clock		= clock,
+		.retry_at	= ktime_add_ns(clock, c->retry_ns),
+		.rails_on	= c->rails_on,
+		.idle_armed	= c->idle_armed,
+		.retry_armed	= c->retry_armed,
+		.gap_open	= c->gap_open,
+		.woken		= c->woken,
+	};
+	long timeout = 12345;
+
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_thread_step(&pass, &timeout), c->step);
+	if (c->step != EBC_STEP_WAIT)
+		return;
+	KUNIT_EXPECT_EQ(test, timeout,
+			c->timeout_us ? (long)usecs_to_jiffies(c->timeout_us) :
+					c->timeout);
+	KUNIT_EXPECT_GE(test, timeout, 1);
 }
 
 /*
@@ -3244,6 +3342,7 @@ static struct kunit_case rk3026_ebc_core_test_cases[] = {
 	KUNIT_CASE_PARAM(ebc_test_thread_deadline, t_deadline_gen_params),
 	KUNIT_CASE_PARAM(ebc_test_take_wait, t_take_gen_params),
 	KUNIT_CASE(ebc_test_thread_woken),
+	KUNIT_CASE_PARAM(ebc_test_thread_step, t_step_gen_params),
 	KUNIT_CASE(ebc_test_pending_cleanup_idle),
 	KUNIT_CASE(ebc_test_pending_auto_ok),
 	KUNIT_CASE(ebc_test_pending_auto_ok_reset),
@@ -5602,8 +5701,10 @@ static int t_rails(struct rk3026_ebc *ebc)
 		t_send(ebc, &t_panel, EBC_MODE_RESET, 0, EBC_SOURCE_ENABLE);
 	if (d->rails_ret)
 		return d->rails_ret;
-	if (!ebc->epd_on)
+	if (!ebc->epd_on) {
 		d->now = ktime_add(d->now, d->ramp);
+		ebc->rails_off_at = jiffies + msecs_to_jiffies(200);
+	}
 	ebc->epd_on = true;
 	ebc->rails_on = true;
 	return 0;
@@ -5806,8 +5907,11 @@ static struct rk3026_ebc *t_gap_ebc(struct kunit *test, struct t_drives *d)
 
 /*
  * The refresh thread's loop on the fake clock while a part is pending, as
- * ebc_refresh_thread() runs it: a look (rk3026_ebc_take_ready()), and while
- * the gap is open, a wait that ends at the next send or at the gap's end.
+ * ebc_refresh_thread() runs it: a pass (rk3026_ebc_thread_pass(),
+ * rk3026_ebc_thread_step()) that looks at the part (rk3026_ebc_take_ready()),
+ * with the rails and the idle cleanup held while the gap is open, past
+ * their deadlines too; and while the gap is open, a wait that ends at the
+ * next send or at the gap's end, at once if that is past.
  * Send k (k from *@sent up to @n) is a plane update of @boxes[k % @nboxes]
  * from @fb at @every_us * k after the start. Every wait must sleep at the
  * look (no newer update: no spin) and wake on the next send. Returns the
@@ -5822,8 +5926,21 @@ static unsigned int t_gap_run(struct kunit *test, struct rk3026_ebc *ebc,
 	unsigned int looks = 0;
 
 	while (looks++ < 1000) {
+		struct rk3026_ebc_pass pass;
 		ktime_t next = KTIME_MAX;
+		long timeout;
 
+		rk3026_ebc_thread_pass(ebc, jiffies, &pass);
+		KUNIT_EXPECT_EQ(test, rk3026_ebc_thread_step(&pass, &timeout),
+				EBC_STEP_LOOK);
+		if (ebc->gap.open) {
+			pass.rails_off_at = pass.now;
+			pass.idle_armed = true;
+			pass.idle_at = pass.now;
+			KUNIT_EXPECT_EQ(test,
+					rk3026_ebc_thread_step(&pass, &timeout),
+					EBC_STEP_LOOK);
+		}
 		if (rk3026_ebc_take_ready(ebc, d->now))
 			return looks;
 		KUNIT_EXPECT_TRUE(test, ebc->gap.open);
@@ -5834,7 +5951,8 @@ static unsigned int t_gap_run(struct kunit *test, struct rk3026_ebc *ebc,
 		if (*sent < n)
 			next = ktime_add_us(t0, *sent * every_us);
 		if (!ktime_before(next, ebc->gap.at)) {
-			d->now = ebc->gap.at;
+			if (ktime_before(d->now, ebc->gap.at))
+				d->now = ebc->gap.at;
 			continue;
 		}
 		if (ktime_after(next, d->now))
@@ -6050,6 +6168,7 @@ static void ebc_test_glue_gap_cap(struct kunit *test)
 
 	ebc->epd_on = true;
 	ebc->rails_on = true;
+	ebc->rails_off_at = jiffies + msecs_to_jiffies(200);
 	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
 							&box));
 	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
@@ -6676,8 +6795,10 @@ static void ebc_test_glue_retry_once(struct kunit *test)
 	struct t_drives d;
 	struct rk3026_ebc *ebc = t_gap_ebc(test, &d);
 	u32 *black = t_plane_fb(test, 0);
+	struct rk3026_ebc_pass pass;
 	struct rk3026_ebc_last last;
 	ktime_t t0 = d.now;
+	long timeout;
 	u32 seq;
 
 	d.rails_ret = -EIO;
@@ -6694,11 +6815,22 @@ static void ebc_test_glue_retry_once(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, rk3026_ebc_seq_finished(&ebc->pending, seq));
 	KUNIT_EXPECT_TRUE(test, ebc->pending.retry.armed);
 	KUNIT_EXPECT_EQ(test, ebc->pending.retry.at, ktime_add_ms(t0, 100));
+	rk3026_ebc_thread_pass(ebc, jiffies, &pass);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_thread_step(&pass, &timeout),
+			EBC_STEP_WAIT);
+	KUNIT_EXPECT_EQ(test, timeout, (long)msecs_to_jiffies(100));
 
 	d.now = ktime_add_ms(t0, 99);
 	KUNIT_EXPECT_FALSE(test, t_woken(ebc, &d));
+	rk3026_ebc_thread_pass(ebc, jiffies, &pass);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_thread_step(&pass, &timeout),
+			EBC_STEP_WAIT);
+	KUNIT_EXPECT_EQ(test, timeout, (long)msecs_to_jiffies(1));
 	d.now = ktime_add_ms(t0, 100);
 	KUNIT_EXPECT_TRUE(test, t_woken(ebc, &d));
+	rk3026_ebc_thread_pass(ebc, jiffies, &pass);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_thread_step(&pass, &timeout),
+			EBC_STEP_LOOK);
 
 	d.rails_ret = 0;
 	KUNIT_EXPECT_TRUE(test, rk3026_ebc_take_ready(ebc, d.now));

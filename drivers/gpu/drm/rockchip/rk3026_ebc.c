@@ -105,7 +105,7 @@
  * (rk3026_ebc_do_refresh()) or when the take's quiet gap opens for it
  * (rk3026_ebc_take_ready()), and off this long after the last waveform
  * ended (or after they came up, if none was driven); while a gap is open
- * they are held past the deadline (rk3026_ebc_rails_off_due()), at most the
+ * they are held past the deadline (rk3026_ebc_thread_step()), at most the
  * gap's cap. A short delay keeps a burst of updates (typing, a scrolling
  * console) from cycling the PMIC per update. Only a driven waveform moves
  * the deadline: an update that is skipped (identical image) or has no LUT
@@ -1339,6 +1339,21 @@ static int ebc_part_temp(const struct rk3026_ebc_set *part, int temp)
 }
 
 /*
+ * The plane parts' DU budget as it stands: what is spent, and the limits
+ * (debugfs du_cleanup_*). Under @image_lock, which guards @du_area.
+ */
+static struct rk3026_ebc_du_budget ebc_du_budget(struct rk3026_ebc *ebc)
+{
+	lockdep_assert_held(&ebc->image_lock);
+	return (struct rk3026_ebc_du_budget) {
+		.area		= ebc->du_area,
+		.limit		= READ_ONCE(ebc->du_cleanup_area),
+		.big_area	= READ_ONCE(ebc->du_cleanup_big_area),
+		.ceiling	= READ_ONCE(ebc->du_cleanup_ceiling),
+	};
+}
+
+/*
  * The repair a part gets on a glass that is not known: a RESET before it;
  * without a RESET waveform at @temp, the part itself driven FULL; without
  * a FULL one either, none (EBC_REPAIR_NOT_DUE): the part is driven as if
@@ -1593,10 +1608,7 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 	 * idle cleanup keeps its FULL. It comes after the skip, which stays
 	 * on the part's own mode, and before force_mode.
 	 */
-	budget.area = ebc->du_area;
-	budget.limit = READ_ONCE(ebc->du_cleanup_area);
-	budget.big_area = READ_ONCE(ebc->du_cleanup_big_area);
-	budget.ceiling = READ_ONCE(ebc->du_cleanup_ceiling);
+	budget = ebc_du_budget(ebc);
 	a2.max_area = READ_ONCE(ebc->a2_max_area);
 	resolved = rk3026_ebc_resolve_mode(&part, scan_mode, two_level,
 					   changed_px, repair, &budget, &a2,
@@ -1828,13 +1840,12 @@ VISIBLE_IF_KUNIT bool rk3026_ebc_idle_tick(struct rk3026_ebc *ebc,
 		.source	= EBC_SOURCE_IDLE,
 	};
 	u32 delay_ms = READ_ONCE(ebc->du_cleanup_idle_ms);
-	struct rk3026_ebc_du_budget budget = { 0 };
+	struct rk3026_ebc_du_budget budget;
 	struct rk3026_ebc_idle idle;
 	bool due, expired;
 
 	mutex_lock(&ebc->image_lock);
-	budget.area = ebc->du_area;
-	budget.limit = READ_ONCE(ebc->du_cleanup_area);
+	budget = ebc_du_budget(ebc);
 	idle = (struct rk3026_ebc_idle) {
 		.armed		= ebc->idle_armed,
 		.last_plane	= ebc->idle_last_plane,
@@ -1864,14 +1875,9 @@ static void ebc_take_state(struct rk3026_ebc *ebc,
 			   const struct rk3026_ebc_set *part,
 			   struct rk3026_ebc_take *t)
 {
-	struct rk3026_ebc_du_budget budget = {
-		.area		= ebc->du_area,
-		.limit		= READ_ONCE(ebc->du_cleanup_area),
-		.ceiling	= READ_ONCE(ebc->du_cleanup_ceiling),
-	};
+	struct rk3026_ebc_du_budget budget = ebc_du_budget(ebc);
 	u64 area = 0;
 
-	lockdep_assert_held(&ebc->image_lock);
 	if (drm_rect_visible(&part->box))
 		area = (u64)drm_rect_width(&part->box) *
 		       drm_rect_height(&part->box);
@@ -1882,7 +1888,7 @@ static void ebc_take_state(struct rk3026_ebc *ebc,
 		.prev_done	= ebc->take_done,
 		.count		= part->merged,
 		.area		= min_t(u64, area, U32_MAX),
-		.big_area	= READ_ONCE(ebc->du_cleanup_big_area),
+		.big_area	= budget.big_area,
 		.quiet_us	= READ_ONCE(ebc->take_quiet_us),
 		.cap_ms		= READ_ONCE(ebc->take_cap_ms),
 		.full		= force_mode == EBC_MODE_FULL ||
@@ -1996,96 +2002,86 @@ static void ebc_gap_wait(struct rk3026_ebc *ebc)
 					   ktime_sub(gap->at, rk3026_ebc_clock(ebc)));
 }
 
-/*
- * The carry's retry time in jiffies, for the deadline of the thread's wait
- * (rk3026_ebc_thread_deadline()), from @now and @clock, the jiffies and
- * rk3026_ebc_clock() of the same look. The retry is not due at it, so this
- * is at least a jiffy ahead: rounded up, the wait ends at the retry or just
- * after, never in a loop before it.
+/**
+ * rk3026_ebc_thread_pass - what one pass of the refresh thread reads
+ * @ebc: controller
+ * @now: the pass's time, in jiffies
+ * @s: returns it, for rk3026_ebc_thread_step()
+ *
+ * Without @image_lock: the rails and their deadline, the idle cleanup's
+ * (ebc_idle_at()), the carry's retry, the take's gap and the wait's
+ * condition (rk3026_ebc_thread_woken()), at one rk3026_ebc_clock() read.
+ * The retry and the gap are this thread's own, so they hold still while
+ * the pass runs.
  */
-static bool ebc_retry_at(struct rk3026_ebc *ebc, unsigned long now,
-			 ktime_t clock, unsigned long *at)
+VISIBLE_IF_KUNIT void rk3026_ebc_thread_pass(struct rk3026_ebc *ebc,
+					     unsigned long now,
+					     struct rk3026_ebc_pass *s)
 {
 	const struct rk3026_ebc_retry *r = &ebc->pending.retry;
-	s64 us;
+	ktime_t clock = rk3026_ebc_clock(ebc);
 
-	if (!READ_ONCE(r->armed))
-		return false;
-	us = ktime_us_delta(READ_ONCE(r->at), clock);
-	*at = now + usecs_to_jiffies(max_t(s64, us, 1));
-	return true;
+	*s = (struct rk3026_ebc_pass) {
+		.now		= now,
+		.rails_off_at	= READ_ONCE(ebc->rails_off_at),
+		.clock		= clock,
+		.retry_at	= READ_ONCE(r->at),
+		.rails_on	= READ_ONCE(ebc->rails_on),
+		.retry_armed	= READ_ONCE(r->armed),
+		.gap_open	= ebc->gap.open,
+		.woken		= rk3026_ebc_thread_woken(&ebc->pending, clock,
+							  READ_ONCE(ebc->crtc_on)),
+	};
+	s->idle_armed = ebc_idle_at(ebc, &s->idle_at);
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_thread_pass);
+
+/*
+ * The refresh thread's wait between parts, up to @timeout jiffies. It
+ * cannot take @image_lock; it asks rk3026_ebc_thread_woken(). A plane
+ * update that arms or moves the idle deadline wakes it
+ * (rk3026_ebc_add_update()), and so does a CRTC disable, for a carry
+ * waiting for its retry.
+ */
+static void ebc_work_wait(struct rk3026_ebc *ebc, long timeout)
+{
+	wait_event_interruptible_timeout(ebc->update_wq,
+					 rk3026_ebc_thread_woken(&ebc->pending,
+								 rk3026_ebc_clock(ebc),
+								 READ_ONCE(ebc->crtc_on)) ||
+					 kthread_should_stop(),
+					 timeout);
 }
 
 static int ebc_refresh_thread(void *data)
 {
 	struct rk3026_ebc *ebc = data;
-	struct rk3026_ebc_gap *gap = &ebc->gap;
 
 	while (!kthread_should_stop()) {
 		struct rk3026_ebc_last last;
-		long timeout = MAX_SCHEDULE_TIMEOUT;
-		unsigned long now = jiffies, deadline, rails_at, idle_at, retry_at;
-		ktime_t clock = rk3026_ebc_clock(ebc);
-		bool rails_on, idle_armed, retry_armed;
+		struct rk3026_ebc_pass s;
+		long timeout;
 
-		/*
-		 * With the rails up, drop them at the deadline. Checked on every
-		 * pass, not only when the wait times out: a steady stream of
-		 * skipped updates keeps the thread busy and must not keep the
-		 * rails up. Held while the take's gap is open: that part will
-		 * be driven, and the gap's cap bounds the hold.
-		 */
-		rails_on = READ_ONCE(ebc->rails_on);
-		rails_at = READ_ONCE(ebc->rails_off_at);
-		if (rk3026_ebc_rails_off_due(rails_on, rails_at, gap->open, now)) {
+		rk3026_ebc_thread_pass(ebc, jiffies, &s);
+		switch (rk3026_ebc_thread_step(&s, &timeout)) {
+		case EBC_STEP_RAILS_OFF:
 			ebc_idle_rails_off(ebc);
-			continue;
-		}
-		/*
-		 * The idle cleanup, at its deadline: the look disarms it, and
-		 * queues it if it is due, which the next pass then takes. Not
-		 * while a gap is open: the part pending holds the glass, and
-		 * its end arms the cleanup again.
-		 */
-		idle_armed = ebc_idle_at(ebc, &idle_at);
-		if (!gap->open && idle_armed && time_after_eq(now, idle_at)) {
-			rk3026_ebc_idle_tick(ebc, now);
-			continue;
-		}
-		/*
-		 * A part to take, a gap open for one, or the carry's retry
-		 * due: take it now, or wait for a newer update or the gap's
-		 * end (ebc_gap_wait()).
-		 */
-		if (gap->open ||
-		    rk3026_ebc_thread_woken(&ebc->pending, clock,
-					    READ_ONCE(ebc->crtc_on))) {
-			if (rk3026_ebc_take_ready(ebc, rk3026_ebc_clock(ebc))) {
+			break;
+		case EBC_STEP_IDLE:
+			/* Disarms the cleanup, and queues it if it is due. */
+			rk3026_ebc_idle_tick(ebc, s.now);
+			break;
+		case EBC_STEP_LOOK:
+			/* Take the part, or wait for the senders to go quiet. */
+			if (rk3026_ebc_take_ready(ebc, rk3026_ebc_clock(ebc)))
 				rk3026_ebc_do_refresh(ebc, &last);
-				continue;
-			}
-			ebc_gap_wait(ebc);
-			continue;
+			else
+				ebc_gap_wait(ebc);
+			break;
+		case EBC_STEP_WAIT:
+			ebc_work_wait(ebc, timeout);
+			break;
 		}
-		retry_armed = ebc_retry_at(ebc, now, clock, &retry_at);
-		if (rk3026_ebc_thread_deadline(rails_on, rails_at, idle_armed,
-					       idle_at, retry_armed, retry_at,
-					       &deadline))
-			timeout = max_t(long, (long)(deadline - now), 1);
-		/*
-		 * The wait cannot take @image_lock; the thread asks between
-		 * parts (rk3026_ebc_thread_woken(): a part to take, or the
-		 * carry's retry due). The deadlines are ahead here; a plane
-		 * update that arms or moves the idle one wakes the wait
-		 * (rk3026_ebc_add_update()), and so does a CRTC disable, for a
-		 * carry waiting for its retry; the next pass takes it.
-		 */
-		wait_event_interruptible_timeout(ebc->update_wq,
-						 rk3026_ebc_thread_woken(&ebc->pending,
-									 rk3026_ebc_clock(ebc),
-									 READ_ONCE(ebc->crtc_on)) ||
-						 kthread_should_stop(),
-						 timeout);
 	}
 
 	mutex_lock(&ebc->rails_lock);

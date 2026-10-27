@@ -397,6 +397,35 @@ struct rk3026_ebc_gap {
 };
 
 /*
+ * One pass of the refresh thread, as it read it without the lock
+ * (rk3026_ebc_thread_pass()): @now in jiffies and @clock
+ * (rk3026_ebc_clock()) of the same pass; the rails up (@rails_on) and their
+ * off deadline; the idle cleanup armed and its deadline; the carry's retry
+ * armed and its time, on @clock; the take's gap open; and the wait's
+ * condition (@woken: rk3026_ebc_thread_woken()).
+ */
+struct rk3026_ebc_pass {
+	unsigned long	now;
+	unsigned long	rails_off_at;
+	unsigned long	idle_at;
+	ktime_t		clock;
+	ktime_t		retry_at;
+	bool		rails_on;
+	bool		idle_armed;
+	bool		retry_armed;
+	bool		gap_open;
+	bool		woken;
+};
+
+/* What a pass of the refresh thread does (rk3026_ebc_thread_step()). */
+enum rk3026_ebc_step {
+	EBC_STEP_RAILS_OFF,	/* the rails go off, at their deadline */
+	EBC_STEP_IDLE,		/* the idle cleanup's look, at its deadline */
+	EBC_STEP_LOOK,		/* the next part's look (rk3026_ebc_take_ready()) */
+	EBC_STEP_WAIT,		/* a wait for work, until the next deadline */
+};
+
+/*
  * The retries of a carried part: EBC_RETRY_TRIES, at these times after the
  * first carry, the last at EBC_RETRY_SPAN_MS (rk3026_ebc_retry_next()).
  */
@@ -1034,6 +1063,8 @@ ktime_t rk3026_ebc_clock(struct rk3026_ebc *ebc);
 bool rk3026_ebc_take_ready(struct rk3026_ebc *ebc, ktime_t now);
 u32 rk3026_ebc_crtc_off(struct rk3026_ebc *ebc);
 int rk3026_ebc_read_temp(struct rk3026_ebc *ebc);
+void rk3026_ebc_thread_pass(struct rk3026_ebc *ebc, unsigned long now,
+			    struct rk3026_ebc_pass *s);
 u32 rk3026_ebc_setup_us(struct rk3026_ebc *ebc,
 			const struct rk3026_ebc_last *last);
 #endif
@@ -1078,12 +1109,10 @@ u32 rk3026_ebc_resolve_mode(const struct rk3026_ebc_set *part, u32 scan_mode,
 			    enum rk3026_ebc_reason *reason);
 bool rk3026_ebc_idle_cleanup_due(const struct rk3026_ebc_idle *idle,
 				 unsigned long now, bool *expired);
-bool rk3026_ebc_thread_deadline(bool rails_on, unsigned long rails_off_at,
-				bool idle_armed, unsigned long idle_at,
-				bool retry_armed, unsigned long retry_at,
-				unsigned long *deadline);
-bool rk3026_ebc_rails_off_due(bool rails_on, unsigned long rails_off_at,
-			      bool gap_open, unsigned long now);
+bool rk3026_ebc_thread_deadline(const struct rk3026_ebc_pass *s,
+				unsigned long retry_at, unsigned long *deadline);
+enum rk3026_ebc_step rk3026_ebc_thread_step(const struct rk3026_ebc_pass *s,
+					    long *timeout);
 bool rk3026_ebc_take_wait(const struct rk3026_ebc_take *t, ktime_t now,
 			  ktime_t *deadline);
 u32 rk3026_ebc_du_account(u32 du_area, const struct rk3026_ebc_set *part,
@@ -1091,7 +1120,7 @@ u32 rk3026_ebc_du_account(u32 du_area, const struct rk3026_ebc_set *part,
 			  enum rk3026_ebc_outcome outcome,
 			  enum rk3026_ebc_repair repair);
 bool rk3026_ebc_retry_next(ktime_t first, ktime_t now, ktime_t *at);
-bool rk3026_ebc_retry_ready(struct rk3026_ebc_pending *p, ktime_t now,
+void rk3026_ebc_retry_ready(struct rk3026_ebc_pending *p, ktime_t now,
 			    bool crtc_on);
 bool rk3026_ebc_scan_finish(struct rk3026_ebc_shadows *sh,
 			    struct rk3026_ebc_pending *p,

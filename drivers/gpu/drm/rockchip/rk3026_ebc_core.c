@@ -499,21 +499,48 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_should_skip);
 /**
  * rk3026_ebc_scan_mode - the mode a part is driven in
  * @part: the part
- * @repaired: a repair RESET runs before it
+ * @repair_due: a repair is due before it
  *
  * After a repair the glass is white outside the box too, while the snapshot
  * there still holds the old greys, and a two-level LUT does not drive white
- * to grey: such a scan runs at least PART.
+ * to grey: such a scan runs at least PART. Without a RESET at the
+ * temperature the part is the repair and runs FULL
+ * (rk3026_ebc_resolve_mode()): its snapshot is not thresholded either.
  */
-u32 rk3026_ebc_scan_mode(const struct rk3026_ebc_set *part, bool repaired)
+u32 rk3026_ebc_scan_mode(const struct rk3026_ebc_set *part, bool repair_due)
 {
-	if (repaired && part->mode != EBC_MODE_RESET &&
+	if (repair_due && part->mode != EBC_MODE_RESET &&
 	    rk3026_ebc_mode_rank(part->mode) <
 	    rk3026_ebc_mode_rank(EBC_MODE_PART))
 		return EBC_MODE_PART;
 	return part->mode;
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_scan_mode);
+
+/**
+ * rk3026_ebc_drive_knows_glass - whether a waveform run to its end makes the
+ *	glass known whatever it showed before
+ * @mode: the EBC work mode it was driven in, for the DSP_CTRL class
+ * @lut_mode: the mode its LUT belongs to
+ *
+ * A RESET reads neither image: every pixel goes through one fixed phase
+ * sequence and ends white. A FULL drives every pixel through its flash,
+ * unchanged ones too, the way the cleanup FULL clears the DU ghosts. Both
+ * need the full DSP_CTRL class (rk3026_ebc_dsp_ctrl_mode() gives
+ * DISPLAY_MODE alone), which drives the whole frame. Any other waveform
+ * (PART, DU, A2, OED_PART) moves only the pixels whose old grey, read from
+ * @shadows.prev, differs from the new one, so it cannot make known a glass
+ * that @shadows.prev_unknown says @shadows.prev does not describe.
+ *
+ * Return: true for a RESET or a FULL LUT driven in the full class.
+ */
+bool rk3026_ebc_drive_knows_glass(u32 mode, u32 lut_mode)
+{
+	if (rk3026_ebc_dsp_ctrl_mode(mode) != DSP_DISPLAY_MODE)
+		return false;
+	return lut_mode == EBC_MODE_RESET || lut_mode == EBC_MODE_FULL;
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_drive_knows_glass);
 
 /**
  * rk3026_ebc_du_spent - whether the DU budget is spent
@@ -615,7 +642,7 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_du_cleanup);
  *	returned it
  * @two_level: the snapshot's two-level result (rk3026_ebc_build_snapshot())
  * @changed_px: the pixels the snapshot changes
- * @repair_due: a repair RESET runs before it
+ * @repair: the repair due before it (enum rk3026_ebc_repair_due)
  * @budget: the plane parts' DU cleanup budget (rk3026_ebc_du_account())
  * @a2: what a two-level plane part needs for A2 (struct rk3026_ebc_a2)
  * @reason: returns why the part is driven in the returned mode
@@ -658,8 +685,13 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_du_cleanup);
  * such a client runs its own fulls.
  *
  * A part that has a mode of its own keeps @scan_mode, and so does one
- * behind a repair: the glass is white then outside the box, and only a
- * 16-level scan draws the old greys back.
+ * behind a repair RESET: the glass is white then outside the box, and only
+ * a 16-level scan draws the old greys back. Without a RESET at the
+ * temperature (EBC_REPAIR_BY_FULL) the part itself makes the glass known:
+ * it is driven FULL, whatever it asked (EBC_REASON_REPAIR_FLOOR if that
+ * raised it), since a PART or DU scan moves only the pixels whose prev,
+ * which is not evidence, differs (rk3026_ebc_drive_knows_glass()). The
+ * FULL that ends clears the mark, so the part after it resolves as usual.
  *
  * The idle cleanup (@part->cleanup_idle, queued by the refresh thread when
  * the budget is spent and the plane has been idle) keeps @scan_mode, FULL,
@@ -668,7 +700,8 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_du_cleanup);
  * are drawn in the same FULL.
  */
 u32 rk3026_ebc_resolve_mode(const struct rk3026_ebc_set *part, u32 scan_mode,
-			    bool two_level, u32 changed_px, bool repair_due,
+			    bool two_level, u32 changed_px,
+			    enum rk3026_ebc_repair_due repair,
 			    const struct rk3026_ebc_du_budget *budget,
 			    const struct rk3026_ebc_a2 *a2,
 			    enum rk3026_ebc_reason *reason)
@@ -678,7 +711,12 @@ u32 rk3026_ebc_resolve_mode(const struct rk3026_ebc_set *part, u32 scan_mode,
 		return scan_mode;
 	}
 	*reason = EBC_REASON_EXPLICIT;
-	if (repair_due) {
+	if (repair == EBC_REPAIR_BY_FULL) {
+		if (part->mode != EBC_MODE_FULL)
+			*reason = EBC_REASON_REPAIR_FLOOR;
+		return EBC_MODE_FULL;
+	}
+	if (repair == EBC_REPAIR_BY_RESET) {
 		if (scan_mode != part->mode)
 			*reason = EBC_REASON_REPAIR_FLOOR;
 		return scan_mode;
@@ -968,14 +1006,19 @@ static void ebc_carry(struct rk3026_ebc_pending *p,
  *   snapshot is what was driven in, so @scan and @prev swap; a RESET instead
  *   leaves @prev white, its target, also when it was cut short: the next
  *   draw repairs the glass and lays its box over that white, as the target
- *   image has it. @prev_unknown says whether every frame ran.
+ *   image has it. A waveform cut short sets @prev_unknown; one that ended
+ *   leaves it as rk3026_ebc_drive() left it, which alone clears it, and
+ *   only for a drive that makes the glass known
+ *   (rk3026_ebc_drive_knows_glass()): a PART or DU scan over a glass that
+ *   is not known leaves it set.
  * - SKIPPED: nothing differs.
  * - NO_RAILS, NO_LUT, NO_WAVEFORM: nothing was driven, so the part is
  *   carried into the next one, except the idle cleanup alone (see
  *   ebc_carry()). A RESET is not carried: @prev_unknown makes the next draw
  *   repair the glass. If a repair did run (EBC_REPAIR_DONE), the glass is
  *   white now: @prev is too, and the whole panel is carried, at least as
- *   PART, the idle cleanup alone too: the white glass must be drawn.
+ *   PART, the idle cleanup alone too: the white glass must be drawn. The
+ *   repair's own drive cleared @prev_unknown.
  * - CRTC_OFF: dropped; the RESET of the next CRTC enable clears the glass.
  *
  * Returns true if @prev changed, so the scanned prev image must follow it.
@@ -1003,7 +1046,8 @@ bool rk3026_ebc_scan_finish(struct rk3026_ebc_shadows *sh,
 	case EBC_OUTCOME_DRIVEN:
 	case EBC_OUTCOME_TIMEOUT:
 	case EBC_OUTCOME_ABANDONED:
-		sh->prev_unknown = outcome != EBC_OUTCOME_DRIVEN;
+		if (outcome != EBC_OUTCOME_DRIVEN)
+			sh->prev_unknown = true;
 		if (!reset) {
 			swap(sh->prev, sh->scan);
 			return true;
@@ -1028,7 +1072,6 @@ bool rk3026_ebc_scan_finish(struct rk3026_ebc_shadows *sh,
 		whole.cleanup_idle = false;
 		ebc_carry(p, &whole);
 		memset(sh->prev, 0xff, size);
-		sh->prev_unknown = false;
 		return true;
 
 	default:

@@ -283,7 +283,11 @@ static u32 dbg_last_status;
  * DISPLAY_MODE nor UPDATE_MODE, so the controller drives from the image without
  * the waveform LUT at all. A hard black/white there proves the pad, clock, rail
  * and image-fetch chain and isolates the fault to the LUT; mush there exonerates
- * the LUT and points at the data path.
+ * the LUT and points at the data path. A mode outside the full class
+ * (rk3026_ebc_drive_knows_glass()) never makes a glass that is not known
+ * known: with no RESET at the temperature the repair is the part's own
+ * drive, which then never clears @prev_unknown, and every part stays
+ * exempt from the skip until force_mode is cleared.
  *
  * swap_mst: put NEXT in WIN_MST0 -- the order this driver shipped between
  * 2026-08-03 and 2026-08-05, which drives one-directionally: the panel only ever
@@ -781,10 +785,15 @@ static irqreturn_t ebc_irq(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
-/* Panel temperature, in degrees Celsius. */
-static int ebc_read_temp(struct rk3026_ebc *ebc)
+/*
+ * Panel temperature, in degrees Celsius. KUnit replaces it with a static
+ * stub, so that the glue can read a temperature of its own.
+ */
+VISIBLE_IF_KUNIT int rk3026_ebc_read_temp(struct rk3026_ebc *ebc)
 {
 	int temp;
+
+	KUNIT_STATIC_STUB_REDIRECT(rk3026_ebc_read_temp, ebc);
 
 	if (!ebc->tzd || thermal_zone_get_temp(ebc->tzd, &temp))
 		return EBC_TEMP_FALLBACK;
@@ -799,6 +808,7 @@ static int ebc_read_temp(struct rk3026_ebc *ebc)
 	}
 	return temp;
 }
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_read_temp);
 
 /*
  * The clock of the take's quiet gap: when an update was queued, when a part
@@ -935,6 +945,10 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_setup_us);
  * @shadows.prev_unknown is set here and cleared in exactly ONE place of this
  * function -- the successful exit below. rk3026_ebc_scan_finish() records the
  * part's outcome afterwards and never clears what this left set.
+ * And only a drive that makes the glass known clears a flag that was set
+ * when it began (rk3026_ebc_drive_knows_glass(): a RESET, or a FULL): a PART
+ * or DU scan moves only the pixels whose prev, not evidence then, differs,
+ * so the glass is no better known after it than before.
  * That asymmetry is the whole design: a refresh that ends any other way,
  * including one added later by someone who never read this comment, leaves
  * the flag set without having to be listed anywhere. Do not "improve" this
@@ -948,6 +962,7 @@ VISIBLE_IF_KUNIT int rk3026_ebc_drive(struct rk3026_ebc *ebc, const u8 *lut,
 				      u32 frames, u32 mode, u32 lut_mode,
 				      struct rk3026_ebc_last *last)
 {
+	bool unknown = READ_ONCE(ebc->shadows.prev_unknown);
 	u32 done = 0, chunk = 0;
 	ktime_t start = ktime_get();
 	int ret = 0;
@@ -1027,7 +1042,8 @@ VISIBLE_IF_KUNIT int rk3026_ebc_drive(struct rk3026_ebc *ebc, const u8 *lut,
 	/* The idle deadline runs from the end of the last waveform. */
 	ebc_rails_rearm(ebc);
 
-	WRITE_ONCE(ebc->shadows.prev_unknown, false);
+	if (!unknown || rk3026_ebc_drive_knows_glass(mode, lut_mode))
+		WRITE_ONCE(ebc->shadows.prev_unknown, false);
 	last->outcome = EBC_OUTCOME_DRIVEN;
 out:
 	last->driven = done;
@@ -1060,38 +1076,35 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_drive);
  * RESET. @prev_virt follows here, for the part's scan; @shadows.prev follows
  * in rk3026_ebc_scan_finish() (EBC_REPAIR_DONE), whatever the part's outcome.
  *
- * Returns 0 if the RESET ran to completion (@last->repaired set) or there is
- * no RESET waveform at @temp (@last->repaired clear: nothing was driven), or
- * rk3026_ebc_drive()'s error: the rails are down and the part must not be
- * driven.
+ * Called for EBC_REPAIR_BY_RESET alone (ebc_repair_by() found the RESET
+ * at @temp).
+ *
+ * Return: EBC_REPAIR_DONE if the RESET ran to completion (@last->repaired
+ * set); EBC_REPAIR_FAILED on rk3026_ebc_drive()'s error: the rails are
+ * down and the part must not be driven.
  */
-static int ebc_recover_panel(struct rk3026_ebc *ebc, int temp,
-			     struct rk3026_ebc_last *last)
+static enum rk3026_ebc_repair ebc_recover_panel(struct rk3026_ebc *ebc,
+						int temp,
+						struct rk3026_ebc_last *last)
 {
 	const u8 *lut;
 	u32 frames;
-	int ret;
 
 	lut = rk3026_ebc_waveform_lut(ebc->waveform, EBC_MODE_RESET, temp,
 				      &frames);
-	if (!lut) {
-		dev_warn_ratelimited(ebc->dev,
-				     "panel state unknown and no RESET waveform at %d C\n",
-				     temp);
-		return 0;
-	}
+	if (WARN_ON_ONCE(!lut))
+		return EBC_REPAIR_NONE;
 
 	dev_warn(ebc->dev, "panel state unknown, clearing with %u RESET frames\n",
 		 frames);
 
 	last->repaired = true;
-	ret = rk3026_ebc_drive(ebc, lut, frames, EBC_MODE_RESET, EBC_MODE_RESET,
-			       last);
-	if (ret)
-		return ret;
+	if (rk3026_ebc_drive(ebc, lut, frames, EBC_MODE_RESET, EBC_MODE_RESET,
+			     last))
+		return EBC_REPAIR_FAILED;
 
 	memset(ebc->prev_virt, 0xff, ebc->img_size);
-	return 0;
+	return EBC_REPAIR_DONE;
 }
 
 /*
@@ -1297,8 +1310,49 @@ static bool ebc_part_drives(struct rk3026_ebc *ebc,
 static int ebc_prepare(struct rk3026_ebc *ebc, bool temp_valid, int *temp)
 {
 	if (!temp_valid)
-		*temp = ebc_read_temp(ebc);
+		*temp = rk3026_ebc_read_temp(ebc);
 	return rk3026_ebc_raise_rails(ebc);
+}
+
+/*
+ * The temperature @part is driven at: the newest one an update brought wins
+ * over the sensor's (@temp, from ebc_prepare()); one above the tables is
+ * replaced by the fallback.
+ */
+static int ebc_part_temp(const struct rk3026_ebc_set *part, int temp)
+{
+	if (part->temp_valid)
+		temp = part->temp;
+	if (temp > EBC_TEMP_MAX)
+		temp = EBC_TEMP_FALLBACK;
+	return temp;
+}
+
+/*
+ * The repair a part gets on a glass that is not known: a RESET before it;
+ * without a RESET waveform at @temp, the part itself driven FULL; without
+ * a FULL one either, none (EBC_REPAIR_NOT_DUE): the part is driven as if
+ * the glass were known, and its drive leaves the mark
+ * (rk3026_ebc_drive_knows_glass()), so every part is drawn so, none
+ * skipped, until the temperature has a RESET or a FULL. The RESET LUT this
+ * looks up is the one ebc_recover_panel() drives (the waveform keeps the
+ * last LUT it decoded), and nothing else is fetched before it.
+ */
+static enum rk3026_ebc_repair_due ebc_repair_by(struct rk3026_ebc *ebc,
+						int temp)
+{
+	u32 frames;
+
+	if (rk3026_ebc_waveform_lut(ebc->waveform, EBC_MODE_RESET, temp,
+				    &frames))
+		return EBC_REPAIR_BY_RESET;
+	dev_warn_ratelimited(ebc->dev,
+			     "panel state unknown and no RESET waveform at %d C\n",
+			     temp);
+	if (rk3026_ebc_waveform_lut(ebc->waveform, EBC_MODE_FULL, temp,
+				    &frames))
+		return EBC_REPAIR_BY_FULL;
+	return EBC_REPAIR_NOT_DUE;
 }
 
 /*
@@ -1331,6 +1385,7 @@ static int ebc_prepare(struct rk3026_ebc *ebc, bool temp_valid, int *temp)
 VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 					    struct rk3026_ebc_last *last)
 {
+	enum rk3026_ebc_repair_due repair = EBC_REPAIR_NOT_DUE;
 	enum rk3026_ebc_repair repair_result = EBC_REPAIR_NONE;
 	struct rk3026_ebc_shadows *sh = &ebc->shadows;
 	ktime_t start = ktime_get(), snap_start;
@@ -1338,7 +1393,7 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 	struct rk3026_ebc_du_budget budget;
 	struct rk3026_ebc_a2 a2 = { 0 };
 	struct rk3026_ebc_set part;
-	bool repair_due, identical, prev_changed, two_level, prepared = false;
+	bool identical, prev_changed, two_level, prepared = false;
 	u32 frames, mode, scan_mode, resolved, lut_mode;
 	u32 changed_px = 0;
 	const u8 *lut, *target;
@@ -1405,14 +1460,28 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 	}
 
 	/*
+	 * The sensor was read before the take (step 1) for a part the look
+	 * found it would drive, so the temperature, and with it what the
+	 * waveform has, is known here.
+	 */
+	if (prepared)
+		temp = ebc_part_temp(&part, temp);
+
+	/*
 	 * A glass that is not known is repaired with a RESET before the draw
 	 * (below), except before a RESET, which clears it anyway. After a
 	 * repair the glass is white outside the box too, while the snapshot
 	 * there holds the old greys, so the scan runs at least PART; the
-	 * snapshot is then not thresholded either.
+	 * snapshot is then not thresholded either. Without a RESET at the
+	 * temperature the part is driven FULL instead
+	 * (rk3026_ebc_resolve_mode()): a PART drive would not clear the mark
+	 * (rk3026_ebc_drive()); without a FULL either, as it is
+	 * (ebc_repair_by()). Such a part was prepared: the look drives every
+	 * part while @prev_unknown is set, and only this thread changes it.
 	 */
-	repair_due = sh->prev_unknown && part.mode != EBC_MODE_RESET;
-	scan_mode = rk3026_ebc_scan_mode(&part, repair_due);
+	if (sh->prev_unknown && part.mode != EBC_MODE_RESET)
+		repair = ebc_repair_by(ebc, temp);
+	scan_mode = rk3026_ebc_scan_mode(&part, repair != EBC_REPAIR_NOT_DUE);
 
 	/* An A2 scan over a grey of the glass comes back as DU. */
 	snap_start = ktime_get();
@@ -1497,8 +1566,8 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 	budget.ceiling = READ_ONCE(ebc->du_cleanup_ceiling);
 	a2.max_area = READ_ONCE(ebc->a2_max_area);
 	resolved = rk3026_ebc_resolve_mode(&part, scan_mode, two_level,
-					   changed_px, repair_due, &budget,
-					   &a2, &reason);
+					   changed_px, repair, &budget, &a2,
+					   &reason);
 	last->reason = reason;
 
 	/* DIAGNOSTIC: drive a different mode class with the same data and scan. */
@@ -1512,16 +1581,14 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 	 * The sensor and the rails came before the take (step 1) for a part
 	 * the look found it would drive. The look and the take see the same
 	 * part under one hold of the lock when it found otherwise, and such a
-	 * part ends above (CRTC off, no waveform, skipped); a part that gets
-	 * here without them gets them now, as before the look. The newest
-	 * temperature an update brought wins over the sensor's.
+	 * part ends above (CRTC off, no waveform, skipped: a target equal to
+	 * the glass makes an identical snapshot); one that got here all the
+	 * same gets them now, as before the look.
 	 */
-	if (!prepared)
+	if (WARN_ON_ONCE(!prepared)) {
 		rails = ebc_prepare(ebc, part.temp_valid, &temp);
-	if (part.temp_valid)
-		temp = part.temp;
-	if (temp > EBC_TEMP_MAX)
-		temp = EBC_TEMP_FALLBACK;
+		temp = ebc_part_temp(&part, temp);
+	}
 	last->temp = temp;
 	last->temp_read = true;
 
@@ -1551,17 +1618,14 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 	 * earlier -- fetching first would silently drive the requested mode's
 	 * frame count through the RESET LUT.
 	 */
-	if (repair_due) {
+	if (repair == EBC_REPAIR_BY_RESET) {
 		/*
 		 * A RESET that failed took the rails down: nothing more this
 		 * time, and the part is carried (rk3026_ebc_scan_finish()).
 		 */
-		if (ebc_recover_panel(ebc, temp, last)) {
-			repair_result = EBC_REPAIR_FAILED;
+		repair_result = ebc_recover_panel(ebc, temp, last);
+		if (repair_result == EBC_REPAIR_FAILED)
 			goto relock;
-		}
-		if (last->repaired)
-			repair_result = EBC_REPAIR_DONE;
 	}
 
 	/*

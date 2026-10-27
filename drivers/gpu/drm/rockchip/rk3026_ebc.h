@@ -243,13 +243,24 @@ enum rk3026_ebc_repair {
 };
 
 /*
+ * The repair due before a part when the glass is not known, as the mode
+ * policy sees it (rk3026_ebc_resolve_mode()): what the waveform has at the
+ * panel's temperature decides it.
+ */
+enum rk3026_ebc_repair_due {
+	EBC_REPAIR_NOT_DUE,	/* glass known, a RESET part, or no RESET nor FULL */
+	EBC_REPAIR_BY_RESET,	/* a RESET runs before the part */
+	EBC_REPAIR_BY_FULL,	/* no RESET at the temperature: the part runs FULL */
+};
+
+/*
  * Why a part is driven in the mode it is (rk3026_ebc_resolve_mode()), for the
  * scan_start tracepoint.
  */
 enum rk3026_ebc_reason {
 	EBC_REASON_EXPLICIT,	/* the part's own mode, as asked or by default */
 	EBC_REASON_AUTO_DU,	/* an auto part whose changes are all 0 or 15 */
-	EBC_REASON_REPAIR_FLOOR, /* raised to PART after a repair RESET */
+	EBC_REASON_REPAIR_FLOOR, /* raised by a repair: PART after its RESET, FULL without one */
 	EBC_REASON_CLEANUP_BIG,	/* a big auto plane part kept FULL: spent, or spent by it */
 	EBC_REASON_AUTO_PART,	/* an auto plane part with a grey change */
 	EBC_REASON_CLEANUP_CEILING, /* ceiling: any auto plane part FULL */
@@ -544,7 +555,8 @@ struct rk3026_ebc_pending {
 /*
  * The CPU-side images, packed 4bpp like the scanned ones (@pitch bytes per
  * line, @height lines): what the glass shows, and the snapshot a scan drives.
- * @prev_unknown says @prev is not evidence (a waveform did not end).
+ * @prev_unknown says @prev is not evidence: a waveform did not end, and no
+ * RESET or FULL has run to its end since (rk3026_ebc_drive_knows_glass()).
  */
 struct rk3026_ebc_shadows {
 	u8		*prev;
@@ -904,6 +916,7 @@ int rk3026_ebc_raise_rails(struct rk3026_ebc *ebc);
 ktime_t rk3026_ebc_clock(struct rk3026_ebc *ebc);
 bool rk3026_ebc_take_ready(struct rk3026_ebc *ebc, ktime_t now);
 u32 rk3026_ebc_crtc_off(struct rk3026_ebc *ebc);
+int rk3026_ebc_read_temp(struct rk3026_ebc *ebc);
 u32 rk3026_ebc_setup_us(struct rk3026_ebc *ebc,
 			const struct rk3026_ebc_last *last);
 #endif
@@ -933,14 +946,16 @@ bool rk3026_ebc_target_differs(const struct rk3026_ebc_shadows *sh,
 			       const u8 *next, const struct drm_rect *box);
 bool rk3026_ebc_should_skip(const struct rk3026_ebc_set *part,
 			    bool prev_unknown, bool identical);
-u32 rk3026_ebc_scan_mode(const struct rk3026_ebc_set *part, bool repaired);
+u32 rk3026_ebc_scan_mode(const struct rk3026_ebc_set *part, bool repair_due);
+bool rk3026_ebc_drive_knows_glass(u32 mode, u32 lut_mode);
 bool rk3026_ebc_du_spent(const struct rk3026_ebc_du_budget *budget);
 bool rk3026_ebc_du_at_ceiling(const struct rk3026_ebc_du_budget *budget);
 bool rk3026_ebc_du_cleanup(const struct rk3026_ebc_du_budget *budget,
 			   u32 changed_px, u32 added_px,
 			   enum rk3026_ebc_reason *reason);
 u32 rk3026_ebc_resolve_mode(const struct rk3026_ebc_set *part, u32 scan_mode,
-			    bool two_level, u32 changed_px, bool repair_due,
+			    bool two_level, u32 changed_px,
+			    enum rk3026_ebc_repair_due repair,
 			    const struct rk3026_ebc_du_budget *budget,
 			    const struct rk3026_ebc_a2 *a2,
 			    enum rk3026_ebc_reason *reason);

@@ -794,6 +794,43 @@ static void ebc_test_scan_mode(struct kunit *test)
 	}
 }
 
+/*
+ * Only a RESET or a FULL, in the full DSP_CTRL class, makes a glass that is
+ * not known known: a PART, DU or A2 scan moves only the pixels whose prev
+ * differs, and prev is what is not known. force_mode can drive a LUT in
+ * another class, and the class decides too.
+ */
+static void ebc_test_drive_knows_glass(struct kunit *test)
+{
+	static const struct {
+		u32	mode;
+		u32	lut_mode;
+		bool	knows;
+	} rows[] = {
+		{ EBC_MODE_RESET, EBC_MODE_RESET, true },
+		{ EBC_MODE_FULL, EBC_MODE_FULL, true },
+		{ EBC_MODE_PART, EBC_MODE_PART, false },
+		{ EBC_MODE_BLACK_WHITE, EBC_MODE_BLACK_WHITE, false },
+		{ EBC_MODE_A2, EBC_MODE_A2, false },
+		{ EBC_MODE_OED_PART, EBC_MODE_OED_PART, false },
+		{ EBC_MODE_FULL_DITHER, EBC_MODE_FULL_DITHER, false },
+		/* force_mode: a partial class over a FULL or a RESET LUT, */
+		{ EBC_MODE_PART, EBC_MODE_FULL, false },
+		{ EBC_MODE_PART, EBC_MODE_RESET, false },
+		/* a direct mode over the FULL LUT it falls back to, */
+		{ EBC_MODE_DIRECT_PART, EBC_MODE_FULL, false },
+		/* a full class over it. */
+		{ EBC_MODE_BLOCK, EBC_MODE_FULL, true },
+	};
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(rows); i++)
+		KUNIT_EXPECT_EQ_MSG(test,
+				    rk3026_ebc_drive_knows_glass(rows[i].mode,
+								 rows[i].lut_mode),
+				    rows[i].knows, "row %u", i);
+}
+
 /* --- sequences of add, take and finish --- */
 
 struct t_ctx {
@@ -1015,22 +1052,32 @@ static void ebc_test_seq_reset_in_flight(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, rk3026_ebc_work_pending(&c->p));
 }
 
+/*
+ * A part driven to its end: the snapshot is prev, and the mark is what
+ * rk3026_ebc_drive() left: clear after a drive that knew the glass or made
+ * it known, still set after a PART over a glass that is not known.
+ */
 static void ebc_test_finish_driven(struct kunit *test)
 {
-	struct t_ctx *c = t_ctx_alloc(test);
-	struct rk3026_ebc_set part;
+	unsigned int i;
 
-	c->sh.prev_unknown = true;
-	t_add(&c->p, &t_panel, EBC_MODE_PART, EBC_SOURCE_PLANE);
-	rk3026_ebc_pending_take(&c->p, &part);
-	KUNIT_EXPECT_TRUE(test, rk3026_ebc_scan_finish(&c->sh, &c->p, &part,
-						       EBC_OUTCOME_DRIVEN,
-						       EBC_REPAIR_NONE));
-	KUNIT_EXPECT_PTR_EQ(test, c->sh.prev, c->scan);
-	KUNIT_EXPECT_PTR_EQ(test, c->sh.scan, c->prev);
-	KUNIT_EXPECT_FALSE(test, c->sh.prev_unknown);
-	KUNIT_EXPECT_EQ(test, c->p.done_seq, part.seq);
-	KUNIT_EXPECT_FALSE(test, c->p.carry.merged);
+	for (i = 0; i < 2; i++) {
+		struct t_ctx *c = t_ctx_alloc(test);
+		struct rk3026_ebc_set part;
+
+		c->sh.prev_unknown = i;
+		t_add(&c->p, &t_panel, EBC_MODE_PART, EBC_SOURCE_PLANE);
+		rk3026_ebc_pending_take(&c->p, &part);
+		KUNIT_EXPECT_TRUE(test,
+				  rk3026_ebc_scan_finish(&c->sh, &c->p, &part,
+							 EBC_OUTCOME_DRIVEN,
+							 EBC_REPAIR_NONE));
+		KUNIT_EXPECT_PTR_EQ(test, c->sh.prev, c->scan);
+		KUNIT_EXPECT_PTR_EQ(test, c->sh.scan, c->prev);
+		KUNIT_EXPECT_EQ(test, c->sh.prev_unknown, i);
+		KUNIT_EXPECT_EQ(test, c->p.done_seq, part.seq);
+		KUNIT_EXPECT_FALSE(test, c->p.carry.merged);
+	}
 }
 
 /* The part's own waveform ran, a repair or not: the snapshot is prev. */
@@ -1049,7 +1096,8 @@ static void ebc_test_finish_entered(struct kunit *test)
 			struct t_ctx *c = t_ctx_alloc(test);
 			struct rk3026_ebc_set part;
 
-			c->sh.prev_unknown = repairs[j] == EBC_REPAIR_DONE;
+			/* As the drive of the part, or of its repair, left it. */
+			c->sh.prev_unknown = false;
 			t_add(&c->p, &t_panel, EBC_MODE_PART, EBC_SOURCE_PLANE);
 			rk3026_ebc_pending_take(&c->p, &part);
 			/* Partly driven: the snapshot is the best prev there is. */
@@ -1254,7 +1302,8 @@ static void ebc_test_finish_reset(struct kunit *test)
 	struct t_ctx *c = t_ctx_alloc(test);
 	struct rk3026_ebc_set part;
 
-	c->sh.prev_unknown = true;
+	/* Its drive, a RESET, cleared the mark (rk3026_ebc_drive()). */
+	c->sh.prev_unknown = false;
 	t_add(&c->p, &t_panel, EBC_MODE_RESET, EBC_SOURCE_ENABLE);
 	rk3026_ebc_pending_take(&c->p, &part);
 	KUNIT_EXPECT_TRUE(test, rk3026_ebc_scan_finish(&c->sh, &c->p, &part,
@@ -1340,7 +1389,8 @@ static void ebc_test_finish_repaired_not_driven(struct kunit *test)
 	struct drm_rect r = DRM_RECT_INIT(2, 2, 2, 2);
 	struct rk3026_ebc_set part;
 
-	c->sh.prev_unknown = true;
+	/* The repair's drive, a RESET, cleared the mark (rk3026_ebc_drive()). */
+	c->sh.prev_unknown = false;
 	t_add(&c->p, &r, EBC_MODE_A2, EBC_SOURCE_MXCFB);
 	rk3026_ebc_pending_take(&c->p, &part);
 	KUNIT_EXPECT_EQ(test, rk3026_ebc_scan_mode(&part, true), EBC_MODE_PART);
@@ -1868,6 +1918,7 @@ static void ebc_test_resolve_mode(struct kunit *test)
 {
 	const struct t_resolve *c = test->param_value;
 	enum rk3026_ebc_reason reason = T_NO_REASON;
+	enum rk3026_ebc_repair_due repair;
 	struct rk3026_ebc_du_budget budget;
 	struct rk3026_ebc_set part;
 	struct rk3026_ebc_a2 a2;
@@ -1879,10 +1930,11 @@ static void ebc_test_resolve_mode(struct kunit *test)
 	t_budget_of(c->budget, &budget, &changed_px, &box);
 	part.box = box;
 	t_a2_of(c->a2, &a2);
+	repair = c->repair ? EBC_REPAIR_BY_RESET : EBC_REPAIR_NOT_DUE;
 	scan_mode = rk3026_ebc_scan_mode(&part, c->repair);
 	KUNIT_EXPECT_EQ(test,
 			rk3026_ebc_resolve_mode(&part, scan_mode, c->two_level,
-						changed_px, c->repair, &budget,
+						changed_px, repair, &budget,
 						&a2, &reason),
 			c->mode);
 	KUNIT_EXPECT_EQ(test, reason, c->reason);
@@ -1895,10 +1947,62 @@ static void ebc_test_resolve_mode(struct kunit *test)
 		KUNIT_EXPECT_EQ(test,
 				rk3026_ebc_resolve_mode(&part, scan_mode,
 							c->two_level,
-							changed_px, c->repair,
+							changed_px, repair,
 							&budget, &a2, &reason),
 				c->mode);
 		KUNIT_EXPECT_EQ(test, reason, c->reason);
+	}
+}
+
+/*
+ * A repair due without a RESET at the temperature (EBC_REPAIR_BY_FULL):
+ * the part is the repair and runs FULL, whatever it asked, its content, the
+ * budget or A2, for the repair's reason when that raised it. The idle
+ * cleanup keeps its own reason (FULL anyway).
+ */
+static void ebc_test_resolve_repair_full(struct kunit *test)
+{
+	static const enum t_kind kinds[] = {
+		T_PLANE, T_AUTO_PART, T_PLANE_AUTO_PART, T_PLANE_DU,
+		T_AUTO_PART_DU, T_MXCFB_FULL, T_A2, T_DU, T_IDLE, T_IDLE_PLANE,
+	};
+	static const enum t_budget budgets[] = {
+		T_FRESH, T_SPENT_BIG, T_CEIL,
+	};
+	static const enum t_a2 a2s[] = { T_A2_OFF, T_A2_ALL };
+	const unsigned int per_kind = ARRAY_SIZE(budgets) * ARRAY_SIZE(a2s) * 2;
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(kinds) * per_kind; i++) {
+		enum t_budget bu = budgets[i / (ARRAY_SIZE(a2s) * 2) %
+					   ARRAY_SIZE(budgets)];
+		enum rk3026_ebc_reason want, reason = T_NO_REASON;
+		enum t_a2 a2k = a2s[i / 2 % ARRAY_SIZE(a2s)];
+		struct rk3026_ebc_du_budget budget;
+		bool two_level = i % 2;
+		struct rk3026_ebc_set part;
+		struct rk3026_ebc_a2 a2;
+		u32 changed_px, scan_mode;
+		struct drm_rect box;
+
+		t_kind_part(kinds[i / per_kind], &part);
+		t_budget_of(bu, &budget, &changed_px, &box);
+		part.box = box;
+		t_a2_of(a2k, &a2);
+		scan_mode = rk3026_ebc_scan_mode(&part, true);
+		if (part.cleanup_idle)
+			want = T_IDLE_CLEAN;
+		else
+			want = part.mode == EBC_MODE_FULL ? T_EXPL : T_FLOOR;
+		KUNIT_EXPECT_EQ_MSG(test,
+				    rk3026_ebc_resolve_mode(&part, scan_mode,
+							    two_level,
+							    changed_px,
+							    EBC_REPAIR_BY_FULL,
+							    &budget, &a2,
+							    &reason),
+				    EBC_MODE_FULL, "case %u", i);
+		KUNIT_EXPECT_EQ_MSG(test, reason, want, "case %u", i);
 	}
 }
 
@@ -2725,7 +2829,9 @@ static struct kunit_case rk3026_ebc_core_test_cases[] = {
 	KUNIT_CASE(ebc_test_target_differs),
 	KUNIT_CASE(ebc_test_skip),
 	KUNIT_CASE(ebc_test_scan_mode),
+	KUNIT_CASE(ebc_test_drive_knows_glass),
 	KUNIT_CASE_PARAM(ebc_test_resolve_mode, t_resolve_gen_params),
+	KUNIT_CASE(ebc_test_resolve_repair_full),
 	KUNIT_CASE_PARAM(ebc_test_du_cleanup, t_du_cleanup_gen_params),
 	KUNIT_CASE_PARAM(ebc_test_du_state, t_du_state_gen_params),
 	KUNIT_CASE_PARAM(ebc_test_idle_cleanup_due, t_idle_gen_params),
@@ -2936,8 +3042,8 @@ static u32 t_mxcfb_resolve(struct kunit *test, u32 waveform, u32 update_mode,
 	KUNIT_EXPECT_FALSE(test, part.has_plane);
 	return rk3026_ebc_resolve_mode(&part,
 				       rk3026_ebc_scan_mode(&part, false),
-				       two_level, U32_MAX, false, &budget, &a2,
-				       reason);
+				       two_level, U32_MAX, EBC_REPAIR_NOT_DUE,
+				       &budget, &a2, reason);
 }
 
 /*
@@ -3154,13 +3260,35 @@ static size_t t_rkf_stream(const struct t_rkf_seg *seg)
 	}
 }
 
+/* The temperature boundary table of a mode's offset table (rkf_modes[]). */
+static u32 t_rkf_temps(u32 table)
+{
+	switch (table) {
+	case T_RKF_RESET:
+		return 0x090;
+	case T_RKF_GRAY16:
+		return 0x0d0;
+	case T_RKF_GRAYA2:
+		return 0x110;
+	case T_RKF_MODE6:
+		return 0x150;
+	default:
+		return 0x190;
+	}
+}
+
 /*
  * Segments laid out one after another from the payload start, the last one
- * @cut bytes short of its stream: the container ends there.
+ * @cut bytes short of its stream: the container ends there. With @hot, the
+ * segment of that offset table is there only from @from degrees up: its
+ * boundary table splits the temperatures at @from, and the slot below is
+ * empty, as a waveform without that mode at those temperatures has it.
  */
-static struct ebc_waveform *t_rkf_wf(struct kunit *test, struct device *dev,
-				     const struct t_rkf_seg *segs,
-				     unsigned int n, size_t cut)
+static struct ebc_waveform *t_rkf_wf_hot(struct kunit *test,
+					 struct device *dev,
+					 const struct t_rkf_seg *segs,
+					 unsigned int n, size_t cut, u32 hot,
+					 u8 from)
 {
 	struct ebc_waveform *wf;
 	size_t size = T_RKF_PAYLOAD;
@@ -3179,11 +3307,51 @@ static struct ebc_waveform *t_rkf_wf(struct kunit *test, struct device *dev,
 		size += 4 + t_rkf_stream(&segs[i]);
 	}
 	size -= cut;
+	if (hot) {
+		put_unaligned_le32(get_unaligned_le32(buf + hot), buf + hot + 4);
+		put_unaligned_le32(0, buf + hot);
+		buf[t_rkf_temps(hot) + 1] = from;
+	}
 	t_rkf_seal(buf, size);
 
 	wf = rk3026_ebc_waveform_parse(dev, buf, size + 4);
 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, wf);
 	return wf;
+}
+
+static struct ebc_waveform *t_rkf_wf(struct kunit *test, struct device *dev,
+				     const struct t_rkf_seg *segs,
+				     unsigned int n, size_t cut)
+{
+	return t_rkf_wf_hot(test, dev, segs, n, cut, 0, 0);
+}
+
+/*
+ * A segment only from 20 degrees up: a LUT at 20 and above, none below;
+ * the other modes at every temperature.
+ */
+static void ebc_test_rkf_hot(struct kunit *test)
+{
+	static const struct t_rkf_seg segs[] = {
+		{ T_RKF_RESET, 5 }, { T_RKF_GRAY16, 1 },
+	};
+	struct device *dev = t_rkf_dev(test);
+	struct ebc_waveform *wf = t_rkf_wf_hot(test, dev, segs,
+					       ARRAY_SIZE(segs), 0,
+					       T_RKF_RESET, 20);
+	u32 frames = 0;
+
+	KUNIT_EXPECT_NULL(test, rk3026_ebc_waveform_lut(wf, EBC_MODE_RESET, 5,
+							&frames));
+	KUNIT_EXPECT_NULL(test, rk3026_ebc_waveform_lut(wf, EBC_MODE_RESET, 19,
+							&frames));
+	KUNIT_EXPECT_NOT_NULL(test, rk3026_ebc_waveform_lut(wf, EBC_MODE_RESET,
+							    20, &frames));
+	KUNIT_EXPECT_EQ(test, frames, 5);
+	KUNIT_EXPECT_NOT_NULL(test, rk3026_ebc_waveform_lut(wf, EBC_MODE_FULL, 5,
+							    &frames));
+	KUNIT_EXPECT_NOT_NULL(test, rk3026_ebc_waveform_lut(wf, EBC_MODE_FULL,
+							    25, &frames));
 }
 
 /* The frames of a mode's LUT, or -1 if there is none. */
@@ -3398,6 +3566,7 @@ static struct kunit_case rk3026_ebc_waveform_test_cases[] = {
 	KUNIT_CASE(ebc_test_rkf_decode_zero_length),
 	KUNIT_CASE(ebc_test_rkf_decode_oversized),
 	KUNIT_CASE(ebc_test_rkf_segment_fits),
+	KUNIT_CASE(ebc_test_rkf_hot),
 	KUNIT_CASE(ebc_test_rkf_segment_truncated),
 	KUNIT_CASE(ebc_test_rkf_modes),
 	KUNIT_CASE(ebc_test_rkf_truncated_modes),
@@ -4058,7 +4227,8 @@ static void ebc_test_glue_du_reset(struct kunit *test)
  * its calls, @rails_ret is what they return, with @rails_fb the first one
  * sends a plane update of @rails_box from it, as a sender would while the
  * rails come up, and rails that come up move the fake clock (t_clock(),
- * @now) by @ramp; drive k moves it by @drive_time[k].
+ * @now) by @ramp; drive k moves it by @drive_time[k]. @temp is what the
+ * sensor reads, with t_temp_ebc().
  */
 struct t_drives {
 	unsigned int	n;
@@ -4072,6 +4242,7 @@ struct t_drives {
 	ktime_t		now;
 	ktime_t		ramp;
 	ktime_t		drive_time[8];
+	int		temp;
 };
 
 /*
@@ -4079,11 +4250,13 @@ struct t_drives {
  * real one records it, and the mode noted in the test's struct t_drives,
  * with the part's seq and the time from its take that the real one traces
  * at scan_start (rk3026_ebc_setup_us()); the waveform then takes its
- * @drive_time on the fake clock.
+ * @drive_time on the fake clock. The mark follows the real one's rule:
+ * cleared by a drive that begins with the glass known or makes it known.
  */
 static int t_drive_ok(struct rk3026_ebc *ebc, const u8 *lut, u32 frames,
 		      u32 mode, u32 lut_mode, struct rk3026_ebc_last *last)
 {
+	bool unknown = READ_ONCE(ebc->shadows.prev_unknown);
 	struct t_drives *d = kunit_get_current_test()->priv;
 
 	if (d->n < ARRAY_SIZE(d->mode)) {
@@ -4098,8 +4271,35 @@ static int t_drive_ok(struct rk3026_ebc *ebc, const u8 *lut, u32 frames,
 	last->frames = frames;
 	last->driven = frames;
 	last->outcome = EBC_OUTCOME_DRIVEN;
-	WRITE_ONCE(ebc->shadows.prev_unknown, false);
+	if (!unknown || rk3026_ebc_drive_knows_glass(mode, lut_mode))
+		WRITE_ONCE(ebc->shadows.prev_unknown, false);
 	return 0;
+}
+
+/*
+ * rk3026_ebc_drive() cut short in its first chunk, as the real one ends on
+ * a frame timeout: nothing driven, the mark set, the mode noted.
+ */
+static int t_drive_timeout(struct rk3026_ebc *ebc, const u8 *lut,
+			   u32 frames, u32 mode, u32 lut_mode,
+			   struct rk3026_ebc_last *last)
+{
+	struct t_drives *d = kunit_get_current_test()->priv;
+
+	if (d->n < ARRAY_SIZE(d->mode)) {
+		d->mode[d->n] = mode;
+		d->seq[d->n] = last->seq;
+		d->setup_us[d->n] = rk3026_ebc_setup_us(ebc, last);
+		d->now = ktime_add(d->now, d->drive_time[d->n]);
+	}
+	d->n++;
+	WRITE_ONCE(ebc->shadows.prev_unknown, true);
+	last->scans++;
+	last->lut_mode = lut_mode;
+	last->frames = frames;
+	last->timeouts++;
+	last->outcome = EBC_OUTCOME_TIMEOUT;
+	return -ETIMEDOUT;
 }
 
 /*
@@ -4798,6 +4998,85 @@ static void ebc_test_glue_du_repaired(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ebc->du_area, 0);
 }
 
+/*
+ * A glass that is not known. With a RESET at the temperature the repair
+ * runs first and an mxcfb DU send after it is drawn PART, the repair floor,
+ * as before. Without one (gray16 and gray2 only) no repair runs: the send
+ * is the repair and is driven FULL, which makes the glass known and clears
+ * the budget; the plane part after it resolves as usual (DU), no FULL loop.
+ * A FULL cut short leaves the mark, and the next part is FULL again.
+ */
+static void ebc_test_glue_repair_no_reset(struct kunit *test)
+{
+	static const struct t_rkf_seg segs[] = {
+		{ T_RKF_GRAY16, 1 }, { T_RKF_GRAY2, 1 },
+	};
+	struct drm_rect r = DRM_RECT_INIT(2, 2, 4, 2);
+	struct t_drives d;
+	struct rk3026_ebc *ebc = t_driven_ebc(test, &d, true);
+	u32 *black = t_plane_fb(test, 0);
+	u32 *white = t_plane_fb(test, 0xffffff);
+	struct rk3026_ebc_last last;
+	u32 seq;
+
+	ebc->du_cleanup_area = 2 * T_W * T_H;
+	ebc->shadows.prev_unknown = true;
+	t_send(ebc, &r, EBC_MODE_BLACK_WHITE, 0, EBC_SOURCE_MXCFB);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_TRUE(test, last.repaired);
+	KUNIT_ASSERT_EQ(test, d.n, 2);
+	KUNIT_EXPECT_EQ(test, d.mode[0], EBC_MODE_RESET);
+	KUNIT_EXPECT_EQ(test, d.mode[1], EBC_MODE_PART);
+	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_REPAIR_FLOOR);
+	KUNIT_EXPECT_FALSE(test, ebc->shadows.prev_unknown);
+
+	ebc->waveform = t_rkf_wf(test, ebc->dev, segs, ARRAY_SIZE(segs), 0);
+	ebc->shadows.prev_unknown = true;
+	ebc->du_area = 50;
+	seq = t_send(ebc, &r, EBC_MODE_BLACK_WHITE, 0, EBC_SOURCE_MXCFB);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_EXPECT_FALSE(test, last.repaired);
+	KUNIT_ASSERT_EQ(test, d.n, 3);
+	KUNIT_EXPECT_EQ(test, d.mode[2], EBC_MODE_FULL);
+	KUNIT_EXPECT_EQ(test, d.seq[2], seq);
+	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_FULL);
+	KUNIT_EXPECT_EQ(test, last.lut_mode, EBC_MODE_FULL);
+	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_REPAIR_FLOOR);
+	KUNIT_EXPECT_FALSE(test, ebc->shadows.prev_unknown);
+	KUNIT_EXPECT_EQ(test, ebc->du_area, 0);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_seq_finished(&ebc->pending, seq));
+
+	/* Black over the glass the FULL left: two-level, DU, as usual. */
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
+							&t_panel));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_ASSERT_EQ(test, d.n, 4);
+	KUNIT_EXPECT_EQ(test, d.mode[3], EBC_MODE_BLACK_WHITE);
+	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_AUTO_DU);
+	KUNIT_EXPECT_FALSE(test, ebc->shadows.prev_unknown);
+
+	/* The FULL cut short: the mark stays, and the next part repairs. */
+	kunit_activate_static_stub(test, rk3026_ebc_drive, t_drive_timeout);
+	ebc->shadows.prev_unknown = true;
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, white, T_W * 4,
+							&t_panel));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_TIMEOUT);
+	KUNIT_ASSERT_EQ(test, d.n, 5);
+	KUNIT_EXPECT_EQ(test, d.mode[4], EBC_MODE_FULL);
+	KUNIT_EXPECT_TRUE(test, ebc->shadows.prev_unknown);
+
+	kunit_activate_static_stub(test, rk3026_ebc_drive, t_drive_ok);
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
+							&t_panel));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_ASSERT_EQ(test, d.n, 6);
+	KUNIT_EXPECT_EQ(test, d.mode[5], EBC_MODE_FULL);
+	KUNIT_EXPECT_FALSE(test, ebc->shadows.prev_unknown);
+}
+
 /* rk3026_ebc_clock() on the fake clock of struct t_drives. */
 static ktime_t t_clock(struct rk3026_ebc *ebc)
 {
@@ -5442,6 +5721,105 @@ static void ebc_test_glue_gap_big_full(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, d.rails, 3);
 }
 
+/* rk3026_ebc_read_temp() without a sensor: @temp of struct t_drives. */
+static int t_temp(struct rk3026_ebc *ebc)
+{
+	struct t_drives *d = kunit_get_current_test()->priv;
+
+	return d->temp;
+}
+
+/*
+ * t_driven_ebc() with gray16 and gray2 LUTs at every temperature, @hot
+ * only from 20 degrees up, and the sensor reading @temp.
+ */
+static struct rk3026_ebc *t_temp_ebc(struct kunit *test, struct t_drives *d,
+				     u32 hot, int temp)
+{
+	static const struct t_rkf_seg segs[] = {
+		{ T_RKF_RESET, 5 }, { T_RKF_GRAY16, 1 }, { T_RKF_GRAY2, 1 },
+	};
+	struct rk3026_ebc *ebc = t_driven_ebc(test, d, false);
+
+	ebc->waveform = t_rkf_wf_hot(test, ebc->dev, segs, ARRAY_SIZE(segs),
+				     0, hot, 20);
+	d->temp = temp;
+	kunit_activate_static_stub(test, rk3026_ebc_read_temp, t_temp);
+	return ebc;
+}
+
+/*
+ * The repair is chosen at the sensor's temperature, read before the
+ * take: with a RESET only from 20 degrees up and the sensor at 5, an
+ * mxcfb DU send on a glass not known is driven FULL, no RESET before it
+ * (the fallback temperature, 25, has one); at 25 the RESET runs and the
+ * send after it is drawn PART.
+ */
+static void ebc_test_glue_repair_sensor(struct kunit *test)
+{
+	struct drm_rect r = DRM_RECT_INIT(2, 2, 4, 2);
+	struct t_drives d;
+	struct rk3026_ebc *ebc = t_temp_ebc(test, &d, T_RKF_RESET, 5);
+	struct rk3026_ebc_last last;
+
+	ebc->shadows.prev_unknown = true;
+	t_send(ebc, &r, EBC_MODE_BLACK_WHITE, 0, EBC_SOURCE_MXCFB);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.temp, 5);
+	KUNIT_EXPECT_FALSE(test, last.repaired);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_ASSERT_EQ(test, d.n, 1);
+	KUNIT_EXPECT_EQ(test, d.mode[0], EBC_MODE_FULL);
+	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_REPAIR_FLOOR);
+	KUNIT_EXPECT_FALSE(test, ebc->shadows.prev_unknown);
+
+	d.temp = 25;
+	ebc->shadows.prev_unknown = true;
+	t_send(ebc, &r, EBC_MODE_BLACK_WHITE, 0, EBC_SOURCE_MXCFB);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.temp, 25);
+	KUNIT_EXPECT_TRUE(test, last.repaired);
+	KUNIT_ASSERT_EQ(test, d.n, 3);
+	KUNIT_EXPECT_EQ(test, d.mode[1], EBC_MODE_RESET);
+	KUNIT_EXPECT_EQ(test, d.mode[2], EBC_MODE_PART);
+	KUNIT_EXPECT_FALSE(test, ebc->shadows.prev_unknown);
+}
+
+/*
+ * Neither a RESET nor a FULL at the temperature (gray2 alone): nothing can
+ * make the glass known, so no repair is due. An mxcfb DU send is drawn in
+ * its own mode, no PART floor, and the mark stays; the same send again is
+ * not skipped: the glass is still not known.
+ */
+static void ebc_test_glue_repair_no_full(struct kunit *test)
+{
+	static const struct t_rkf_seg segs[] = { { T_RKF_GRAY2, 1 } };
+	struct drm_rect r = DRM_RECT_INIT(2, 2, 4, 2);
+	struct t_drives d;
+	struct rk3026_ebc *ebc = t_driven_ebc(test, &d, false);
+	struct rk3026_ebc_last last;
+	u32 seq;
+
+	ebc->waveform = t_rkf_wf(test, ebc->dev, segs, ARRAY_SIZE(segs), 0);
+	ebc->shadows.prev_unknown = true;
+	t_img_fill(ebc->next_shadow, 0);
+	seq = t_send(ebc, &r, EBC_MODE_BLACK_WHITE, 0, EBC_SOURCE_MXCFB);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_EXPECT_FALSE(test, last.repaired);
+	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_EXPLICIT);
+	KUNIT_ASSERT_EQ(test, d.n, 1);
+	KUNIT_EXPECT_EQ(test, d.mode[0], EBC_MODE_BLACK_WHITE);
+	KUNIT_EXPECT_TRUE(test, ebc->shadows.prev_unknown);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_seq_finished(&ebc->pending, seq));
+
+	t_send(ebc, &r, EBC_MODE_BLACK_WHITE, 0, EBC_SOURCE_MXCFB);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_EXPECT_EQ(test, d.n, 2);
+	KUNIT_EXPECT_TRUE(test, ebc->shadows.prev_unknown);
+}
+
 /*
  * A part whose target is what the glass shows is still driven when it is
  * exempt from the skip, so it gets the rails: a full-class mxcfb send (the
@@ -6022,6 +6400,7 @@ static struct kunit_case rk3026_ebc_glue_test_cases[] = {
 	KUNIT_CASE(ebc_test_glue_idle_carried),
 	KUNIT_CASE(ebc_test_glue_idle_busy),
 	KUNIT_CASE(ebc_test_glue_du_repaired),
+	KUNIT_CASE(ebc_test_glue_repair_no_reset),
 	KUNIT_CASE(ebc_test_glue_part_record),
 	KUNIT_CASE(ebc_test_glue_rails_not_raised),
 	KUNIT_CASE(ebc_test_glue_rails_before_take),
@@ -6032,6 +6411,8 @@ static struct kunit_case rk3026_ebc_glue_test_cases[] = {
 	KUNIT_CASE(ebc_test_glue_gap_cap),
 	KUNIT_CASE(ebc_test_glue_gap_exempt),
 	KUNIT_CASE(ebc_test_glue_gap_big_full),
+	KUNIT_CASE(ebc_test_glue_repair_sensor),
+	KUNIT_CASE(ebc_test_glue_repair_no_full),
 	KUNIT_CASE(ebc_test_glue_rails_exempt),
 #if IS_ENABLED(CONFIG_DRM_RK3026_EBC_MXCFB)
 	KUNIT_CASE(ebc_test_glue_mxcfb_send),

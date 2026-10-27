@@ -26,6 +26,15 @@
  *   a2_max_area      the most pixels a two-level auto plane part may change
  *                    to be driven in A2, read-write; 0: no A2, as probe sets
  *                    it.
+ *   take_quiet_us    how long the senders must be quiet before a burst, a
+ *                    big or a FULL part, or a part with the rails down, is
+ *                    taken (rk3026_ebc_take_wait()), read-write; 0: no gap.
+ *                    Used up to the cap. Probe sets EBC_TAKE_QUIET_US.
+ *   take_cap_ms      the longest such a take waits, counted from the later
+ *                    of the first pending update and the previous part's
+ *                    finish, read-write; 0: no gap. Used up to
+ *                    EBC_TAKE_CAP_MAX_MS: the rails are held while the take
+ *                    waits. Probe sets EBC_TAKE_CAP_MS.
  *   timing           text, the blit and snapshot times of the last part and
  *                    the last driven one (rk3026_ebc_timing_show())
  *
@@ -327,6 +336,8 @@ void rk3026_ebc_debugfs_init(struct rk3026_ebc *ebc)
 	debugfs_create_u32("du_cleanup_idle_ms", 0644, dir,
 			   &ebc->du_cleanup_idle_ms);
 	debugfs_create_u32("a2_max_area", 0644, dir, &ebc->a2_max_area);
+	debugfs_create_u32("take_quiet_us", 0644, dir, &ebc->take_quiet_us);
+	debugfs_create_u32("take_cap_ms", 0644, dir, &ebc->take_cap_ms);
 	debugfs_create_file("timing", 0444, dir, ebc, &rk3026_ebc_timing_fops);
 }
 

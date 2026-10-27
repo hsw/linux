@@ -139,6 +139,7 @@ static void ebc_set_merge(struct rk3026_ebc_set *set, bool empty,
 		set->auto_ok &= src->auto_ok;
 	}
 	set->has_mxcfb_full |= src->has_mxcfb_full;
+	set->has_mxcfb |= src->has_mxcfb;
 	set->has_plane |= src->has_plane;
 	set->cleanup_idle |= src->cleanup_idle;
 }
@@ -158,11 +159,15 @@ static void ebc_set_add(struct rk3026_ebc_set *set,
 		.has_mxcfb_full	= upd->source == EBC_SOURCE_MXCFB &&
 				  rk3026_ebc_dsp_ctrl_mode(upd->mode) ==
 				  DSP_DISPLAY_MODE,
+		.has_mxcfb	= upd->source == EBC_SOURCE_MXCFB,
 		.auto_ok	= upd->auto_mode,
 		.has_plane	= upd->source == EBC_SOURCE_PLANE,
 		.cleanup_idle	= upd->source == EBC_SOURCE_IDLE,
 	};
 
+	if (!set->merged)
+		set->first = upd->queued;
+	set->last = upd->queued;
 	ebc_set_merge(set, !set->merged, &one);
 	if (upd->temp_valid) {
 		set->temp = upd->temp;
@@ -771,6 +776,89 @@ bool rk3026_ebc_thread_deadline(bool rails_on, unsigned long rails_off_at,
 	return true;
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_thread_deadline);
+
+/**
+ * rk3026_ebc_rails_off_due - whether the refresh thread drops the rails now
+ * @rails_on: the panel rails are up
+ * @rails_off_at: their off deadline, in jiffies
+ * @gap_open: the take's quiet gap is open (rk3026_ebc_take_ready())
+ * @now: the time of the look, in jiffies
+ *
+ * At the deadline, but not while a gap is open: the part taken after it
+ * will be driven (a gap opens only for such a part), and the gap's cap
+ * bounds the hold. The drive after it moves the deadline.
+ *
+ * Return: true when the rails are to be dropped.
+ */
+bool rk3026_ebc_rails_off_due(bool rails_on, unsigned long rails_off_at,
+			      bool gap_open, unsigned long now)
+{
+	return rails_on && !gap_open && time_after_eq(now, rails_off_at);
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_rails_off_due);
+
+/**
+ * rk3026_ebc_take_wait - whether the take of the next part waits for a gap
+ * @t: the next part (struct rk3026_ebc_take)
+ * @now: the time of the look
+ * @deadline: returns the gap's end when the take waits; left alone if not
+ *
+ * The thread wakes on the first update of a burst: an fbdev client fills
+ * the panel in strips some ms apart, and a take on the first strip makes a
+ * part of it alone, then one of the rest, two scans for one fill. A take
+ * that waits until the senders have been quiet for @t->quiet_us after the
+ * newest update gets the whole burst into one part.
+ *
+ * A lone small update must not wait: a pointer move or a key typed is the
+ * latency the user feels. So a gap opens only for what is gathered anyway:
+ * a burst (two updates or more), a big box (@t->big_area, as the DU
+ * cleanup sizes a big part), a part that will be driven FULL, or any part
+ * while the rails are down: the rails take tens of ms to come up, and the
+ * gap opened then raises them at once (rk3026_ebc_take_ready()), so it ends
+ * no earlier than a drive could start anyway, and a lone update gets no
+ * latency the rails did not add already. With the rails up, a lone small
+ * update is taken at once.
+ *
+ * Once open (@t->open), a gap runs to its end however small the part
+ * stays, unless the part becomes exempt (an mxcfb send or a RESET is
+ * sent): then it ends at once. It ends @t->quiet_us after the newest
+ * update, or @t->cap_ms after the later of the first update and the
+ * previous part's finish, whichever is earlier: a steady stream is taken
+ * at the cap, and updates queued while a scan ran do not use up the cap of
+ * the part they make. The cap is at most EBC_TAKE_CAP_MAX_MS and the quiet
+ * gap at most the cap: debugfs may set either higher, and the rails would
+ * be held all that time.
+ *
+ * Never for an exempt part (@t->exempt: an mxcfb send, the idle cleanup, a
+ * RESET pending), and never with a quiet gap or a cap of 0.
+ *
+ * Return: true while the take waits, with @deadline the gap's end.
+ */
+bool rk3026_ebc_take_wait(const struct rk3026_ebc_take *t, ktime_t now,
+			  ktime_t *deadline)
+{
+	ktime_t from = ktime_after(t->prev_done, t->first) ? t->prev_done :
+							     t->first;
+	u32 cap_ms = min_t(u32, t->cap_ms, EBC_TAKE_CAP_MAX_MS);
+	u32 quiet_us = min_t(u32, t->quiet_us, cap_ms * USEC_PER_MSEC);
+	ktime_t end, cap;
+
+	if (!quiet_us || t->exempt)
+		return false;
+	if (!t->open && t->rails_up && t->count < 2 &&
+	    t->area < t->big_area && !t->full)
+		return false;
+
+	end = ktime_add_us(t->last, quiet_us);
+	cap = ktime_add_ms(from, cap_ms);
+	if (ktime_before(cap, end))
+		end = cap;
+	if (!ktime_before(now, end))
+		return false;
+	*deadline = end;
+	return true;
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_take_wait);
 
 /**
  * rk3026_ebc_du_account - the DU cleanup budget after one part

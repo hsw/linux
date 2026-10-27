@@ -271,11 +271,11 @@ static void ebc_test_pending_add(struct kunit *test)
 	struct rk3026_ebc_update a = {
 		.clip = DRM_RECT_INIT(2, 1, 4, 2), .mode = EBC_MODE_A2,
 		.marker = 7, .temp = 20, .temp_valid = true,
-		.source = EBC_SOURCE_MXCFB,
+		.source = EBC_SOURCE_MXCFB, .queued = 1000,
 	};
 	struct rk3026_ebc_update b = {
 		.clip = DRM_RECT_INIT(9, 3, 3, 3), .mode = EBC_MODE_PART,
-		.source = EBC_SOURCE_PLANE,
+		.source = EBC_SOURCE_PLANE, .queued = 5000,
 	};
 	struct rk3026_ebc_pending p = {};
 	struct rk3026_ebc_set part;
@@ -304,6 +304,10 @@ static void ebc_test_pending_add(struct kunit *test)
 	/* The newest update's marker, even when it had none. */
 	KUNIT_EXPECT_EQ(test, part.marker, 0);
 	KUNIT_EXPECT_FALSE(test, part.has_mxcfb_full);
+	/* An mxcfb send is in it; queued from the first to the newest. */
+	KUNIT_EXPECT_TRUE(test, part.has_mxcfb);
+	KUNIT_EXPECT_EQ(test, part.first, 1000);
+	KUNIT_EXPECT_EQ(test, part.last, 5000);
 	KUNIT_EXPECT_TRUE(test, rk3026_ebc_pending_empty(&p));
 	KUNIT_EXPECT_EQ(test, rk3026_ebc_pending_parts(&p), 0);
 	KUNIT_EXPECT_FALSE(test, rk3026_ebc_pending_take(&p, &part));
@@ -2152,6 +2156,149 @@ static void ebc_test_thread_deadline(struct kunit *test)
 }
 
 /*
+ * The take's quiet gap (rk3026_ebc_take_wait()), times in us: a lone small
+ * update with the rails up is taken at once; a burst, a big box, a FULL
+ * part or any part with the rails down waits until @quiet_us after the
+ * newest update, at most the cap (250 ms) from the later of the first
+ * update and the previous finish; an open gap runs to its end; an exempt
+ * part (mxcfb, RESET) and a quiet gap or a cap of 0 never wait. A big box
+ * is 1000 pixels here. A cap above EBC_TAKE_CAP_MAX_MS (@cap_ms, with
+ * @own_cap) is clamped to it, and a quiet gap above the cap to the cap.
+ */
+struct t_take {
+	const char	*desc;
+	u32		count;
+	u32		area;
+	bool		full;
+	bool		exempt;
+	bool		rails_up;
+	bool		open;
+	u32		quiet_us;
+	s64		first_us;
+	s64		prev_us;
+	s64		last_us;
+	s64		now_us;
+	bool		wait;
+	s64		end_us;
+	bool		own_cap;
+	u32		cap_ms;
+};
+
+static const struct t_take t_take_cases[] = {
+	/* count, area, full, exempt, rails_up, open, quiet, first, prev, last, now */
+	{ "lone small, rails up: now", 1, 100, false, false, true, false,
+	  10000, 0, 0, 0, 0, false },
+	{ "burst: the gap after the newest", 2, 100, false, false, true, false,
+	  10000, 0, 0, 5000, 6000, true, 15000 },
+	{ "burst, quiet reached: now", 2, 100, false, false, true, false,
+	  10000, 0, 0, 5000, 15000, false },
+	{ "big box", 1, 1000, false, false, true, false,
+	  10000, 0, 0, 0, 0, true, 10000 },
+	{ "box just under big: now", 1, 999, false, false, true, false,
+	  10000, 0, 0, 0, 0, false },
+	{ "FULL part", 1, 100, true, false, true, false,
+	  10000, 0, 0, 0, 2000, true, 10000 },
+	{ "rails down, lone small", 1, 100, false, false, false, false,
+	  10000, 0, 0, 0, 0, true, 10000 },
+	{ "rails down, quiet reached: now", 1, 100, false, false, false, false,
+	  10000, 0, 0, 0, 10000, false },
+	{ "open, lone small, rails up", 1, 100, false, false, true, true,
+	  10000, 0, 0, 3000, 5000, true, 13000 },
+	{ "exempt: now", 3, 100000, true, true, false, false,
+	  10000, 0, 0, 0, 0, false },
+	{ "exempt while open: now", 3, 100, false, true, true, true,
+	  10000, 0, 0, 0, 0, false },
+	{ "quiet 0: now", 3, 100000, true, false, false, true,
+	  0, 0, 0, 0, 0, false },
+	{ "stream: the cap", 5, 100, false, false, true, true,
+	  10000, 0, 0, 245000, 249000, true, 250000 },
+	{ "stream, cap reached: now", 5, 100, false, false, true, true,
+	  10000, 0, 0, 245000, 250000, false },
+	{ "cap from the previous finish", 5, 100, false, false, true, true,
+	  10000, 0, 100000, 345000, 349000, true, 350000 },
+	{ "cap from the first update", 5, 100, false, false, true, true,
+	  10000, 100000, 0, 345000, 349000, true, 350000 },
+	/* ..., wait, end, own_cap, cap_ms */
+	{ "cap 0: now", 2, 100, false, false, false, false,
+	  10000, 0, 0, 0, 0, false, 0, true, 0 },
+	{ "cap above the max: clamped", 5, 100, false, false, true, true,
+	  10000, 0, 0, 995000, 999000, true, 1000000, true, 60000 },
+	{ "quiet above the cap: the cap", 2, 100, false, false, true, false,
+	  300000, 0, 0, 0, 0, true, 250000 },
+	{ "quiet above the cap, cap from the previous finish", 2, 100, false,
+	  false, true, false, 300000, 0, 200000, 100000, 300000, true, 350000 },
+	{ "previous finish after the quiet gap: now", 2, 100, false, false,
+	  true, false, 10000, 0, 50000, 5000, 50000, false },
+};
+
+KUNIT_ARRAY_PARAM_DESC(t_take, t_take_cases, desc);
+
+static void ebc_test_take_wait(struct kunit *test)
+{
+	const struct t_take *c = test->param_value;
+	const struct rk3026_ebc_take t = {
+		.first		= c->first_us * NSEC_PER_USEC,
+		.last		= c->last_us * NSEC_PER_USEC,
+		.prev_done	= c->prev_us * NSEC_PER_USEC,
+		.count		= c->count,
+		.area		= c->area,
+		.big_area	= 1000,
+		.quiet_us	= c->quiet_us,
+		.cap_ms		= c->own_cap ? c->cap_ms : 250,
+		.full		= c->full,
+		.exempt		= c->exempt,
+		.rails_up	= c->rails_up,
+		.open		= c->open,
+	};
+	ktime_t end = 12345;
+
+	KUNIT_EXPECT_EQ(test,
+			rk3026_ebc_take_wait(&t, c->now_us * NSEC_PER_USEC,
+					     &end),
+			c->wait);
+	if (c->wait)
+		KUNIT_EXPECT_EQ(test, end, c->end_us * NSEC_PER_USEC);
+	else
+		KUNIT_EXPECT_EQ(test, end, 12345);
+}
+
+/*
+ * The refresh thread's wait condition and rails-off: between parts it
+ * wakes on work; while a gap is open, on an update newer than the one it
+ * saw, not on the part pending all along, or on the CRTC going off; and
+ * the rails are held up while a gap is open, at their deadline too.
+ */
+static void ebc_test_thread_woken(struct kunit *test)
+{
+	struct rk3026_ebc_pending p = {};
+	u32 seen;
+
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_thread_woken(&p));
+	t_add(&p, &t_panel, EBC_MODE_FULL, EBC_SOURCE_PLANE);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_thread_woken(&p));
+
+	seen = p.queued_seq;
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_work_pending(&p));
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_gap_woken(&p, seen, true));
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_gap_woken(&p, seen, false));
+	t_add(&p, &t_panel, EBC_MODE_FULL, EBC_SOURCE_PLANE);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_gap_woken(&p, seen, true));
+	seen = p.queued_seq;
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_gap_woken(&p, seen, true));
+
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_rails_off_due(true, 100, false, 100));
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_rails_off_due(true, 100, false, 99));
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_rails_off_due(true, 100, true, 100));
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_rails_off_due(true, 100, true,
+							  100000));
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_rails_off_due(false, 100, false,
+							  200));
+	/* time_after_eq(), across a wrap too. */
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_rails_off_due(true, ULONG_MAX - 5,
+							 false, 5));
+}
+
+/*
  * The idle cleanup's flag survives what may join the part before it is
  * taken: updates on either side of it, and a carry merged into it. Not
  * driven (no rails, no LUT), the cleanup alone is not carried, and one
@@ -2583,6 +2730,8 @@ static struct kunit_case rk3026_ebc_core_test_cases[] = {
 	KUNIT_CASE_PARAM(ebc_test_du_state, t_du_state_gen_params),
 	KUNIT_CASE_PARAM(ebc_test_idle_cleanup_due, t_idle_gen_params),
 	KUNIT_CASE_PARAM(ebc_test_thread_deadline, t_deadline_gen_params),
+	KUNIT_CASE_PARAM(ebc_test_take_wait, t_take_gen_params),
+	KUNIT_CASE(ebc_test_thread_woken),
 	KUNIT_CASE(ebc_test_pending_cleanup_idle),
 	KUNIT_CASE(ebc_test_pending_auto_ok),
 	KUNIT_CASE(ebc_test_pending_auto_ok_reset),
@@ -3579,14 +3728,17 @@ static void ebc_test_glue_wait_barrier(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, rk3026_ebc_work_pending(&ebc->pending));
 }
 
-/* Four parts, each a setup and eight chunks at their budget. */
+/*
+ * Four parts, each a setup and eight chunks at their budget, and the
+ * longest quiet gap.
+ */
 static void ebc_test_glue_wait_timeout(struct kunit *test)
 {
 	struct rk3026_ebc *ebc = t_ebc_alloc(test);
 
 	/* The fallback dot clock on a 16x6 panel: every budget at its floor. */
 	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_timeout_ms(ebc),
-			4 * (1000 + 8 * 5000));
+			4 * (1000 + 8 * 5000) + EBC_TAKE_CAP_MAX_MS);
 
 	/*
 	 * 1 kHz, 4 x 6 clocks a frame: 24 ms a frame, a 64-frame budget of
@@ -3594,7 +3746,7 @@ static void ebc_test_glue_wait_timeout(struct kunit *test)
 	 */
 	ebc->timing.pixelclock.typ = 1000;
 	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_timeout_ms(ebc),
-			4 * (1000 + 8 * 6144));
+			4 * (1000 + 8 * 6144) + EBC_TAKE_CAP_MAX_MS);
 }
 
 /* A plane update leaves the panel to an mxcfb client. */
@@ -3903,9 +4055,10 @@ static void ebc_test_glue_du_reset(struct kunit *test)
 /*
  * The waveforms the static stub of rk3026_ebc_drive() was asked for, and
  * what the stub of rk3026_ebc_raise_rails() (t_rails()) does: @rails counts
- * its calls, @rails_ret is what they return, and with @rails_fb the first
- * one sends a plane update of @rails_box from it, as a sender would while
- * the rails come up.
+ * its calls, @rails_ret is what they return, with @rails_fb the first one
+ * sends a plane update of @rails_box from it, as a sender would while the
+ * rails come up, and rails that come up move the fake clock (t_clock(),
+ * @now) by @ramp; drive k moves it by @drive_time[k].
  */
 struct t_drives {
 	unsigned int	n;
@@ -3916,13 +4069,17 @@ struct t_drives {
 	int		rails_ret;
 	const u32	*rails_fb;
 	struct drm_rect	rails_box;
+	ktime_t		now;
+	ktime_t		ramp;
+	ktime_t		drive_time[8];
 };
 
 /*
  * rk3026_ebc_drive() without the controller: every frame driven, as the
  * real one records it, and the mode noted in the test's struct t_drives,
  * with the part's seq and the time from its take that the real one traces
- * at scan_start (rk3026_ebc_setup_us()).
+ * at scan_start (rk3026_ebc_setup_us()); the waveform then takes its
+ * @drive_time on the fake clock.
  */
 static int t_drive_ok(struct rk3026_ebc *ebc, const u8 *lut, u32 frames,
 		      u32 mode, u32 lut_mode, struct rk3026_ebc_last *last)
@@ -3933,6 +4090,7 @@ static int t_drive_ok(struct rk3026_ebc *ebc, const u8 *lut, u32 frames,
 		d->mode[d->n] = mode;
 		d->seq[d->n] = last->seq;
 		d->setup_us[d->n] = rk3026_ebc_setup_us(ebc, last);
+		d->now = ktime_add(d->now, d->drive_time[d->n]);
 	}
 	d->n++;
 	last->scans++;
@@ -4640,13 +4798,23 @@ static void ebc_test_glue_du_repaired(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ebc->du_area, 0);
 }
 
+/* rk3026_ebc_clock() on the fake clock of struct t_drives. */
+static ktime_t t_clock(struct rk3026_ebc *ebc)
+{
+	struct t_drives *d = kunit_get_current_test()->priv;
+
+	return d->now;
+}
+
 /*
  * The record the tracepoints read: the part's newest seq, its box, the
  * pixels its snapshot changes and the DU budget spent at its take, and
- * when it was taken. A black plane update over the white glass is driven
- * DU and changes every pixel; the same update again is skipped, with the
- * budget it spent; with the CRTC off nothing is built (0 pixels). A repair
- * RESET is driven for the part's own seq, before the part.
+ * when it was taken, on the driver's clock (a fake one here). A black
+ * plane update over the white glass is driven DU and changes every pixel,
+ * its waveform at once after the take (setup 1 us, the floor); the same
+ * update again is skipped, with the budget it spent; with the CRTC off
+ * nothing is built (0 pixels). A repair RESET is driven for the part's own
+ * seq, before the part, which starts the RESET's 7 ms after its take.
  */
 static void ebc_test_glue_part_record(struct kunit *test)
 {
@@ -4655,15 +4823,15 @@ static void ebc_test_glue_part_record(struct kunit *test)
 	u32 *black = t_plane_fb(test, 0);
 	u32 *white = t_plane_fb(test, 0xffffff);
 	struct rk3026_ebc_last last;
-	ktime_t before, after;
+	ktime_t t0 = ms_to_ktime(1000);
 
+	d.now = t0;
+	kunit_activate_static_stub(test, rk3026_ebc_clock, t_clock);
 	ebc->du_cleanup_area = 2 * T_W * T_H;
 	ebc->du_area = 5;
 	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
 							&t_panel));
-	before = ktime_get();
 	rk3026_ebc_do_refresh(ebc, &last);
-	after = ktime_get();
 	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
 	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_BLACK_WHITE);
 	KUNIT_EXPECT_EQ(test, last.seq, ebc->pending.queued_seq);
@@ -4671,14 +4839,13 @@ static void ebc_test_glue_part_record(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, last.changed_px, T_W * T_H);
 	KUNIT_EXPECT_EQ(test, last.du_area, 5);
 	KUNIT_EXPECT_EQ(test, ebc->du_area, 5 + T_W * T_H);
-	KUNIT_EXPECT_GE(test, ktime_to_ns(last.taken), ktime_to_ns(before));
-	KUNIT_EXPECT_LE(test, ktime_to_ns(last.taken), ktime_to_ns(after));
+	KUNIT_EXPECT_EQ(test, last.taken, t0);
 	KUNIT_EXPECT_EQ(test, last.gap_us, 0);
 	KUNIT_EXPECT_EQ(test, last.tries, 0);
 	KUNIT_EXPECT_FALSE(test, last.gave_up);
 	KUNIT_ASSERT_EQ(test, d.n, 1);
 	KUNIT_EXPECT_EQ(test, d.seq[0], last.seq);
-	KUNIT_EXPECT_GE(test, d.setup_us[0], 1);
+	KUNIT_EXPECT_EQ(test, d.setup_us[0], 1);
 	KUNIT_EXPECT_EQ(test, ebc->last.seq, last.seq);
 	KUNIT_EXPECT_EQ(test, ebc->last.changed_px, T_W * T_H);
 
@@ -4703,16 +4870,20 @@ static void ebc_test_glue_part_record(struct kunit *test)
 
 	ebc->crtc_on = true;
 	ebc->shadows.prev_unknown = true;
+	d.now = ktime_add_ms(t0, 500);
+	d.drive_time[1] = ms_to_ktime(7);
 	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, white, T_W * 4,
 							&t_panel));
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_TRUE(test, last.repaired);
 	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_EXPECT_EQ(test, last.taken, ktime_add_ms(t0, 500));
 	KUNIT_ASSERT_EQ(test, d.n, 3);
 	KUNIT_EXPECT_EQ(test, d.mode[1], EBC_MODE_RESET);
 	KUNIT_EXPECT_EQ(test, d.seq[1], last.seq);
 	KUNIT_EXPECT_EQ(test, d.seq[2], last.seq);
-	KUNIT_EXPECT_GE(test, d.setup_us[2], d.setup_us[1]);
+	KUNIT_EXPECT_EQ(test, d.setup_us[1], 1);
+	KUNIT_EXPECT_EQ(test, d.setup_us[2], 7000);
 }
 
 /* rk3026_ebc_raise_rails() without a regulator, see struct t_drives. */
@@ -4725,6 +4896,8 @@ static int t_rails(struct rk3026_ebc *ebc)
 					&d->rails_box);
 	if (d->rails_ret)
 		return d->rails_ret;
+	if (!ebc->epd_on)
+		d->now = ktime_add(d->now, d->ramp);
 	ebc->epd_on = true;
 	ebc->rails_on = true;
 	return 0;
@@ -4868,6 +5041,442 @@ static void ebc_test_glue_rails_fail(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, rk3026_ebc_seq_finished(&ebc->pending, seq));
 	KUNIT_EXPECT_EQ(test, ebc->stats.dropped, 1);
 	KUNIT_EXPECT_FALSE(test, ebc->epd_on);
+}
+
+/*
+ * t_rails_ebc() on the fake clock, at 1 s, with the take's gap as probe
+ * sets it; the last part finished long before.
+ */
+static struct rk3026_ebc *t_gap_ebc(struct kunit *test, struct t_drives *d)
+{
+	struct rk3026_ebc *ebc = t_rails_ebc(test, d);
+
+	ebc->take_quiet_us = EBC_TAKE_QUIET_US;
+	ebc->take_cap_ms = EBC_TAKE_CAP_MS;
+	d->now = ms_to_ktime(1000);
+	kunit_activate_static_stub(test, rk3026_ebc_clock, t_clock);
+	return ebc;
+}
+
+/*
+ * The refresh thread's loop on the fake clock while a part is pending, as
+ * ebc_refresh_thread() runs it: a look (rk3026_ebc_take_ready()), and while
+ * the gap is open, a wait that ends at the next send or at the gap's end.
+ * Send k (k from *@sent up to @n) is a plane update of @boxes[k % @nboxes]
+ * from @fb at @every_us * k after the start. Every wait must sleep at the
+ * look (no newer update: no spin) and wake on the next send. Returns the
+ * looks, the one that takes included.
+ */
+static unsigned int t_gap_run(struct kunit *test, struct rk3026_ebc *ebc,
+			      struct t_drives *d, const u32 *fb,
+			      const struct drm_rect *boxes, unsigned int nboxes,
+			      unsigned int n, s64 every_us, unsigned int *sent)
+{
+	ktime_t t0 = d->now;
+	unsigned int looks = 0;
+
+	while (looks++ < 1000) {
+		ktime_t next = KTIME_MAX;
+
+		if (rk3026_ebc_take_ready(ebc, d->now))
+			return looks;
+		KUNIT_EXPECT_TRUE(test, ebc->gap.open);
+		KUNIT_EXPECT_TRUE(test, rk3026_ebc_work_pending(&ebc->pending));
+		KUNIT_EXPECT_FALSE(test,
+				   rk3026_ebc_gap_woken(&ebc->pending,
+							ebc->gap.seen, true));
+		if (*sent < n)
+			next = ktime_add_us(t0, *sent * every_us);
+		if (!ktime_before(next, ebc->gap.at)) {
+			d->now = ebc->gap.at;
+			continue;
+		}
+		if (ktime_after(next, d->now))
+			d->now = next;
+		KUNIT_EXPECT_TRUE(test,
+				  rk3026_ebc_plane_update(ebc, fb, T_W * 4,
+							  &boxes[*sent % nboxes]));
+		(*sent)++;
+		KUNIT_EXPECT_TRUE(test,
+				  rk3026_ebc_gap_woken(&ebc->pending,
+						       ebc->gap.seen, true));
+	}
+	KUNIT_FAIL(test, "no take after %u looks", looks);
+	return looks;
+}
+
+/*
+ * A burst of strips, as an fbdev fill sends them 2 ms apart, with the
+ * rails down: the first strip opens the gap and raises the rails (4 ms
+ * here), each later strip moves its end, and the take comes 10 ms after
+ * the last strip. One part, one scan for the whole fill; one look per
+ * strip and one at the gap's end, each followed by a wait that sleeps.
+ */
+static void ebc_test_glue_gap_burst(struct kunit *test)
+{
+	struct t_drives d;
+	struct rk3026_ebc *ebc = t_gap_ebc(test, &d);
+	u32 *black = t_plane_fb(test, 0);
+	struct drm_rect rows[T_H];
+	struct rk3026_ebc_last last;
+	unsigned int i, sent = 1, looks;
+	ktime_t t0 = d.now;
+
+	for (i = 0; i < T_H; i++)
+		rows[i] = DRM_RECT_INIT(0, i, T_W, 1);
+	d.ramp = ms_to_ktime(4);
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
+							&rows[0]));
+	looks = t_gap_run(test, ebc, &d, black, rows, T_H, T_H, 2000, &sent);
+	KUNIT_EXPECT_EQ(test, sent, T_H);
+	KUNIT_EXPECT_EQ(test, looks, T_H + 1);
+	KUNIT_EXPECT_EQ(test, d.rails, 1);
+	KUNIT_EXPECT_EQ(test, ktime_us_delta(d.now, t0), 20000);
+	KUNIT_EXPECT_FALSE(test, ebc->gap.open);
+
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_EXPECT_EQ(test, last.merged, T_H);
+	KUNIT_EXPECT_TRUE(test, drm_rect_equals(&last.clip, &t_panel));
+	KUNIT_EXPECT_EQ(test, last.gap_us, 20000);
+	KUNIT_EXPECT_EQ(test, d.n, 1);
+	KUNIT_EXPECT_EQ(test, ebc->take_done, d.now);
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_work_pending(&ebc->pending));
+}
+
+/*
+ * A lone small update is not delayed. With the rails down the gap raises
+ * them (42 ms here) and ends with them: the drive would have waited for
+ * them anyway. With the rails up it is taken at once, no gap. A part with
+ * an mxcfb send in it is taken at once with the rails down, and so is any
+ * part with no quiet gap.
+ */
+static void ebc_test_glue_gap_lone(struct kunit *test)
+{
+	struct t_drives d;
+	struct rk3026_ebc *ebc = t_gap_ebc(test, &d);
+	u32 *fb = t_plane_fb(test, 0xffffff);
+	struct drm_rect a = DRM_RECT_INIT(4, 2, 2, 2);
+	struct drm_rect b = DRM_RECT_INIT(8, 2, 2, 2);
+	struct rk3026_ebc_last last;
+	ktime_t t0 = d.now;
+
+	d.ramp = ms_to_ktime(42);
+	t_fb_box(fb, 4, 2, 6, 4, 0);
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, fb, T_W * 4, &a));
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_take_ready(ebc, d.now));
+	KUNIT_EXPECT_EQ(test, d.rails, 1);
+	KUNIT_EXPECT_TRUE(test, ebc->epd_on);
+	KUNIT_EXPECT_EQ(test, ktime_us_delta(d.now, t0), 42000);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_take_ready(ebc, d.now));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_EXPECT_EQ(test, last.gap_us, 42000);
+	KUNIT_EXPECT_EQ(test, d.n, 1);
+
+	t_fb_box(fb, 8, 2, 10, 4, 0);
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, fb, T_W * 4, &b));
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_take_ready(ebc, d.now));
+	KUNIT_EXPECT_FALSE(test, ebc->gap.open);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_EXPECT_EQ(test, last.gap_us, 0);
+	KUNIT_EXPECT_EQ(test, d.n, 2);
+
+	ebc->epd_on = false;
+	ebc->rails_on = false;
+	d.rails = 0;
+	t_fb_box(fb, 4, 2, 6, 4, 0xffffff);
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, fb, T_W * 4, &a));
+	t_send(ebc, &b, EBC_MODE_FULL, 9, EBC_SOURCE_MXCFB);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_take_ready(ebc, d.now));
+	KUNIT_EXPECT_FALSE(test, ebc->gap.open);
+	KUNIT_EXPECT_EQ(test, d.rails, 0);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.merged, 2);
+	KUNIT_EXPECT_EQ(test, last.gap_us, 0);
+
+	ebc->epd_on = false;
+	ebc->rails_on = false;
+	d.rails = 0;
+	ebc->take_quiet_us = 0;
+	t_fb_box(fb, 4, 2, 6, 4, 0);
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, fb, T_W * 4, &a));
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, fb, T_W * 4, &a));
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_take_ready(ebc, d.now));
+	KUNIT_EXPECT_EQ(test, d.rails, 0);
+}
+
+/* The refresh thread's wait queue, as a waiter on it sees a wake-up. */
+struct t_waker {
+	struct wait_queue_entry	wq;
+	unsigned int		woken;
+};
+
+static int t_wake(struct wait_queue_entry *wq, unsigned int mode, int flags,
+		  void *key)
+{
+	container_of(wq, struct t_waker, wq)->woken++;
+	return 0;
+}
+
+/*
+ * rk3026_ebc_crtc_off(), as the CRTC disable calls it: the CRTC goes off,
+ * the newest seq is returned for the disable's wait, and the refresh
+ * thread's wait is woken, once.
+ */
+static void t_crtc_off(struct kunit *test, struct rk3026_ebc *ebc)
+{
+	struct t_waker w = { .woken = 0 };
+
+	init_waitqueue_func_entry(&w.wq, t_wake);
+	add_wait_queue(&ebc->update_wq, &w.wq);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_crtc_off(ebc),
+			ebc->pending.queued_seq);
+	remove_wait_queue(&ebc->update_wq, &w.wq);
+	KUNIT_EXPECT_FALSE(test, ebc->crtc_on);
+	KUNIT_EXPECT_EQ(test, w.woken, 1);
+}
+
+/*
+ * No gap for a part that will not be driven, so no rails: a burst that
+ * redraws what the glass shows is taken at once and skipped. A gap open
+ * when the CRTC goes off wakes the thread's wait (rk3026_ebc_crtc_off()),
+ * ends at the next look, and the part is dropped.
+ */
+static void ebc_test_glue_gap_not_driven(struct kunit *test)
+{
+	struct t_drives d;
+	struct rk3026_ebc *ebc = t_gap_ebc(test, &d);
+	u32 *white = t_plane_fb(test, 0xffffff);
+	u32 *black = t_plane_fb(test, 0);
+	struct rk3026_ebc_last last;
+
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, white, T_W * 4,
+							&t_panel));
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, white, T_W * 4,
+							&t_panel));
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_take_ready(ebc, d.now));
+	KUNIT_EXPECT_FALSE(test, ebc->gap.open);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_SKIPPED);
+	KUNIT_EXPECT_EQ(test, d.rails, 0);
+	KUNIT_EXPECT_FALSE(test, ebc->epd_on);
+
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
+							&t_panel));
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_take_ready(ebc, d.now));
+	KUNIT_EXPECT_TRUE(test, ebc->gap.open);
+	KUNIT_EXPECT_EQ(test, d.rails, 1);
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_gap_woken(&ebc->pending,
+						      ebc->gap.seen,
+						      ebc->crtc_on));
+	t_crtc_off(test, ebc);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_gap_woken(&ebc->pending,
+						     ebc->gap.seen,
+						     ebc->crtc_on));
+	d.now = ktime_add_us(d.now, 1000);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_take_ready(ebc, d.now));
+	KUNIT_EXPECT_FALSE(test, ebc->gap.open);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_CRTC_OFF);
+	KUNIT_EXPECT_EQ(test, last.gap_us, 1000);
+	KUNIT_EXPECT_EQ(test, d.n, 0);
+}
+
+/*
+ * A steady stream, an update every 4 ms, never 10 ms quiet: with the rails
+ * up it opens a gap once two updates are pending, and is taken at the cap,
+ * 250 ms after its first update; then, with the previous part finished
+ * 100 ms after the first update of the next stream, 250 ms after that
+ * finish. Still one look per update.
+ */
+static void ebc_test_glue_gap_cap(struct kunit *test)
+{
+	struct t_drives d;
+	struct rk3026_ebc *ebc = t_gap_ebc(test, &d);
+	struct drm_rect box = DRM_RECT_INIT(4, 2, 2, 2);
+	u32 *black = t_plane_fb(test, 0);
+	u32 *white = t_plane_fb(test, 0xffffff);
+	struct rk3026_ebc_last last;
+	unsigned int sent = 2, looks;
+	ktime_t t0 = d.now;
+
+	ebc->epd_on = true;
+	ebc->rails_on = true;
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
+							&box));
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
+							&box));
+	looks = t_gap_run(test, ebc, &d, black, &box, 1, 1000, 4000, &sent);
+	KUNIT_EXPECT_EQ(test, ktime_us_delta(d.now, t0), 250000);
+	/* Sends at 8, 12, ... 248 ms: 61 of them, and the two at the start. */
+	KUNIT_EXPECT_EQ(test, sent, 63);
+	KUNIT_EXPECT_EQ(test, looks, 63);
+	KUNIT_EXPECT_EQ(test, d.rails, 0);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_EXPECT_EQ(test, last.merged, 63);
+	KUNIT_EXPECT_EQ(test, last.gap_us, 250000);
+
+	d.now = ktime_add_ms(d.now, 1000);
+	t0 = d.now;
+	sent = 2;
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, white, T_W * 4,
+							&box));
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, white, T_W * 4,
+							&box));
+	ebc->take_done = ktime_add_ms(t0, 100);
+	t_gap_run(test, ebc, &d, white, &box, 1, 1000, 4000, &sent);
+	KUNIT_EXPECT_EQ(test, ktime_us_delta(d.now, t0), 350000);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_EXPECT_EQ(test, last.gap_us, 350000);
+	KUNIT_EXPECT_EQ(test, d.n, 2);
+}
+
+/*
+ * Parts that never wait for the quiet gap, with the rails down too: the
+ * idle cleanup, the whole panel already, with a plane update joined; and,
+ * with a gap open for a plane update, a RESET sent ends it at the next
+ * look: the part in front of the RESET is taken at once, and the RESET
+ * after it.
+ */
+static void ebc_test_glue_gap_exempt(struct kunit *test)
+{
+	struct t_drives d;
+	struct rk3026_ebc *ebc = t_gap_ebc(test, &d);
+	struct drm_rect a = DRM_RECT_INIT(4, 2, 2, 2);
+	u32 *fb = t_plane_fb(test, 0xffffff);
+	struct rk3026_ebc_last last;
+	u32 seq;
+
+	t_fb_box(fb, 4, 2, 6, 4, 0);
+	t_send(ebc, &t_panel, EBC_MODE_FULL, 0, EBC_SOURCE_IDLE);
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, fb, T_W * 4, &a));
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_take_ready(ebc, d.now));
+	KUNIT_EXPECT_FALSE(test, ebc->gap.open);
+	KUNIT_EXPECT_EQ(test, d.rails, 0);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_CLEANUP_IDLE);
+	KUNIT_EXPECT_EQ(test, last.merged, 2);
+	KUNIT_EXPECT_EQ(test, last.gap_us, 0);
+	KUNIT_EXPECT_EQ(test, d.rails, 1);
+
+	ebc->epd_on = false;
+	ebc->rails_on = false;
+	t_fb_box(fb, 4, 2, 6, 4, 0xffffff);
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, fb, T_W * 4, &a));
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_take_ready(ebc, d.now));
+	KUNIT_EXPECT_TRUE(test, ebc->gap.open);
+	KUNIT_EXPECT_EQ(test, d.rails, 2);
+	d.now = ktime_add_us(d.now, 2000);
+	seq = t_send(ebc, &t_panel, EBC_MODE_RESET, 0, EBC_SOURCE_ENABLE);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_gap_woken(&ebc->pending,
+						     ebc->gap.seen, true));
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_take_ready(ebc, d.now));
+	KUNIT_EXPECT_FALSE(test, ebc->gap.open);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_EXPECT_EQ(test, last.asked_mode, EBC_MODE_FULL);
+	KUNIT_EXPECT_EQ(test, last.gap_us, 2000);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_take_ready(ebc, d.now));
+	KUNIT_EXPECT_FALSE(test, ebc->gap.open);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.asked_mode, EBC_MODE_RESET);
+	KUNIT_EXPECT_EQ(test, last.seq, seq);
+	KUNIT_EXPECT_EQ(test, last.gap_us, 0);
+	KUNIT_EXPECT_EQ(test, d.n, 3);
+}
+
+/*
+ * With the rails up a lone update waits for the quiet gap when it is big
+ * (half the panel here), or when it will be driven FULL: an auto plane
+ * part with the DU budget at its ceiling. A smaller box is taken at once.
+ */
+static void ebc_test_glue_gap_big_full(struct kunit *test)
+{
+	struct t_drives d;
+	struct rk3026_ebc *ebc = t_gap_ebc(test, &d);
+	struct drm_rect big = DRM_RECT_INIT(0, 0, 8, 6);
+	struct drm_rect small = DRM_RECT_INIT(8, 0, 8, 5);
+	u32 *black = t_plane_fb(test, 0);
+	u32 *white = t_plane_fb(test, 0xffffff);
+	struct rk3026_ebc_last last;
+	ktime_t t0 = d.now;
+
+	ebc->epd_on = true;
+	ebc->rails_on = true;
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
+							&big));
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_take_ready(ebc, d.now));
+	KUNIT_EXPECT_TRUE(test, ebc->gap.open);
+	KUNIT_EXPECT_EQ(test, ebc->gap.at, ktime_add_us(t0, EBC_TAKE_QUIET_US));
+	d.now = ebc->gap.at;
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_take_ready(ebc, d.now));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_EXPECT_EQ(test, last.gap_us, EBC_TAKE_QUIET_US);
+
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
+							&small));
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_take_ready(ebc, d.now));
+	KUNIT_EXPECT_FALSE(test, ebc->gap.open);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_EXPECT_EQ(test, last.gap_us, 0);
+
+	ebc->du_area = ebc->du_cleanup_ceiling;
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, white, T_W * 4,
+							&small));
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_take_ready(ebc, d.now));
+	KUNIT_EXPECT_TRUE(test, ebc->gap.open);
+	d.now = ebc->gap.at;
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_take_ready(ebc, d.now));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_FULL);
+	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_CLEANUP_CEILING);
+	KUNIT_EXPECT_EQ(test, last.gap_us, EBC_TAKE_QUIET_US);
+	/* Asked by the drives alone: no gap raises rails that are up. */
+	KUNIT_EXPECT_EQ(test, d.rails, 3);
+}
+
+/*
+ * A part whose target is what the glass shows is still driven when it is
+ * exempt from the skip, so it gets the rails: a full-class mxcfb send (the
+ * flash its client asked for), and, with the glass not known, a plane
+ * update, whose look opens a gap and raises them there.
+ */
+static void ebc_test_glue_rails_exempt(struct kunit *test)
+{
+	struct t_drives d;
+	struct rk3026_ebc *ebc = t_gap_ebc(test, &d);
+	u32 *white = t_plane_fb(test, 0xffffff);
+	struct rk3026_ebc_last last;
+
+	t_send(ebc, &t_panel, EBC_MODE_FULL, 0, EBC_SOURCE_MXCFB);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_take_ready(ebc, d.now));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_EXPECT_EQ(test, last.changed_px, 0);
+	KUNIT_EXPECT_EQ(test, d.rails, 1);
+
+	ebc->epd_on = false;
+	ebc->rails_on = false;
+	ebc->shadows.prev_unknown = true;
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, white, T_W * 4,
+							&t_panel));
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_take_ready(ebc, d.now));
+	KUNIT_EXPECT_TRUE(test, ebc->gap.open);
+	KUNIT_EXPECT_EQ(test, d.rails, 2);
+	KUNIT_EXPECT_TRUE(test, ebc->epd_on);
+	d.now = ebc->gap.at;
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_take_ready(ebc, d.now));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_EXPECT_TRUE(test, last.repaired);
+	KUNIT_EXPECT_EQ(test, d.n, 3);
 }
 
 #if IS_ENABLED(CONFIG_DRM_RK3026_EBC_MXCFB)
@@ -5417,6 +6026,13 @@ static struct kunit_case rk3026_ebc_glue_test_cases[] = {
 	KUNIT_CASE(ebc_test_glue_rails_not_raised),
 	KUNIT_CASE(ebc_test_glue_rails_before_take),
 	KUNIT_CASE(ebc_test_glue_rails_fail),
+	KUNIT_CASE(ebc_test_glue_gap_burst),
+	KUNIT_CASE(ebc_test_glue_gap_lone),
+	KUNIT_CASE(ebc_test_glue_gap_not_driven),
+	KUNIT_CASE(ebc_test_glue_gap_cap),
+	KUNIT_CASE(ebc_test_glue_gap_exempt),
+	KUNIT_CASE(ebc_test_glue_gap_big_full),
+	KUNIT_CASE(ebc_test_glue_rails_exempt),
 #if IS_ENABLED(CONFIG_DRM_RK3026_EBC_MXCFB)
 	KUNIT_CASE(ebc_test_glue_mxcfb_send),
 #endif

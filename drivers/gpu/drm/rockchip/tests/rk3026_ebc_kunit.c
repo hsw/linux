@@ -13,6 +13,7 @@
 
 #include <linux/err.h>
 #include <linux/jiffies.h>
+#include <linux/ktime.h>
 #include <linux/limits.h>
 #include <linux/math.h>
 #include <linux/minmax.h>
@@ -165,6 +166,30 @@ static void ebc_test_dsp_ctrl_mode(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk3026_ebc_dsp_ctrl_mode(EBC_MODE_AUTO), 0);
 	KUNIT_EXPECT_EQ(test, rk3026_ebc_dsp_ctrl_mode(EBC_MODE_MAX + 1),
 			DSP_DISPLAY_MODE);
+}
+
+/*
+ * A record's time in us: rounded up, at least 1 once measured (0 means
+ * none), 1 for a clock seen going backwards, saturated at U32_MAX.
+ */
+static void ebc_test_us_between(struct kunit *test)
+{
+	ktime_t t0 = ns_to_ktime(5000);
+
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_us_between(t0, t0), 1);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_us_between(t0, t0 + 1), 1);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_us_between(t0, t0 + 1000), 1);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_us_between(t0, t0 + 1001), 2);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_us_between(t0, t0 + 42 * NSEC_PER_MSEC),
+			42000);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_us_between(t0, t0 - 1), 1);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_us_between(t0, KTIME_MAX), U32_MAX);
+	KUNIT_EXPECT_EQ(test,
+			rk3026_ebc_us_between(0, (ktime_t)U32_MAX * NSEC_PER_USEC),
+			U32_MAX);
+	KUNIT_EXPECT_EQ(test,
+			rk3026_ebc_us_between(0, ((ktime_t)U32_MAX - 1) * NSEC_PER_USEC),
+			U32_MAX - 1);
 }
 
 static void ebc_test_rank_order(struct kunit *test)
@@ -2436,6 +2461,7 @@ static void ebc_test_du_account_reset(struct kunit *test)
 
 static struct kunit_case rk3026_ebc_core_test_cases[] = {
 	KUNIT_CASE(ebc_test_dsp_ctrl_mode),
+	KUNIT_CASE(ebc_test_us_between),
 	KUNIT_CASE(ebc_test_rank_order),
 	KUNIT_CASE(ebc_test_rank_unknown),
 	KUNIT_CASE(ebc_test_rank_merge),
@@ -3778,19 +3804,26 @@ static void ebc_test_glue_du_reset(struct kunit *test)
 struct t_drives {
 	unsigned int	n;
 	u32		mode[8];
+	u32		seq[8];
+	u32		setup_us[8];
 };
 
 /*
  * rk3026_ebc_drive() without the controller: every frame driven, as the
- * real one records it, and the mode noted in the test's struct t_drives.
+ * real one records it, and the mode noted in the test's struct t_drives,
+ * with the part's seq and the time from its take that the real one traces
+ * at scan_start (rk3026_ebc_setup_us()).
  */
 static int t_drive_ok(struct rk3026_ebc *ebc, const u8 *lut, u32 frames,
 		      u32 mode, u32 lut_mode, struct rk3026_ebc_last *last)
 {
 	struct t_drives *d = kunit_get_current_test()->priv;
 
-	if (d->n < ARRAY_SIZE(d->mode))
+	if (d->n < ARRAY_SIZE(d->mode)) {
 		d->mode[d->n] = mode;
+		d->seq[d->n] = last->seq;
+		d->setup_us[d->n] = rk3026_ebc_setup_us(ebc, last);
+	}
 	d->n++;
 	last->scans++;
 	last->lut_mode = lut_mode;
@@ -4497,6 +4530,81 @@ static void ebc_test_glue_du_repaired(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ebc->du_area, 0);
 }
 
+/*
+ * The record the tracepoints read: the part's newest seq, its box, the
+ * pixels its snapshot changes and the DU budget spent at its take, and
+ * when it was taken. A black plane update over the white glass is driven
+ * DU and changes every pixel; the same update again is skipped, with the
+ * budget it spent; with the CRTC off nothing is built (0 pixels). A repair
+ * RESET is driven for the part's own seq, before the part.
+ */
+static void ebc_test_glue_part_record(struct kunit *test)
+{
+	struct t_drives d;
+	struct rk3026_ebc *ebc = t_driven_ebc(test, &d, true);
+	u32 *black = t_plane_fb(test, 0);
+	u32 *white = t_plane_fb(test, 0xffffff);
+	struct rk3026_ebc_last last;
+	ktime_t before, after;
+
+	ebc->du_cleanup_area = 2 * T_W * T_H;
+	ebc->du_area = 5;
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
+							&t_panel));
+	before = ktime_get();
+	rk3026_ebc_do_refresh(ebc, &last);
+	after = ktime_get();
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_BLACK_WHITE);
+	KUNIT_EXPECT_EQ(test, last.seq, ebc->pending.queued_seq);
+	KUNIT_EXPECT_TRUE(test, drm_rect_equals(&last.clip, &t_panel));
+	KUNIT_EXPECT_EQ(test, last.changed_px, T_W * T_H);
+	KUNIT_EXPECT_EQ(test, last.du_area, 5);
+	KUNIT_EXPECT_EQ(test, ebc->du_area, 5 + T_W * T_H);
+	KUNIT_EXPECT_GE(test, ktime_to_ns(last.taken), ktime_to_ns(before));
+	KUNIT_EXPECT_LE(test, ktime_to_ns(last.taken), ktime_to_ns(after));
+	KUNIT_EXPECT_EQ(test, last.gap_us, 0);
+	KUNIT_EXPECT_EQ(test, last.tries, 0);
+	KUNIT_EXPECT_FALSE(test, last.gave_up);
+	KUNIT_ASSERT_EQ(test, d.n, 1);
+	KUNIT_EXPECT_EQ(test, d.seq[0], last.seq);
+	KUNIT_EXPECT_GE(test, d.setup_us[0], 1);
+	KUNIT_EXPECT_EQ(test, ebc->last.seq, last.seq);
+	KUNIT_EXPECT_EQ(test, ebc->last.changed_px, T_W * T_H);
+
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
+							&t_panel));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_SKIPPED);
+	KUNIT_EXPECT_EQ(test, last.seq, ebc->pending.queued_seq);
+	KUNIT_EXPECT_EQ(test, last.changed_px, 0);
+	KUNIT_EXPECT_EQ(test, last.du_area, 5 + T_W * T_H);
+	KUNIT_EXPECT_EQ(test, d.n, 1);
+
+	ebc->crtc_on = false;
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, white, T_W * 4,
+							&t_panel));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_CRTC_OFF);
+	KUNIT_EXPECT_EQ(test, last.seq, ebc->pending.queued_seq);
+	KUNIT_EXPECT_TRUE(test, drm_rect_equals(&last.clip, &t_panel));
+	KUNIT_EXPECT_EQ(test, last.changed_px, 0);
+	KUNIT_EXPECT_EQ(test, d.n, 1);
+
+	ebc->crtc_on = true;
+	ebc->shadows.prev_unknown = true;
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, white, T_W * 4,
+							&t_panel));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_TRUE(test, last.repaired);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_ASSERT_EQ(test, d.n, 3);
+	KUNIT_EXPECT_EQ(test, d.mode[1], EBC_MODE_RESET);
+	KUNIT_EXPECT_EQ(test, d.seq[1], last.seq);
+	KUNIT_EXPECT_EQ(test, d.seq[2], last.seq);
+	KUNIT_EXPECT_GE(test, d.setup_us[2], d.setup_us[1]);
+}
+
 #if IS_ENABLED(CONFIG_DRM_RK3026_EBC_MXCFB)
 /* The part one mxcfb send queued, taken as the refresh thread takes it. */
 static int t_mxcfb_part(struct rk3026_ebc *ebc, const u32 *src,
@@ -5040,6 +5148,7 @@ static struct kunit_case rk3026_ebc_glue_test_cases[] = {
 	KUNIT_CASE(ebc_test_glue_idle_carried),
 	KUNIT_CASE(ebc_test_glue_idle_busy),
 	KUNIT_CASE(ebc_test_glue_du_repaired),
+	KUNIT_CASE(ebc_test_glue_part_record),
 #if IS_ENABLED(CONFIG_DRM_RK3026_EBC_MXCFB)
 	KUNIT_CASE(ebc_test_glue_mxcfb_send),
 #endif

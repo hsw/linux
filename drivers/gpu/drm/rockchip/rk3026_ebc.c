@@ -794,15 +794,10 @@ static int ebc_read_temp(struct rk3026_ebc *ebc)
 	return temp;
 }
 
-/*
- * Microseconds since @start, rounded up and at least 1, so a time that was
- * measured is never 0 (0 means none), even on a clock too coarse to see it.
- */
+/* Microseconds since @start, as a record keeps them (rk3026_ebc_us_between()). */
 static u32 ebc_us_since(ktime_t start)
 {
-	u64 ns = ktime_to_ns(ktime_sub(ktime_get(), start));
-
-	return clamp_t(u64, DIV_ROUND_UP_ULL(ns, NSEC_PER_USEC), 1, U32_MAX);
+	return rk3026_ebc_us_between(start, ktime_get());
 }
 
 /**
@@ -892,6 +887,17 @@ static void ebc_stop_scan(struct rk3026_ebc *ebc)
 		 ebc->rst ? "reset" : "un-armed");
 }
 
+/*
+ * The time from the take of @last's part to now, for the scan_start event
+ * of each of its waveforms (@last->taken).
+ */
+VISIBLE_IF_KUNIT u32 rk3026_ebc_setup_us(struct rk3026_ebc *ebc,
+					 const struct rk3026_ebc_last *last)
+{
+	return rk3026_ebc_us_between(last->taken, ktime_get());
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_setup_us);
+
 /**
  * rk3026_ebc_drive - run one whole waveform, and own the "is prev true?" flag
  * @ebc: controller
@@ -930,10 +936,9 @@ VISIBLE_IF_KUNIT int rk3026_ebc_drive(struct rk3026_ebc *ebc, const u8 *lut,
 				   lut_mode, last);
 
 	/* A repair is the first waveform of an update that has repaired set. */
-	trace_rk3026_ebc_scan_start(mode, lut_mode, last->temp, frames,
-				    last->marker, last->merged,
+	trace_rk3026_ebc_scan_start(last, mode, lut_mode, frames,
 				    last->repaired && !last->scans,
-				    last->reason);
+				    rk3026_ebc_setup_us(ebc, last));
 
 	WRITE_ONCE(ebc->shadows.prev_unknown, true);
 	last->scans++;
@@ -1007,7 +1012,8 @@ VISIBLE_IF_KUNIT int rk3026_ebc_drive(struct rk3026_ebc *ebc, const u8 *lut,
 out:
 	last->driven = done;
 	last->scan_ms = ktime_ms_delta(ktime_get(), start);
-	trace_rk3026_ebc_scan_end(mode, frames, done, last->scan_ms, ret);
+	trace_rk3026_ebc_scan_end(mode, frames, done, last->scan_ms, ret,
+				  last->seq);
 	return ret;
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_drive);
@@ -1179,8 +1185,7 @@ static void ebc_publish(struct rk3026_ebc *ebc, struct rk3026_ebc_last *last,
 	case EBC_OUTCOME_NO_WAVEFORM:
 	case EBC_OUTCOME_NO_RAILS:
 	case EBC_OUTCOME_NO_LUT:
-		trace_rk3026_ebc_skip(last->asked_mode, last->marker,
-				      last->outcome);
+		trace_rk3026_ebc_skip(last);
 		break;
 	default:
 		break;
@@ -1228,8 +1233,8 @@ static void ebc_publish(struct rk3026_ebc *ebc, struct rk3026_ebc_last *last,
  *  3. under @image_lock again: rk3026_ebc_scan_finish() says what the glass
  *     shows now and moves @pending.done_seq over the part, the DU cleanup
  *     budget follows it (rk3026_ebc_du_account()), and the record is
- *     published with them. The waiters on the part's updates are woken then,
- *     whatever the outcome, and @prev_virt follows.
+ *     published and traced (part_done) with them. The waiters on the part's
+ *     updates are woken then, whatever the outcome, and @prev_virt follows.
  */
 VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 					    struct rk3026_ebc_last *last)
@@ -1266,6 +1271,9 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 	}
 
 	memset(last, 0, sizeof(*last));
+	last->taken = ktime_get();
+	last->seq = part.seq;
+	last->du_area = ebc->du_area;
 	last->clip = part.box;
 	last->asked_mode = part.mode;
 	last->mode = part.mode;
@@ -1308,6 +1316,7 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 					       &scan_mode, &two_level,
 					       &a2.over_grey, &changed_px);
 	last->snap_us = ebc_us_since(snap_start);
+	last->changed_px = changed_px;
 	if (debug_scan)
 		ebc_report_image(ebc);
 
@@ -1520,6 +1529,7 @@ finish:
 		WRITE_ONCE(ebc->idle_armed, true);
 	}
 	ebc_publish(ebc, last, start);
+	trace_rk3026_ebc_part_done(last, ebc->du_area);
 	mutex_unlock(&ebc->image_lock);
 
 	/*

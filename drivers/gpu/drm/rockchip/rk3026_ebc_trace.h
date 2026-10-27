@@ -1,8 +1,9 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
  * Tracepoints of the RK3026 EBC driver: what was queued, what was driven, what
- * was skipped and when the panel rails switched. Mode numbers are the EBC work
- * modes of rk3026_ebc.h (EBC_MODE_*).
+ * was skipped, how each part ended and when the panel rails switched. Mode
+ * numbers are the EBC work modes of rk3026_ebc.h (EBC_MODE_*). A part's events
+ * carry the seq of its newest update; new keys go at the end of a line.
  */
 #undef TRACE_SYSTEM
 #define TRACE_SYSTEM rk3026_ebc
@@ -18,11 +19,15 @@ TRACE_DEFINE_ENUM(EBC_SOURCE_PLANE);
 TRACE_DEFINE_ENUM(EBC_SOURCE_MXCFB);
 TRACE_DEFINE_ENUM(EBC_SOURCE_ENABLE);
 TRACE_DEFINE_ENUM(EBC_SOURCE_IDLE);
+TRACE_DEFINE_ENUM(EBC_OUTCOME_NONE);
+TRACE_DEFINE_ENUM(EBC_OUTCOME_DRIVEN);
 TRACE_DEFINE_ENUM(EBC_OUTCOME_SKIPPED);
 TRACE_DEFINE_ENUM(EBC_OUTCOME_CRTC_OFF);
 TRACE_DEFINE_ENUM(EBC_OUTCOME_NO_WAVEFORM);
 TRACE_DEFINE_ENUM(EBC_OUTCOME_NO_RAILS);
 TRACE_DEFINE_ENUM(EBC_OUTCOME_NO_LUT);
+TRACE_DEFINE_ENUM(EBC_OUTCOME_TIMEOUT);
+TRACE_DEFINE_ENUM(EBC_OUTCOME_ABANDONED);
 TRACE_DEFINE_ENUM(EBC_REASON_EXPLICIT);
 TRACE_DEFINE_ENUM(EBC_REASON_AUTO_DU);
 TRACE_DEFINE_ENUM(EBC_REASON_REPAIR_FLOOR);
@@ -57,11 +62,15 @@ TRACE_DEFINE_ENUM(EBC_REASON_AUTO_A2);
 
 #define ebc_trace_outcome(o)						\
 	__print_symbolic(o,						\
+			 { EBC_OUTCOME_NONE,		"none" },	\
+			 { EBC_OUTCOME_DRIVEN,		"driven" },	\
 			 { EBC_OUTCOME_SKIPPED,		"identical" },	\
 			 { EBC_OUTCOME_CRTC_OFF,	"crtc_off" },	\
 			 { EBC_OUTCOME_NO_WAVEFORM,	"no_waveform" },\
 			 { EBC_OUTCOME_NO_RAILS,	"no_rails" },	\
-			 { EBC_OUTCOME_NO_LUT,		"no_lut" })
+			 { EBC_OUTCOME_NO_LUT,		"no_lut" },	\
+			 { EBC_OUTCOME_TIMEOUT,		"timeout" },	\
+			 { EBC_OUTCOME_ABANDONED,	"abandoned" })
 
 TRACE_EVENT(rk3026_ebc_update_queue,
 	TP_PROTO(u32 source, u32 mode, const struct drm_rect *clip, u32 marker,
@@ -114,12 +123,17 @@ TRACE_EVENT(rk3026_ebc_update_queue,
 /*
  * One waveform starts. @reason is why the part is driven in its mode
  * (rk3026_ebc_resolve_mode()); the repair RESET in front of a part (@repair)
- * carries the part's reason.
+ * carries the part's reason, seq, box and counts. The part's fields are
+ * appended to the line: its newest update's seq, its box in panel
+ * coordinates, the pixels its snapshot changes, the DU budget spent at its
+ * take, the time from the take to this waveform (@setup_us,
+ * rk3026_ebc_setup_us()), the time the take waited for a quiet gap and the
+ * retries of a carried part.
  */
 TRACE_EVENT(rk3026_ebc_scan_start,
-	TP_PROTO(u32 mode, u32 lut_mode, int temp, u32 frames, u32 marker,
-		 u32 merged, bool repair, u32 reason),
-	TP_ARGS(mode, lut_mode, temp, frames, marker, merged, repair, reason),
+	TP_PROTO(const struct rk3026_ebc_last *last, u32 mode, u32 lut_mode,
+		 u32 frames, bool repair, u32 setup_us),
+	TP_ARGS(last, mode, lut_mode, frames, repair, setup_us),
 	TP_STRUCT__entry(
 		__field(u32, mode)
 		__field(u32, lut_mode)
@@ -129,34 +143,59 @@ TRACE_EVENT(rk3026_ebc_scan_start,
 		__field(u32, merged)
 		__field(bool, repair)
 		__field(u32, reason)
+		__field(u32, seq)
+		__field(int, x1)
+		__field(int, y1)
+		__field(int, x2)
+		__field(int, y2)
+		__field(u32, changed_px)
+		__field(u32, du_area)
+		__field(u32, setup_us)
+		__field(u32, gap_us)
+		__field(u32, tries)
 	),
 	TP_fast_assign(
 		__entry->mode = mode;
 		__entry->lut_mode = lut_mode;
-		__entry->temp = temp;
+		__entry->temp = last->temp;
 		__entry->frames = frames;
-		__entry->marker = marker;
-		__entry->merged = merged;
+		__entry->marker = last->marker;
+		__entry->merged = last->merged;
 		__entry->repair = repair;
-		__entry->reason = reason;
+		__entry->reason = last->reason;
+		__entry->seq = last->seq;
+		__entry->x1 = last->clip.x1;
+		__entry->y1 = last->clip.y1;
+		__entry->x2 = last->clip.x2;
+		__entry->y2 = last->clip.y2;
+		__entry->changed_px = last->changed_px;
+		__entry->du_area = last->du_area;
+		__entry->setup_us = setup_us;
+		__entry->gap_us = last->gap_us;
+		__entry->tries = last->tries;
 	),
-	TP_printk("mode=%u(%s) lut_mode=%u(%s) temp=%d frames=%u marker=%u merged=%u repair=%d reason=%s",
+	TP_printk("mode=%u(%s) lut_mode=%u(%s) temp=%d frames=%u marker=%u merged=%u repair=%d reason=%s seq=%u box=%d,%d-%d,%d changed_px=%u du_area=%u setup_us=%u gap_us=%u tries=%u",
 		  __entry->mode, ebc_trace_mode(__entry->mode),
 		  __entry->lut_mode, ebc_trace_mode(__entry->lut_mode),
 		  __entry->temp, __entry->frames, __entry->marker,
 		  __entry->merged, __entry->repair,
-		  ebc_trace_reason(__entry->reason))
+		  ebc_trace_reason(__entry->reason), __entry->seq,
+		  __entry->x1, __entry->y1, __entry->x2, __entry->y2,
+		  __entry->changed_px, __entry->du_area, __entry->setup_us,
+		  __entry->gap_us, __entry->tries)
 );
 
+/* A waveform ends; @seq is its part's (a repair RESET's too). */
 TRACE_EVENT(rk3026_ebc_scan_end,
-	TP_PROTO(u32 mode, u32 frames, u32 driven, s64 ms, int ret),
-	TP_ARGS(mode, frames, driven, ms, ret),
+	TP_PROTO(u32 mode, u32 frames, u32 driven, s64 ms, int ret, u32 seq),
+	TP_ARGS(mode, frames, driven, ms, ret, seq),
 	TP_STRUCT__entry(
 		__field(u32, mode)
 		__field(u32, frames)
 		__field(u32, driven)
 		__field(s64, ms)
 		__field(int, ret)
+		__field(u32, seq)
 	),
 	TP_fast_assign(
 		__entry->mode = mode;
@@ -164,28 +203,76 @@ TRACE_EVENT(rk3026_ebc_scan_end,
 		__entry->driven = driven;
 		__entry->ms = ms;
 		__entry->ret = ret;
+		__entry->seq = seq;
 	),
-	TP_printk("mode=%u(%s) driven=%u/%u ms=%lld ret=%d",
+	TP_printk("mode=%u(%s) driven=%u/%u ms=%lld ret=%d seq=%u",
 		  __entry->mode, ebc_trace_mode(__entry->mode),
-		  __entry->driven, __entry->frames, __entry->ms, __entry->ret)
+		  __entry->driven, __entry->frames, __entry->ms, __entry->ret,
+		  __entry->seq)
 );
 
+/*
+ * A part was taken and nothing was driven for it: skipped as identical,
+ * dropped or carried (the reason). Its seq, box and the pixels its snapshot
+ * changes (0 if none was built) are appended.
+ */
 TRACE_EVENT(rk3026_ebc_skip,
-	TP_PROTO(u32 mode, u32 marker, u32 reason),
-	TP_ARGS(mode, marker, reason),
+	TP_PROTO(const struct rk3026_ebc_last *last),
+	TP_ARGS(last),
 	TP_STRUCT__entry(
 		__field(u32, mode)
 		__field(u32, marker)
 		__field(u32, reason)
+		__field(u32, seq)
+		__field(int, x1)
+		__field(int, y1)
+		__field(int, x2)
+		__field(int, y2)
+		__field(u32, changed_px)
 	),
 	TP_fast_assign(
-		__entry->mode = mode;
-		__entry->marker = marker;
-		__entry->reason = reason;
+		__entry->mode = last->asked_mode;
+		__entry->marker = last->marker;
+		__entry->reason = last->outcome;
+		__entry->seq = last->seq;
+		__entry->x1 = last->clip.x1;
+		__entry->y1 = last->clip.y1;
+		__entry->x2 = last->clip.x2;
+		__entry->y2 = last->clip.y2;
+		__entry->changed_px = last->changed_px;
 	),
-	TP_printk("mode=%u(%s) marker=%u reason=%s",
+	TP_printk("mode=%u(%s) marker=%u reason=%s seq=%u box=%d,%d-%d,%d changed_px=%u",
 		  __entry->mode, ebc_trace_mode(__entry->mode),
-		  __entry->marker, ebc_trace_outcome(__entry->reason))
+		  __entry->marker, ebc_trace_outcome(__entry->reason),
+		  __entry->seq, __entry->x1, __entry->y1, __entry->x2,
+		  __entry->y2, __entry->changed_px)
+);
+
+/*
+ * A part is finished, whatever became of it: after its last scan_end or its
+ * skip, with the DU budget spent after it (@du_area) and the retries of a
+ * carried part (@last's tries, gave_up).
+ */
+TRACE_EVENT(rk3026_ebc_part_done,
+	TP_PROTO(const struct rk3026_ebc_last *last, u32 du_area),
+	TP_ARGS(last, du_area),
+	TP_STRUCT__entry(
+		__field(u32, seq)
+		__field(u32, outcome)
+		__field(u32, du_area)
+		__field(u32, tries)
+		__field(bool, gave_up)
+	),
+	TP_fast_assign(
+		__entry->seq = last->seq;
+		__entry->outcome = last->outcome;
+		__entry->du_area = du_area;
+		__entry->tries = last->tries;
+		__entry->gave_up = last->gave_up;
+	),
+	TP_printk("seq=%u outcome=%s du_area=%u tries=%u gave_up=%d",
+		  __entry->seq, ebc_trace_outcome(__entry->outcome),
+		  __entry->du_area, __entry->tries, __entry->gave_up)
 );
 
 TRACE_EVENT(rk3026_ebc_rails,

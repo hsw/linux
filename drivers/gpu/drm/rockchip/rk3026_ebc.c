@@ -232,7 +232,7 @@ static unsigned int ebc_chunk_timeout_ms(struct rk3026_ebc *ebc, u32 frames)
  * chunk counts at its budget. Derived from the timings like the budget: at
  * a lower dot clock a part takes longer.
  */
-static unsigned int ebc_part_max_ms(struct rk3026_ebc *ebc)
+VISIBLE_IF_KUNIT unsigned int rk3026_ebc_part_max_ms(struct rk3026_ebc *ebc)
 {
 	u32 chunks = 2 * DIV_ROUND_UP(EBC_WAVEFORM_MAX_FRAMES,
 				      EBC_LUT_MAX_FRAMES);
@@ -240,19 +240,26 @@ static unsigned int ebc_part_max_ms(struct rk3026_ebc *ebc)
 	return EBC_PART_SETUP_MS +
 	       chunks * ebc_chunk_timeout_ms(ebc, EBC_LUT_MAX_FRAMES);
 }
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_part_max_ms);
 
 /*
  * Longest a wait on one update blocks (rk3026_ebc_wait_seq():
  * MXCFB_WAIT_FOR_UPDATE_COMPLETE, CRTC enable and disable): EBC_WAIT_PARTS
- * parts at their longest, and the quiet gap its own part may wait in before
- * the take, at most EBC_TAKE_CAP_MAX_MS: the parts ahead of it are in flight
- * already or exempt (in front of a RESET, or the RESET). 165 s with every
- * chunk budget at its 5 s floor. Past this the thread is stuck outside the
- * EBC (an I2C transfer, say), and the waiter goes on without it.
+ * parts at their longest, and the retries of its own part if that is
+ * carried: tries until EBC_RETRY_SPAN_MS after its first carry, and the
+ * one that gives it up may start just before then, so one part more and
+ * the span (rk3026_ebc_retry_next()); and the quiet gap its own part may
+ * wait in before the take, at most EBC_TAKE_CAP_MAX_MS: the parts ahead of
+ * it are in flight already or exempt (in front of a RESET, or the RESET),
+ * and a retry is exempt. 208 s with every chunk budget at its 5 s floor.
+ * Past this the thread is stuck outside the EBC (an I2C transfer, say), and
+ * the waiter goes on without it.
  */
 VISIBLE_IF_KUNIT unsigned int rk3026_ebc_wait_timeout_ms(struct rk3026_ebc *ebc)
 {
-	return EBC_WAIT_PARTS * ebc_part_max_ms(ebc) + EBC_TAKE_CAP_MAX_MS;
+	return (EBC_WAIT_PARTS + 1) * rk3026_ebc_part_max_ms(ebc) +
+	       EBC_RETRY_SPAN_MS +
+	       EBC_TAKE_CAP_MAX_MS;
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_wait_timeout_ms);
 
@@ -1305,13 +1312,16 @@ static bool ebc_part_drives(struct rk3026_ebc *ebc,
 /*
  * What a part needs before its waveform, without @image_lock: the sensor,
  * unless an update brought a temperature (@temp_valid), and the rails.
- * Returns rk3026_ebc_raise_rails()'s result.
+ * Returns rk3026_ebc_raise_rails()'s result, or @failed, the error of the
+ * rails raised for the part already, at the take's gap: they are not asked
+ * twice for one try, the carry's retry asks next (rk3026_ebc_retry_next()).
  */
-static int ebc_prepare(struct rk3026_ebc *ebc, bool temp_valid, int *temp)
+static int ebc_prepare(struct rk3026_ebc *ebc, bool temp_valid, int *temp,
+		       int failed)
 {
 	if (!temp_valid)
 		*temp = rk3026_ebc_read_temp(ebc);
-	return rk3026_ebc_raise_rails(ebc);
+	return failed ?: rk3026_ebc_raise_rails(ebc);
 }
 
 /*
@@ -1377,10 +1387,13 @@ static enum rk3026_ebc_repair_due ebc_repair_by(struct rk3026_ebc *ebc,
  *  3. without it: the snapshot into @next_virt, a repair if the glass is
  *     not known, the waveform;
  *  4. under @image_lock again: rk3026_ebc_scan_finish() says what the glass
- *     shows now and moves @pending.done_seq over the part, the DU cleanup
- *     budget follows it (rk3026_ebc_du_account()), and the record is
- *     published and traced (part_done) with them. The waiters on the part's
- *     updates are woken then, whatever the outcome, and @prev_virt follows.
+ *     shows now and moves @pending.done_seq over the part, or arms the
+ *     retry of a carry, the DU cleanup budget follows it
+ *     (rk3026_ebc_du_account()), and the record is published and traced
+ *     (part_done) with them. The waiters on the part's updates are woken
+ *     then, and @prev_virt follows.
+ *
+ * The part is the carry alone at its retry (rk3026_ebc_retry_ready()).
  */
 VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 					    struct rk3026_ebc_last *last)
@@ -1392,30 +1405,49 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 	enum rk3026_ebc_reason reason;
 	struct rk3026_ebc_du_budget budget;
 	struct rk3026_ebc_a2 a2 = { 0 };
+	enum rk3026_ebc_gave_up gave_up;
 	struct rk3026_ebc_set part;
 	bool identical, prev_changed, two_level, prepared = false;
-	u32 frames, mode, scan_mode, resolved, lut_mode;
+	u32 frames, mode, scan_mode, resolved, lut_mode, tries;
 	u32 changed_px = 0;
 	const u8 *lut, *target;
 	int temp = EBC_TEMP_FALLBACK;
-	int rails = 0;
+	int rails = 0, rails_err;
 
 	mutex_lock(&ebc->image_lock);
 	if (!rk3026_ebc_pending_peek(&ebc->pending, &part)) {
 		mutex_unlock(&ebc->image_lock);
 		return;
 	}
+	/* The rails failed at the take's gap: this try does not ask again. */
+	rails_err = ebc->gap.rails_err;
+	ebc->gap.rails_err = 0;
 
 	/*
 	 * Only this thread takes, so the part is still pending after the
 	 * unlock; senders may have joined it, which is the point.
 	 */
 	if (ebc_part_drives(ebc, &part)) {
+		bool sensed = !part.temp_valid;
+
 		mutex_unlock(&ebc->image_lock);
-		rails = ebc_prepare(ebc, part.temp_valid, &temp);
+		rails = ebc_prepare(ebc, part.temp_valid, &temp, rails_err);
 		prepared = true;
 		mutex_lock(&ebc->image_lock);
+		/*
+		 * A RESET sent meanwhile drops the carry, and with it the
+		 * temperature the part may have had from it alone: the sensor
+		 * is read after all. Updates only add temperatures, and only
+		 * this thread makes a carry, so the next look holds.
+		 */
+		rk3026_ebc_pending_peek(&ebc->pending, &part);
+		if (!sensed && !part.temp_valid) {
+			mutex_unlock(&ebc->image_lock);
+			temp = rk3026_ebc_read_temp(ebc);
+			mutex_lock(&ebc->image_lock);
+		}
 	}
+	tries = rk3026_ebc_retry_try(&ebc->pending);
 	rk3026_ebc_pending_take(&ebc->pending, &part);
 
 	/*
@@ -1441,6 +1473,7 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 	/* The gap the take waited in, if one was open (rk3026_ebc_take_ready()). */
 	last->gap_us = ebc->gap.us;
 	ebc->gap.us = 0;
+	last->tries = tries;
 
 	/*
 	 * Nothing reaches the panel while the CRTC is off: the rails stay
@@ -1586,7 +1619,7 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 	 * same gets them now, as before the look.
 	 */
 	if (WARN_ON_ONCE(!prepared)) {
-		rails = ebc_prepare(ebc, part.temp_valid, &temp);
+		rails = ebc_prepare(ebc, part.temp_valid, &temp, rails_err);
 		temp = ebc_part_temp(&part, temp);
 	}
 	last->temp = temp;
@@ -1595,9 +1628,10 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 	/*
 	 * Rails up before anything is driven, the repair below included. If they
 	 * did not come up nothing is driven and the glass is as it was, so the
-	 * prev image stays true and the part is carried into the next scan --
-	 * except for a RESET, which is only queued when the glass is not known
-	 * (the boot clear) and so leaves the mark (rk3026_ebc_scan_finish()).
+	 * prev image stays true and the part is carried and tried again
+	 * (rk3026_ebc_retry_next()) -- except for a RESET, which is only queued
+	 * when the glass is not known (the boot clear) and so leaves the mark
+	 * (rk3026_ebc_scan_finish()).
 	 */
 	if (rails) {
 		last->outcome = EBC_OUTCOME_NO_RAILS;
@@ -1632,11 +1666,11 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 	 * A direct mode has no LUT of its own; fall back to the resolved mode
 	 * for the scan data so the DSP_CTRL class is the only thing that changed.
 	 * A resolved mode without a LUT is not driven in another one: the part
-	 * is carried in its plain mode (rk3026_ebc_scan_finish()). A carry
-	 * alone is no work for the thread, so such a part waits for the next
-	 * update and is drawn with it, in the stronger of the two plain modes:
-	 * an auto plane part without a DU or PART LUT ends up FULL, as before
-	 * the policy.
+	 * is carried in its plain mode (rk3026_ebc_scan_finish()) and tried
+	 * again, alone at its retry (the temperature, and with it the table,
+	 * may change) or with the next update, in the stronger of the two
+	 * plain modes: an auto plane part without a DU or PART LUT ends up
+	 * FULL, as before the policy. Given up, it waits for the next update.
 	 */
 	lut_mode = mode;
 	lut = rk3026_ebc_waveform_lut(ebc->waveform, mode, temp, &frames);
@@ -1682,7 +1716,17 @@ finish:
 	 * saying so. @prev_unknown is the mark, and the next draw acts on it.
 	 */
 	prev_changed = rk3026_ebc_scan_finish(sh, &ebc->pending, &part,
-					      last->outcome, repair_result);
+					      last->outcome, repair_result,
+					      rk3026_ebc_clock(ebc), &gave_up);
+	last->gave_up = gave_up != EBC_GAVE_UP_NONE;
+	if (last->gave_up) {
+		ebc->stats.carry_failed++;
+		/* Once a failure: later carries give up at once until a drive. */
+		if (gave_up == EBC_GAVE_UP)
+			dev_warn_ratelimited(ebc->dev,
+					     "part (seq %u) not drawn after %u tries (outcome %u), given up\n",
+					     part.seq, tries + 1, last->outcome);
+	}
 	ebc->du_area = rk3026_ebc_du_account(ebc->du_area, &part, last->mode,
 					     changed_px, last->outcome,
 					     repair_result);
@@ -1703,9 +1747,10 @@ finish:
 	mutex_unlock(&ebc->image_lock);
 
 	/*
-	 * @pending.done_seq moved over the part on every outcome -- driven,
-	 * skipped, dropped with the CRTC off, carried without rails -- so
-	 * every wait on one of its updates ends here.
+	 * @pending.done_seq moved over the part -- driven, skipped, dropped
+	 * with the CRTC off, a carry given up -- so every wait on one of its
+	 * updates ends here; a carry armed for a retry holds it (a wake-up
+	 * then finds the wait's condition false and sleeps again).
 	 */
 	wake_up_all(&ebc->marker_wq);
 
@@ -1845,9 +1890,12 @@ static void ebc_take_state(struct rk3026_ebc *ebc,
 				   rk3026_ebc_du_at_ceiling(&budget)),
 		.exempt		= part->has_mxcfb || part->cleanup_idle ||
 				  part->mode == EBC_MODE_RESET ||
-				  ebc->pending.reset.merged,
+				  ebc->pending.reset.merged ||
+				  ebc->pending.retry.ready,
 		.rails_up	= ebc_rails_up(ebc),
 		.open		= ebc->gap.open,
+		.retry_at	= ebc->pending.retry.at,
+		.retry_armed	= ebc->pending.retry.armed,
 	};
 }
 
@@ -1865,10 +1913,10 @@ static void ebc_gap_close(struct rk3026_ebc *ebc, ktime_t now)
  * @ebc: controller
  * @now: the time of the look (rk3026_ebc_clock())
  *
- * Called by the refresh thread when a part is pending or a gap is open.
- * Under @image_lock it looks at the next part and asks
- * rk3026_ebc_take_wait(), which holds the rules, whether to wait for the
- * senders to go quiet.
+ * Called by the refresh thread when a part is pending, a gap is open, or
+ * the carry's retry is due (rk3026_ebc_retry_ready()). Under @image_lock
+ * it looks at the next part and asks rk3026_ebc_take_wait(), which holds
+ * the rules, whether to wait for the senders to go quiet.
  *
  * A gap opens only for a part that will be driven (ebc_part_drives()); the
  * look cannot tell every part that will be skipped (a two-level change
@@ -1876,8 +1924,8 @@ static void ebc_gap_close(struct rk3026_ebc *ebc, ktime_t now)
  * and such a part raised the rails for nothing, once. Opening the gap
  * raises the rails at once, without the lock: they take tens of ms, and
  * updates sent meanwhile join the part. Rails that do not come up end the
- * gap: the part is taken and carried (rk3026_ebc_do_refresh() asks for
- * them once more).
+ * gap: the part is taken and carried without asking for them again
+ * (@gap.rails_err), and its retries ask next.
  *
  * Every look records the newest seq in @gap.seen, for the thread's wait
  * (rk3026_ebc_gap_woken()). The gap ends at its deadline, when the part
@@ -1896,6 +1944,7 @@ VISIBLE_IF_KUNIT bool rk3026_ebc_take_ready(struct rk3026_ebc *ebc,
 	bool raise = false;
 
 	mutex_lock(&ebc->image_lock);
+	rk3026_ebc_retry_ready(&ebc->pending, now, ebc->crtc_on);
 	gap->seen = ebc->pending.queued_seq;
 	if (!rk3026_ebc_pending_peek(&ebc->pending, &part) || !ebc->crtc_on)
 		goto take;
@@ -1911,9 +1960,14 @@ VISIBLE_IF_KUNIT bool rk3026_ebc_take_ready(struct rk3026_ebc *ebc,
 	}
 	mutex_unlock(&ebc->image_lock);
 
-	if (raise && rk3026_ebc_raise_rails(ebc)) {
-		ebc_gap_close(ebc, rk3026_ebc_clock(ebc));
-		return true;
+	if (raise) {
+		int ret = rk3026_ebc_raise_rails(ebc);
+
+		if (ret) {
+			gap->rails_err = ret;
+			ebc_gap_close(ebc, rk3026_ebc_clock(ebc));
+			return true;
+		}
 	}
 	return false;
 
@@ -1926,8 +1980,9 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_take_ready);
 
 /*
  * The refresh thread's wait while the take's gap is open: for an update
- * newer than its last look, the CRTC going off, or the gap's end. The gap
- * is a few ms, so the wait runs on an hrtimer, not on jiffies.
+ * newer than its last look, the CRTC going off, or the gap's end, which is
+ * the carry's retry at the latest (rk3026_ebc_take_wait()). The gap is a
+ * few ms, so the wait runs on an hrtimer, not on jiffies.
  */
 static void ebc_gap_wait(struct rk3026_ebc *ebc)
 {
@@ -1941,6 +1996,26 @@ static void ebc_gap_wait(struct rk3026_ebc *ebc)
 					   ktime_sub(gap->at, rk3026_ebc_clock(ebc)));
 }
 
+/*
+ * The carry's retry time in jiffies, for the deadline of the thread's wait
+ * (rk3026_ebc_thread_deadline()), from @now and @clock, the jiffies and
+ * rk3026_ebc_clock() of the same look. The retry is not due at it, so this
+ * is at least a jiffy ahead: rounded up, the wait ends at the retry or just
+ * after, never in a loop before it.
+ */
+static bool ebc_retry_at(struct rk3026_ebc *ebc, unsigned long now,
+			 ktime_t clock, unsigned long *at)
+{
+	const struct rk3026_ebc_retry *r = &ebc->pending.retry;
+	s64 us;
+
+	if (!READ_ONCE(r->armed))
+		return false;
+	us = ktime_us_delta(READ_ONCE(r->at), clock);
+	*at = now + usecs_to_jiffies(max_t(s64, us, 1));
+	return true;
+}
+
 static int ebc_refresh_thread(void *data)
 {
 	struct rk3026_ebc *ebc = data;
@@ -1949,8 +2024,9 @@ static int ebc_refresh_thread(void *data)
 	while (!kthread_should_stop()) {
 		struct rk3026_ebc_last last;
 		long timeout = MAX_SCHEDULE_TIMEOUT;
-		unsigned long now = jiffies, deadline, rails_at, idle_at;
-		bool rails_on, idle_armed;
+		unsigned long now = jiffies, deadline, rails_at, idle_at, retry_at;
+		ktime_t clock = rk3026_ebc_clock(ebc);
+		bool rails_on, idle_armed, retry_armed;
 
 		/*
 		 * With the rails up, drop them at the deadline. Checked on every
@@ -1977,10 +2053,13 @@ static int ebc_refresh_thread(void *data)
 			continue;
 		}
 		/*
-		 * A part to take, or a gap open for one: take it now, or wait
-		 * for a newer update or the gap's end (ebc_gap_wait()).
+		 * A part to take, a gap open for one, or the carry's retry
+		 * due: take it now, or wait for a newer update or the gap's
+		 * end (ebc_gap_wait()).
 		 */
-		if (gap->open || rk3026_ebc_work_pending(&ebc->pending)) {
+		if (gap->open ||
+		    rk3026_ebc_thread_woken(&ebc->pending, clock,
+					    READ_ONCE(ebc->crtc_on))) {
 			if (rk3026_ebc_take_ready(ebc, rk3026_ebc_clock(ebc))) {
 				rk3026_ebc_do_refresh(ebc, &last);
 				continue;
@@ -1988,18 +2067,23 @@ static int ebc_refresh_thread(void *data)
 			ebc_gap_wait(ebc);
 			continue;
 		}
+		retry_armed = ebc_retry_at(ebc, now, clock, &retry_at);
 		if (rk3026_ebc_thread_deadline(rails_on, rails_at, idle_armed,
-					       idle_at, &deadline))
-			timeout = (long)(deadline - now);
+					       idle_at, retry_armed, retry_at,
+					       &deadline))
+			timeout = max_t(long, (long)(deadline - now), 1);
 		/*
 		 * The wait cannot take @image_lock; the thread asks between
-		 * parts, where rk3026_ebc_work_pending() means a part to take.
-		 * Both deadlines are ahead here, so @timeout is positive; a
-		 * plane update that arms or moves the idle one wakes the wait
-		 * (rk3026_ebc_add_update()), and the next pass takes it.
+		 * parts (rk3026_ebc_thread_woken(): a part to take, or the
+		 * carry's retry due). The deadlines are ahead here; a plane
+		 * update that arms or moves the idle one wakes the wait
+		 * (rk3026_ebc_add_update()), and so does a CRTC disable, for a
+		 * carry waiting for its retry; the next pass takes it.
 		 */
 		wait_event_interruptible_timeout(ebc->update_wq,
-						 rk3026_ebc_thread_woken(&ebc->pending) ||
+						 rk3026_ebc_thread_woken(&ebc->pending,
+									 rk3026_ebc_clock(ebc),
+									 READ_ONCE(ebc->crtc_on)) ||
 						 kthread_should_stop(),
 						 timeout);
 	}
@@ -2017,11 +2101,15 @@ static int ebc_refresh_thread(void *data)
  * @timeout_ms: the longest wait
  * @interruptible: a signal ends the wait
  *
- * The update has finished once @pending.done_seq reached @seq, whatever
- * became of its part: driven, skipped, dropped with the CRTC off, or carried
- * into a later scan. Every part taken before it has finished too, and the
- * seqs cover each part from its take to rk3026_ebc_scan_finish(), waveform
- * included: @done_seq moves only in the @image_lock section after the scan.
+ * The update has finished once @pending.done_seq reached @seq: its part was
+ * driven, skipped, dropped with the CRTC off, or given up (a RESET not
+ * driven, a carry without a waveform); or, carried for want of rails or a
+ * LUT or behind a repair RESET cut short, it was drawn by a later try or
+ * given up after its retries (rk3026_ebc_retry_next()), the wait on it
+ * held meanwhile. Every part taken before it has finished too, and the
+ * seqs cover each part from its take to rk3026_ebc_scan_finish(),
+ * waveform included: @done_seq moves only in the @image_lock section
+ * after the scan.
  *
  * ⚠️ Nothing pending is NOT finished: the thread takes a part out of
  * @pending before it drives it, and in that window nothing is pending while a
@@ -2144,9 +2232,11 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_add_update);
  * @marker: the marker the update was sent with
  *
  * Waits for the newest update sent with @marker, until the part that took
- * it has finished, whatever became of it: driven, skipped, dropped with the
- * CRTC off, or carried into a later scan because the rails did not come up.
- * The marker is resolved to its seq once, here. Marker 0, a marker never
+ * it has finished: driven, skipped, dropped with the CRTC off, or, carried
+ * because the rails or a LUT were missing, drawn by a retry or given up
+ * (rk3026_ebc_wait_seq()). A give-up returns 0 like a drive: the client's
+ * wait means "done with it", and the content stays carried for the next
+ * part. The marker is resolved to its seq once, here. Marker 0, a marker never
  * sent, and one overwritten by EBC_MARKER_RING_LEN newer markers return at
  * once.
  */
@@ -2391,7 +2481,7 @@ static void ebc_crtc_atomic_enable(struct drm_crtc *crtc,
 	 * is time the RESET takes regardless; it only moves who blocks for it.
 	 */
 	mutex_lock(&ebc->image_lock);
-	ebc->crtc_on = true;
+	WRITE_ONCE(ebc->crtc_on, true);
 	seq = rk3026_ebc_add_update(ebc, &upd);
 	mutex_unlock(&ebc->image_lock);
 	ebc_wait_finished(ebc, seq);
@@ -2399,9 +2489,10 @@ static void ebc_crtc_atomic_enable(struct drm_crtc *crtc,
 
 /*
  * The CRTC goes off: no new waveform from here on, the refresh thread drops
- * what it takes, and mxcfb sends are refused. The thread is woken, so an
- * open gap ends now, not at its end (rk3026_ebc_gap_woken()). Returns the
- * newest seq, for the disable's wait.
+ * what it takes, and mxcfb sends are refused. The thread is woken, so a
+ * carry waiting for its retry is dropped and an open gap ends now, not at
+ * their time (rk3026_ebc_gap_woken()). Returns the newest seq, for the
+ * disable's wait.
  */
 VISIBLE_IF_KUNIT u32 rk3026_ebc_crtc_off(struct rk3026_ebc *ebc)
 {

@@ -11,6 +11,8 @@
 #include <linux/compiler.h>
 #include <linux/export.h>
 #include <linux/jiffies.h>
+#include <linux/ktime.h>
+#include <linux/math.h>
 #include <linux/minmax.h>
 #include <linux/overflow.h>
 #include <linux/string.h>
@@ -43,6 +45,25 @@ u32 rk3026_ebc_dsp_ctrl_mode(u32 mode)
 	return DSP_DISPLAY_MODE;
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_dsp_ctrl_mode);
+
+/**
+ * rk3026_ebc_us_between - microseconds from @start to @end, for a record
+ * @start: when it began
+ * @end: when it ended
+ *
+ * Return: the time rounded up and at least 1, so a time that was measured
+ * is never 0 (0 means none in a record), even on a clock too coarse to see
+ * it; an @end before @start counts as 1 too. Saturates at U32_MAX.
+ */
+u32 rk3026_ebc_us_between(ktime_t start, ktime_t end)
+{
+	s64 ns = ktime_to_ns(ktime_sub(end, start));
+
+	if (ns <= 0)
+		return 1;
+	return min_t(u64, DIV_ROUND_UP_ULL(ns, NSEC_PER_USEC), U32_MAX);
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_us_between);
 
 /*
  * How strongly a mode drives, for merging updates into one scan: the merged

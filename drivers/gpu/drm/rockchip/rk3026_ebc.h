@@ -11,6 +11,7 @@
 #include <linux/atomic.h>
 #include <linux/bits.h>
 #include <linux/completion.h>
+#include <linux/ktime.h>
 #include <linux/math.h>
 #include <linux/minmax.h>
 #include <linux/mutex.h>
@@ -337,20 +338,34 @@ struct rk3026_ebc_update {
 };
 
 /*
- * The record of one part, for debugfs. Filled by the refresh thread and
- * published under @image_lock. The _us times (debugfs "timing") are
- * rounded up and at least 1 when measured; 0 means none.
+ * The record of one part, for debugfs and the tracepoints. Filled by the
+ * refresh thread and published under @image_lock. The _us times (debugfs
+ * "timing") are rounded up and at least 1 when measured; 0 means none.
+ *
+ * @taken is when the part was taken; a scan_start event reports the time
+ * from it to the waveform (the sensor, the rails, a repair RESET before the
+ * part). @du_area is the plane parts' DU budget spent at the take, before
+ * the part is accounted (rk3026_ebc_du_account()). @gap_us and @tries are
+ * the time the take waited for the senders to go quiet and the retries of
+ * a carried part; @gave_up says the retries ended without a drive.
  */
 struct rk3026_ebc_last {
 	struct drm_rect	clip;
+	ktime_t		taken;
+	u32		seq;		/* the newest update's */
 	u32		asked_mode;	/* the part's own mode */
 	u32		mode;		/* the DSP_CTRL class driven (force_mode) */
 	u32		lut_mode;	/* the mode whose LUT was driven */
 	u32		marker;		/* the newest update's */
 	u32		merged;		/* updates in the part */
+	u32		changed_px;	/* by its snapshot, 0: none built */
+	u32		du_area;	/* the DU budget spent at the take */
+	u32		gap_us;		/* the take's wait for a quiet gap */
+	u32		tries;		/* a carried part's retries */
 	int		temp;		/* clamped; valid if @temp_read */
 	bool		temp_read;
 	bool		repaired;	/* a RESET repair ran before it */
+	bool		gave_up;	/* given up without a drive */
 	u8		source;		/* enum rk3026_ebc_source */
 	u8		outcome;	/* enum rk3026_ebc_outcome */
 	u8		reason;		/* enum rk3026_ebc_reason, of @mode */
@@ -775,6 +790,8 @@ bool rk3026_ebc_plane_box(const struct drm_plane_state *old_state,
 bool rk3026_ebc_plane_update(struct rk3026_ebc *ebc, const void *src,
 			     unsigned int src_pitch, const struct drm_rect *box);
 bool rk3026_ebc_idle_tick(struct rk3026_ebc *ebc, unsigned long now);
+u32 rk3026_ebc_setup_us(struct rk3026_ebc *ebc,
+			const struct rk3026_ebc_last *last);
 #endif
 
 /* rk3026_ebc_blit.c */
@@ -787,6 +804,7 @@ const char *rk3026_ebc_blit_impl(void);
 
 /* rk3026_ebc_core.c */
 u32 rk3026_ebc_dsp_ctrl_mode(u32 mode);
+u32 rk3026_ebc_us_between(ktime_t start, ktime_t end);
 bool rk3026_ebc_pending_add(struct rk3026_ebc_pending *p,
 			    const struct rk3026_ebc_update *upd, u32 *seq);
 bool rk3026_ebc_pending_take(struct rk3026_ebc_pending *p,

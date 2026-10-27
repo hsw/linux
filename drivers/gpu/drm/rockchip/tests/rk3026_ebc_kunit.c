@@ -260,6 +260,7 @@ static void ebc_test_pending_empty(struct kunit *test)
 	memset(&part, 0x5a, sizeof(part));
 	KUNIT_EXPECT_TRUE(test, rk3026_ebc_pending_empty(&p));
 	KUNIT_EXPECT_FALSE(test, rk3026_ebc_work_pending(&p));
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_take_pending(&p));
 	KUNIT_EXPECT_FALSE(test, rk3026_ebc_pending_take(&p, &part));
 	KUNIT_EXPECT_EQ(test, part.merged, 0);
 	KUNIT_EXPECT_EQ(test, part.seq, 0);
@@ -839,6 +840,7 @@ struct t_ctx {
 	struct rk3026_ebc_shadows	sh;
 	u8				*prev;
 	u8				*scan;
+	enum rk3026_ebc_gave_up		gave_up;	/* of the last finish */
 };
 
 static struct t_ctx *t_ctx_alloc(struct kunit *test)
@@ -864,7 +866,26 @@ static bool t_done(const struct t_ctx *c, u32 seq)
 static void t_finish(struct t_ctx *c, const struct rk3026_ebc_set *part,
 		     enum rk3026_ebc_outcome outcome)
 {
-	rk3026_ebc_scan_finish(&c->sh, &c->p, part, outcome, EBC_REPAIR_NONE);
+	rk3026_ebc_scan_finish(&c->sh, &c->p, part, outcome, EBC_REPAIR_NONE,
+			       0, &c->gave_up);
+}
+
+/* t_finish() at @ms on the time line of the carry's retries. */
+static void t_finish_at(struct t_ctx *c, const struct rk3026_ebc_set *part,
+			enum rk3026_ebc_outcome outcome, s64 ms)
+{
+	rk3026_ebc_scan_finish(&c->sh, &c->p, part, outcome, EBC_REPAIR_NONE,
+			       ms_to_ktime(ms), &c->gave_up);
+}
+
+/*
+ * The refresh thread's look at @ms with the CRTC on, then its take: the
+ * carry alone when its retry is due, else whatever is pending.
+ */
+static bool t_retry_take(struct t_ctx *c, s64 ms, struct rk3026_ebc_set *part)
+{
+	rk3026_ebc_retry_ready(&c->p, ms_to_ktime(ms), true);
+	return rk3026_ebc_pending_take(&c->p, part);
 }
 
 static void ebc_test_seq_barrier(struct kunit *test)
@@ -966,18 +987,32 @@ static void ebc_test_seq_merged_markers(struct kunit *test)
 }
 
 /*
- * What the driver asks locklessly between parts: work pending
- * (rk3026_ebc_work_pending(), the thread's wake) must agree with
+ * What the driver asks locklessly between parts: a part to take
+ * (rk3026_ebc_take_pending(), the thread's wake) must agree with
  * rk3026_ebc_pending_empty() on every outcome, a carry included, or the
- * thread would sleep on work or spin on a carry.
+ * thread would sleep on work or spin on a carry; an update not finished
+ * (rk3026_ebc_work_pending()) is one pending or held by a carry's retry.
  */
 static void t_expect_between_parts(struct kunit *test,
 				   const struct rk3026_ebc_pending *p)
 {
-	KUNIT_EXPECT_EQ(test, rk3026_ebc_work_pending(p),
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_take_pending(p),
 			!rk3026_ebc_pending_empty(p));
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_work_pending(p),
+			!rk3026_ebc_pending_empty(p) || p->retry.armed);
 }
 
+/* The outcomes after which a part is carried and tried again. */
+static bool t_retried(enum rk3026_ebc_outcome outcome)
+{
+	return outcome == EBC_OUTCOME_NO_RAILS || outcome == EBC_OUTCOME_NO_LUT;
+}
+
+/*
+ * done_seq moves over a part when it is driven, skipped, dropped or given
+ * up; a part carried for a retry holds it below, and the RESET behind it,
+ * which drops the carry, moves it on.
+ */
 static void ebc_test_seq_between_parts(struct kunit *test)
 {
 	static const enum rk3026_ebc_outcome outcomes[] = {
@@ -990,6 +1025,7 @@ static void ebc_test_seq_between_parts(struct kunit *test)
 	unsigned int i;
 
 	for (i = 0; i < ARRAY_SIZE(outcomes); i++) {
+		bool retried = t_retried(outcomes[i]);
 		struct t_ctx *c = t_ctx_alloc(test);
 		struct rk3026_ebc_set part;
 		unsigned int parts = 0;
@@ -1002,20 +1038,29 @@ static void ebc_test_seq_between_parts(struct kunit *test)
 		t_expect_between_parts(test, &c->p);
 
 		while (rk3026_ebc_pending_take(&c->p, &part)) {
+			bool held = retried && part.mode != EBC_MODE_RESET;
+
 			before = c->p.done_seq;
-			/* in flight: still work, so not idle */
+			/* in flight: still work, nothing more to take */
 			KUNIT_EXPECT_TRUE(test, rk3026_ebc_work_pending(&c->p));
+			KUNIT_EXPECT_EQ(test, c->p.taken_seq, part.seq);
 			rk3026_ebc_scan_finish(&c->sh, &c->p, &part,
-					       outcomes[i], EBC_REPAIR_NONE);
-			/* done_seq advanced, whatever the outcome */
-			KUNIT_EXPECT_EQ(test, c->p.done_seq, part.seq);
-			KUNIT_EXPECT_GT(test, (s32)(c->p.done_seq - before), 0);
+					       outcomes[i], EBC_REPAIR_NONE, 0, &c->gave_up);
+			if (held) {
+				KUNIT_EXPECT_EQ(test, c->p.done_seq, before);
+				KUNIT_EXPECT_TRUE(test, c->p.retry.armed);
+			} else {
+				KUNIT_EXPECT_EQ(test, c->p.done_seq, part.seq);
+				KUNIT_EXPECT_GT(test,
+						(s32)(c->p.done_seq - before), 0);
+			}
 			t_expect_between_parts(test, &c->p);
 			parts++;
 		}
 		KUNIT_EXPECT_EQ(test, parts, 3);
-		KUNIT_EXPECT_EQ(test, c->p.done_seq, c->p.queued_seq);
-		KUNIT_EXPECT_TRUE(test, t_done(c, last));
+		KUNIT_EXPECT_EQ(test, t_done(c, last), !retried);
+		KUNIT_EXPECT_EQ(test, c->p.done_seq == c->p.queued_seq,
+				!retried);
 	}
 }
 
@@ -1071,7 +1116,7 @@ static void ebc_test_finish_driven(struct kunit *test)
 		KUNIT_EXPECT_TRUE(test,
 				  rk3026_ebc_scan_finish(&c->sh, &c->p, &part,
 							 EBC_OUTCOME_DRIVEN,
-							 EBC_REPAIR_NONE));
+							 EBC_REPAIR_NONE, 0, &c->gave_up));
 		KUNIT_EXPECT_PTR_EQ(test, c->sh.prev, c->scan);
 		KUNIT_EXPECT_PTR_EQ(test, c->sh.scan, c->prev);
 		KUNIT_EXPECT_EQ(test, c->sh.prev_unknown, i);
@@ -1105,7 +1150,7 @@ static void ebc_test_finish_entered(struct kunit *test)
 					  rk3026_ebc_scan_finish(&c->sh, &c->p,
 								 &part,
 								 outcomes[i],
-								 repairs[j]));
+								 repairs[j], 0, &c->gave_up));
 			KUNIT_EXPECT_PTR_EQ(test, c->sh.prev, c->scan);
 			KUNIT_EXPECT_EQ(test, c->sh.prev_unknown,
 					outcomes[i] != EBC_OUTCOME_DRIVEN);
@@ -1140,13 +1185,16 @@ static void ebc_test_finish_repair_failed(struct kunit *test)
 		KUNIT_EXPECT_FALSE(test,
 				   rk3026_ebc_scan_finish(&c->sh, &c->p, &part,
 							  outcomes[i],
-							  EBC_REPAIR_FAILED));
+							  EBC_REPAIR_FAILED, 0, &c->gave_up));
 		KUNIT_EXPECT_PTR_EQ(test, c->sh.prev, c->prev);
 		KUNIT_EXPECT_EQ(test, c->prev[0], 0x77);
 		KUNIT_EXPECT_TRUE(test, c->sh.prev_unknown);
-		KUNIT_EXPECT_TRUE(test, t_done(c, seq));
+		/* Tried again, like a part without rails: its wait holds. */
+		KUNIT_EXPECT_FALSE(test, t_done(c, seq));
+		KUNIT_EXPECT_TRUE(test, c->p.retry.armed);
 		KUNIT_EXPECT_TRUE(test, drm_rect_equals(&c->p.carry.box, &r));
-		KUNIT_EXPECT_FALSE(test, rk3026_ebc_work_pending(&c->p));
+		KUNIT_EXPECT_TRUE(test, rk3026_ebc_work_pending(&c->p));
+		KUNIT_EXPECT_FALSE(test, rk3026_ebc_take_pending(&c->p));
 
 		/* The next part draws it, in its mode, still a full send. */
 		t_add(&c->p, &s, EBC_MODE_A2, EBC_SOURCE_MXCFB);
@@ -1177,18 +1225,26 @@ static void ebc_test_finish_carry(struct kunit *test)
 		struct t_ctx *c = t_ctx_alloc(test);
 		struct rk3026_ebc_set part;
 		u32 seq;
+		bool retried = t_retried(outcomes[i]);
 
 		seq = t_add_marked(&c->p, &c->ring, &a, EBC_MODE_FULL, 1);
 		rk3026_ebc_pending_take(&c->p, &part);
 		KUNIT_EXPECT_FALSE(test, rk3026_ebc_scan_finish(&c->sh, &c->p,
 								&part,
 								outcomes[i],
-								EBC_REPAIR_NONE));
-		/* Nothing driven: prev stays, the wait ends, nothing wakes. */
+								EBC_REPAIR_NONE, 0, &c->gave_up));
+		/*
+		 * Nothing driven: prev stays, nothing to take. The wait
+		 * holds for the retries; without a waveform the part is
+		 * given up at once and its wait ends.
+		 */
 		KUNIT_EXPECT_PTR_EQ(test, c->sh.prev, c->prev);
-		KUNIT_EXPECT_TRUE(test, t_done(c, seq));
+		KUNIT_EXPECT_EQ(test, t_done(c, seq), !retried);
+		KUNIT_EXPECT_EQ(test, c->p.retry.armed, retried);
+		KUNIT_EXPECT_EQ(test, c->gave_up != EBC_GAVE_UP_NONE, !retried);
 		KUNIT_EXPECT_TRUE(test, rk3026_ebc_pending_empty(&c->p));
-		KUNIT_EXPECT_FALSE(test, rk3026_ebc_work_pending(&c->p));
+		KUNIT_EXPECT_EQ(test, rk3026_ebc_work_pending(&c->p), retried);
+		KUNIT_EXPECT_FALSE(test, rk3026_ebc_take_pending(&c->p));
 		KUNIT_EXPECT_FALSE(test, rk3026_ebc_pending_take(&c->p, &part));
 
 		/* The next update's scan draws the carried box, as strongly. */
@@ -1289,7 +1345,7 @@ static void ebc_test_finish_skipped_crtc_off(struct kunit *test)
 		KUNIT_EXPECT_FALSE(test, rk3026_ebc_scan_finish(&c->sh, &c->p,
 								&part,
 								outcomes[i],
-								EBC_REPAIR_NONE));
+								EBC_REPAIR_NONE, 0, &c->gave_up));
 		KUNIT_EXPECT_PTR_EQ(test, c->sh.prev, c->prev);
 		KUNIT_EXPECT_TRUE(test, t_done(c, seq));
 		/* Dropped, not carried. */
@@ -1308,7 +1364,7 @@ static void ebc_test_finish_reset(struct kunit *test)
 	rk3026_ebc_pending_take(&c->p, &part);
 	KUNIT_EXPECT_TRUE(test, rk3026_ebc_scan_finish(&c->sh, &c->p, &part,
 						       EBC_OUTCOME_DRIVEN,
-						       EBC_REPAIR_NONE));
+						       EBC_REPAIR_NONE, 0, &c->gave_up));
 	t_expect_white(test, c->sh.prev);
 	KUNIT_EXPECT_FALSE(test, c->sh.prev_unknown);
 	KUNIT_EXPECT_FALSE(test, c->p.carry.merged);
@@ -1332,7 +1388,7 @@ static void ebc_test_finish_reset_failed(struct kunit *test)
 		KUNIT_EXPECT_FALSE(test, rk3026_ebc_scan_finish(&c->sh, &c->p,
 								&part,
 								outcomes[i],
-								EBC_REPAIR_NONE));
+								EBC_REPAIR_NONE, 0, &c->gave_up));
 		/* The glass is not known: the next draw repairs it first. */
 		KUNIT_EXPECT_TRUE(test, c->sh.prev_unknown);
 		KUNIT_EXPECT_PTR_EQ(test, c->sh.prev, c->prev);
@@ -1365,7 +1421,7 @@ static void ebc_test_finish_reset_cut_short(struct kunit *test)
 		KUNIT_EXPECT_TRUE(test,
 				  rk3026_ebc_scan_finish(&c->sh, &c->p, &part,
 							 outcomes[i],
-							 EBC_REPAIR_NONE));
+							 EBC_REPAIR_NONE, 0, &c->gave_up));
 		KUNIT_EXPECT_TRUE(test, c->sh.prev_unknown);
 		KUNIT_EXPECT_PTR_EQ(test, c->sh.prev, c->prev);
 		t_expect_white(test, c->sh.prev);
@@ -1397,7 +1453,7 @@ static void ebc_test_finish_repaired_not_driven(struct kunit *test)
 	/* The repair whitened the glass, then the LUT was missing. */
 	KUNIT_EXPECT_TRUE(test, rk3026_ebc_scan_finish(&c->sh, &c->p, &part,
 						       EBC_OUTCOME_NO_LUT,
-						       EBC_REPAIR_DONE));
+						       EBC_REPAIR_DONE, 0, &c->gave_up));
 	t_expect_white(test, c->sh.prev);
 	KUNIT_EXPECT_FALSE(test, c->sh.prev_unknown);
 
@@ -1405,6 +1461,303 @@ static void ebc_test_finish_repaired_not_driven(struct kunit *test)
 	rk3026_ebc_pending_take(&c->p, &part);
 	KUNIT_EXPECT_TRUE(test, drm_rect_equals(&part.box, &t_panel));
 	KUNIT_EXPECT_EQ(test, part.mode, EBC_MODE_PART);
+}
+
+/*
+ * The retry schedule (rk3026_ebc_retry_next()), in ms from the first carry:
+ * the next try is the first of 100, 500 and 2100 after the one that failed;
+ * after 2100, the span the waits allow for, none: the part is given up.
+ */
+static void ebc_test_retry_next(struct kunit *test)
+{
+	static const struct {
+		s64	now;
+		bool	more;
+		s64	at;
+	} rows[] = {
+		{ 0, true, 100 }, { 99, true, 100 }, { 100, true, 500 },
+		{ 250, true, 500 }, { 500, true, EBC_RETRY_SPAN_MS },
+		{ EBC_RETRY_SPAN_MS - 1, true, EBC_RETRY_SPAN_MS },
+		{ EBC_RETRY_SPAN_MS, false }, { 60000, false },
+	};
+	ktime_t first = ms_to_ktime(1000);
+	unsigned int i;
+
+	KUNIT_EXPECT_EQ(test, EBC_RETRY_SPAN_MS, 100 + 400 + 1600);
+	for (i = 0; i < ARRAY_SIZE(rows); i++) {
+		ktime_t at = 12345;
+
+		KUNIT_EXPECT_EQ_MSG(test,
+				    rk3026_ebc_retry_next(first,
+							  ktime_add_ms(first,
+								       rows[i].now),
+							  &at),
+				    rows[i].more, "failed at %lld ms",
+				    rows[i].now);
+		KUNIT_EXPECT_EQ(test, at, rows[i].more ?
+				ktime_add_ms(first, rows[i].at) : 12345);
+	}
+}
+
+/*
+ * A carry keeps its part's marker, source and temperature: taken alone at
+ * its retry, the part has them. Merged into the next part, that part's
+ * own win, and a temperature it lacks comes from the carry.
+ */
+static void ebc_test_carry_record(struct kunit *test)
+{
+	struct t_ctx *c = t_ctx_alloc(test);
+	struct drm_rect a = DRM_RECT_INIT(0, 0, 4, 2);
+	struct rk3026_ebc_update upd = t_upd(&a, EBC_MODE_PART, 7,
+					     EBC_SOURCE_MXCFB);
+	struct rk3026_ebc_set part;
+	u32 seq;
+
+	upd.temp = 12;
+	upd.temp_valid = true;
+	rk3026_ebc_pending_add(&c->p, &upd, &seq);
+	rk3026_ebc_pending_take(&c->p, &part);
+	t_finish_at(c, &part, EBC_OUTCOME_NO_RAILS, 1000);
+	KUNIT_ASSERT_TRUE(test, t_retry_take(c, 1100, &part));
+	KUNIT_EXPECT_EQ(test, part.seq, seq);
+	KUNIT_EXPECT_EQ(test, part.marker, 7);
+	KUNIT_EXPECT_EQ(test, part.source, EBC_SOURCE_MXCFB);
+	KUNIT_EXPECT_TRUE(test, part.temp_valid);
+	KUNIT_EXPECT_EQ(test, part.temp, 12);
+
+	/* Carried again; a plane update with no temperature joins it. */
+	t_finish_at(c, &part, EBC_OUTCOME_NO_RAILS, 1100);
+	t_add(&c->p, &a, EBC_MODE_FULL, EBC_SOURCE_PLANE);
+	rk3026_ebc_pending_take(&c->p, &part);
+	KUNIT_EXPECT_EQ(test, part.marker, 0);
+	KUNIT_EXPECT_EQ(test, part.source, EBC_SOURCE_PLANE);
+	KUNIT_EXPECT_TRUE(test, part.temp_valid);
+	KUNIT_EXPECT_EQ(test, part.temp, 12);
+
+	/* One that brings its own temperature keeps it. */
+	t_finish_at(c, &part, EBC_OUTCOME_NO_RAILS, 1200);
+	upd = t_upd(&a, EBC_MODE_PART, 8, EBC_SOURCE_MXCFB);
+	upd.temp = 30;
+	upd.temp_valid = true;
+	rk3026_ebc_pending_add(&c->p, &upd, &seq);
+	rk3026_ebc_pending_take(&c->p, &part);
+	KUNIT_EXPECT_EQ(test, part.marker, 8);
+	KUNIT_EXPECT_EQ(test, part.temp, 30);
+}
+
+/*
+ * A RESET that was not driven (no rails, no LUT, no waveform) is not
+ * carried: the glass is marked not known, for the next draw to repair,
+ * its waits end, and it is given up, so it is counted. It does not make
+ * the next carry give up at once. Driven, it is not given up.
+ */
+static void ebc_test_finish_reset_lost(struct kunit *test)
+{
+	static const enum rk3026_ebc_outcome outcomes[] = {
+		EBC_OUTCOME_NO_RAILS, EBC_OUTCOME_NO_LUT,
+		EBC_OUTCOME_NO_WAVEFORM, EBC_OUTCOME_DRIVEN,
+	};
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(outcomes); i++) {
+		bool lost = outcomes[i] != EBC_OUTCOME_DRIVEN;
+		struct t_ctx *c = t_ctx_alloc(test);
+		struct rk3026_ebc_set part;
+		u32 seq;
+
+		seq = t_add(&c->p, &t_panel, EBC_MODE_RESET, EBC_SOURCE_ENABLE);
+		rk3026_ebc_pending_take(&c->p, &part);
+		t_finish_at(c, &part, outcomes[i], 1000);
+		KUNIT_EXPECT_EQ(test, c->gave_up,
+				lost ? EBC_GAVE_UP : EBC_GAVE_UP_NONE);
+		KUNIT_EXPECT_EQ(test, c->sh.prev_unknown, lost);
+		KUNIT_EXPECT_TRUE(test, t_done(c, seq));
+		KUNIT_EXPECT_FALSE(test, c->p.carry.merged);
+		KUNIT_EXPECT_FALSE(test, c->p.retry.armed);
+		KUNIT_EXPECT_FALSE(test, c->p.retry.failing);
+	}
+}
+
+/*
+ * A carried part on the time line of its retries: carried at 1000 ms, its
+ * wait held; nothing to take before 1100, then the carry alone, its seq,
+ * nothing new taken; an update that joins it at 1200 is tried with it and
+ * moves neither the next try (1500) nor the last (3100); the try at 3100
+ * gives both up, their waits end, the carry stays for the next part. That
+ * part gives up at once (failing), until a part is driven; the next carry
+ * is tried again, on a schedule of its own.
+ */
+static void ebc_test_finish_retry(struct kunit *test)
+{
+	struct t_ctx *c = t_ctx_alloc(test);
+	struct rk3026_ebc_retry *r = &c->p.retry;
+	struct drm_rect a = DRM_RECT_INIT(0, 0, 4, 2);
+	struct drm_rect b = DRM_RECT_INIT(8, 4, 2, 2);
+	struct rk3026_ebc_set part;
+	u32 s1, s2, s3, s4;
+
+	s1 = t_add_marked(&c->p, &c->ring, &a, EBC_MODE_FULL, 1);
+	rk3026_ebc_pending_take(&c->p, &part);
+	t_finish_at(c, &part, EBC_OUTCOME_NO_RAILS, 1000);
+	KUNIT_EXPECT_TRUE(test, r->armed);
+	KUNIT_EXPECT_EQ(test, r->at, ms_to_ktime(1100));
+	KUNIT_EXPECT_EQ(test, r->tries, 0);
+	KUNIT_EXPECT_EQ(test, c->gave_up, EBC_GAVE_UP_NONE);
+	KUNIT_EXPECT_FALSE(test, t_done(c, s1));
+	KUNIT_EXPECT_EQ(test, c->p.carry.seq, s1);
+	/* Not due: the next take would not have the carry in it. */
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_retry_try(&c->p), 0);
+
+	KUNIT_EXPECT_FALSE(test, t_retry_take(c, 1099, &part));
+	KUNIT_EXPECT_TRUE(test, c->p.carry.merged);
+	rk3026_ebc_retry_ready(&c->p, ms_to_ktime(1100), true);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_retry_try(&c->p), 1);
+	KUNIT_ASSERT_TRUE(test, t_retry_take(c, 1100, &part));
+	KUNIT_EXPECT_EQ(test, part.seq, s1);
+	KUNIT_EXPECT_EQ(test, part.mode, EBC_MODE_FULL);
+	KUNIT_EXPECT_TRUE(test, drm_rect_equals(&part.box, &a));
+	KUNIT_EXPECT_FALSE(test, c->p.carry.merged);
+	KUNIT_EXPECT_EQ(test, c->p.taken_seq, s1);
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_take_pending(&c->p));
+	t_finish_at(c, &part, EBC_OUTCOME_NO_RAILS, 1100);
+	KUNIT_EXPECT_EQ(test, r->at, ms_to_ktime(1500));
+	KUNIT_EXPECT_EQ(test, r->tries, 1);
+
+	s2 = t_add_marked(&c->p, &c->ring, &b, EBC_MODE_PART, 2);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_retry_try(&c->p), 2);
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_pending_take(&c->p, &part));
+	KUNIT_EXPECT_EQ(test, part.seq, s2);
+	KUNIT_EXPECT_EQ(test, part.box.x2, 10);
+	t_finish_at(c, &part, EBC_OUTCOME_NO_LUT, 1200);
+	KUNIT_EXPECT_EQ(test, r->at, ms_to_ktime(1500));
+	KUNIT_EXPECT_EQ(test, r->first, ms_to_ktime(1000));
+	KUNIT_EXPECT_EQ(test, r->tries, 2);
+	KUNIT_EXPECT_EQ(test, c->p.carry.seq, s2);
+	KUNIT_EXPECT_FALSE(test, t_done(c, s1));
+
+	KUNIT_ASSERT_TRUE(test, t_retry_take(c, 1500, &part));
+	t_finish_at(c, &part, EBC_OUTCOME_NO_RAILS, 1500);
+	KUNIT_EXPECT_EQ(test, r->at, ms_to_ktime(3100));
+	KUNIT_EXPECT_FALSE(test, t_retry_take(c, 3099, &part));
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_retry_try(&c->p), 0);
+	rk3026_ebc_retry_ready(&c->p, ms_to_ktime(3100), true);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_retry_try(&c->p), 4);
+	KUNIT_ASSERT_TRUE(test, t_retry_take(c, 3100, &part));
+	t_finish_at(c, &part, EBC_OUTCOME_NO_RAILS, 3100);
+	KUNIT_EXPECT_EQ(test, c->gave_up, EBC_GAVE_UP);
+	KUNIT_EXPECT_TRUE(test, r->failing);
+	KUNIT_EXPECT_FALSE(test, r->armed);
+	KUNIT_EXPECT_TRUE(test, t_done(c, s1));
+	KUNIT_EXPECT_TRUE(test, t_done(c, s2));
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_work_pending(&c->p));
+	KUNIT_EXPECT_TRUE(test, c->p.carry.merged);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_retry_try(&c->p), 0);
+	KUNIT_EXPECT_FALSE(test, t_retry_take(c, 60000, &part));
+
+	s3 = t_add_marked(&c->p, &c->ring, &a, EBC_MODE_PART, 3);
+	rk3026_ebc_pending_take(&c->p, &part);
+	t_finish_at(c, &part, EBC_OUTCOME_NO_RAILS, 4000);
+	KUNIT_EXPECT_EQ(test, c->gave_up, EBC_GAVE_UP_FAILING);
+	KUNIT_EXPECT_FALSE(test, r->armed);
+	KUNIT_EXPECT_TRUE(test, t_done(c, s3));
+
+	t_add_marked(&c->p, &c->ring, &a, EBC_MODE_PART, 4);
+	rk3026_ebc_pending_take(&c->p, &part);
+	t_finish_at(c, &part, EBC_OUTCOME_DRIVEN, 5000);
+	KUNIT_EXPECT_FALSE(test, r->failing);
+	KUNIT_EXPECT_EQ(test, c->gave_up, EBC_GAVE_UP_NONE);
+	KUNIT_EXPECT_FALSE(test, c->p.carry.merged);
+
+	s4 = t_add_marked(&c->p, &c->ring, &b, EBC_MODE_PART, 5);
+	rk3026_ebc_pending_take(&c->p, &part);
+	t_finish_at(c, &part, EBC_OUTCOME_NO_LUT, 6000);
+	KUNIT_EXPECT_TRUE(test, r->armed);
+	KUNIT_EXPECT_EQ(test, r->first, ms_to_ktime(6000));
+	KUNIT_EXPECT_EQ(test, r->at, ms_to_ktime(6100));
+	KUNIT_EXPECT_FALSE(test, t_done(c, s4));
+}
+
+/*
+ * What ends a retry besides a give-up: the try drawn, skipped, dropped with
+ * the CRTC off, or cut short in its waveform; the CRTC off makes it due at
+ * once. A repair cut short is retried like missing rails. A RESET sent
+ * drops the carry: the next look disarms the retry, and the RESET's finish
+ * ends the waits; a carry made while a RESET was pending (its part was in
+ * flight) is dropped by the RESET's finish.
+ */
+static void ebc_test_finish_retry_ends(struct kunit *test)
+{
+	static const enum rk3026_ebc_outcome outcomes[] = {
+		EBC_OUTCOME_DRIVEN, EBC_OUTCOME_SKIPPED, EBC_OUTCOME_CRTC_OFF,
+		EBC_OUTCOME_TIMEOUT, EBC_OUTCOME_ABANDONED,
+	};
+	struct drm_rect a = DRM_RECT_INIT(0, 0, 4, 2);
+	struct rk3026_ebc_set part;
+	struct t_ctx *c;
+	unsigned int i;
+	u32 seq, s2;
+
+	for (i = 0; i < ARRAY_SIZE(outcomes); i++) {
+		c = t_ctx_alloc(test);
+		seq = t_add(&c->p, &a, EBC_MODE_PART, EBC_SOURCE_MXCFB);
+		rk3026_ebc_pending_take(&c->p, &part);
+		t_finish_at(c, &part, EBC_OUTCOME_NO_RAILS, 1000);
+		KUNIT_ASSERT_TRUE(test, t_retry_take(c, 1100, &part));
+		t_finish_at(c, &part, outcomes[i], 1100);
+		KUNIT_EXPECT_TRUE(test, t_done(c, seq));
+		KUNIT_EXPECT_FALSE(test, c->p.retry.armed);
+		KUNIT_EXPECT_EQ(test, c->gave_up, EBC_GAVE_UP_NONE);
+		KUNIT_EXPECT_FALSE(test, c->p.carry.merged);
+		KUNIT_EXPECT_FALSE(test, rk3026_ebc_work_pending(&c->p));
+	}
+
+	c = t_ctx_alloc(test);
+	seq = t_add(&c->p, &a, EBC_MODE_PART, EBC_SOURCE_MXCFB);
+	rk3026_ebc_pending_take(&c->p, &part);
+	t_finish_at(c, &part, EBC_OUTCOME_NO_LUT, 1000);
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_retry_due(&c->p.retry,
+						      ms_to_ktime(1001), true));
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_retry_due(&c->p.retry,
+						     ms_to_ktime(1001), false));
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_retry_ready(&c->p, ms_to_ktime(1001),
+						       false));
+
+	c = t_ctx_alloc(test);
+	c->sh.prev_unknown = true;
+	seq = t_add(&c->p, &a, EBC_MODE_PART, EBC_SOURCE_MXCFB);
+	rk3026_ebc_pending_take(&c->p, &part);
+	rk3026_ebc_scan_finish(&c->sh, &c->p, &part, EBC_OUTCOME_TIMEOUT,
+			       EBC_REPAIR_FAILED, ms_to_ktime(1000), &c->gave_up);
+	KUNIT_EXPECT_TRUE(test, c->p.retry.armed);
+	KUNIT_EXPECT_FALSE(test, t_done(c, seq));
+
+	s2 = t_add(&c->p, &t_panel, EBC_MODE_RESET, EBC_SOURCE_ENABLE);
+	KUNIT_EXPECT_FALSE(test, c->p.carry.merged);
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_retry_ready(&c->p,
+							ms_to_ktime(5000),
+							true));
+	KUNIT_EXPECT_FALSE(test, c->p.retry.armed);
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_pending_take(&c->p, &part));
+	KUNIT_EXPECT_EQ(test, part.mode, EBC_MODE_RESET);
+	t_finish_at(c, &part, EBC_OUTCOME_DRIVEN, 5000);
+	KUNIT_EXPECT_TRUE(test, t_done(c, seq));
+	KUNIT_EXPECT_TRUE(test, t_done(c, s2));
+
+	c = t_ctx_alloc(test);
+	seq = t_add(&c->p, &a, EBC_MODE_PART, EBC_SOURCE_MXCFB);
+	rk3026_ebc_pending_take(&c->p, &part);
+	s2 = t_add(&c->p, &t_panel, EBC_MODE_RESET, EBC_SOURCE_ENABLE);
+	t_finish_at(c, &part, EBC_OUTCOME_NO_RAILS, 1000);
+	KUNIT_EXPECT_TRUE(test, c->p.carry.merged);
+	KUNIT_EXPECT_TRUE(test, c->p.retry.armed);
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_pending_take(&c->p, &part));
+	KUNIT_EXPECT_EQ(test, part.mode, EBC_MODE_RESET);
+	t_finish_at(c, &part, EBC_OUTCOME_DRIVEN, 1050);
+	KUNIT_EXPECT_FALSE(test, c->p.carry.merged);
+	KUNIT_EXPECT_FALSE(test, c->p.retry.armed);
+	KUNIT_EXPECT_TRUE(test, t_done(c, seq));
+	KUNIT_EXPECT_TRUE(test, t_done(c, s2));
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_work_pending(&c->p));
 }
 
 /* --- seq and markers --- */
@@ -2216,8 +2569,8 @@ static void ebc_test_idle_cleanup_due(struct kunit *test)
 /*
  * The deadline of the refresh thread's wait
  * (rk3026_ebc_thread_deadline()): the rails-off one while the rails are
- * on, the idle one while the cleanup is armed, the earlier of the two, or
- * none (@has false).
+ * on, the idle one while the cleanup is armed, the retry of a carry while
+ * one is armed, the earliest of them, or none (@has false).
  */
 struct t_deadline {
 	const char	*desc;
@@ -2227,6 +2580,8 @@ struct t_deadline {
 	unsigned long	idle_at;
 	bool		has;
 	unsigned long	deadline;
+	bool		retry_armed;
+	unsigned long	retry_at;
 };
 
 static const struct t_deadline t_deadline_cases[] = {
@@ -2239,6 +2594,14 @@ static const struct t_deadline t_deadline_cases[] = {
 	/* time_after(), not a plain compare: the later one wrapped. */
 	{ "rails wrapped", true, 5, true, ULONG_MAX - 5, true, ULONG_MAX - 5 },
 	{ "idle wrapped", true, ULONG_MAX - 5, true, 5, true, ULONG_MAX - 5 },
+	/* ..., has, deadline, retry_armed, retry_at */
+	{ "retry", false, 100, false, 200, true, 700, true, 700 },
+	{ "retry first", true, 1000, true, 2000, true, 700, true, 700 },
+	{ "rails before retry", true, 500, false, 0, true, 500, true, 700 },
+	{ "idle before retry", false, 0, true, 600, true, 600, true, 700 },
+	{ "retry not armed", true, 1000, false, 0, true, 1000, false, 700 },
+	{ "retry wrapped", true, ULONG_MAX - 5, false, 0, true, ULONG_MAX - 5,
+	  true, 5 },
 };
 
 KUNIT_ARRAY_PARAM_DESC(t_deadline, t_deadline_cases, desc);
@@ -2251,6 +2614,7 @@ static void ebc_test_thread_deadline(struct kunit *test)
 	KUNIT_EXPECT_EQ(test,
 			rk3026_ebc_thread_deadline(c->rails_on, c->rails_off_at,
 						   c->idle_armed, c->idle_at,
+						   c->retry_armed, c->retry_at,
 						   &deadline),
 			c->has);
 	if (c->has)
@@ -2268,6 +2632,8 @@ static void ebc_test_thread_deadline(struct kunit *test)
  * part (mxcfb, RESET) and a quiet gap or a cap of 0 never wait. A big box
  * is 1000 pixels here. A cap above EBC_TAKE_CAP_MAX_MS (@cap_ms, with
  * @own_cap) is clamped to it, and a quiet gap above the cap to the cap.
+ * A carry's retry armed for @retry_us (@retry) ends the gap there, if that
+ * comes first: its look finds the retry due and the part exempt.
  */
 struct t_take {
 	const char	*desc;
@@ -2286,6 +2652,8 @@ struct t_take {
 	s64		end_us;
 	bool		own_cap;
 	u32		cap_ms;
+	bool		retry;
+	s64		retry_us;
 };
 
 static const struct t_take t_take_cases[] = {
@@ -2333,6 +2701,15 @@ static const struct t_take t_take_cases[] = {
 	  false, true, false, 300000, 0, 200000, 100000, 300000, true, 350000 },
 	{ "previous finish after the quiet gap: now", 2, 100, false, false,
 	  true, false, 10000, 0, 50000, 5000, 50000, false },
+	/* ..., wait, end, own_cap, cap_ms, retry, retry_us */
+	{ "retry before the gap's end: the retry", 2, 100, false, false, true,
+	  true, 10000, 0, 0, 5000, 6000, true, 8000, false, 0, true, 8000 },
+	{ "retry after the gap's end: the end", 2, 100, false, false, true,
+	  true, 10000, 0, 0, 5000, 6000, true, 15000, false, 0, true, 20000 },
+	{ "retry before the cap: the retry", 5, 100, false, false, true, true,
+	  10000, 0, 0, 245000, 249000, true, 249500, false, 0, true, 249500 },
+	{ "retry at the look: now", 2, 100, false, false, true, true,
+	  10000, 0, 0, 5000, 6000, false, 0, false, 0, true, 6000 },
 };
 
 KUNIT_ARRAY_PARAM_DESC(t_take, t_take_cases, desc);
@@ -2353,6 +2730,8 @@ static void ebc_test_take_wait(struct kunit *test)
 		.exempt		= c->exempt,
 		.rails_up	= c->rails_up,
 		.open		= c->open,
+		.retry_armed	= c->retry,
+		.retry_at	= c->retry_us * NSEC_PER_USEC,
 	};
 	ktime_t end = 12345;
 
@@ -2368,18 +2747,21 @@ static void ebc_test_take_wait(struct kunit *test)
 
 /*
  * The refresh thread's wait condition and rails-off: between parts it
- * wakes on work; while a gap is open, on an update newer than the one it
- * saw, not on the part pending all along, or on the CRTC going off; and
- * the rails are held up while a gap is open, at their deadline too.
+ * wakes on a part to take, or a carry's retry due; while a gap is open, on
+ * an update newer than the one it saw, not on the part pending all along,
+ * or on the CRTC going off; and the rails are held up while a gap is open,
+ * at their deadline too.
  */
 static void ebc_test_thread_woken(struct kunit *test)
 {
 	struct rk3026_ebc_pending p = {};
+	struct rk3026_ebc_set part;
+	struct t_ctx *c;
 	u32 seen;
 
-	KUNIT_EXPECT_FALSE(test, rk3026_ebc_thread_woken(&p));
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_thread_woken(&p, 0, true));
 	t_add(&p, &t_panel, EBC_MODE_FULL, EBC_SOURCE_PLANE);
-	KUNIT_EXPECT_TRUE(test, rk3026_ebc_thread_woken(&p));
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_thread_woken(&p, 0, true));
 
 	seen = p.queued_seq;
 	KUNIT_EXPECT_TRUE(test, rk3026_ebc_work_pending(&p));
@@ -2389,6 +2771,30 @@ static void ebc_test_thread_woken(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, rk3026_ebc_gap_woken(&p, seen, true));
 	seen = p.queued_seq;
 	KUNIT_EXPECT_FALSE(test, rk3026_ebc_gap_woken(&p, seen, true));
+
+	/*
+	 * A carry armed for its retry and nothing new: work not finished,
+	 * nothing to take, asleep until its time; with the CRTC off at once.
+	 */
+	c = t_ctx_alloc(test);
+	t_add(&c->p, &t_panel, EBC_MODE_FULL, EBC_SOURCE_PLANE);
+	rk3026_ebc_pending_take(&c->p, &part);
+	t_finish_at(c, &part, EBC_OUTCOME_NO_RAILS, 1000);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_work_pending(&c->p));
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_take_pending(&c->p));
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_thread_woken(&c->p,
+							 ms_to_ktime(1000),
+							 true));
+	KUNIT_EXPECT_FALSE(test,
+			   rk3026_ebc_thread_woken(&c->p,
+						   ktime_sub_ns(ms_to_ktime(1100),
+								1), true));
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_thread_woken(&c->p,
+							ms_to_ktime(1100),
+							true));
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_thread_woken(&c->p,
+							ms_to_ktime(1000),
+							false));
 
 	KUNIT_EXPECT_TRUE(test, rk3026_ebc_rails_off_due(true, 100, false, 100));
 	KUNIT_EXPECT_FALSE(test, rk3026_ebc_rails_off_due(true, 100, false, 99));
@@ -2445,7 +2851,7 @@ static void ebc_test_pending_cleanup_idle(struct kunit *test)
 	t_add(&c->p, &t_panel, EBC_MODE_FULL, EBC_SOURCE_IDLE);
 	rk3026_ebc_pending_take(&c->p, &part);
 	rk3026_ebc_scan_finish(&c->sh, &c->p, &part, EBC_OUTCOME_NO_RAILS,
-			       EBC_REPAIR_NONE);
+			       EBC_REPAIR_NONE, 0, &c->gave_up);
 	KUNIT_EXPECT_FALSE(test, c->p.carry.merged);
 	t_add_auto(&c->p, &r, EBC_MODE_FULL, EBC_SOURCE_PLANE);
 	rk3026_ebc_pending_take(&c->p, &part);
@@ -2458,7 +2864,7 @@ static void ebc_test_pending_cleanup_idle(struct kunit *test)
 	t_add_auto(&c->p, &r, EBC_MODE_FULL, EBC_SOURCE_PLANE);
 	rk3026_ebc_pending_take(&c->p, &part);
 	rk3026_ebc_scan_finish(&c->sh, &c->p, &part, EBC_OUTCOME_NO_LUT,
-			       EBC_REPAIR_NONE);
+			       EBC_REPAIR_NONE, 0, &c->gave_up);
 	KUNIT_EXPECT_TRUE(test, c->p.carry.merged);
 	KUNIT_EXPECT_FALSE(test, c->p.carry.cleanup_idle);
 	KUNIT_EXPECT_TRUE(test, c->p.carry.has_plane);
@@ -2474,7 +2880,7 @@ static void ebc_test_pending_cleanup_idle(struct kunit *test)
 	t_add(&c->p, &t_panel, EBC_MODE_FULL, EBC_SOURCE_IDLE);
 	rk3026_ebc_pending_take(&c->p, &part);
 	rk3026_ebc_scan_finish(&c->sh, &c->p, &part, EBC_OUTCOME_NO_LUT,
-			       EBC_REPAIR_DONE);
+			       EBC_REPAIR_DONE, 0, &c->gave_up);
 	KUNIT_EXPECT_TRUE(test, c->p.carry.merged);
 	KUNIT_EXPECT_FALSE(test, c->p.carry.cleanup_idle);
 	KUNIT_EXPECT_TRUE(test, drm_rect_equals(&c->p.carry.box, &t_panel));
@@ -2487,7 +2893,7 @@ static void ebc_test_pending_cleanup_idle(struct kunit *test)
 	t_add_auto(&c->p, &r, EBC_MODE_FULL, EBC_SOURCE_PLANE);
 	rk3026_ebc_pending_take(&c->p, &part);
 	rk3026_ebc_scan_finish(&c->sh, &c->p, &part, EBC_OUTCOME_NO_LUT,
-			       EBC_REPAIR_NONE);
+			       EBC_REPAIR_NONE, 0, &c->gave_up);
 	KUNIT_EXPECT_FALSE(test, c->p.carry.cleanup_idle);
 	t_add(&c->p, &t_panel, EBC_MODE_FULL, EBC_SOURCE_IDLE);
 	rk3026_ebc_pending_take(&c->p, &part);
@@ -2598,7 +3004,7 @@ static void ebc_test_pending_auto_ok_carry(struct kunit *test)
 			rk3026_ebc_pending_take(&c->p, &part);
 			KUNIT_EXPECT_TRUE(test, part.auto_ok);
 			rk3026_ebc_scan_finish(&c->sh, &c->p, &part,
-					       outcomes[i], repairs[j]);
+					       outcomes[i], repairs[j], 0, &c->gave_up);
 			KUNIT_EXPECT_TRUE(test, c->p.carry.merged);
 			KUNIT_EXPECT_EQ(test, c->p.carry.mode, EBC_MODE_FULL);
 			KUNIT_EXPECT_FALSE(test, c->p.carry.auto_ok);
@@ -2622,7 +3028,7 @@ static void ebc_test_pending_auto_ok_carry(struct kunit *test)
 		rk3026_ebc_pending_take(&c->p, &part);
 		rk3026_ebc_scan_finish(&c->sh, &c->p, &part,
 				       i ? EBC_OUTCOME_ABANDONED :
-				       EBC_OUTCOME_TIMEOUT, EBC_REPAIR_FAILED);
+				       EBC_OUTCOME_TIMEOUT, EBC_REPAIR_FAILED, 0, &c->gave_up);
 		KUNIT_EXPECT_EQ(test, c->p.carry.mode, EBC_MODE_PART);
 		KUNIT_EXPECT_FALSE(test, c->p.carry.auto_ok);
 		KUNIT_EXPECT_FALSE(test, c->p.carry.has_plane);
@@ -2862,6 +3268,11 @@ static struct kunit_case rk3026_ebc_core_test_cases[] = {
 	KUNIT_CASE(ebc_test_finish_reset_failed),
 	KUNIT_CASE(ebc_test_finish_reset_cut_short),
 	KUNIT_CASE(ebc_test_finish_repaired_not_driven),
+	KUNIT_CASE(ebc_test_retry_next),
+	KUNIT_CASE(ebc_test_finish_retry),
+	KUNIT_CASE(ebc_test_finish_reset_lost),
+	KUNIT_CASE(ebc_test_carry_record),
+	KUNIT_CASE(ebc_test_finish_retry_ends),
 	KUNIT_CASE(ebc_test_seq_wrap),
 	KUNIT_CASE(ebc_test_marker_zero),
 	KUNIT_CASE(ebc_test_marker_newest),
@@ -3713,18 +4124,25 @@ static void ebc_test_glue_no_waveform(struct kunit *test)
 	struct drm_rect a = DRM_RECT_INIT(0, 0, 4, 2);
 	struct drm_rect b = DRM_RECT_INIT(8, 4, 2, 2);
 	struct rk3026_ebc_last last;
-	u32 seq;
+	u32 seq, mseq;
 
 	ebc->shadows.prev_unknown = true;
 	seq = t_send(ebc, &a, EBC_MODE_FULL, 2, EBC_SOURCE_MXCFB);
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_NO_WAVEFORM);
 	KUNIT_EXPECT_FALSE(test, last.repaired);
+	/* Loaded once, at probe: given up at once, the marker done. */
+	KUNIT_EXPECT_TRUE(test, last.gave_up);
+	KUNIT_EXPECT_EQ(test, last.tries, 0);
 	KUNIT_EXPECT_TRUE(test, rk3026_ebc_seq_finished(&ebc->pending, seq));
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_marker_seq_lookup(&ebc->markers, 2,
+							     &mseq));
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_seq_finished(&ebc->pending, mseq));
+	KUNIT_EXPECT_FALSE(test, ebc->pending.retry.armed);
+	KUNIT_EXPECT_EQ(test, ebc->stats.carry_failed, 1);
 	KUNIT_EXPECT_TRUE(test, drm_rect_equals(&ebc->pending.carry.box, &a));
 	KUNIT_EXPECT_TRUE(test, ebc->shadows.prev_unknown);
 	KUNIT_EXPECT_FALSE(test, rk3026_ebc_work_pending(&ebc->pending));
-	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_marker(ebc, 2), 0);
 
 	t_send(ebc, &b, EBC_MODE_A2, 0, EBC_SOURCE_PLANE);
 	rk3026_ebc_do_refresh(ebc, &last);
@@ -3732,6 +4150,7 @@ static void ebc_test_glue_no_waveform(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, last.clip.x2, 10);
 	KUNIT_EXPECT_EQ(test, last.asked_mode, EBC_MODE_FULL);
 	KUNIT_EXPECT_EQ(test, ebc->stats.dropped, 2);
+	KUNIT_EXPECT_EQ(test, ebc->stats.carry_failed, 2);
 }
 
 /* A snapshot that moves nothing is skipped before any hardware. */
@@ -3899,7 +4318,7 @@ static void ebc_test_glue_wait_barrier(struct kunit *test)
 
 /*
  * Four parts, each a setup and eight chunks at their budget, and the
- * longest quiet gap.
+ * retries of a carried one: a part more and the schedule's span.
  */
 static void ebc_test_glue_wait_timeout(struct kunit *test)
 {
@@ -3907,7 +4326,8 @@ static void ebc_test_glue_wait_timeout(struct kunit *test)
 
 	/* The fallback dot clock on a 16x6 panel: every budget at its floor. */
 	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_timeout_ms(ebc),
-			4 * (1000 + 8 * 5000) + EBC_TAKE_CAP_MAX_MS);
+			5 * (1000 + 8 * 5000) + EBC_RETRY_SPAN_MS +
+			EBC_TAKE_CAP_MAX_MS);
 
 	/*
 	 * 1 kHz, 4 x 6 clocks a frame: 24 ms a frame, a 64-frame budget of
@@ -3915,7 +4335,8 @@ static void ebc_test_glue_wait_timeout(struct kunit *test)
 	 */
 	ebc->timing.pixelclock.typ = 1000;
 	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_timeout_ms(ebc),
-			4 * (1000 + 8 * 6144) + EBC_TAKE_CAP_MAX_MS);
+			5 * (1000 + 8 * 6144) + EBC_RETRY_SPAN_MS +
+			EBC_TAKE_CAP_MAX_MS);
 }
 
 /* A plane update leaves the panel to an mxcfb client. */
@@ -4226,9 +4647,10 @@ static void ebc_test_glue_du_reset(struct kunit *test)
  * what the stub of rk3026_ebc_raise_rails() (t_rails()) does: @rails counts
  * its calls, @rails_ret is what they return, with @rails_fb the first one
  * sends a plane update of @rails_box from it, as a sender would while the
- * rails come up, and rails that come up move the fake clock (t_clock(),
- * @now) by @ramp; drive k moves it by @drive_time[k]. @temp is what the
- * sensor reads, with t_temp_ebc().
+ * rails come up, with @rails_reset a RESET, as a CRTC enable would, and
+ * rails that come up move the fake clock (t_clock(), @now) by @ramp; drive
+ * k moves it by @drive_time[k]. @temp is what the sensor reads, with
+ * t_temp_ebc().
  */
 struct t_drives {
 	unsigned int	n;
@@ -4239,6 +4661,7 @@ struct t_drives {
 	int		rails_ret;
 	const u32	*rails_fb;
 	struct drm_rect	rails_box;
+	bool		rails_reset;
 	ktime_t		now;
 	ktime_t		ramp;
 	ktime_t		drive_time[8];
@@ -4967,7 +5390,9 @@ static void ebc_test_glue_idle_busy(struct kunit *test)
 	ebc->du_area = ebc->du_cleanup_area;
 	KUNIT_EXPECT_FALSE(test, rk3026_ebc_idle_tick(ebc, t_idle_at(ebc)));
 	KUNIT_EXPECT_FALSE(test, ebc->idle_armed);
-	KUNIT_EXPECT_FALSE(test, rk3026_ebc_work_pending(&ebc->pending));
+	/* Nothing to take; the carry's retry holds its update unfinished. */
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_take_pending(&ebc->pending));
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_work_pending(&ebc->pending));
 	ebc->waveform = wf;
 
 	KUNIT_EXPECT_EQ(test, d.n, 3);
@@ -5173,6 +5598,8 @@ static int t_rails(struct rk3026_ebc *ebc)
 	if (!d->rails++ && d->rails_fb)
 		rk3026_ebc_plane_update(ebc, d->rails_fb, T_W * 4,
 					&d->rails_box);
+	if (d->rails == 1 && d->rails_reset)
+		t_send(ebc, &t_panel, EBC_MODE_RESET, 0, EBC_SOURCE_ENABLE);
 	if (d->rails_ret)
 		return d->rails_ret;
 	if (!ebc->epd_on)
@@ -5296,7 +5723,8 @@ static void ebc_test_glue_rails_before_take(struct kunit *test)
 
 /*
  * Rails that do not come up are asked once for the part: it is taken all
- * the same, with the sensor read before the take, and carried.
+ * the same, with the sensor read before the take, and carried for a retry,
+ * its update not finished yet.
  */
 static void ebc_test_glue_rails_fail(struct kunit *test)
 {
@@ -5317,9 +5745,48 @@ static void ebc_test_glue_rails_fail(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, last.temp_read);
 	KUNIT_EXPECT_EQ(test, last.temp, EBC_TEMP_FALLBACK);
 	KUNIT_EXPECT_TRUE(test, ebc->pending.carry.merged);
-	KUNIT_EXPECT_TRUE(test, rk3026_ebc_seq_finished(&ebc->pending, seq));
+	KUNIT_EXPECT_TRUE(test, ebc->pending.retry.armed);
+	KUNIT_EXPECT_FALSE(test, last.gave_up);
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_seq_finished(&ebc->pending, seq));
 	KUNIT_EXPECT_EQ(test, ebc->stats.dropped, 1);
 	KUNIT_EXPECT_FALSE(test, ebc->epd_on);
+}
+
+/*
+ * The RESET of a CRTC enable that is not driven, for want of rails or of
+ * a RESET LUT: its wait ends, the glass is marked not known, and it is
+ * given up and counted (carry_failed), where it was silent before.
+ */
+static void ebc_test_glue_reset_lost(struct kunit *test)
+{
+	static const struct t_rkf_seg segs[] = {
+		{ T_RKF_GRAY16, 1 }, { T_RKF_GRAY2, 1 },
+	};
+	struct t_drives d;
+	struct rk3026_ebc *ebc = t_rails_ebc(test, &d);
+	struct rk3026_ebc_last last;
+	u32 seq;
+
+	d.rails_ret = -EIO;
+	seq = t_send(ebc, &t_panel, EBC_MODE_RESET, 0, EBC_SOURCE_ENABLE);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_NO_RAILS);
+	KUNIT_EXPECT_TRUE(test, last.gave_up);
+	KUNIT_EXPECT_EQ(test, last.tries, 0);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_seq_finished(&ebc->pending, seq));
+	KUNIT_EXPECT_TRUE(test, ebc->shadows.prev_unknown);
+	KUNIT_EXPECT_EQ(test, ebc->stats.carry_failed, 1);
+	KUNIT_EXPECT_FALSE(test, ebc->pending.retry.failing);
+
+	d.rails_ret = 0;
+	ebc->waveform = t_rkf_wf(test, ebc->dev, segs, ARRAY_SIZE(segs), 0);
+	seq = t_send(ebc, &t_panel, EBC_MODE_RESET, 0, EBC_SOURCE_ENABLE);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_NO_LUT);
+	KUNIT_EXPECT_TRUE(test, last.gave_up);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_seq_finished(&ebc->pending, seq));
+	KUNIT_EXPECT_EQ(test, ebc->stats.carry_failed, 2);
+	KUNIT_EXPECT_EQ(test, d.n, 0);
 }
 
 /*
@@ -5721,6 +6188,93 @@ static void ebc_test_glue_gap_big_full(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, d.rails, 3);
 }
 
+/*
+ * A carry armed for its retry does not exempt what is sent before it: a
+ * plane update carried for want of rails (its gap's raise failed), then a
+ * burst at 95 ms waits in a gap, which the retry falling due at 100 ms
+ * ends: the gap's end is the retry's time, so the thread's wait wakes for
+ * it with no update to wake it. The part is taken with the carry in it,
+ * as the carry's first try.
+ */
+static void ebc_test_glue_gap_retry(struct kunit *test)
+{
+	struct t_drives d;
+	struct rk3026_ebc *ebc = t_gap_ebc(test, &d);
+	struct drm_rect a = DRM_RECT_INIT(0, 0, 4, 2);
+	struct drm_rect b = DRM_RECT_INIT(8, 2, 4, 2);
+	u32 *fb = t_plane_fb(test, 0xffffff);
+	struct rk3026_ebc_last last;
+	ktime_t t0 = d.now;
+	u32 s1;
+
+	d.rails_ret = -EIO;
+	t_fb_box(fb, 0, 0, 4, 2, 0);
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, fb, T_W * 4, &a));
+	s1 = ebc->pending.queued_seq;
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_take_ready(ebc, d.now));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_NO_RAILS);
+	KUNIT_EXPECT_TRUE(test, ebc->pending.retry.armed);
+	KUNIT_EXPECT_EQ(test, ebc->pending.retry.at, ktime_add_ms(t0, 100));
+
+	d.rails_ret = 0;
+	d.now = ktime_add_ms(t0, 95);
+	t_fb_box(fb, 8, 2, 12, 4, 0);
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, fb, T_W * 4, &b));
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, fb, T_W * 4, &b));
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_take_ready(ebc, d.now));
+	KUNIT_EXPECT_TRUE(test, ebc->gap.open);
+	KUNIT_EXPECT_EQ(test, ebc->gap.at, ktime_add_ms(t0, 100));
+	d.now = ktime_add_ms(t0, 99);
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_take_ready(ebc, d.now));
+	KUNIT_EXPECT_TRUE(test, ebc->gap.open);
+	d.now = ebc->gap.at;
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_take_ready(ebc, d.now));
+	KUNIT_EXPECT_FALSE(test, ebc->gap.open);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_EXPECT_EQ(test, last.tries, 1);
+	KUNIT_EXPECT_EQ(test, last.gap_us, 5000);
+	KUNIT_EXPECT_EQ(test, last.clip.x1, 0);
+	KUNIT_EXPECT_EQ(test, last.clip.x2, 12);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_seq_finished(&ebc->pending, s1));
+	KUNIT_EXPECT_FALSE(test, ebc->pending.retry.armed);
+	KUNIT_EXPECT_EQ(test, d.n, 1);
+}
+
+/*
+ * A carry made while a RESET is pending (the RESET sent while the rails
+ * of the part in flight came up) is not in the RESET's part: the RESET
+ * records no try, and its finish drops the carry and ends its waits.
+ */
+static void ebc_test_glue_retry_reset_tries(struct kunit *test)
+{
+	struct t_drives d;
+	struct rk3026_ebc *ebc = t_gap_ebc(test, &d);
+	struct drm_rect a = DRM_RECT_INIT(0, 0, 4, 2);
+	struct rk3026_ebc_last last;
+	u32 s1;
+
+	d.rails_ret = -EIO;
+	d.rails_reset = true;
+	t_img_fill(ebc->next_shadow, 0);
+	s1 = t_send(ebc, &a, EBC_MODE_PART, 5, EBC_SOURCE_MXCFB);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_take_ready(ebc, d.now));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_NO_RAILS);
+	KUNIT_EXPECT_TRUE(test, ebc->pending.carry.merged);
+	KUNIT_EXPECT_TRUE(test, ebc->pending.retry.armed);
+	KUNIT_EXPECT_TRUE(test, ebc->pending.reset.merged);
+
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_take_ready(ebc, d.now));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.asked_mode, EBC_MODE_RESET);
+	KUNIT_EXPECT_EQ(test, last.tries, 0);
+	KUNIT_EXPECT_FALSE(test, ebc->pending.carry.merged);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_seq_finished(&ebc->pending, s1));
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_work_pending(&ebc->pending));
+}
+
 /* rk3026_ebc_read_temp() without a sensor: @temp of struct t_drives. */
 static int t_temp(struct rk3026_ebc *ebc)
 {
@@ -5821,6 +6375,171 @@ static void ebc_test_glue_repair_no_full(struct kunit *test)
 }
 
 /*
+ * A part carried for want of a LUT is retried at the temperature of its
+ * try: with gray16 only from 20 degrees up and the sensor at 5, an mxcfb
+ * PART send is carried; the sensor reads 25 by its retry, 100 ms later,
+ * and the retry draws it.
+ */
+static void ebc_test_glue_retry_temp(struct kunit *test)
+{
+	struct drm_rect r = DRM_RECT_INIT(2, 2, 4, 2);
+	struct t_drives d;
+	struct rk3026_ebc *ebc = t_temp_ebc(test, &d, T_RKF_GRAY16, 5);
+	struct rk3026_ebc_last last;
+	ktime_t t0 = ms_to_ktime(1000);
+	u32 seq;
+
+	d.now = t0;
+	kunit_activate_static_stub(test, rk3026_ebc_clock, t_clock);
+	t_img_fill(ebc->next_shadow, 0);
+	seq = t_send(ebc, &r, EBC_MODE_PART, 0, EBC_SOURCE_MXCFB);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_take_ready(ebc, d.now));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_NO_LUT);
+	KUNIT_EXPECT_EQ(test, last.temp, 5);
+	KUNIT_EXPECT_TRUE(test, ebc->pending.retry.armed);
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_seq_finished(&ebc->pending, seq));
+
+	d.temp = 25;
+	d.now = ktime_add_ms(t0, 100);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_take_ready(ebc, d.now));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_EXPECT_EQ(test, last.temp, 25);
+	KUNIT_EXPECT_EQ(test, last.tries, 1);
+	KUNIT_EXPECT_EQ(test, d.n, 1);
+	KUNIT_EXPECT_EQ(test, d.mode[0], EBC_MODE_PART);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_seq_finished(&ebc->pending, seq));
+}
+
+/*
+ * A RESET sent while the rails come up for a part drops the carry
+ * (rk3026_ebc_pending_add()). The look read no sensor: the carry brought a
+ * temperature, 30 degrees, and gave it to the part. The part taken in its
+ * place has none, so the sensor is read after all, and the part is driven
+ * at the sensor's 5 degrees, not at the fallback's 25. With @pre, an mxcfb
+ * send with no temperature is taken, the carry was merged into it at the
+ * look; without, the carry's try alone, and the RESET is taken instead.
+ */
+static void t_reset_drops_carry_temp(struct kunit *test, bool pre)
+{
+	struct drm_rect r = DRM_RECT_INIT(2, 2, 4, 2);
+	struct rk3026_ebc_update upd = t_upd(&r, EBC_MODE_PART, 0,
+					     EBC_SOURCE_MXCFB);
+	struct t_drives d;
+	struct rk3026_ebc *ebc = t_gap_ebc(test, &d);
+	struct rk3026_ebc_last last;
+	ktime_t t0 = d.now;
+
+	d.temp = 5;
+	kunit_activate_static_stub(test, rk3026_ebc_read_temp, t_temp);
+	d.rails_ret = -EIO;
+	upd.temp = 30;
+	upd.temp_valid = true;
+	t_img_fill(ebc->next_shadow, 0);
+	mutex_lock(&ebc->image_lock);
+	rk3026_ebc_add_update(ebc, &upd);
+	mutex_unlock(&ebc->image_lock);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_take_ready(ebc, d.now));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_NO_RAILS);
+	KUNIT_ASSERT_TRUE(test, ebc->pending.carry.temp_valid);
+
+	d.rails_ret = 0;
+	d.rails = 0;
+	d.rails_reset = true;
+	d.now = ktime_add_ms(t0, 100);
+	if (pre)
+		t_send(ebc, &r, EBC_MODE_PART, 0, EBC_SOURCE_MXCFB);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_take_ready(ebc, d.now));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, d.rails, 1);
+	KUNIT_EXPECT_EQ(test, last.asked_mode,
+			pre ? EBC_MODE_PART : EBC_MODE_RESET);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_EXPECT_TRUE(test, last.temp_read);
+	KUNIT_EXPECT_EQ(test, last.temp, 5);
+	KUNIT_EXPECT_FALSE(test, ebc->pending.carry.merged);
+}
+
+static void ebc_test_glue_reset_drops_carry_temp(struct kunit *test)
+{
+	t_reset_drops_carry_temp(test, false);
+}
+
+static void ebc_test_glue_reset_drops_carry_temp_pre(struct kunit *test)
+{
+	t_reset_drops_carry_temp(test, true);
+}
+
+/*
+ * The wait bound (rk3026_ebc_wait_timeout_ms()) against the worst schedule
+ * on the fake clock: the three parts ahead of an update take their longest
+ * (rk3026_ebc_part_max_ms()), its own part
+ * waits the longest gap (a cap set above EBC_TAKE_CAP_MAX_MS, a sender
+ * busy until the previous part's finish), and every
+ * try is a repair RESET cut short: the first and the last at a part's
+ * longest, the one between ending just before the last retry is due. The
+ * give-up ends the wait, at the bound and not after it.
+ */
+static void ebc_test_glue_wait_bound(struct kunit *test)
+{
+	struct t_drives d;
+	struct rk3026_ebc *ebc = t_gap_ebc(test, &d);
+	u32 *black = t_plane_fb(test, 0);
+	struct rk3026_ebc_last last;
+	ktime_t t0 = d.now, first;
+	unsigned int part_ms = rk3026_ebc_part_max_ms(ebc);
+	u32 seq;
+
+	kunit_activate_static_stub(test, rk3026_ebc_drive, t_drive_timeout);
+	ebc->take_quiet_us = U32_MAX;
+	ebc->take_cap_ms = 60000;
+	ebc->shadows.prev_unknown = true;
+	d.drive_time[0] = ms_to_ktime(part_ms);
+	d.drive_time[1] = ms_to_ktime(EBC_RETRY_SPAN_MS - 100 - 1);
+	d.drive_time[2] = ms_to_ktime(part_ms);
+
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
+							&t_panel));
+	seq = ebc->pending.queued_seq;
+	/*
+	 * In flight, before a RESET, the RESET: done at their longest; a
+	 * sender still busy then keeps the gap open to its cap.
+	 */
+	d.now = ktime_add_ms(t0, 3 * part_ms);
+	ebc->take_done = d.now;
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
+							&t_panel));
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_take_ready(ebc, d.now));
+	KUNIT_EXPECT_EQ(test, ebc->gap.at,
+			ktime_add_ms(d.now, EBC_TAKE_CAP_MAX_MS));
+	d.now = ebc->gap.at;
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_take_ready(ebc, d.now));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_TRUE(test, last.repaired);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_TIMEOUT);
+	KUNIT_EXPECT_TRUE(test, ebc->pending.retry.armed);
+	first = d.now;
+
+	while (ebc->pending.retry.armed) {
+		KUNIT_EXPECT_FALSE(test, rk3026_ebc_seq_finished(&ebc->pending,
+								 seq));
+		d.now = ebc->pending.retry.at;
+		KUNIT_ASSERT_TRUE(test, rk3026_ebc_take_ready(ebc, d.now));
+		rk3026_ebc_do_refresh(ebc, &last);
+	}
+	KUNIT_EXPECT_EQ(test, d.n, 3);
+	KUNIT_EXPECT_EQ(test, last.tries, 2);
+	KUNIT_EXPECT_TRUE(test, last.gave_up);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_seq_finished(&ebc->pending, seq));
+	KUNIT_EXPECT_EQ(test, ktime_ms_delta(d.now, first),
+			EBC_RETRY_SPAN_MS + part_ms);
+	KUNIT_EXPECT_LE(test, ktime_ms_delta(d.now, t0),
+			(s64)rk3026_ebc_wait_timeout_ms(ebc));
+}
+
+/*
  * A part whose target is what the glass shows is still driven when it is
  * exempt from the skip, so it gets the rails: a full-class mxcfb send (the
  * flash its client asked for), and, with the glass not known, a plane
@@ -5855,6 +6574,279 @@ static void ebc_test_glue_rails_exempt(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
 	KUNIT_EXPECT_TRUE(test, last.repaired);
 	KUNIT_EXPECT_EQ(test, d.n, 3);
+}
+
+/*
+ * A repair RESET cut short carries the part (its own waveform never ran),
+ * the glass still not known, and its update waits; the retry repairs the
+ * glass, draws the part, and the update finishes.
+ */
+static void ebc_test_glue_retry_repair(struct kunit *test)
+{
+	struct t_drives d;
+	struct rk3026_ebc *ebc = t_gap_ebc(test, &d);
+	struct drm_rect a = DRM_RECT_INIT(0, 0, 4, 2);
+	struct rk3026_ebc_last last;
+	ktime_t t0 = d.now;
+	u32 seq;
+
+	kunit_activate_static_stub(test, rk3026_ebc_drive, t_drive_timeout);
+	ebc->shadows.prev_unknown = true;
+	t_img_fill(ebc->next_shadow, 0);
+	seq = t_send(ebc, &a, EBC_MODE_PART, 3, EBC_SOURCE_MXCFB);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_take_ready(ebc, d.now));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_TRUE(test, last.repaired);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_TIMEOUT);
+	KUNIT_EXPECT_FALSE(test, last.gave_up);
+	KUNIT_ASSERT_EQ(test, d.n, 1);
+	KUNIT_EXPECT_EQ(test, d.mode[0], EBC_MODE_RESET);
+	KUNIT_EXPECT_TRUE(test, ebc->shadows.prev_unknown);
+	KUNIT_EXPECT_TRUE(test, ebc->pending.carry.merged);
+	KUNIT_EXPECT_TRUE(test, ebc->pending.retry.armed);
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_seq_finished(&ebc->pending, seq));
+
+	kunit_activate_static_stub(test, rk3026_ebc_drive, t_drive_ok);
+	d.now = ktime_add_ms(t0, 100);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_take_ready(ebc, d.now));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_TRUE(test, last.repaired);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_EXPECT_EQ(test, last.tries, 1);
+	KUNIT_EXPECT_EQ(test, last.marker, 3);
+	KUNIT_ASSERT_EQ(test, d.n, 3);
+	KUNIT_EXPECT_EQ(test, d.mode[1], EBC_MODE_RESET);
+	KUNIT_EXPECT_EQ(test, d.mode[2], EBC_MODE_PART);
+	KUNIT_EXPECT_FALSE(test, ebc->shadows.prev_unknown);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_seq_finished(&ebc->pending, seq));
+	KUNIT_EXPECT_FALSE(test, ebc->pending.retry.armed);
+}
+
+/*
+ * While a failure lasts (a carry was given up, none driven since), a plane
+ * update with the rails down still opens a gap, whose raise fails: the
+ * part is taken at once, not asked for the rails again, and given up at
+ * once, without retries; its update finishes.
+ */
+static void ebc_test_glue_retry_failing(struct kunit *test)
+{
+	struct t_drives d;
+	struct rk3026_ebc *ebc = t_gap_ebc(test, &d);
+	u32 *black = t_plane_fb(test, 0);
+	struct rk3026_ebc_last last;
+	u32 seq;
+
+	d.rails_ret = -EIO;
+	ebc->pending.retry.failing = true;
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
+							&t_panel));
+	seq = ebc->pending.queued_seq;
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_take_ready(ebc, d.now));
+	KUNIT_EXPECT_FALSE(test, ebc->gap.open);
+	KUNIT_EXPECT_EQ(test, d.rails, 1);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_NO_RAILS);
+	KUNIT_EXPECT_TRUE(test, last.gave_up);
+	KUNIT_EXPECT_EQ(test, last.tries, 0);
+	KUNIT_EXPECT_EQ(test, d.rails, 1);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_seq_finished(&ebc->pending, seq));
+	KUNIT_EXPECT_FALSE(test, ebc->pending.retry.armed);
+	KUNIT_EXPECT_TRUE(test, ebc->pending.carry.merged);
+	KUNIT_EXPECT_EQ(test, ebc->stats.carry_failed, 1);
+}
+
+/*
+ * The refresh thread's look between parts on the fake clock, with no gap
+ * open, as ebc_refresh_thread() makes it: whether its wait wakes.
+ */
+static bool t_woken(struct rk3026_ebc *ebc, const struct t_drives *d)
+{
+	return rk3026_ebc_thread_woken(&ebc->pending, d->now, ebc->crtc_on);
+}
+
+/*
+ * Rails that fail once. A plane update with the rails down opens the take's
+ * gap, whose raise fails: the part is taken at once and carried without
+ * asking for the rails again, its update not finished. Nothing wakes the
+ * thread until the retry, 100 ms later, which opens no gap, brings the
+ * rails up and draws the part; its update finishes then.
+ */
+static void ebc_test_glue_retry_once(struct kunit *test)
+{
+	struct t_drives d;
+	struct rk3026_ebc *ebc = t_gap_ebc(test, &d);
+	u32 *black = t_plane_fb(test, 0);
+	struct rk3026_ebc_last last;
+	ktime_t t0 = d.now;
+	u32 seq;
+
+	d.rails_ret = -EIO;
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
+							&t_panel));
+	seq = ebc->pending.queued_seq;
+	KUNIT_EXPECT_TRUE(test, t_woken(ebc, &d));
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_take_ready(ebc, d.now));
+	KUNIT_EXPECT_FALSE(test, ebc->gap.open);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_NO_RAILS);
+	KUNIT_EXPECT_EQ(test, last.tries, 0);
+	KUNIT_EXPECT_EQ(test, d.rails, 1);
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_seq_finished(&ebc->pending, seq));
+	KUNIT_EXPECT_TRUE(test, ebc->pending.retry.armed);
+	KUNIT_EXPECT_EQ(test, ebc->pending.retry.at, ktime_add_ms(t0, 100));
+
+	d.now = ktime_add_ms(t0, 99);
+	KUNIT_EXPECT_FALSE(test, t_woken(ebc, &d));
+	d.now = ktime_add_ms(t0, 100);
+	KUNIT_EXPECT_TRUE(test, t_woken(ebc, &d));
+
+	d.rails_ret = 0;
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_take_ready(ebc, d.now));
+	KUNIT_EXPECT_FALSE(test, ebc->gap.open);
+	KUNIT_EXPECT_EQ(test, d.rails, 1);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_EXPECT_EQ(test, last.seq, seq);
+	KUNIT_EXPECT_EQ(test, last.tries, 1);
+	KUNIT_EXPECT_EQ(test, last.gap_us, 0);
+	KUNIT_EXPECT_FALSE(test, last.gave_up);
+	KUNIT_EXPECT_TRUE(test, drm_rect_equals(&last.clip, &t_panel));
+	KUNIT_EXPECT_EQ(test, d.rails, 2);
+	KUNIT_EXPECT_EQ(test, d.n, 1);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_seq_finished(&ebc->pending, seq));
+	KUNIT_EXPECT_FALSE(test, ebc->pending.retry.armed);
+	KUNIT_EXPECT_FALSE(test, ebc->pending.carry.merged);
+	KUNIT_EXPECT_FALSE(test, t_woken(ebc, &d));
+	KUNIT_EXPECT_EQ(test, ebc->stats.carry_failed, 0);
+}
+
+/*
+ * Rails that stay down. An mxcfb send (no gap) is carried at 1 s and tried
+ * at 1.1, 1.5 and 3.1 s, the thread asleep between; a send at 1.2 s joins
+ * it and is tried at once, moving neither. The try at 3.1 s gives both up:
+ * their waits end (a marker wait returns 0), carry_failed counts it, and
+ * the carry is kept for the next part, which gives up at once. Once the
+ * rails are back, that part draws it and the failure ends.
+ */
+static void ebc_test_glue_retry_give_up(struct kunit *test)
+{
+	static const s64 tries_ms[] = { 100, 200, 500, EBC_RETRY_SPAN_MS };
+	struct t_drives d;
+	struct rk3026_ebc *ebc = t_gap_ebc(test, &d);
+	struct drm_rect a = DRM_RECT_INIT(0, 0, 4, 2);
+	struct drm_rect b = DRM_RECT_INIT(8, 4, 2, 2);
+	struct rk3026_ebc_last last;
+	ktime_t t0 = d.now;
+	u32 s1, s2 = 0, s3;
+	unsigned int i;
+
+	d.rails_ret = -EIO;
+	t_img_fill(ebc->next_shadow, 0);
+	s1 = t_send(ebc, &a, EBC_MODE_PART, 5, EBC_SOURCE_MXCFB);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_take_ready(ebc, d.now));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_NO_RAILS);
+	KUNIT_EXPECT_FALSE(test, last.gave_up);
+
+	for (i = 0; i < ARRAY_SIZE(tries_ms); i++) {
+		ktime_t at = ktime_add_ms(t0, tries_ms[i]);
+
+		if (i == 1) {
+			d.now = at;
+			s2 = t_send(ebc, &b, EBC_MODE_PART, 6,
+				    EBC_SOURCE_MXCFB);
+		} else {
+			KUNIT_EXPECT_EQ(test, ebc->pending.retry.at, at);
+			d.now = ktime_sub_ns(at, 1);
+			KUNIT_EXPECT_FALSE(test, t_woken(ebc, &d));
+			d.now = at;
+		}
+		KUNIT_EXPECT_TRUE(test, t_woken(ebc, &d));
+		KUNIT_EXPECT_FALSE(test,
+				   rk3026_ebc_seq_finished(&ebc->pending, s1));
+		KUNIT_EXPECT_TRUE(test, rk3026_ebc_take_ready(ebc, d.now));
+		KUNIT_EXPECT_FALSE(test, ebc->gap.open);
+		rk3026_ebc_do_refresh(ebc, &last);
+		KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_NO_RAILS);
+		KUNIT_EXPECT_EQ(test, last.tries, i + 1);
+		/* The carry's own record: the newest send's marker. */
+		KUNIT_EXPECT_EQ(test, last.marker, i ? 6 : 5);
+		KUNIT_EXPECT_EQ(test, last.source, EBC_SOURCE_MXCFB);
+	}
+	KUNIT_EXPECT_TRUE(test, last.gave_up);
+	KUNIT_EXPECT_EQ(test, last.seq, s2);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_seq_finished(&ebc->pending, s1));
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_seq_finished(&ebc->pending, s2));
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_marker(ebc, 5), 0);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_marker(ebc, 6), 0);
+	KUNIT_EXPECT_EQ(test, ebc->stats.carry_failed, 1);
+	KUNIT_EXPECT_EQ(test, d.rails, 5);
+	KUNIT_EXPECT_EQ(test, d.n, 0);
+	KUNIT_EXPECT_TRUE(test, ebc->pending.carry.merged);
+	KUNIT_EXPECT_FALSE(test, ebc->pending.retry.armed);
+	KUNIT_EXPECT_FALSE(test, t_woken(ebc, &d));
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_work_pending(&ebc->pending));
+
+	d.now = ktime_add_ms(t0, 4000);
+	s3 = t_send(ebc, &a, EBC_MODE_PART, 7, EBC_SOURCE_MXCFB);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_take_ready(ebc, d.now));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_NO_RAILS);
+	KUNIT_EXPECT_EQ(test, last.tries, 0);
+	KUNIT_EXPECT_TRUE(test, last.gave_up);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_seq_finished(&ebc->pending, s3));
+	KUNIT_EXPECT_FALSE(test, ebc->pending.retry.armed);
+	KUNIT_EXPECT_EQ(test, ebc->stats.carry_failed, 2);
+	KUNIT_EXPECT_EQ(test, d.rails, 6);
+
+	d.rails_ret = 0;
+	t_send(ebc, &a, EBC_MODE_PART, 8, EBC_SOURCE_MXCFB);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_take_ready(ebc, d.now));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_EXPECT_EQ(test, last.clip.x2, 10);
+	KUNIT_EXPECT_FALSE(test, last.gave_up);
+	KUNIT_EXPECT_FALSE(test, ebc->pending.retry.failing);
+	KUNIT_EXPECT_FALSE(test, ebc->pending.carry.merged);
+	KUNIT_EXPECT_EQ(test, d.n, 1);
+}
+
+/*
+ * A CRTC disable while a carry waits for its retry: the waiting thread
+ * wakes at once (ebc_crtc_atomic_disable() wakes it), takes the carry and
+ * drops it, so the disable's wait on the newest seq ends without the
+ * retry's delay, and without a give-up.
+ */
+static void ebc_test_glue_retry_crtc_off(struct kunit *test)
+{
+	struct t_drives d;
+	struct rk3026_ebc *ebc = t_gap_ebc(test, &d);
+	struct rk3026_ebc_last last;
+	u32 seq;
+
+	d.rails_ret = -EIO;
+	t_img_fill(ebc->next_shadow, 0);
+	seq = t_send(ebc, &t_panel, EBC_MODE_FULL, 0, EBC_SOURCE_MXCFB);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_take_ready(ebc, d.now));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_NO_RAILS);
+	KUNIT_EXPECT_FALSE(test, t_woken(ebc, &d));
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_seq(ebc, seq, 0, false),
+			-ETIMEDOUT);
+
+	t_crtc_off(test, ebc);
+	KUNIT_EXPECT_TRUE(test, t_woken(ebc, &d));
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_take_ready(ebc, d.now));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_CRTC_OFF);
+	KUNIT_EXPECT_EQ(test, last.seq, seq);
+	KUNIT_EXPECT_FALSE(test, last.gave_up);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_seq(ebc, seq, 0, false), 0);
+	KUNIT_EXPECT_FALSE(test, ebc->pending.retry.armed);
+	KUNIT_EXPECT_FALSE(test, ebc->pending.carry.merged);
+	KUNIT_EXPECT_FALSE(test, t_woken(ebc, &d));
+	KUNIT_EXPECT_EQ(test, d.rails, 1);
+	KUNIT_EXPECT_EQ(test, ebc->stats.carry_failed, 0);
 }
 
 #if IS_ENABLED(CONFIG_DRM_RK3026_EBC_MXCFB)
@@ -6411,9 +7403,21 @@ static struct kunit_case rk3026_ebc_glue_test_cases[] = {
 	KUNIT_CASE(ebc_test_glue_gap_cap),
 	KUNIT_CASE(ebc_test_glue_gap_exempt),
 	KUNIT_CASE(ebc_test_glue_gap_big_full),
+	KUNIT_CASE(ebc_test_glue_gap_retry),
+	KUNIT_CASE(ebc_test_glue_retry_reset_tries),
+	KUNIT_CASE(ebc_test_glue_reset_lost),
 	KUNIT_CASE(ebc_test_glue_repair_sensor),
 	KUNIT_CASE(ebc_test_glue_repair_no_full),
+	KUNIT_CASE(ebc_test_glue_retry_temp),
+	KUNIT_CASE(ebc_test_glue_reset_drops_carry_temp),
+	KUNIT_CASE(ebc_test_glue_reset_drops_carry_temp_pre),
+	KUNIT_CASE(ebc_test_glue_wait_bound),
 	KUNIT_CASE(ebc_test_glue_rails_exempt),
+	KUNIT_CASE(ebc_test_glue_retry_repair),
+	KUNIT_CASE(ebc_test_glue_retry_failing),
+	KUNIT_CASE(ebc_test_glue_retry_once),
+	KUNIT_CASE(ebc_test_glue_retry_give_up),
+	KUNIT_CASE(ebc_test_glue_retry_crtc_off),
 #if IS_ENABLED(CONFIG_DRM_RK3026_EBC_MXCFB)
 	KUNIT_CASE(ebc_test_glue_mxcfb_send),
 #endif

@@ -199,8 +199,11 @@ static void ebc_show_last(struct seq_file *m, const char *p,
  * one scan took: its clip is their bounding box, its marker and source the
  * newest update's. queued counts the parts still to take (at most three:
  * before a RESET, the RESET, after it); busy is 1 while a part is pending or
- * in flight (a send not finished yet). Clips are x1 y1 x2 y2, x2/y2
- * exclusive. Modes are the EBC work modes (EBC_MODE_*). Times in ms.
+ * in flight, or a carry waits for its retry (a send not finished yet).
+ * carry_failed counts the carried parts given up after their retries
+ * (rk3026_ebc_retry_next()), or at once, and the RESETs not driven.
+ * Clips are x1 y1 x2 y2, x2/y2 exclusive. Modes are the EBC work modes
+ * (EBC_MODE_*). Times in ms.
  */
 static int rk3026_ebc_state_show(struct seq_file *m, void *unused)
 {
@@ -241,6 +244,7 @@ static int rk3026_ebc_state_show(struct seq_file *m, void *unused)
 	seq_printf(m, "dropped %llu\n", st.dropped);
 	seq_printf(m, "timeouts %llu\n", st.timeouts);
 	seq_printf(m, "abandoned %llu\n", st.abandoned);
+	seq_printf(m, "carry_failed %llu\n", st.carry_failed);
 	ebc_show_last(m, "last_", &last);
 	ebc_show_last(m, "scan_", &scan);
 	return 0;

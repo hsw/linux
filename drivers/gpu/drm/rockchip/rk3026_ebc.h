@@ -351,10 +351,15 @@ struct rk3026_ebc_idle {
  *	force_mode, an auto plane part at the DU ceiling;
  * @exempt: it never waits: an mxcfb send is in it (its client batches its
  *	own updates and waits on the marker), it is the idle cleanup (the
- *	whole panel already), or a RESET is pending (the part is the RESET,
- *	or the one in front of it, which nothing can join);
+ *	whole panel already), a RESET is pending (the part is the RESET, or
+ *	the one in front of it, which nothing can join), or the carry's
+ *	retry is due (@retry.ready): the part is that try, late already;
  * @rails_up: the panel rails are up;
- * @open: a gap is open for it already.
+ * @open: a gap is open for it already;
+ * @retry_armed, @retry_at: the carry's retry is armed, for @retry_at. A gap
+ *	opens only for a part with @pre in it, which holds the carry, and
+ *	the retry falling due makes it exempt: the gap ends there at the
+ *	latest, so the thread's wait wakes for it.
  */
 struct rk3026_ebc_take {
 	ktime_t		first;
@@ -369,6 +374,8 @@ struct rk3026_ebc_take {
 	bool		exempt;
 	bool		rails_up;
 	bool		open;
+	ktime_t		retry_at;
+	bool		retry_armed;
 };
 
 /*
@@ -376,14 +383,62 @@ struct rk3026_ebc_take {
  * open since @start, until @at unless a new update moves it; @seen is the
  * newest seq at the last look, so the thread's wait wakes on a newer one
  * (rk3026_ebc_gap_woken()); @us is the length of the gap that ended at
- * the last take, for that part's record.
+ * the last take, for that part's record. @rails_err is the error of the
+ * rails raised at the gap's open, if they did not come up: the take does
+ * not ask for them again, the carry's retry does.
  */
 struct rk3026_ebc_gap {
 	ktime_t		start;
 	ktime_t		at;
 	u32		seen;
 	u32		us;
+	int		rails_err;
 	bool		open;
+};
+
+/*
+ * The retries of a carried part: EBC_RETRY_TRIES, at these times after the
+ * first carry, the last at EBC_RETRY_SPAN_MS (rk3026_ebc_retry_next()).
+ */
+#define EBC_RETRY_TRIES		3
+#define EBC_RETRY_FIRST_MS	100
+#define EBC_RETRY_SECOND_MS	500
+#define EBC_RETRY_SPAN_MS	2100
+
+/*
+ * The retry of the carry (@carry of struct rk3026_ebc_pending), under
+ * @image_lock and written by the refresh thread alone, which also reads
+ * @armed and @at without the lock, for its wait:
+ *
+ * @armed: the carry is tried again at @at, and @done_seq stays below its
+ *	updates until it is driven, skipped, dropped or given up;
+ * @first: when it was first carried: the schedule counts from it, and
+ *	updates that join the carry later do not move it;
+ * @tries: the tries since then;
+ * @ready: the retry is due at the thread's look (rk3026_ebc_retry_ready()):
+ *	the carry alone is the next part (rk3026_ebc_pending_peek());
+ * @failing: a carry was given up and no part was driven since, so a carry
+ *	gives up at once, without retries.
+ */
+struct rk3026_ebc_retry {
+	ktime_t		first;
+	ktime_t		at;
+	u32		tries;
+	bool		armed;
+	bool		ready;
+	bool		failing;
+};
+
+/*
+ * Whether a part was given up (rk3026_ebc_scan_finish()): not drawn and not
+ * tried again, its waits ended. A carry past its last retry, or at once
+ * without a waveform or while a failure lasts (@retry.failing); and a
+ * RESET that was not driven, whose glass the next draw repairs.
+ */
+enum rk3026_ebc_gave_up {
+	EBC_GAVE_UP_NONE,	/* driven, skipped, dropped, or its retry armed */
+	EBC_GAVE_UP,		/* given up, the first since a part was driven */
+	EBC_GAVE_UP_FAILING,	/* given up at once: a carry was given up already */
 };
 
 /*
@@ -425,7 +480,8 @@ struct rk3026_ebc_update {
  * @du_area is the plane parts' DU budget spent at the take, before
  * the part is accounted (rk3026_ebc_du_account()). @gap_us and @tries are
  * the time the take waited for the senders to go quiet and the retries of
- * a carried part; @gave_up says the retries ended without a drive.
+ * a carried part; @gave_up says the part was given up without a drive
+ * (enum rk3026_ebc_gave_up).
  */
 struct rk3026_ebc_last {
 	struct drm_rect	clip;
@@ -462,7 +518,9 @@ struct rk3026_ebc_last {
  * parts; @updates less @coalesced is the parts made, @done plus those
  * pending, except where a RESET absorbed a pending set behind another RESET
  * (rk3026_ebc_pending_add()): that set's first update made a part that is
- * gone.
+ * gone; and a carry taken alone at its retry is a part of its own.
+ * @carry_failed counts the parts given up (enum rk3026_ebc_gave_up): carries
+ * past their retries, and RESETs not driven.
  */
 struct rk3026_ebc_stats {
 	u64		updates;	/* rk3026_ebc_add_update() calls */
@@ -473,6 +531,7 @@ struct rk3026_ebc_stats {
 	u64		dropped;	/* CRTC off, no waveform, rails or LUT */
 	u64		timeouts;	/* chunk timeouts */
 	u64		abandoned;	/* rails found down before a chunk */
+	u64		carry_failed;	/* carries, RESETs given up */
 };
 
 /*
@@ -532,23 +591,31 @@ struct rk3026_ebc_set {
  * (rk3026_ebc_add_update()).
  *
  * @carry is what a scan took but could not drive (no rails, LUT or waveform,
- * or a failed repair). It is merged into the next @pre that is taken and is
- * not work on its own, so a failing rail cannot spin the thread. A RESET
- * sent drops it: that RESET whitens the glass it would draw. Present while
- * its @merged is 1 (a carry counts no updates).
+ * or a failed repair). It is merged into the next @pre that is taken, and
+ * without one the refresh thread takes it alone at its retry (@retry,
+ * rk3026_ebc_retry_next()), a bounded number of times; it is not work
+ * before that, so a failing rail cannot spin the thread. A RESET sent drops
+ * it: that RESET whitens the glass it would draw. Present while its
+ * @merged is 1 (a carry counts no updates); its @seq is that of the newest
+ * update in it.
  *
- * @queued_seq is the seq of the newest update and @done_seq that of the newest
- * finished one; both wrap and compare with rk3026_ebc_seq_done(). Parts are
- * taken in seq order and finished one at a time, so once the part taken
- * last has finished, @done_seq equals @queued_seq exactly when nothing is
- * pending. A carry has no seq of its own.
+ * @queued_seq is the seq of the newest update, @taken_seq that of the
+ * newest taken one and @done_seq that of the newest finished one; all wrap
+ * and compare with rk3026_ebc_seq_done(). Parts are taken in seq order and
+ * finished one at a time; a part's @done_seq moves when it is driven,
+ * skipped or dropped, and for a carry when it is given up, so it stays
+ * behind while the carry waits for a retry. Once the part taken last has
+ * finished and no retry is armed, @done_seq equals @queued_seq exactly when
+ * nothing is pending.
  */
 struct rk3026_ebc_pending {
 	struct rk3026_ebc_set	pre;
 	struct rk3026_ebc_set	reset;
 	struct rk3026_ebc_set	post;
 	struct rk3026_ebc_set	carry;
+	struct rk3026_ebc_retry	retry;
 	u32			queued_seq;
+	u32			taken_seq;
 	u32			done_seq;
 };
 
@@ -601,7 +668,10 @@ static inline bool rk3026_ebc_seq_done(u32 done_seq, u32 seq)
 	return (s32)(done_seq - seq) >= 0;
 }
 
-/* Nothing for the refresh thread to take; a carry alone is not work. */
+/*
+ * Nothing pending. A carry alone is not pending: the refresh thread takes
+ * it at its retry (rk3026_ebc_retry_ready()) or with the next part.
+ */
 static inline bool rk3026_ebc_pending_empty(const struct rk3026_ebc_pending *p)
 {
 	return !p->pre.merged && !p->reset.merged;
@@ -610,9 +680,11 @@ static inline bool rk3026_ebc_pending_empty(const struct rk3026_ebc_pending *p)
 /*
  * A part is pending or in flight, read without the lock. Parts are taken in
  * seq order and @done_seq moves only when one finishes, so from the take of
- * a part to its finish @done_seq is behind @queued_seq; between parts the two
- * differ exactly when a part is pending (!rk3026_ebc_pending_empty()). A
- * carry has no seq: on its own it wakes nothing.
+ * a part to its finish @done_seq is behind @queued_seq, and so it stays while
+ * a carry waits for its retry (@retry.armed); otherwise, between parts, the
+ * two differ exactly when a part is pending (!rk3026_ebc_pending_empty()).
+ * An update not finished, for debugfs "busy"; the thread's wake is
+ * rk3026_ebc_take_pending().
  */
 static inline bool rk3026_ebc_work_pending(const struct rk3026_ebc_pending *p)
 {
@@ -620,12 +692,40 @@ static inline bool rk3026_ebc_work_pending(const struct rk3026_ebc_pending *p)
 }
 
 /*
- * The refresh thread's wait condition between parts, read without the
- * lock: a part to take (rk3026_ebc_work_pending()).
+ * A part to take, read without the lock: an update sent and not taken.
+ * Parts are taken in seq order, so @taken_seq differs from @queued_seq
+ * exactly when one is pending (!rk3026_ebc_pending_empty()). A carry is not
+ * one: it is taken at its retry (rk3026_ebc_retry_due()) or with the next
+ * part, so a held @done_seq does not spin the thread.
  */
-static inline bool rk3026_ebc_thread_woken(const struct rk3026_ebc_pending *p)
+static inline bool rk3026_ebc_take_pending(const struct rk3026_ebc_pending *p)
 {
-	return rk3026_ebc_work_pending(p);
+	return READ_ONCE(p->queued_seq) != READ_ONCE(p->taken_seq);
+}
+
+/*
+ * The carry's retry is due at @now (struct rk3026_ebc_retry): at its time,
+ * or at once with the CRTC off, which drops it and ends its waits.
+ */
+static inline bool rk3026_ebc_retry_due(const struct rk3026_ebc_retry *r,
+					ktime_t now, bool crtc_on)
+{
+	return READ_ONCE(r->armed) &&
+	       (!crtc_on || !ktime_before(now, READ_ONCE(r->at)));
+}
+
+/*
+ * The refresh thread's wait condition between parts, read without the
+ * lock: a part to take (rk3026_ebc_take_pending()) or the carry's retry due
+ * at @now (rk3026_ebc_retry_due(), with @crtc_on). A carry that waits for
+ * its retry is not work before it; its time is a deadline of the wait
+ * (rk3026_ebc_thread_deadline()).
+ */
+static inline bool rk3026_ebc_thread_woken(const struct rk3026_ebc_pending *p,
+					   ktime_t now, bool crtc_on)
+{
+	return rk3026_ebc_take_pending(p) ||
+	       rk3026_ebc_retry_due(&p->retry, now, crtc_on);
 }
 
 /*
@@ -640,6 +740,21 @@ static inline bool rk3026_ebc_gap_woken(const struct rk3026_ebc_pending *p,
 					u32 seen, bool crtc_on)
 {
 	return READ_ONCE(p->queued_seq) != seen || !crtc_on;
+}
+
+/*
+ * The try of the carry the next take makes (struct rk3026_ebc_retry), for
+ * its record: 0 when the carry is not armed for a retry, or not in the part
+ * taken next (rk3026_ebc_pending_peek(): a RESET goes first, and the carry
+ * alone only at its retry). Under @image_lock.
+ */
+static inline u32 rk3026_ebc_retry_try(const struct rk3026_ebc_pending *p)
+{
+	if (!p->carry.merged || !p->retry.armed)
+		return 0;
+	if (!p->pre.merged && (p->reset.merged || !p->retry.ready))
+		return 0;
+	return p->retry.tries + 1;
 }
 
 /* The update queued with @seq has finished. Read without the lock. */
@@ -828,8 +943,9 @@ struct rk3026_ebc {
 	struct completion	frame_done;
 
 	/*
-	 * Refresh thread. A send wakes @update_wq; every finished part
-	 * (@pending.done_seq moved, whatever the outcome) wakes @marker_wq.
+	 * Refresh thread. A send and a CRTC disable wake @update_wq; every
+	 * finished part wakes @marker_wq, where the waits on
+	 * @pending.done_seq look whether it moved over their update.
 	 */
 	struct task_struct	*refresh_thread;
 	wait_queue_head_t	update_wq;
@@ -904,6 +1020,7 @@ int rk3026_ebc_drive(struct rk3026_ebc *ebc, const u8 *lut, u32 frames,
 		     u32 mode, u32 lut_mode, struct rk3026_ebc_last *last);
 int rk3026_ebc_wait_seq(struct rk3026_ebc *ebc, u32 seq,
 			unsigned int timeout_ms, bool interruptible);
+unsigned int rk3026_ebc_part_max_ms(struct rk3026_ebc *ebc);
 unsigned int rk3026_ebc_wait_timeout_ms(struct rk3026_ebc *ebc);
 bool rk3026_ebc_plane_box(const struct drm_plane_state *old_state,
 			  const struct drm_plane_state *new_state,
@@ -963,6 +1080,7 @@ bool rk3026_ebc_idle_cleanup_due(const struct rk3026_ebc_idle *idle,
 				 unsigned long now, bool *expired);
 bool rk3026_ebc_thread_deadline(bool rails_on, unsigned long rails_off_at,
 				bool idle_armed, unsigned long idle_at,
+				bool retry_armed, unsigned long retry_at,
 				unsigned long *deadline);
 bool rk3026_ebc_rails_off_due(bool rails_on, unsigned long rails_off_at,
 			      bool gap_open, unsigned long now);
@@ -972,11 +1090,15 @@ u32 rk3026_ebc_du_account(u32 du_area, const struct rk3026_ebc_set *part,
 			  u32 mode, u32 changed_px,
 			  enum rk3026_ebc_outcome outcome,
 			  enum rk3026_ebc_repair repair);
+bool rk3026_ebc_retry_next(ktime_t first, ktime_t now, ktime_t *at);
+bool rk3026_ebc_retry_ready(struct rk3026_ebc_pending *p, ktime_t now,
+			    bool crtc_on);
 bool rk3026_ebc_scan_finish(struct rk3026_ebc_shadows *sh,
 			    struct rk3026_ebc_pending *p,
 			    const struct rk3026_ebc_set *part,
 			    enum rk3026_ebc_outcome outcome,
-			    enum rk3026_ebc_repair repair);
+			    enum rk3026_ebc_repair repair, ktime_t now,
+			    enum rk3026_ebc_gave_up *gave_up);
 void rk3026_ebc_marker_seq_record(struct rk3026_ebc_marker_ring *ring,
 				  u32 marker, u32 seq);
 bool rk3026_ebc_marker_seq_lookup(const struct rk3026_ebc_marker_ring *ring,

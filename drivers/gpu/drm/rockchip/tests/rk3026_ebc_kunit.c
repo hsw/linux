@@ -12,6 +12,7 @@
 #include <kunit/test.h>
 
 #include <linux/err.h>
+#include <linux/hrtimer.h>
 #include <linux/jiffies.h>
 #include <linux/ktime.h>
 #include <linux/limits.h>
@@ -2749,6 +2750,49 @@ static void ebc_test_take_wait(struct kunit *test)
 }
 
 /*
+ * The thread's sleep in the gap (rk3026_ebc_gap_timeout()), the gap's end
+ * in ns after the wait's start: none once the end has come, as when the
+ * rails' ramp outlasted the gap; else the time to it, which the hrtimer
+ * adds to the clock (ktime_add_safe()) to expire at the gap's end. A
+ * negative timeout would saturate there and never expire.
+ */
+struct t_gap_timeout {
+	const char	*desc;
+	s64		at_ns;
+	bool		sleeps;
+};
+
+static const struct t_gap_timeout t_gap_timeout_cases[] = {
+	{ "27 ms past (37 ms ramp, 10 ms gap): no wait", -27000000, false },
+	{ "1 ns past: no wait", -1, false },
+	{ "at it: no wait", 0, false },
+	{ "1 ns ahead: 1 ns", 1, true },
+	{ "10 ms ahead", 10000000, true },
+	{ "the 1 s cap maximum ahead", 1000000000, true },
+	{ "far ahead", S64_MAX / 4, true },
+};
+
+KUNIT_ARRAY_PARAM_DESC(t_gap_timeout, t_gap_timeout_cases, desc);
+
+static void ebc_test_gap_timeout(struct kunit *test)
+{
+	const struct t_gap_timeout *c = test->param_value;
+	ktime_t now = ms_to_ktime(5000);
+	ktime_t at = ktime_add_ns(now, c->at_ns);
+	ktime_t left = 12345;
+
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_gap_timeout(at, now, &left),
+			c->sleeps);
+	if (!c->sleeps) {
+		KUNIT_EXPECT_EQ(test, left, 12345);
+		return;
+	}
+	KUNIT_EXPECT_EQ(test, left, c->at_ns);
+	KUNIT_EXPECT_GT(test, left, 0);
+	KUNIT_EXPECT_EQ(test, ktime_add_safe(left, now), at);
+}
+
+/*
  * The refresh thread's wait condition: between parts it wakes on a part to
  * take, or a carry's retry due; while a gap is open, on an update newer
  * than the one it saw, not on the part pending all along, or on the CRTC
@@ -3341,6 +3385,7 @@ static struct kunit_case rk3026_ebc_core_test_cases[] = {
 	KUNIT_CASE_PARAM(ebc_test_idle_cleanup_due, t_idle_gen_params),
 	KUNIT_CASE_PARAM(ebc_test_thread_deadline, t_deadline_gen_params),
 	KUNIT_CASE_PARAM(ebc_test_take_wait, t_take_gen_params),
+	KUNIT_CASE_PARAM(ebc_test_gap_timeout, t_gap_timeout_gen_params),
 	KUNIT_CASE(ebc_test_thread_woken),
 	KUNIT_CASE_PARAM(ebc_test_thread_step, t_step_gen_params),
 	KUNIT_CASE(ebc_test_pending_cleanup_idle),
@@ -5910,8 +5955,10 @@ static struct rk3026_ebc *t_gap_ebc(struct kunit *test, struct t_drives *d)
  * ebc_refresh_thread() runs it: a pass (rk3026_ebc_thread_pass(),
  * rk3026_ebc_thread_step()) that looks at the part (rk3026_ebc_take_ready()),
  * with the rails and the idle cleanup held while the gap is open, past
- * their deadlines too; and while the gap is open, a wait that ends at the
- * next send or at the gap's end, at once if that is past.
+ * their deadlines too; and while the gap is open, ebc_gap_wait(): a wait
+ * that sleeps for the time rk3026_ebc_gap_timeout() gives, ending at the
+ * gap's end or at the next send, and none at all if the end has passed
+ * (the rails' ramp outlasted the gap): the next look must take then.
  * Send k (k from *@sent up to @n) is a plane update of @boxes[k % @nboxes]
  * from @fb at @every_us * k after the start. Every wait must sleep at the
  * look (no newer update: no spin) and wake on the next send. Returns the
@@ -5924,10 +5971,12 @@ static unsigned int t_gap_run(struct kunit *test, struct rk3026_ebc *ebc,
 {
 	ktime_t t0 = d->now;
 	unsigned int looks = 0;
+	bool ended = false;
 
 	while (looks++ < 1000) {
 		struct rk3026_ebc_pass pass;
 		ktime_t next = KTIME_MAX;
+		ktime_t left, end;
 		long timeout;
 
 		rk3026_ebc_thread_pass(ebc, jiffies, &pass);
@@ -5943,16 +5992,23 @@ static unsigned int t_gap_run(struct kunit *test, struct rk3026_ebc *ebc,
 		}
 		if (rk3026_ebc_take_ready(ebc, d->now))
 			return looks;
+		KUNIT_EXPECT_FALSE(test, ended);
 		KUNIT_EXPECT_TRUE(test, ebc->gap.open);
 		KUNIT_EXPECT_TRUE(test, rk3026_ebc_work_pending(&ebc->pending));
 		KUNIT_EXPECT_FALSE(test,
 				   rk3026_ebc_gap_woken(&ebc->pending,
 							ebc->gap.seen, true));
+		if (!rk3026_ebc_gap_timeout(ebc->gap.at, d->now, &left)) {
+			ended = true;
+			continue;
+		}
+		/* The hrtimer expires at the gap's end. */
+		end = ktime_add_safe(left, d->now);
+		KUNIT_EXPECT_EQ(test, end, ebc->gap.at);
 		if (*sent < n)
 			next = ktime_add_us(t0, *sent * every_us);
-		if (!ktime_before(next, ebc->gap.at)) {
-			if (ktime_before(d->now, ebc->gap.at))
-				d->now = ebc->gap.at;
+		if (!ktime_before(next, end)) {
+			d->now = end;
 			continue;
 		}
 		if (ktime_after(next, d->now))
@@ -6069,6 +6125,94 @@ static void ebc_test_glue_gap_lone(struct kunit *test)
 	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, fb, T_W * 4, &a));
 	KUNIT_EXPECT_TRUE(test, rk3026_ebc_take_ready(ebc, d.now));
 	KUNIT_EXPECT_EQ(test, d.rails, 0);
+}
+
+/*
+ * A lone update with the rails down whose ramp (37 ms, as the book's)
+ * outlasts the quiet gap (10 ms): the gap's end has passed when the
+ * thread would wait, so it does not sleep, and the next look takes the
+ * part, its gap the ramp. No later update is needed to end the wait: one
+ * sent 200 ms later is a part of its own, taken at once with the rails up.
+ */
+static void ebc_test_glue_gap_ramp_past(struct kunit *test)
+{
+	struct t_drives d;
+	struct rk3026_ebc *ebc = t_gap_ebc(test, &d);
+	u32 *fb = t_plane_fb(test, 0xffffff);
+	struct drm_rect a = DRM_RECT_INIT(4, 2, 2, 2);
+	struct drm_rect b = DRM_RECT_INIT(8, 2, 2, 2);
+	struct rk3026_ebc_last last;
+	unsigned int sent = 1;
+	ktime_t t0 = d.now;
+
+	d.ramp = ms_to_ktime(37);
+	t_fb_box(fb, 4, 2, 6, 4, 0);
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, fb, T_W * 4, &a));
+	KUNIT_EXPECT_EQ(test, t_gap_run(test, ebc, &d, fb, &a, 1, 1, 0, &sent),
+			2);
+	KUNIT_EXPECT_EQ(test, d.rails, 1);
+	KUNIT_EXPECT_EQ(test, ktime_us_delta(d.now, t0), 37000);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_EXPECT_EQ(test, last.merged, 1);
+	KUNIT_EXPECT_TRUE(test, drm_rect_equals(&last.clip, &a));
+	KUNIT_EXPECT_EQ(test, last.gap_us, 37000);
+	KUNIT_EXPECT_EQ(test, d.n, 1);
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_work_pending(&ebc->pending));
+
+	d.now = ktime_add_ms(t0, 200);
+	t_fb_box(fb, 8, 2, 10, 4, 0);
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, fb, T_W * 4, &b));
+	sent = 1;
+	KUNIT_EXPECT_EQ(test, t_gap_run(test, ebc, &d, fb, &b, 1, 1, 0, &sent),
+			1);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_EXPECT_EQ(test, last.merged, 1);
+	KUNIT_EXPECT_TRUE(test, drm_rect_equals(&last.clip, &b));
+	KUNIT_EXPECT_EQ(test, last.gap_us, 0);
+	KUNIT_EXPECT_EQ(test, ktime_us_delta(d.now, t0), 200000);
+	KUNIT_EXPECT_EQ(test, d.n, 2);
+}
+
+/*
+ * A blinking cursor, as fbcon draws it: on, then off 210 ms later, with
+ * the rails down at each toggle (37 ms ramp). Each toggle is a part of its
+ * own, taken at the look after the ramp and driven: the on is not held
+ * until the off joins it, which would make the pair what the glass shows
+ * and skip it.
+ */
+static void ebc_test_glue_gap_cursor_blink(struct kunit *test)
+{
+	struct t_drives d;
+	struct rk3026_ebc *ebc = t_gap_ebc(test, &d);
+	u32 *fb = t_plane_fb(test, 0xffffff);
+	struct drm_rect c = DRM_RECT_INIT(4, 2, 2, 2);
+	struct rk3026_ebc_last last;
+	ktime_t t0 = d.now;
+	unsigned int i, sent;
+
+	d.ramp = ms_to_ktime(37);
+	for (i = 0; i < 2; i++) {
+		ebc->epd_on = false;
+		ebc->rails_on = false;
+		d.now = ktime_add_ms(t0, 210 * i);
+		t_fb_box(fb, 4, 2, 6, 4, i ? 0xffffff : 0);
+		KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, fb,
+								T_W * 4, &c));
+		sent = 1;
+		KUNIT_EXPECT_EQ(test, t_gap_run(test, ebc, &d, fb, &c, 1, 1, 0,
+						&sent), 2);
+		/* One raise at the gap's open, one at each drive. */
+		KUNIT_EXPECT_EQ(test, d.rails, 2 * i + 1);
+		KUNIT_EXPECT_EQ(test, ktime_us_delta(d.now, t0),
+				210000 * i + 37000);
+		rk3026_ebc_do_refresh(ebc, &last);
+		KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+		KUNIT_EXPECT_EQ(test, last.merged, 1);
+		KUNIT_EXPECT_EQ(test, last.gap_us, 37000);
+	}
+	KUNIT_EXPECT_EQ(test, d.n, 2);
 }
 
 /* The refresh thread's wait queue, as a waiter on it sees a wake-up. */
@@ -7531,6 +7675,8 @@ static struct kunit_case rk3026_ebc_glue_test_cases[] = {
 	KUNIT_CASE(ebc_test_glue_rails_fail),
 	KUNIT_CASE(ebc_test_glue_gap_burst),
 	KUNIT_CASE(ebc_test_glue_gap_lone),
+	KUNIT_CASE(ebc_test_glue_gap_ramp_past),
+	KUNIT_CASE(ebc_test_glue_gap_cursor_blink),
 	KUNIT_CASE(ebc_test_glue_gap_not_driven),
 	KUNIT_CASE(ebc_test_glue_gap_cap),
 	KUNIT_CASE(ebc_test_glue_gap_exempt),

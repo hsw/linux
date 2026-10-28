@@ -1988,18 +1988,23 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_take_ready);
  * The refresh thread's wait while the take's gap is open: for an update
  * newer than its last look, the CRTC going off, or the gap's end, which is
  * the carry's retry at the latest (rk3026_ebc_take_wait()). The gap is a
- * few ms, so the wait runs on an hrtimer, not on jiffies.
+ * few ms, so the wait runs on an hrtimer, not on jiffies. A gap whose end
+ * passed while the rails came up is not waited for
+ * (rk3026_ebc_gap_timeout()): the next look takes the part.
  */
 static void ebc_gap_wait(struct rk3026_ebc *ebc)
 {
 	const struct rk3026_ebc_gap *gap = &ebc->gap;
+	ktime_t left;
 
+	if (!rk3026_ebc_gap_timeout(gap->at, rk3026_ebc_clock(ebc), &left))
+		return;
 	wait_event_interruptible_hrtimeout(ebc->update_wq,
 					   rk3026_ebc_gap_woken(&ebc->pending,
 								gap->seen,
 								READ_ONCE(ebc->crtc_on)) ||
 					   kthread_should_stop(),
-					   ktime_sub(gap->at, rk3026_ebc_clock(ebc)));
+					   left);
 }
 
 /**

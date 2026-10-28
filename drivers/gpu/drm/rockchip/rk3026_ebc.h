@@ -1115,6 +1115,7 @@ enum rk3026_ebc_step rk3026_ebc_thread_step(const struct rk3026_ebc_pass *s,
 					    long *timeout);
 bool rk3026_ebc_take_wait(const struct rk3026_ebc_take *t, ktime_t now,
 			  ktime_t *deadline);
+bool rk3026_ebc_gap_timeout(ktime_t at, ktime_t now, ktime_t *left);
 u32 rk3026_ebc_du_account(u32 du_area, const struct rk3026_ebc_set *part,
 			  u32 mode, u32 changed_px,
 			  enum rk3026_ebc_outcome outcome,

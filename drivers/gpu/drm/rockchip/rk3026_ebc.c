@@ -1815,6 +1815,82 @@ VISIBLE_IF_KUNIT bool rk3026_ebc_plane_update(struct rk3026_ebc *ebc,
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_plane_update);
 
+/*
+ * The framebuffer's object if it is one of ours that another device can
+ * write: exported over PRIME, as Mesa's kmsro does with the scanout buffer
+ * it allocates here and lets the GPU render into. Our mapping of it is
+ * cached (shmem without map_wc) and the device writes memory behind the
+ * CPU caches, but nothing on that path maintains them: the importer maps
+ * its attachment with DMA_ATTR_SKIP_CPU_SYNC, the shmem dma-buf ops have
+ * no begin_cpu_access, and drm_gem_fb_begin_cpu_access() reaches imported
+ * objects only. Without a sync the blit can read lines the cache still
+ * holds from an earlier frame.
+ */
+static struct drm_gem_shmem_object *ebc_fb_exported(struct drm_framebuffer *fb)
+{
+	struct drm_gem_object *obj = drm_gem_fb_get_obj(fb, 0);
+
+	if (!obj || drm_gem_is_imported(obj) || !READ_ONCE(obj->dma_buf))
+		return NULL;
+	return to_drm_gem_shmem_obj(obj);
+}
+
+/*
+ * The shadow plane's vmap, and for an exported framebuffer its pages
+ * mapped for the EBC (drm_gem_shmem_get_pages_sgt(), kept until the
+ * object is freed), which the CPU sync before the blit needs. Done here,
+ * outside the commit's fence signalling section: it takes the
+ * reservation lock and allocates.
+ */
+static int ebc_plane_begin_fb_access(struct drm_plane *plane,
+				     struct drm_plane_state *new_state)
+{
+	struct drm_gem_shmem_object *shmem;
+	struct sg_table *sgt;
+	int ret;
+
+	ret = drm_gem_begin_shadow_fb_access(plane, new_state);
+	if (ret || !new_state->fb)
+		return ret;
+	shmem = ebc_fb_exported(new_state->fb);
+	if (!shmem)
+		return 0;
+	sgt = drm_gem_shmem_get_pages_sgt(shmem);
+	if (IS_ERR(sgt)) {
+		drm_gem_end_shadow_fb_access(plane, new_state);
+		return PTR_ERR(sgt);
+	}
+	return 0;
+}
+
+/*
+ * Make what another device wrote into the framebuffer visible to the
+ * blit's CPU reads. An imported object goes through its exporter
+ * (dma_buf_begin_cpu_access()), which owns the CPU mapping and knows what
+ * it needs. For an exported one of ours that is the EBC itself, so the
+ * cache is maintained here, over the whole buffer: no DMA API call syncs a
+ * byte range of a scatterlist. Lines a CPU writer left dirty through a
+ * cached mmap are written back first, then the lines the device may have
+ * overwritten are dropped; an invalidate alone would discard such writes.
+ *
+ * Returns true if drm_gem_fb_end_cpu_access() is owed.
+ */
+static bool ebc_fb_begin_read(struct drm_framebuffer *fb)
+{
+	struct drm_gem_object *obj = drm_gem_fb_get_obj(fb, 0);
+	struct drm_gem_shmem_object *shmem;
+
+	if (obj && drm_gem_is_imported(obj))
+		return !drm_gem_fb_begin_cpu_access(fb, DMA_FROM_DEVICE);
+
+	shmem = ebc_fb_exported(fb);
+	if (!shmem || !shmem->sgt)
+		return false;
+	dma_sync_sgtable_for_device(obj->dev->dev, shmem->sgt, DMA_TO_DEVICE);
+	dma_sync_sgtable_for_cpu(obj->dev->dev, shmem->sgt, DMA_FROM_DEVICE);
+	return false;
+}
+
 static void ebc_plane_atomic_update(struct drm_plane *plane,
 				    struct drm_atomic_state *state)
 {
@@ -1826,6 +1902,7 @@ static void ebc_plane_atomic_update(struct drm_plane *plane,
 		to_drm_shadow_plane_state(new_state);
 	struct rk3026_ebc *ebc = drm_to_ebc(plane->dev);
 	struct drm_rect box;
+	bool end_access;
 	int idx;
 
 	if (!new_state->fb || !new_state->visible)
@@ -1847,8 +1924,12 @@ static void ebc_plane_atomic_update(struct drm_plane *plane,
 	if (!drm_dev_enter(plane->dev, &idx))
 		return;
 
+	/* A failed begin leaves the pixels as unsynced as before: blit them. */
+	end_access = ebc_fb_begin_read(new_state->fb);
 	rk3026_ebc_plane_update(ebc, shadow->data[0].vaddr,
 				new_state->fb->pitches[0], &box);
+	if (end_access)
+		drm_gem_fb_end_cpu_access(new_state->fb, DMA_FROM_DEVICE);
 
 	drm_dev_exit(idx);
 }
@@ -1861,7 +1942,8 @@ static const struct drm_plane_funcs ebc_plane_funcs = {
 };
 
 static const struct drm_plane_helper_funcs ebc_plane_helper_funcs = {
-	DRM_GEM_SHADOW_PLANE_HELPER_FUNCS,
+	.begin_fb_access	= ebc_plane_begin_fb_access,
+	.end_fb_access		= drm_gem_end_shadow_fb_access,
 	.atomic_check		= ebc_plane_atomic_check,
 	.atomic_update		= ebc_plane_atomic_update,
 };

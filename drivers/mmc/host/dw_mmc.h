@@ -235,6 +235,15 @@ struct dw_mci {
 	struct timer_list       cto_timer;
 	struct timer_list       dto_timer;
 
+	/* RC2 debug: stalled read diagnostics (dw_mci_dbg_* in dw_mmc.c) */
+	struct timer_list	dbg_timer;
+	ktime_t			dbg_cmd_ts;
+	struct notifier_block	dbg_clk_nb;
+	atomic_t		dbg_clk_changes;
+	ktime_t			dbg_clk_ts;
+	unsigned long		dbg_clk_old;
+	unsigned long		dbg_clk_new;
+
 #ifdef CONFIG_FAULT_INJECTION
 	struct fault_attr	fail_data_crc;
 	struct hrtimer		fault_timer;

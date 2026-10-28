@@ -9,6 +9,7 @@
 
 #include <linux/bitops.h>
 #include <linux/clk.h>
+#include <linux/clk-provider.h>
 #include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/device.h>
@@ -28,6 +29,7 @@
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
+#include <linux/ratelimit.h>
 #include <linux/regulator/consumer.h>
 
 #include "dw_mmc.h"
@@ -1256,6 +1258,9 @@ static void dw_mci_start_request(struct dw_mci *host, struct mmc_command *cmd)
 	if (data) {
 		dw_mci_submit_data(host, data);
 		wmb(); /* drain writebuffer */
+		/* RC2 debug */
+		timer_delete(&host->dbg_timer);
+		host->dbg_cmd_ts = ktime_get();
 	}
 
 	dw_mci_start_command(host, cmd, cmdflags);
@@ -1846,6 +1851,121 @@ static int dw_mci_data_complete(struct dw_mci *host, struct mmc_data *data)
 	return data->error;
 }
 
+/*
+ * RC2 debug: why do SD reads stall for more than the software DTO budget?
+ * Dumps the host state when the DTO timer fires, when a data error interrupt
+ * arrives and every 100 ms of a read that is still running at 50 ms.
+ * drto_extra_ms widens the software read budget; 0 keeps the stock behaviour.
+ * Built in, the knob is /sys/module/dw_mmc/parameters/drto_extra_ms.
+ */
+static unsigned int drto_extra_ms;
+module_param(drto_extra_ms, uint, 0644);
+MODULE_PARM_DESC(drto_extra_ms, "debug: extra ms for the software data read timeout");
+
+#define DW_MCI_DBG_SAMPLE_MS	50
+#define DW_MCI_DBG_RESAMPLE_MS	100
+
+static DEFINE_RATELIMIT_STATE(dw_mci_dbg_err_rs, 5 * HZ, 20);
+static DEFINE_RATELIMIT_STATE(dw_mci_dbg_smp_rs, 5 * HZ, 20);
+
+static void dw_mci_dbg_dump(struct dw_mci *host, const char *why, u32 pending)
+{
+	/* registers first, before anything else can move */
+	u32 status = mci_readl(host, STATUS);
+	u32 rintsts = mci_readl(host, RINTSTS);
+	u32 mintsts = mci_readl(host, MINTSTS);
+	u32 ctrl = mci_readl(host, CTRL);
+	u32 clkena = mci_readl(host, CLKENA);
+	u32 clkdiv = mci_readl(host, CLKDIV);
+	u32 clksrc = mci_readl(host, CLKSRC);
+	u32 tmout = mci_readl(host, TMOUT);
+	u32 fifoth = mci_readl(host, FIFOTH);
+	u32 tcbcnt = mci_readl(host, TCBCNT);
+	u32 tbbcnt = mci_readl(host, TBBCNT);
+	u32 bytcnt = mci_readl(host, BYTCNT);
+	u32 blksiz = mci_readl(host, BLKSIZ);
+	u32 cmd = mci_readl(host, CMD);
+	u32 cmdarg = mci_readl(host, CMDARG);
+	bool idmac = ctrl & SDMMC_CTRL_USE_IDMAC;
+	ktime_t now = ktime_get();
+	struct clk_hw *ciu = NULL, *p1 = NULL, *p2 = NULL;
+	int changes = atomic_read(&host->dbg_clk_changes);
+
+	if (!IS_ERR_OR_NULL(host->ciu_clk))
+		ciu = __clk_get_hw(host->ciu_clk);
+	if (ciu)
+		p1 = clk_hw_get_parent(ciu);
+	if (p1)
+		p2 = clk_hw_get_parent(p1);
+
+	dev_err(host->dev, "dbg %s: %lld ms after the data cmd, state %d, events 0x%lx done 0x%lx, irq 0x%08x, %s\n",
+		why, ktime_ms_delta(now, host->dbg_cmd_ts), host->state,
+		host->pending_events, host->completed_events, pending,
+		idmac ? "idmac" : "pio");
+	dev_err(host->dev, "dbg %s: STATUS 0x%08x fifo_count %u data_busy %d mc_busy %d fifo_full %d fifo_empty %d cmd_fsm %u dma_req %d\n",
+		why, status, SDMMC_GET_FCNT(status), !!(status & BIT(9)),
+		!!(status & BIT(10)), !!(status & BIT(3)), !!(status & BIT(2)),
+		(status >> 4) & 0xf, !!(status & SDMMC_STATUS_DMA_REQ));
+	dev_err(host->dev, "dbg %s: RINTSTS 0x%08x MINTSTS 0x%08x CTRL 0x%08x CLKENA 0x%x CLKDIV 0x%x CLKSRC 0x%x TMOUT 0x%08x FIFOTH 0x%08x\n",
+		why, rintsts, mintsts, ctrl, clkena, clkdiv, clksrc, tmout, fifoth);
+	dev_err(host->dev, "dbg %s: TCBCNT %u TBBCNT %u BYTCNT %u BLKSIZ %u CMD 0x%08x CMDARG 0x%08x\n",
+		why, tcbcnt, tbbcnt, bytcnt, blksiz, cmd, cmdarg);
+	if (idmac && host->dma_64bit_address)
+		dev_err(host->dev, "dbg %s: IDSTS64 0x%08x BMOD 0x%08x\n",
+			why, mci_readl(host, IDSTS64), mci_readl(host, BMOD));
+	else if (idmac)
+		dev_err(host->dev, "dbg %s: IDSTS 0x%08x BMOD 0x%08x DSCADDR 0x%08x BUFADDR 0x%08x\n",
+			why, mci_readl(host, IDSTS), mci_readl(host, BMOD),
+			mci_readl(host, DSCADDR), mci_readl(host, BUFADDR));
+	dev_err(host->dev, "dbg %s: bus_hz %u ciu %s %lu <- %s %lu <- %s %lu; ciu rate changes %d, last %lld ms ago %lu -> %lu\n",
+		why, host->bus_hz,
+		ciu ? clk_hw_get_name(ciu) : "-", ciu ? clk_hw_get_rate(ciu) : 0,
+		p1 ? clk_hw_get_name(p1) : "-", p1 ? clk_hw_get_rate(p1) : 0,
+		p2 ? clk_hw_get_name(p2) : "-", p2 ? clk_hw_get_rate(p2) : 0,
+		changes, changes ? ktime_ms_delta(now, host->dbg_clk_ts) : -1LL,
+		host->dbg_clk_old, host->dbg_clk_new);
+}
+
+/* every DW_MCI_DBG_RESAMPLE_MS while a read runs past DW_MCI_DBG_SAMPLE_MS */
+static void dw_mci_dbg_sample(struct timer_list *t)
+{
+	struct dw_mci *host = timer_container_of(host, t, dbg_timer);
+	unsigned long irqflags;
+	s64 age;
+	unsigned int next = DW_MCI_DBG_RESAMPLE_MS;
+
+	spin_lock_irqsave(&host->irq_lock, irqflags);
+	if ((host->state != STATE_SENDING_DATA &&
+	     host->state != STATE_DATA_BUSY) ||
+	    test_bit(EVENT_DATA_COMPLETE, &host->pending_events))
+		goto out;
+
+	age = ktime_ms_delta(ktime_get(), host->dbg_cmd_ts);
+	if (age < DW_MCI_DBG_SAMPLE_MS)
+		next = DW_MCI_DBG_SAMPLE_MS - age;
+	else if (__ratelimit(&dw_mci_dbg_smp_rs))
+		dw_mci_dbg_dump(host, "sample", 0);
+	mod_timer(&host->dbg_timer, jiffies + msecs_to_jiffies(next) + 1);
+out:
+	spin_unlock_irqrestore(&host->irq_lock, irqflags);
+}
+
+/* catches a transient move of the ciu clock or a parent PLL */
+static int dw_mci_dbg_clk_notify(struct notifier_block *nb,
+				 unsigned long event, void *data)
+{
+	struct dw_mci *host = container_of(nb, struct dw_mci, dbg_clk_nb);
+	struct clk_notifier_data *cnd = data;
+
+	if (event == POST_RATE_CHANGE) {
+		host->dbg_clk_old = cnd->old_rate;
+		host->dbg_clk_new = cnd->new_rate;
+		host->dbg_clk_ts = ktime_get();
+		atomic_inc(&host->dbg_clk_changes);
+	}
+	return NOTIFY_DONE;
+}
+
 static void dw_mci_set_drto(struct dw_mci *host)
 {
 	const struct dw_mci_drv_data *drv_data = host->drv_data;
@@ -1869,11 +1989,17 @@ static void dw_mci_set_drto(struct dw_mci *host)
 
 	/* add a bit spare time */
 	drto_ms += 10;
+	drto_ms += READ_ONCE(drto_extra_ms); /* RC2 debug */
 
 	spin_lock_irqsave(&host->irq_lock, irqflags);
-	if (!test_bit(EVENT_DATA_COMPLETE, &host->pending_events))
+	if (!test_bit(EVENT_DATA_COMPLETE, &host->pending_events)) {
 		mod_timer(&host->dto_timer,
 			  jiffies + msecs_to_jiffies(drto_ms));
+		/* RC2 debug */
+		if (!timer_pending(&host->dbg_timer))
+			mod_timer(&host->dbg_timer, jiffies +
+				  msecs_to_jiffies(DW_MCI_DBG_SAMPLE_MS) + 1);
+	}
 	spin_unlock_irqrestore(&host->irq_lock, irqflags);
 }
 
@@ -2692,6 +2818,11 @@ static irqreturn_t dw_mci_interrupt(int irq, void *dev_id)
 		if (pending & DW_MCI_DATA_ERROR_FLAGS) {
 			spin_lock(&host->irq_lock);
 
+			/* RC2 debug: before RINTSTS is cleared */
+			timer_delete(&host->dbg_timer);
+			if (__ratelimit(&dw_mci_dbg_err_rs))
+				dw_mci_dbg_dump(host, "hw-irq", pending);
+
 			if (host->quirks & DW_MMC_QUIRK_EXTENDED_TMOUT)
 				timer_delete(&host->dto_timer);
 
@@ -2715,6 +2846,7 @@ static irqreturn_t dw_mci_interrupt(int irq, void *dev_id)
 			spin_lock(&host->irq_lock);
 
 			timer_delete(&host->dto_timer);
+			timer_delete(&host->dbg_timer); /* RC2 debug */
 
 			mci_writel(host, RINTSTS, SDMMC_INT_DATA_OVER);
 			if (!host->data_status)
@@ -3099,6 +3231,10 @@ static void dw_mci_dto_timer(struct timer_list *t)
 		 * we should notify the driver to terminate current transfer
 		 * and report a data timeout to the core.
 		 */
+		/* RC2 debug */
+		timer_delete(&host->dbg_timer);
+		if (__ratelimit(&dw_mci_dbg_err_rs))
+			dw_mci_dbg_dump(host, "sw-dto", pending);
 		host->data_status = SDMMC_INT_DRTO;
 		set_bit(EVENT_DATA_ERROR, &host->pending_events);
 		set_bit(EVENT_DATA_COMPLETE, &host->pending_events);
@@ -3236,6 +3372,12 @@ int dw_mci_probe(struct dw_mci *host)
 					 host->bus_hz);
 		}
 		host->bus_hz = clk_get_rate(host->ciu_clk);
+
+		/* RC2 debug */
+		host->dbg_clk_nb.notifier_call = dw_mci_dbg_clk_notify;
+		if (devm_clk_notifier_register(host->dev, host->ciu_clk,
+					       &host->dbg_clk_nb))
+			dev_warn(host->dev, "dbg: no ciu clock notifier\n");
 	}
 
 	if (!host->bus_hz) {
@@ -3263,6 +3405,7 @@ int dw_mci_probe(struct dw_mci *host)
 	timer_setup(&host->cmd11_timer, dw_mci_cmd11_timer, 0);
 	timer_setup(&host->cto_timer, dw_mci_cto_timer, 0);
 	timer_setup(&host->dto_timer, dw_mci_dto_timer, 0);
+	timer_setup(&host->dbg_timer, dw_mci_dbg_sample, 0); /* RC2 debug */
 
 	spin_lock_init(&host->lock);
 	spin_lock_init(&host->irq_lock);
@@ -3405,6 +3548,7 @@ void dw_mci_remove(struct dw_mci *host)
 {
 	dev_dbg(host->dev, "remove host\n");
 	dw_mci_cleanup_host(host);
+	timer_delete_sync(&host->dbg_timer); /* RC2 debug */
 
 	mci_writel(host, RINTSTS, 0xFFFFFFFF);
 	mci_writel(host, INTMASK, 0); /* disable all mmc interrupt first */

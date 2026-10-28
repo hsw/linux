@@ -503,7 +503,13 @@ static struct rockchip_clk_branch rk3026_clk_branches[] __initdata = {
 	COMPOSITE(0, "aclk_lcdc0_src", mux_pll_src_cpll_gpll_p, 0,
 			RK2928_CLKSEL_CON(31), 7, 1, MFLAGS, 0, 5, DFLAGS,
 			RK2928_CLKGATE_CON(3), 0, GFLAGS),
-	GATE(ACLK_LCDC0, "aclk_lcdc0", "aclk_lcdc0_src", 0,
+	/*
+	 * The VIO0 NIU, the AXI path of LCDC0, CIF and RGA, mirrors the VIO1
+	 * one below (vendor clock_data.c: aclk_vio0_niu <- aclk_lcdc0_pre).
+	 */
+	GATE(0, "aclk_vio0_niu", "aclk_lcdc0_src", 0,
+			RK2928_CLKGATE_CON(6), 13, GFLAGS),
+	GATE(ACLK_LCDC0, "aclk_lcdc0", "aclk_vio0_niu", 0,
 			RK2928_CLKGATE_CON(6), 0, GFLAGS),
 	GATE(HCLK_LCDC0, "hclk_lcdc0", "hclk_peri_src", 0,
 			RK2928_CLKGATE_CON(6), 1, GFLAGS),
@@ -623,6 +629,10 @@ static struct rockchip_clk_branch rk3026_clk_branches[] __initdata = {
 			RK2928_CLKGATE_CON(3), 9, GFLAGS),
 	FACTOR_GATE(HCLK_VCODEC, "hclk_vcodec", "aclk_vcodec", 0, 1, 4,
 			RK2928_CLKGATE_CON(3), 12, GFLAGS),
+	/* aclk_vdpu: CLKSEL_CON(32), bit15=mux, bits[12:8]=div, CON3 bit11 */
+	COMPOSITE(0, "aclk_vdpu", mux_pll_src_cpll_gpll_p, 0,
+			RK2928_CLKSEL_CON(32), 15, 1, MFLAGS, 8, 5, DFLAGS,
+			RK2928_CLKGATE_CON(3), 11, GFLAGS),
 
 	/*
 	 * GPU clock
@@ -757,6 +767,37 @@ static struct rockchip_clk_branch rk3026_clk_branches[] __initdata = {
 			RK2928_CLKGATE_CON(8), 11, GFLAGS),
 	GATE(PCLK_GPIO3, "pclk_gpio3", "pclk_peri", 0,
 			RK2928_CLKGATE_CON(8), 12, GFLAGS),
+
+	/*
+	 * Crypto, EMEM, GPS, CIF, RGA and IEP. Without an entry nothing ever
+	 * closes these gates, so they keep the open state the loader left,
+	 * whether or not a driver claims the block (vendor clock_data.c,
+	 * CLKGATE bits from its cru.h).
+	 */
+	GATE(HCLK_CRYPTO, "hclk_crypto", "hclk_peri", 0,
+			RK2928_CLKGATE_CON(3), 5, GFLAGS),
+	GATE(0, "hclk_emem_peri", "hclk_peri", 0,
+			RK2928_CLKGATE_CON(3), 6, GFLAGS),
+	GATE(0, "aclk_gps", "aclk_peri", 0,
+			RK2928_CLKGATE_CON(3), 14, GFLAGS),
+	/* CIF: pixel clock input pad, CON3 bit3; cif_out: CLKSEL_CON(29) */
+	GATE(PCLK_CIF, "pclkin_cif", "xin24m", 0,
+			RK2928_CLKGATE_CON(3), 3, GFLAGS),
+	COMPOSITE(0, "cif_out_div", mux_pll_src_cpll_gpll_p, 0,
+			RK2928_CLKSEL_CON(29), 0, 1, MFLAGS, 1, 5, DFLAGS,
+			RK2928_CLKGATE_CON(3), 7, GFLAGS),
+	GATE(ACLK_CIF, "aclk_cif", "aclk_vio0_niu", 0,
+			RK2928_CLKGATE_CON(6), 5, GFLAGS),
+	GATE(HCLK_CIF, "hclk_cif", "hclk_disp_pre", 0,
+			RK2928_CLKGATE_CON(6), 4, GFLAGS),
+	GATE(ACLK_RGA, "aclk_rga", "aclk_vio0_niu", 0,
+			RK2928_CLKGATE_CON(6), 11, GFLAGS),
+	GATE(HCLK_RGA, "hclk_rga", "hclk_disp_pre", 0,
+			RK2928_CLKGATE_CON(6), 10, GFLAGS),
+	GATE(ACLK_IEP, "aclk_iep", "aclk_vio1_niu", 0,
+			RK2928_CLKGATE_CON(9), 8, GFLAGS),
+	GATE(HCLK_IEP, "hclk_iep", "hclk_disp_pre", 0,
+			RK2928_CLKGATE_CON(9), 7, GFLAGS),
 
 	/* Debug clocks */
 	GATE(0, "clk_core_dbg", "armclk", CLK_IGNORE_UNUSED,

@@ -993,6 +993,32 @@ bool rk3026_ebc_take_wait(const struct rk3026_ebc_take *t, ktime_t now,
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_take_wait);
 
 /**
+ * rk3026_ebc_gap_timeout - how long the refresh thread sleeps in the gap
+ * @at: the gap's end (rk3026_ebc_take_wait()'s @deadline)
+ * @now: the time the wait starts
+ * @left: returns the time to @at when the wait sleeps; left alone if not
+ *
+ * The gap's end is set at the look, and the look that opens the gap raises
+ * the rails before the wait (rk3026_ebc_take_ready()): their ramp, tens of
+ * ms, may outlast the gap, so its end may be past when the wait starts.
+ * The wait must not sleep then: a relative hrtimer with a negative expiry
+ * saturates to KTIME_SEC_MAX (ktime_add_safe()), and the thread would sleep
+ * until the next update or the CRTC going off, the part pending all along.
+ * The next look takes it.
+ *
+ * Return: true to sleep for @left, which is positive; false when @at is
+ * @now or past: look again at once.
+ */
+bool rk3026_ebc_gap_timeout(ktime_t at, ktime_t now, ktime_t *left)
+{
+	if (!ktime_before(now, at))
+		return false;
+	*left = ktime_sub(at, now);
+	return true;
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_gap_timeout);
+
+/**
  * rk3026_ebc_du_account - the DU cleanup budget after one part
  * @du_area: the pixels plane parts changed in DU or A2 since the glass was
  *	cleared

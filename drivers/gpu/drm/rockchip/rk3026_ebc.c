@@ -267,13 +267,15 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_wait_timeout_ms);
  * DIAGNOSTIC, REVERT ME. The scan completes -- frame-end interrupts arrive and
  * no chunk times out -- while the glass does not move, so every stage between
  * the source image and the panel is reported as a positive marker rather than
- * inferred from the absence of an error. Reports the next N scans; defaults to
- * the first few so the fbcon updates at boot are covered without a shell, and
- * re-arms with
+ * inferred from the absence of an error. Reports the next N scans; off by
+ * default, armed at runtime with
  *
  *	echo 4 > /sys/module/rk3026_ebc/parameters/debug_scan
+ *
+ * or for the fbcon updates at boot with rk3026_ebc.debug_scan=6 on the kernel
+ * command line. The debugfs panel, target and state files do not depend on it.
  */
-static unsigned int debug_scan = 6;
+static unsigned int debug_scan;
 module_param(debug_scan, uint, 0644);
 MODULE_PARM_DESC(debug_scan, "report every stage of the next N waveform scans (0 = off)");
 

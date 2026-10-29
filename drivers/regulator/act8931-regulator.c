@@ -10,7 +10,8 @@
  * measurement. OK (power good) is set while the output is in regulation.
  *
  * The charger is only read (APCH 0x78 and 0x7a), and polled: the driver
- * enables none of its interrupts.
+ * enables none of its interrupts. It is registered after the outputs, and
+ * a charger failure leaves them registered.
  *
  * There is no shutdown callback: the chip keeps its registers across a
  * warm reset, so the boot firmware starts with the voltages the consumers
@@ -62,10 +63,9 @@
 #define ACT8931_STATUS_CHGDAT	BIT(0)	/* end of charge */
 #define ACT8931_STATUS_INDAT	BIT(1)	/* valid input at CHGIN */
 #define ACT8931_STATE_CSTATE	GENMASK(5, 4)
-#define ACT8931_STATE_ACINSTAT	BIT(1)	/* ACIN above 1.2 V: AC mode */
-/* the bits the properties are made of: a change raises a uevent */
+/* the bits the properties are made of (0x78, 0x7a; they do not overlap) */
 #define ACT8931_STATUS_WATCH	(ACT8931_STATUS_CHGDAT | ACT8931_STATUS_INDAT)
-#define ACT8931_STATE_WATCH	(ACT8931_STATE_CSTATE | ACT8931_STATE_ACINSTAT)
+#define ACT8931_STATE_WATCH	ACT8931_STATE_CSTATE
 
 #define ACT8931_CSTATE_OFF	0	/* suspended, disabled or fault */
 #define ACT8931_CSTATE_EOC	1
@@ -97,11 +97,9 @@ enum {
 struct act8931 {
 	struct device *dev;
 	struct regmap *regmap;
-	struct power_supply_desc charger_desc;	/* type follows ACINSTAT */
 	struct power_supply *charger;
 	struct delayed_work poll;
-	unsigned int last_status;	/* watched bits at the last read */
-	unsigned int last_state;
+	unsigned int last;	/* watched charger bits at the last read */
 };
 
 /* ACT8931 output voltage table: three linear ranges of the 6-bit selector */
@@ -490,13 +488,6 @@ static int act8931_charger_type(unsigned int state)
 	}
 }
 
-static enum power_supply_type act8931_supply_type(unsigned int state)
-{
-	if (state & ACT8931_STATE_ACINSTAT)
-		return POWER_SUPPLY_TYPE_MAINS;
-	return POWER_SUPPLY_TYPE_USB;
-}
-
 static int act8931_charger_get_property(struct power_supply *psy,
 					enum power_supply_property psp,
 					union power_supply_propval *val)
@@ -531,9 +522,14 @@ static const enum power_supply_property act8931_charger_props[] = {
 	POWER_SUPPLY_PROP_CHARGE_TYPE,
 };
 
-/* The template of chip->charger_desc, whose type follows ACINSTAT */
+/*
+ * The chip cannot tell what feeds CHGIN, a USB port or an adapter (ACIN
+ * only selects the current mode, which is board wiring): the type is
+ * fixed and unknown.
+ */
 static const struct power_supply_desc act8931_charger_desc = {
 	.name		= "act8931-charger",
+	.type		= POWER_SUPPLY_TYPE_UNKNOWN,
 	.properties	= act8931_charger_props,
 	.num_properties	= ARRAY_SIZE(act8931_charger_props),
 	.get_property	= act8931_charger_get_property,
@@ -548,17 +544,14 @@ static void act8931_poll_arm(struct act8931 *chip)
 /* True when the watched bits changed; a failed read is no change */
 static bool act8931_charger_changed(struct act8931 *chip)
 {
-	unsigned int status, state;
+	unsigned int status, state, cur;
 
 	if (act8931_charger_read(chip, &status, &state))
 		return false;
-	status &= ACT8931_STATUS_WATCH;
-	state &= ACT8931_STATE_WATCH;
-	if (status == chip->last_status && state == chip->last_state)
+	cur = (status & ACT8931_STATUS_WATCH) | (state & ACT8931_STATE_WATCH);
+	if (cur == chip->last)
 		return false;
-	chip->last_status = status;
-	chip->last_state = state;
-	chip->charger_desc.type = act8931_supply_type(state);
+	chip->last = cur;
 	return true;
 }
 
@@ -572,38 +565,39 @@ static void act8931_charger_poll(struct work_struct *work)
 }
 
 /*
- * The charger comes first: a failure there leaves no output registered
- * that a consumer could already hold.
+ * The charger only reports state: it comes after the outputs, and a
+ * failure here is logged and leaves them registered. Its node is the
+ * chip's, so a fuel gauge can name it in power-supplies.
  */
-static int act8931_charger_init(struct act8931 *chip)
+static void act8931_charger_init(struct act8931 *chip)
 {
-	/* no fwnode: the charger stays out of the board's supply graph */
-	struct power_supply_config psy_cfg = { .drv_data = chip };
-	unsigned int status, state;
+	struct power_supply_config psy_cfg = {
+		.drv_data = chip,
+		.fwnode = dev_fwnode(chip->dev),
+	};
 	int ret;
 
-	ret = act8931_charger_read(chip, &status, &state);
-	if (ret)
-		return dev_err_probe(chip->dev, ret,
-				     "failed to read the charger state\n");
-	chip->last_status = status & ACT8931_STATUS_WATCH;
-	chip->last_state = state & ACT8931_STATE_WATCH;
-	chip->charger_desc = act8931_charger_desc;
-	chip->charger_desc.type = act8931_supply_type(state);
+	if (!IS_ENABLED(CONFIG_POWER_SUPPLY))
+		return;
 
+	act8931_charger_changed(chip);	/* the state at registration */
 	chip->charger = devm_power_supply_register(chip->dev,
-						   &chip->charger_desc,
+						   &act8931_charger_desc,
 						   &psy_cfg);
-	if (IS_ERR(chip->charger))
-		return dev_err_probe(chip->dev, PTR_ERR(chip->charger),
-				     "failed to register the charger\n");
+	if (IS_ERR(chip->charger)) {
+		dev_warn(chip->dev, "failed to register the charger: %pe\n",
+			 chip->charger);
+		return;
+	}
 
 	ret = devm_delayed_work_autocancel(chip->dev, &chip->poll,
 					   act8931_charger_poll);
-	if (ret)
-		return ret;
+	if (ret) {
+		dev_warn(chip->dev, "failed to poll the charger: %pe\n",
+			 ERR_PTR(ret));
+		return;
+	}
 	act8931_poll_arm(chip);
-	return 0;
 }
 
 static int act8931_probe(struct i2c_client *client)
@@ -614,7 +608,6 @@ static int act8931_probe(struct i2c_client *client)
 	struct regulator_dev *rdev;
 	struct act8931 *chip;
 	unsigned int i;
-	int ret;
 
 	chip = devm_kzalloc(dev, sizeof(*chip), GFP_KERNEL);
 	if (!chip)
@@ -625,10 +618,6 @@ static int act8931_probe(struct i2c_client *client)
 	if (IS_ERR(chip->regmap))
 		return dev_err_probe(dev, PTR_ERR(chip->regmap),
 				     "regmap init failed\n");
-
-	ret = act8931_charger_init(chip);
-	if (ret)
-		return ret;
 
 	if (of_property_read_bool(dev->of_node, "active-semi,vsel-high"))
 		desc = act8931_descs_vset2;
@@ -644,6 +633,8 @@ static int act8931_probe(struct i2c_client *client)
 					     "failed to register %s\n",
 					     desc[i].name);
 	}
+
+	act8931_charger_init(chip);
 	return 0;
 }
 

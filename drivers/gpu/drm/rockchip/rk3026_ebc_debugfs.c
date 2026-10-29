@@ -139,6 +139,7 @@ static const char *const ebc_source_names[] = {
 	[EBC_SOURCE_MXCFB]	= "mxcfb",
 	[EBC_SOURCE_ENABLE]	= "enable",
 	[EBC_SOURCE_IDLE]	= "idle",
+	[EBC_SOURCE_RESTORE]	= "restore",
 };
 
 static const char *const ebc_outcome_names[] = {

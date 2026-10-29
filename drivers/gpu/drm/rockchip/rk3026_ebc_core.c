@@ -888,7 +888,11 @@ static unsigned long ebc_retry_jiffies(unsigned long now, ktime_t clock,
  *   when the wait times out: a steady stream of skipped updates keeps the
  *   thread busy and must not keep the rails up. Not while the take's gap is
  *   open: the part taken after it will be driven (a gap opens only for
- *   such a part), and the gap's cap bounds the hold;
+ *   such a part), and the gap's cap bounds the hold; but while the system
+ *   suspends (@s->suspended) nothing is taken, so the gap holds nothing;
+ * - while the system suspends, nothing else: no look at the idle cleanup,
+ *   the next part or the carry's retry, which all wait for the resume, and
+ *   the wait has the rails' deadline alone;
  * - the idle cleanup is looked at, at its deadline (rk3026_ebc_idle_tick()).
  *   Not while a gap is open: the part pending holds the glass, and its end
  *   arms the cleanup again;
@@ -908,9 +912,14 @@ enum rk3026_ebc_step rk3026_ebc_thread_step(const struct rk3026_ebc_pass *s,
 	unsigned long deadline, retry_at = 0;
 
 	*timeout = MAX_SCHEDULE_TIMEOUT;
-	if (s->rails_on && !s->gap_open &&
+	if (s->rails_on && (!s->gap_open || s->suspended) &&
 	    time_after_eq(s->now, s->rails_off_at))
 		return EBC_STEP_RAILS_OFF;
+	if (s->suspended) {
+		if (s->rails_on)
+			*timeout = (long)(s->rails_off_at - s->now);
+		return EBC_STEP_WAIT;
+	}
 	if (s->idle_armed && !s->gap_open && time_after_eq(s->now, s->idle_at))
 		return EBC_STEP_IDLE;
 	if (s->gap_open || s->woken)

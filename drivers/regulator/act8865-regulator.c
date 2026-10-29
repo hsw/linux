@@ -8,6 +8,7 @@
  */
 
 #include <linux/bitfield.h>
+#include <linux/devm-helpers.h>
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/i2c.h>
@@ -125,6 +126,15 @@
  */
 #define	ACT8931_APCH_STATUS	0x78
 #define	ACT8931_APCH_STATE	0x7a
+
+#define	ACT8931_APCH_CHGDAT	BIT(0)		/* 0x78: end of charge */
+#define	ACT8931_APCH_INDAT	BIT(1)		/* 0x78: valid input */
+#define	ACT8931_CSTATE_MASK	GENMASK(5, 4)	/* 0x7a: charge state */
+#define	ACT8931_CSTATE_EOC	1	/* end of charge */
+#define	ACT8931_CSTATE_FAST	2	/* fast charge or top-off */
+#define	ACT8931_CSTATE_PRE	3	/* precondition */
+
+#define	ACT8931_CHARGER_POLL_MS	5000
 
 /*
  * Field Definitions.
@@ -934,6 +944,176 @@ static int act8600_charger_probe(struct device *dev, struct regmap *regmap)
 	return PTR_ERR_OR_ZERO(charger);
 }
 
+/*
+ * ACT8931 charger, read only: APCH 0x78 holds the input (INDAT) and
+ * end-of-charge (CHGDAT) status, 0x7a the charge state (CSTATE). Bits 7:4
+ * of 0x78 arm the charger interrupts together with 0x79 and read back
+ * their status, which a read clears. Neither is written, so no interrupt
+ * is enabled and the state is polled for the change event. The chip does
+ * not tell a USB port from an adapter at its input (ACINSTAT is the level
+ * of the ACIN current-mode pin), so the supply type is fixed.
+ */
+struct act8931_charger {
+	struct regmap *regmap;
+	struct power_supply *psy;
+	struct delayed_work poll;
+	unsigned int status;	/* INDAT and CHGDAT of the last poll */
+	unsigned int state;	/* CSTATE of the last poll */
+};
+
+static int act8931_charger_read(struct act8931_charger *chg,
+				unsigned int *status, unsigned int *state)
+{
+	int ret;
+
+	ret = regmap_read(chg->regmap, ACT8931_APCH_STATUS, status);
+	if (ret)
+		return ret;
+	ret = regmap_read(chg->regmap, ACT8931_APCH_STATE, state);
+	if (ret)
+		return ret;
+
+	*status &= ACT8931_APCH_INDAT | ACT8931_APCH_CHGDAT;
+	*state &= ACT8931_CSTATE_MASK;
+	return 0;
+}
+
+static int act8931_charger_status(unsigned int status, unsigned int state)
+{
+	switch (FIELD_GET(ACT8931_CSTATE_MASK, state)) {
+	case ACT8931_CSTATE_PRE:
+	case ACT8931_CSTATE_FAST:
+		return POWER_SUPPLY_STATUS_CHARGING;
+	case ACT8931_CSTATE_EOC:
+		if (status & ACT8931_APCH_CHGDAT)
+			return POWER_SUPPLY_STATUS_FULL;
+		return POWER_SUPPLY_STATUS_NOT_CHARGING;
+	default:	/* suspended, disabled or fault */
+		if (status & ACT8931_APCH_INDAT)
+			return POWER_SUPPLY_STATUS_NOT_CHARGING;
+		return POWER_SUPPLY_STATUS_DISCHARGING;
+	}
+}
+
+static int act8931_charger_type(unsigned int state)
+{
+	switch (FIELD_GET(ACT8931_CSTATE_MASK, state)) {
+	case ACT8931_CSTATE_PRE:
+		return POWER_SUPPLY_CHARGE_TYPE_TRICKLE;
+	case ACT8931_CSTATE_FAST:
+		return POWER_SUPPLY_CHARGE_TYPE_FAST;
+	default:
+		return POWER_SUPPLY_CHARGE_TYPE_NONE;
+	}
+}
+
+static int act8931_charger_get_property(struct power_supply *psy,
+					enum power_supply_property psp,
+					union power_supply_propval *val)
+{
+	struct act8931_charger *chg = power_supply_get_drvdata(psy);
+	unsigned int status, state;
+	int ret;
+
+	ret = act8931_charger_read(chg, &status, &state);
+	if (ret)
+		return ret;
+
+	switch (psp) {
+	case POWER_SUPPLY_PROP_ONLINE:
+		val->intval = !!(status & ACT8931_APCH_INDAT);
+		break;
+	case POWER_SUPPLY_PROP_STATUS:
+		val->intval = act8931_charger_status(status, state);
+		break;
+	case POWER_SUPPLY_PROP_CHARGE_TYPE:
+		val->intval = act8931_charger_type(state);
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static const enum power_supply_property act8931_charger_properties[] = {
+	POWER_SUPPLY_PROP_ONLINE,
+	POWER_SUPPLY_PROP_STATUS,
+	POWER_SUPPLY_PROP_CHARGE_TYPE,
+};
+
+static const struct power_supply_desc act8931_charger_desc = {
+	.name = "act8931-charger",
+	.type = POWER_SUPPLY_TYPE_USB,
+	.properties = act8931_charger_properties,
+	.num_properties = ARRAY_SIZE(act8931_charger_properties),
+	.get_property = act8931_charger_get_property,
+};
+
+static void act8931_charger_poll(struct work_struct *work)
+{
+	struct act8931_charger *chg = container_of(to_delayed_work(work),
+						   struct act8931_charger, poll);
+	unsigned int status, state;
+
+	if (!act8931_charger_read(chg, &status, &state) &&
+	    (status != chg->status || state != chg->state)) {
+		chg->status = status;
+		chg->state = state;
+		power_supply_changed(chg->psy);
+	}
+
+	queue_delayed_work(system_freezable_power_efficient_wq, &chg->poll,
+			   msecs_to_jiffies(ACT8931_CHARGER_POLL_MS));
+}
+
+/*
+ * A failure releases what the charger got so far (devres group); the
+ * caller keeps the outputs.
+ */
+static int act8931_charger_probe(struct device *dev, struct regmap *regmap)
+{
+	struct power_supply_config cfg = { .fwnode = dev_fwnode(dev) };
+	struct act8931_charger *chg;
+	int ret;
+
+	if (!devres_open_group(dev, act8931_charger_probe, GFP_KERNEL))
+		return -ENOMEM;
+
+	chg = devm_kzalloc(dev, sizeof(*chg), GFP_KERNEL);
+	if (!chg) {
+		ret = -ENOMEM;
+		goto err;
+	}
+
+	chg->regmap = regmap;
+	ret = act8931_charger_read(chg, &chg->status, &chg->state);
+	if (ret)
+		goto err;
+
+	cfg.drv_data = chg;
+	chg->psy = devm_power_supply_register(dev, &act8931_charger_desc, &cfg);
+	if (IS_ERR(chg->psy)) {
+		ret = PTR_ERR(chg->psy);
+		goto err;
+	}
+
+	/* after the power supply: the work is cancelled before it goes */
+	ret = devm_delayed_work_autocancel(dev, &chg->poll,
+					   act8931_charger_poll);
+	if (ret)
+		goto err;
+
+	devres_close_group(dev, act8931_charger_probe);
+	queue_delayed_work(system_freezable_power_efficient_wq, &chg->poll,
+			   msecs_to_jiffies(ACT8931_CHARGER_POLL_MS));
+	return 0;
+
+err:
+	devres_release_group(dev, act8931_charger_probe);
+	return ret;
+}
+
 static int act8865_pmic_probe(struct i2c_client *client)
 {
 	const struct i2c_device_id *i2c_id = i2c_client_get_device_id(client);
@@ -1063,6 +1243,16 @@ static int act8865_pmic_probe(struct i2c_client *client)
 				dev_err(dev, "Failed to probe charger");
 			return ret;
 		}
+	}
+
+	/*
+	 * The outputs are registered and may have consumers already, so a
+	 * charger that fails is reported and left out; the outputs stay.
+	 */
+	if (type == ACT8931) {
+		ret = act8931_charger_probe(dev, act8865->regmap);
+		if (ret)
+			dev_warn(dev, "Failed to probe charger: %d\n", ret);
 	}
 
 	i2c_set_clientdata(client, act8865);

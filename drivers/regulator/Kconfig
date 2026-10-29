@@ -103,8 +103,10 @@ config REGULATOR_ACT8865
 	depends on POWER_SUPPLY
 	select REGMAP_I2C
 	help
-	  This driver controls a active-semi act8865 voltage output
-	  regulator via I2C bus.
+	  This driver controls the voltage outputs of the active-semi
+	  ACT8600, ACT8846, ACT8865 and ACT8931 PMICs via I2C bus. For the
+	  ACT8600 and the ACT8931 it also reports the charger state as a
+	  power supply.
 
 config REGULATOR_ACT8931
 	tristate "Active-semi ACT8931 regulators and charger state"

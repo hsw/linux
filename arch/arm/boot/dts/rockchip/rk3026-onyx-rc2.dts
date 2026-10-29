@@ -16,12 +16,10 @@
  * Deliberately left out until each part is checked on the board:
  *  - the eMMC (0x1021c000) and the NAND controller (0x10500000): the NFC pads
  *    are the eMMC data lines on this board. Both nodes are deleted;
- *  - control of the ACT8931 (i2c0 0x5b) beyond the CPU supply: its other
- *    rails are described as fixed regulators at the voltages the chip
- *    holds, and its node in rk3026-onyx-rc2-sys.dtsi pins every output but
- *    DCDC3 at that voltage (a module loaded after /init). The one ACT8931
- *    write the panel needs, LDO4 (the panel logic rail, off at power-on)
- *    on, comes from /init before the EBC driver is loaded;
+ *  - consumers of the ACT8931 (i2c0 0x5b) outputs other than the CPU
+ *    supply: those rails are described as fixed regulators at the voltages
+ *    the chip holds. What the PMIC node (rk3026-onyx-rc2-sys.dtsi; a module
+ *    loaded after /init) keeps on and changes is in its comment;
  *  - audio, Bluetooth;
  *
  * The panel: the EBC with the stock ED060 1448x1072 timings and the TPS65185
@@ -174,12 +172,13 @@
 
 	/*
 	 * ACT8931 rails, as fixed regulators at the selectors the chip holds
-	 * (VSET2 bank, read on this board). DCDC3 (vdd_arm) is the PMIC
-	 * node's, in rk3026-onyx-rc2-sys.dtsi.
+	 * (VSET2 bank, read on this board), for the consumers until they take
+	 * the PMIC node's outputs (rk3026-onyx-rc2-sys.dtsi), which carry the
+	 * rail names. DCDC3 (vdd_arm) is only the PMIC node's.
 	 */
 	vcc_io: regulator-vcc-io {
 		compatible = "regulator-fixed";
-		regulator-name = "vcc_io";		/* DCDC1 */
+		regulator-name = "vcc_io_fixed";		/* DCDC1 */
 		regulator-min-microvolt = <3400000>;
 		regulator-max-microvolt = <3400000>;
 		regulator-always-on;
@@ -188,7 +187,7 @@
 
 	vcc_ddr: regulator-vcc-ddr {
 		compatible = "regulator-fixed";
-		regulator-name = "vcc_ddr";		/* DCDC2 */
+		regulator-name = "vcc_ddr_fixed";		/* DCDC2 */
 		regulator-min-microvolt = <1350000>;
 		regulator-max-microvolt = <1350000>;
 		regulator-always-on;
@@ -197,7 +196,7 @@
 
 	vcc_tp: regulator-vcc-tp {
 		compatible = "regulator-fixed";
-		regulator-name = "vcc_tp";		/* LDO1, touch */
+		regulator-name = "vcc_tp_fixed";		/* LDO1, touch */
 		regulator-min-microvolt = <3100000>;
 		regulator-max-microvolt = <3100000>;
 		regulator-always-on;
@@ -219,7 +218,7 @@
 
 	vcc_sd: regulator-vcc-sd {
 		compatible = "regulator-fixed";
-		regulator-name = "vcc_sd";		/* LDO3, microSD */
+		regulator-name = "vcc_sd_fixed";		/* LDO3, microSD */
 		regulator-min-microvolt = <3100000>;
 		regulator-max-microvolt = <3100000>;
 		regulator-always-on;

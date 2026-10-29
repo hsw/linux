@@ -144,6 +144,28 @@
 		};
 	};
 
+	gpu_opp_table: opp-table-1 {
+		compatible = "operating-points-v2";
+
+		/*
+		 * The vendor's GPU levels, 200, 266 and 400 MHz nominal, as
+		 * the 768 MHz GPLL divides them. No voltages: the vendor runs
+		 * every GPU level at one logic rail voltage, which belongs to
+		 * the board's regulator.
+		 */
+		opp-192000000 {
+			opp-hz = /bits/ 64 <192000000>;
+		};
+
+		opp-256000000 {
+			opp-hz = /bits/ 64 <256000000>;
+		};
+
+		opp-384000000 {
+			opp-hz = /bits/ 64 <384000000>;
+		};
+	};
+
 	arm-pmu {
 		compatible = "arm,cortex-a9-pmu";
 		interrupts = <GIC_SPI 86 IRQ_TYPE_LEVEL_HIGH>,
@@ -710,6 +732,14 @@
 				  "ppmmu1";
 		clocks = <&cru ACLK_GPU>, <&cru ACLK_GPU>;
 		clock-names = "bus", "core";
+		/*
+		 * GPLL is set to 768 MHz above and divides to every OPP rate;
+		 * the CPLL rate depends on the board and the loader.
+		 */
+		assigned-clocks = <&cru ACLK_GPU>;
+		assigned-clock-parents = <&cru PLL_GPLL>;
+		assigned-clock-rates = <192000000>;
+		operating-points-v2 = <&gpu_opp_table>;
 		resets = <&cru SRST_GPU>;
 		status = "disabled";
 	};

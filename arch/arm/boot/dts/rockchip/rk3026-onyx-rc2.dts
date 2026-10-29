@@ -403,6 +403,7 @@
 		vdd-supply = <&vcc_tp>;
 		touchscreen-swapped-x-y;
 		touchscreen-inverted-x;
+		wakeup-source;
 	};
 };
 

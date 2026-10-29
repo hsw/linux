@@ -21,6 +21,9 @@ description: |
   charger status registers, without the suspend set-point registers of
   those parts. The charge current is set by pins (ISET, CHGLEV, ACIN).
 
+  The charger has no child node: a device that uses its state, such as a
+  fuel gauge listing it in power-supplies, refers to the PMIC node.
+
 properties:
   compatible:
     const: active-semi,act8931
@@ -107,19 +110,20 @@ examples:
           DCDC_REG1 {
             regulator-min-microvolt = <3400000>;
             regulator-max-microvolt = <3500000>;
+            regulator-always-on;
           };
 
           DCDC_REG3 {
-            regulator-min-microvolt = <1400000>;
+            regulator-min-microvolt = <950000>;
             regulator-max-microvolt = <1400000>;
+            regulator-ramp-delay = <500>;
             regulator-always-on;
+            regulator-boot-on;
           };
 
           LDO_REG4 {
             regulator-min-microvolt = <3100000>;
             regulator-max-microvolt = <3100000>;
-            regulator-always-on;
-            regulator-boot-on;
           };
         };
       };

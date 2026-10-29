@@ -1846,13 +1846,12 @@ static int dw_mci_data_complete(struct dw_mci *host, struct mmc_data *data)
 	return data->error;
 }
 
-static void dw_mci_set_drto(struct dw_mci *host)
+static unsigned int dw_mci_get_drto_ms(struct dw_mci *host)
 {
 	const struct dw_mci_drv_data *drv_data = host->drv_data;
 	unsigned int drto_clks;
 	unsigned int drto_div;
 	unsigned int drto_ms;
-	unsigned long irqflags;
 
 	if (drv_data && drv_data->get_drto_clks)
 		drto_clks = drv_data->get_drto_clks(host);
@@ -1868,12 +1867,22 @@ static void dw_mci_set_drto(struct dw_mci *host)
 	dev_dbg(host->dev, "drto_ms: %u\n", drto_ms);
 
 	/* add a bit spare time */
-	drto_ms += 10;
+	return drto_ms + 10;
+}
+
+static void dw_mci_set_drto(struct dw_mci *host)
+{
+	unsigned int drto_ms = dw_mci_get_drto_ms(host);
+	struct mmc_data *data;
+	unsigned long irqflags;
 
 	spin_lock_irqsave(&host->irq_lock, irqflags);
-	if (!test_bit(EVENT_DATA_COMPLETE, &host->pending_events))
+	if (!test_bit(EVENT_DATA_COMPLETE, &host->pending_events)) {
+		data = READ_ONCE(host->data);
+		host->dto_xfered = data ? data->bytes_xfered : 0;
 		mod_timer(&host->dto_timer,
 			  jiffies + msecs_to_jiffies(drto_ms));
+	}
 	spin_unlock_irqrestore(&host->irq_lock, irqflags);
 }
 
@@ -3066,6 +3075,7 @@ exit:
 static void dw_mci_dto_timer(struct timer_list *t)
 {
 	struct dw_mci *host = timer_container_of(host, t, dto_timer);
+	struct mmc_data *data;
 	unsigned long irqflags;
 	u32 pending;
 
@@ -3094,6 +3104,24 @@ static void dw_mci_dto_timer(struct timer_list *t)
 	switch (host->state) {
 	case STATE_SENDING_DATA:
 	case STATE_DATA_BUSY:
+		/*
+		 * The budget is the card's data read timeout, which the
+		 * controller applies to each block, but the timer covers the
+		 * whole read. In PIO mode the controller stops the card clock
+		 * while its FIFO is full, so slow interrupt handling stretches
+		 * a multi-block read past one budget although no block is
+		 * late. Allow another budget as long as the driver keeps
+		 * draining data. DMA modes update bytes_xfered only at the
+		 * end, so for them nothing changes.
+		 */
+		data = READ_ONCE(host->data);
+		if (data && data->bytes_xfered != host->dto_xfered) {
+			host->dto_xfered = data->bytes_xfered;
+			mod_timer(&host->dto_timer, jiffies +
+				  msecs_to_jiffies(dw_mci_get_drto_ms(host)));
+			break;
+		}
+
 		/*
 		 * If DTO interrupt does NOT come in sending data state,
 		 * we should notify the driver to terminate current transfer

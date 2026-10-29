@@ -7,6 +7,7 @@
  * Copyright (C) 2013 Atmel Corporation
  */
 
+#include <linux/bitfield.h>
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/i2c.h>
@@ -119,12 +120,29 @@
 #define	ACT8865_MSTROFF		0x20
 
 /*
+ * ACT8931 Global Register Map: the ACT8865 output registers (without
+ * 0x0b and the *_SUS registers) and the charger registers.
+ */
+#define	ACT8931_APCH_STATUS	0x78
+#define	ACT8931_APCH_STATE	0x7a
+
+/*
  * Field Definitions.
  */
 #define	ACT8865_ENA		0x80	/* ON - [7] */
 #define	ACT8865_DIS		0x40	/* DIS - [6] */
 
 #define	ACT8865_VSEL_MASK	0x3F	/* VSET - [5:0] */
+
+#define	ACT8931_CTRL_DELAY	GENMASK(4, 2)	/* turn-on delay */
+#define	ACT8931_CTRL_OK		BIT(0)		/* power good */
+
+/*
+ * ACT8931 soft-start, typical: 400 us for a DC/DC converter, 140 us for
+ * an LDO at 2.9 V. The longer one is used for an enable and a voltage
+ * raise; no slew rate is given for a VSET change.
+ */
+#define	ACT8931_SOFTSTART_US	400
 
 
 #define ACT8600_LDO10_ENA		0x40	/* ON - [6] */
@@ -213,6 +231,59 @@ static const struct regmap_config act8600_regmap_config = {
 	.wr_table = &act8600_write_ranges_table,
 	.rd_table = &act8600_read_ranges_table,
 	.volatile_table = &act8600_volatile_ranges_table,
+};
+
+static const struct regmap_range act8931_reg_ranges[] = {
+	regmap_reg_range(0x00, 0x01),
+	regmap_reg_range(0x20, 0x22),
+	regmap_reg_range(0x30, 0x32),
+	regmap_reg_range(0x40, 0x42),
+	regmap_reg_range(0x50, 0x51),
+	regmap_reg_range(0x54, 0x55),
+	regmap_reg_range(0x60, 0x61),
+	regmap_reg_range(0x64, 0x65),
+	regmap_reg_range(0x70, 0x71),
+	regmap_reg_range(0x78, 0x7A),
+};
+
+/* Only the output registers: VSET1, VSET2, VSET and CTRL */
+static const struct regmap_range act8931_reg_wr_ranges[] = {
+	regmap_reg_range(0x20, 0x22),
+	regmap_reg_range(0x30, 0x32),
+	regmap_reg_range(0x40, 0x42),
+	regmap_reg_range(0x50, 0x51),
+	regmap_reg_range(0x54, 0x55),
+	regmap_reg_range(0x60, 0x61),
+	regmap_reg_range(0x64, 0x65),
+};
+
+/* Bits 7:4 of APCH 0x78 report the charger interrupts and clear on read */
+static const struct regmap_range act8931_reg_precious_ranges[] = {
+	regmap_reg_range(ACT8931_APCH_STATUS, ACT8931_APCH_STATUS),
+};
+
+static const struct regmap_access_table act8931_read_ranges_table = {
+	.yes_ranges	= act8931_reg_ranges,
+	.n_yes_ranges	= ARRAY_SIZE(act8931_reg_ranges),
+};
+
+static const struct regmap_access_table act8931_write_ranges_table = {
+	.yes_ranges	= act8931_reg_wr_ranges,
+	.n_yes_ranges	= ARRAY_SIZE(act8931_reg_wr_ranges),
+};
+
+static const struct regmap_access_table act8931_precious_ranges_table = {
+	.yes_ranges	= act8931_reg_precious_ranges,
+	.n_yes_ranges	= ARRAY_SIZE(act8931_reg_precious_ranges),
+};
+
+static const struct regmap_config act8931_regmap_config = {
+	.reg_bits = 8,
+	.val_bits = 8,
+	.max_register = ACT8931_APCH_STATE,
+	.wr_table = &act8931_write_ranges_table,
+	.rd_table = &act8931_read_ranges_table,
+	.precious_table = &act8931_precious_ranges_table,
 };
 
 static const struct regmap_config act8865_regmap_config = {
@@ -434,6 +505,197 @@ static const struct regulator_ops act8865_fixed_ldo_ops = {
 	.is_enabled		= regulator_is_enabled_regmap,
 };
 
+/*
+ * The ACT8931 ON bit is edge-triggered: an output follows the last rising
+ * or falling edge written to ON, and ON reads back that edge, not the
+ * output state. OK (power good) is set while the output is in regulation;
+ * an LDO that is off may read OK set. An output is on with ON and OK;
+ * is_enabled of a DC/DC reads ON alone (act8931_ops).
+ */
+static bool act8931_ctrl_enabled(unsigned int ctrl)
+{
+	return (ctrl & ACT8865_ENA) && (ctrl & ACT8931_CTRL_OK);
+}
+
+/*
+ * The turn-on delay set in CTRL (DELAY n > 0: 2^n ms, up to 12% longer)
+ * plus the soft-start
+ */
+static unsigned int act8931_turn_on_us(unsigned int ctrl)
+{
+	unsigned int delay = FIELD_GET(ACT8931_CTRL_DELAY, ctrl);
+
+	return ACT8931_SOFTSTART_US + (delay ? (1000U << delay) * 112 / 100 : 0);
+}
+
+/*
+ * LDOs: ON without OK counts as off. Such an LDO is out of regulation, or
+ * ramps inside an enable (which holds the regulator lock); while it reads
+ * so, a voltage change skips the ramp wait, the max-step stepping and the
+ * coupling balance.
+ */
+static int act8931_is_enabled(struct regulator_dev *rdev)
+{
+	unsigned int ctrl;
+	int ret;
+
+	ret = regmap_read(rdev->regmap, rdev->desc->enable_reg, &ctrl);
+	if (ret)
+		return ret;
+	return act8931_ctrl_enabled(ctrl);
+}
+
+/* ON with OK is on, ON without OK is out of regulation */
+static int act8931_get_status(struct regulator_dev *rdev)
+{
+	unsigned int ctrl;
+	int ret;
+
+	ret = regmap_read(rdev->regmap, rdev->desc->enable_reg, &ctrl);
+	if (ret)
+		return ret;
+	if (!(ctrl & ACT8865_ENA))
+		return REGULATOR_STATUS_OFF;
+	if (!(ctrl & ACT8931_CTRL_OK))
+		return REGULATOR_STATUS_ERROR;
+	return REGULATOR_STATUS_ON;
+}
+
+/*
+ * The core enables without a wait when this fails, and the enable reads
+ * CTRL again: a failed read gives the longest turn-on time instead.
+ */
+static int act8931_enable_time(struct regulator_dev *rdev)
+{
+	unsigned int ctrl;
+
+	if (regmap_read(rdev->regmap, rdev->desc->enable_reg, &ctrl))
+		ctrl = ACT8931_CTRL_DELAY;
+	return act8931_turn_on_us(ctrl);
+}
+
+/*
+ * Enable: ON 0 then ON 1 from the value read back, the datasheet's
+ * sequence; nothing is written when the output is on already. An output
+ * that is ON without power good after its turn-on time is never toggled:
+ * the falling edge would cut a load that may still run from it.
+ */
+static int act8931_enable(struct regulator_dev *rdev)
+{
+	struct regmap *regmap = rdev->regmap;
+	unsigned int reg = rdev->desc->enable_reg;
+	unsigned int ctrl;
+	int ret;
+
+	ret = regmap_read(regmap, reg, &ctrl);
+	if (ret)
+		return ret;
+	/* ON without power good may still be ramping up: wait, read again */
+	if ((ctrl & ACT8865_ENA) && !(ctrl & ACT8931_CTRL_OK)) {
+		fsleep(act8931_turn_on_us(ctrl));
+		ret = regmap_read(regmap, reg, &ctrl);
+		if (ret)
+			return ret;
+	}
+	if (act8931_ctrl_enabled(ctrl))
+		return 0;
+	if (ctrl & ACT8865_ENA) {
+		dev_err(rdev_get_dev(rdev)->parent,
+			"%s: ON without power good (CTRL 0x%02x): not toggled\n",
+			rdev->desc->name, ctrl);
+		return -EIO;
+	}
+
+	ret = regmap_write(regmap, reg, ctrl & ~ACT8865_ENA);
+	if (ret)
+		return ret;
+	return regmap_write(regmap, reg, ctrl | ACT8865_ENA);
+}
+
+/*
+ * Disable: ON 1 then ON 0. Nothing is written when ON reads 0: an output
+ * kept on by the power-up sequence with ON at 0 cannot be told from one
+ * that is off.
+ */
+static int act8931_disable(struct regulator_dev *rdev)
+{
+	struct regmap *regmap = rdev->regmap;
+	unsigned int reg = rdev->desc->enable_reg;
+	unsigned int ctrl;
+	int ret;
+
+	ret = regmap_read(regmap, reg, &ctrl);
+	if (ret)
+		return ret;
+	if (!(ctrl & ACT8865_ENA))
+		return 0;
+
+	ret = regmap_write(regmap, reg, ctrl | ACT8865_ENA);
+	if (ret)
+		return ret;
+	return regmap_write(regmap, reg, ctrl & ~ACT8865_ENA);
+}
+
+/*
+ * The core calls this instead of its own delay: return that delay, and at
+ * least the soft-start time for a raise.
+ */
+static int act8931_set_voltage_time_sel(struct regulator_dev *rdev,
+					unsigned int old_sel,
+					unsigned int new_sel)
+{
+	int us = regulator_set_voltage_time_sel(rdev, old_sel, new_sel);
+
+	if (us < 0 || new_sel <= old_sel)
+		return us;
+	return max(us, ACT8931_SOFTSTART_US);
+}
+
+/*
+ * The ACT8931 has no suspend registers. The DC/DC converters get no
+ * disable op: they supply the SoC, and a falling edge on their ON bit
+ * would cut the system it runs on. They are on with ON alone, OK goes
+ * to get_status: the core must not count a live CPU or memory rail off
+ * when OK drops for a moment, or it skips the voltage-change wait, the
+ * max-step stepping and the coupling balance. A DC/DC left on by firmware
+ * with ON at 0 counts off, with the same skips, until its first enable;
+ * with regulator-always-on the core makes that enable at registration.
+ *
+ * No shutdown hook puts DCDC3, the CPU rail of the RK3026 reference
+ * design, back to its boot voltage. A SoC reset leaves the chip as it
+ * is: after a warm reboot DCDC3 is at the last DVFS level, and the boot
+ * loader must set the voltage it needs itself.
+ */
+static const struct regulator_ops act8931_ops = {
+	.list_voltage		= regulator_list_voltage_linear_range,
+	.map_voltage		= regulator_map_voltage_linear_range,
+	.get_voltage_sel	= regulator_get_voltage_sel_regmap,
+	.set_voltage_sel	= regulator_set_voltage_sel_regmap,
+	.set_voltage_time_sel	= act8931_set_voltage_time_sel,
+	.enable			= act8931_enable,
+	.is_enabled		= regulator_is_enabled_regmap,
+	.enable_time		= act8931_enable_time,
+	.get_status		= act8931_get_status,
+	.set_mode		= act8865_set_mode,
+	.get_mode		= act8865_get_mode,
+};
+
+static const struct regulator_ops act8931_ldo_ops = {
+	.list_voltage		= regulator_list_voltage_linear_range,
+	.map_voltage		= regulator_map_voltage_linear_range,
+	.get_voltage_sel	= regulator_get_voltage_sel_regmap,
+	.set_voltage_sel	= regulator_set_voltage_sel_regmap,
+	.set_voltage_time_sel	= act8931_set_voltage_time_sel,
+	.enable			= act8931_enable,
+	.disable		= act8931_disable,
+	.is_enabled		= act8931_is_enabled,
+	.enable_time		= act8931_enable_time,
+	.get_status		= act8931_get_status,
+	.set_mode		= act8865_set_mode,
+	.get_mode		= act8865_get_mode,
+	.set_pull_down		= regulator_set_pull_down_regmap,
+};
+
 #define ACT88xx_REG_(_name, _family, _id, _vsel_reg, _supply, _ops)	\
 	[_family##_ID_##_id] = {					\
 		.name			= _name,			\
@@ -549,11 +811,32 @@ static const struct regulator_desc act8865_alt_regulators[] = {
 	ACT88xx_LDO("LDO_REG4", ACT8865, LDO4, VSET, "inl67"),
 };
 
+static const struct regulator_desc act8931_regulators[] = {
+	ACT88xx_REG_("DCDC_REG1", ACT8865, DCDC1, VSET1, "vp1", &act8931_ops),
+	ACT88xx_REG_("DCDC_REG2", ACT8865, DCDC2, VSET1, "vp2", &act8931_ops),
+	ACT88xx_REG_("DCDC_REG3", ACT8865, DCDC3, VSET1, "vp3", &act8931_ops),
+	ACT88xx_REG_("LDO_REG1", ACT8865, LDO1, VSET, "inl", &act8931_ldo_ops),
+	ACT88xx_REG_("LDO_REG2", ACT8865, LDO2, VSET, "inl", &act8931_ldo_ops),
+	ACT88xx_REG_("LDO_REG3", ACT8865, LDO3, VSET, "inl", &act8931_ldo_ops),
+	ACT88xx_REG_("LDO_REG4", ACT8865, LDO4, VSET, "inl", &act8931_ldo_ops),
+};
+
+static const struct regulator_desc act8931_alt_regulators[] = {
+	ACT88xx_REG_("DCDC_REG1", ACT8865, DCDC1, VSET2, "vp1", &act8931_ops),
+	ACT88xx_REG_("DCDC_REG2", ACT8865, DCDC2, VSET2, "vp2", &act8931_ops),
+	ACT88xx_REG_("DCDC_REG3", ACT8865, DCDC3, VSET2, "vp3", &act8931_ops),
+	ACT88xx_REG_("LDO_REG1", ACT8865, LDO1, VSET, "inl", &act8931_ldo_ops),
+	ACT88xx_REG_("LDO_REG2", ACT8865, LDO2, VSET, "inl", &act8931_ldo_ops),
+	ACT88xx_REG_("LDO_REG3", ACT8865, LDO3, VSET, "inl", &act8931_ldo_ops),
+	ACT88xx_REG_("LDO_REG4", ACT8865, LDO4, VSET, "inl", &act8931_ldo_ops),
+};
+
 #ifdef CONFIG_OF
 static const struct of_device_id act8865_dt_ids[] = {
 	{ .compatible = "active-semi,act8600", .data = (void *)ACT8600 },
 	{ .compatible = "active-semi,act8846", .data = (void *)ACT8846 },
 	{ .compatible = "active-semi,act8865", .data = (void *)ACT8865 },
+	{ .compatible = "active-semi,act8931", .data = (void *)ACT8931 },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, act8865_dt_ids);
@@ -706,6 +989,19 @@ static int act8865_pmic_probe(struct i2c_client *client)
 		off_reg = ACT8865_SYS_CTRL;
 		off_mask = ACT8865_MSTROFF;
 		break;
+	case ACT8931:
+		if (voltage_select) {
+			regulators = act8931_alt_regulators;
+			num_regulators = ARRAY_SIZE(act8931_alt_regulators);
+		} else {
+			regulators = act8931_regulators;
+			num_regulators = ARRAY_SIZE(act8931_regulators);
+		}
+		regmap_config = &act8931_regmap_config;
+		/* MSTROFF is in SYS 0x01, which the regmap does not write */
+		off_reg = -1;
+		off_mask = -1;
+		break;
 	default:
 		dev_err(dev, "invalid device id %lu\n", type);
 		return -EINVAL;
@@ -780,6 +1076,7 @@ static const struct i2c_device_id act8865_ids[] = {
 	{ .name = "act8600", .driver_data = ACT8600 },
 	{ .name = "act8846", .driver_data = ACT8846 },
 	{ .name = "act8865", .driver_data = ACT8865 },
+	{ .name = "act8931", .driver_data = ACT8931 },
 	{ },
 };
 MODULE_DEVICE_TABLE(i2c, act8865_ids);

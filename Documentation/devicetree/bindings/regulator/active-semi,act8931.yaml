@@ -20,6 +20,12 @@ description: |
   The register map is the ACT8865's regulator part plus the ACT8945A's
   charger status registers, without the suspend set-point registers of
   those parts. The charge current is set by pins (ISET, CHGLEV, ACIN).
+  The charger has no node of its own: a fuel gauge or battery node that
+  takes the charger as its supply names the PMIC node in its
+  power-supplies property.
+
+  regulator-initial-mode and regulator-allowed-modes take the values of
+  dt-bindings/regulator/active-semi,8865-regulator.h, as for the ACT8865.
 
 properties:
   compatible:
@@ -89,6 +95,7 @@ properties:
 required:
   - compatible
   - reg
+  - regulators
 
 additionalProperties: false
 

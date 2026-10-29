@@ -122,6 +122,7 @@ struct dw_mci_dma_slave {
  * @cmd11_timer: Timer for SD3.0 voltage switch over scheme.
  * @cto_timer: Timer for broken command transfer over scheme.
  * @dto_timer: Timer for broken data transfer over scheme.
+ * @dto_xfered: data->bytes_xfered when @dto_timer was last armed.
  * @mmc: The mmc_host representing this dw_mci.
  * @flags: Random state bits associated with the host.
  * @ctype: Card type for this host.
@@ -234,6 +235,7 @@ struct dw_mci {
 	struct timer_list       cmd11_timer;
 	struct timer_list       cto_timer;
 	struct timer_list       dto_timer;
+	unsigned int		dto_xfered;
 
 #ifdef CONFIG_FAULT_INJECTION
 	struct fault_attr	fail_data_crc;

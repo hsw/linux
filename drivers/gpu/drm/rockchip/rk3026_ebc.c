@@ -1411,6 +1411,11 @@ static enum rk3026_ebc_repair_due ebc_repair_by(struct rk3026_ebc *ebc,
  *     then, and @prev_virt follows.
  *
  * The part is the carry alone at its retry (rk3026_ebc_retry_ready()).
+ *
+ * While the system suspends (@suspended) nothing is taken: at step 1, or
+ * at step 2 when the suspend began while the rails came up. From the take
+ * to the finish of step 4 the part is @in_flight, which the suspend waits
+ * for, so a waveform is never cut short by it.
  */
 VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 					    struct rk3026_ebc_last *last)
@@ -1432,7 +1437,7 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 	int rails = 0, rails_err;
 
 	mutex_lock(&ebc->image_lock);
-	if (!rk3026_ebc_pending_peek(&ebc->pending, &part)) {
+	if (ebc->suspended || !rk3026_ebc_pending_peek(&ebc->pending, &part)) {
 		mutex_unlock(&ebc->image_lock);
 		return;
 	}
@@ -1463,9 +1468,20 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 			temp = rk3026_ebc_read_temp(ebc);
 			mutex_lock(&ebc->image_lock);
 		}
+		/*
+		 * A suspend that began while the rails came up: the part stays
+		 * pending, with its carry and retry as they were, and is taken
+		 * after the resume. The suspend takes the rails down.
+		 */
+		if (ebc->suspended) {
+			mutex_unlock(&ebc->image_lock);
+			return;
+		}
 	}
 	tries = rk3026_ebc_retry_try(&ebc->pending);
 	rk3026_ebc_pending_take(&ebc->pending, &part);
+	/* Until the finish below; a suspend waits for it (ebc_suspend()). */
+	WRITE_ONCE(ebc->in_flight, true);
 
 	/*
 	 * Taken while @pre_split, the part is the @pending.pre a RESET was sent
@@ -1527,7 +1543,8 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 	 * (rk3026_ebc_resolve_mode()): a PART drive would not clear the mark
 	 * (rk3026_ebc_drive()); without a FULL either, as it is
 	 * (ebc_repair_by()). Such a part was prepared: the look drives every
-	 * part while @prev_unknown is set, and only this thread changes it.
+	 * part while @prev_unknown is set, and while this thread runs only it
+	 * changes it (a hibernation restore sets it with the thread parked).
 	 */
 	if (sh->prev_unknown && part.mode != EBC_MODE_RESET)
 		repair = ebc_repair_by(ebc, temp);
@@ -1756,6 +1773,7 @@ finish:
 	}
 	/* The cap of the next take's gap counts from here at the earliest. */
 	ebc->take_done = rk3026_ebc_clock(ebc);
+	WRITE_ONCE(ebc->in_flight, false);
 	ebc_publish(ebc, last, start);
 	trace_rk3026_ebc_part_done(last, ebc->du_area);
 	mutex_unlock(&ebc->image_lock);
@@ -1764,7 +1782,8 @@ finish:
 	 * @pending.done_seq moved over the part -- driven, skipped, dropped
 	 * with the CRTC off, a carry given up -- so every wait on one of its
 	 * updates ends here; a carry armed for a retry holds it (a wake-up
-	 * then finds the wait's condition false and sleeps again).
+	 * then finds the wait's condition false and sleeps again). A suspend
+	 * waiting for the part in flight is woken here too.
 	 */
 	wake_up_all(&ebc->marker_wq);
 
@@ -1937,8 +1956,9 @@ static void ebc_gap_close(struct rk3026_ebc *ebc, ktime_t now)
  *
  * Every look records the newest seq in @gap.seen, for the thread's wait
  * (rk3026_ebc_gap_woken()). The gap ends at its deadline, when the part
- * becomes exempt or the gap is switched off, or when the CRTC goes off
- * (rk3026_ebc_crtc_off()); its length is the next part's @gap_us.
+ * becomes exempt or the gap is switched off, when the CRTC goes off
+ * (rk3026_ebc_crtc_off()), or when the system suspends; its length is the
+ * next part's @gap_us.
  *
  * Return: true to take the next part now; false while the gap is open,
  * which ends at @gap.at unless a newer update moves it.
@@ -1952,6 +1972,9 @@ VISIBLE_IF_KUNIT bool rk3026_ebc_take_ready(struct rk3026_ebc *ebc,
 	bool raise = false;
 
 	mutex_lock(&ebc->image_lock);
+	/* Suspending: the gap ends, and rk3026_ebc_do_refresh() takes nothing. */
+	if (ebc->suspended)
+		goto take;
 	rk3026_ebc_retry_ready(&ebc->pending, now, ebc->crtc_on);
 	gap->seen = ebc->pending.queued_seq;
 	if (!rk3026_ebc_pending_peek(&ebc->pending, &part) || !ebc->crtc_on)
@@ -1992,7 +2015,8 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_take_ready);
  * the carry's retry at the latest (rk3026_ebc_take_wait()). The gap is a
  * few ms, so the wait runs on an hrtimer, not on jiffies. A gap whose end
  * passed while the rails came up is not waited for
- * (rk3026_ebc_gap_timeout()): the next look takes the part.
+ * (rk3026_ebc_gap_timeout()): the next look takes the part. A park ends
+ * the wait (ebc_suspend()); the gap stays open across it.
  */
 static void ebc_gap_wait(struct rk3026_ebc *ebc)
 {
@@ -2005,7 +2029,8 @@ static void ebc_gap_wait(struct rk3026_ebc *ebc)
 					   rk3026_ebc_gap_woken(&ebc->pending,
 								gap->seen,
 								READ_ONCE(ebc->crtc_on)) ||
-					   kthread_should_stop(),
+					   kthread_should_stop() ||
+					   kthread_should_park(),
 					   left);
 }
 
@@ -2016,8 +2041,9 @@ static void ebc_gap_wait(struct rk3026_ebc *ebc)
  * @s: returns it, for rk3026_ebc_thread_step()
  *
  * Without @image_lock: the rails and their deadline, the idle cleanup's
- * (ebc_idle_at()), the carry's retry, the take's gap and the wait's
- * condition (rk3026_ebc_thread_woken()), at one rk3026_ebc_clock() read.
+ * (ebc_idle_at()), the carry's retry, the take's gap, whether the system
+ * suspends and the wait's condition (rk3026_ebc_thread_woken()), at one
+ * rk3026_ebc_clock() read.
  * The retry and the gap are this thread's own, so they hold still while
  * the pass runs.
  */
@@ -2026,6 +2052,7 @@ VISIBLE_IF_KUNIT void rk3026_ebc_thread_pass(struct rk3026_ebc *ebc,
 					     struct rk3026_ebc_pass *s)
 {
 	const struct rk3026_ebc_retry *r = &ebc->pending.retry;
+	bool suspended = READ_ONCE(ebc->suspended);
 	ktime_t clock = rk3026_ebc_clock(ebc);
 
 	*s = (struct rk3026_ebc_pass) {
@@ -2036,8 +2063,10 @@ VISIBLE_IF_KUNIT void rk3026_ebc_thread_pass(struct rk3026_ebc *ebc,
 		.rails_on	= READ_ONCE(ebc->rails_on),
 		.retry_armed	= READ_ONCE(r->armed),
 		.gap_open	= ebc->gap.open,
+		.suspended	= suspended,
 		.woken		= rk3026_ebc_thread_woken(&ebc->pending, clock,
-							  READ_ONCE(ebc->crtc_on)),
+							  READ_ONCE(ebc->crtc_on),
+							  suspended),
 	};
 	s->idle_armed = ebc_idle_at(ebc, &s->idle_at);
 }
@@ -2048,15 +2077,18 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_thread_pass);
  * cannot take @image_lock; it asks rk3026_ebc_thread_woken(). A plane
  * update that arms or moves the idle deadline wakes it
  * (rk3026_ebc_add_update()), and so does a CRTC disable, for a carry
- * waiting for its retry.
+ * waiting for its retry, and the end of a suspend (rk3026_ebc_sleep_end()).
+ * A park ends it too (ebc_suspend()).
  */
 static void ebc_work_wait(struct rk3026_ebc *ebc, long timeout)
 {
 	wait_event_interruptible_timeout(ebc->update_wq,
 					 rk3026_ebc_thread_woken(&ebc->pending,
 								 rk3026_ebc_clock(ebc),
-								 READ_ONCE(ebc->crtc_on)) ||
-					 kthread_should_stop(),
+								 READ_ONCE(ebc->crtc_on),
+								 READ_ONCE(ebc->suspended)) ||
+					 kthread_should_stop() ||
+					 kthread_should_park(),
 					 timeout);
 }
 
@@ -2068,6 +2100,12 @@ static int ebc_refresh_thread(void *data)
 		struct rk3026_ebc_last last;
 		struct rk3026_ebc_pass s;
 		long timeout;
+
+		/* Between passes only: no part is in flight here. */
+		if (kthread_should_park()) {
+			kthread_parkme();
+			continue;
+		}
 
 		rk3026_ebc_thread_pass(ebc, jiffies, &s);
 		switch (rk3026_ebc_thread_step(&s, &timeout)) {
@@ -2146,14 +2184,41 @@ VISIBLE_IF_KUNIT int rk3026_ebc_wait_seq(struct rk3026_ebc *ebc, u32 seq,
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_wait_seq);
 
 /*
+ * The wait of a CRTC enable or disable (ebc_wait_finished()): for the
+ * update of @seq to finish, as rk3026_ebc_wait_seq() without a signal, or
+ * for the system to be asleep with no part in flight
+ * (rk3026_ebc_sleep_begin()), whichever comes first. Asleep, no part is
+ * taken until the resume, and after a resume that found no clocks none is
+ * taken at all, so a wait for the seq would block for @timeout_ms, a
+ * suspend's freezer included; what is pending then is drawn after the
+ * resume, in the order it was sent. A part in flight is still waited for:
+ * the disable takes the rails down after the wait.
+ *
+ * Returns 0, or -ETIMEDOUT after @timeout_ms.
+ */
+VISIBLE_IF_KUNIT int rk3026_ebc_crtc_wait(struct rk3026_ebc *ebc, u32 seq,
+					  unsigned int timeout_ms)
+{
+	if (!wait_event_timeout(ebc->marker_wq,
+				rk3026_ebc_seq_finished(&ebc->pending, seq) ||
+				(READ_ONCE(ebc->suspended) &&
+				 !READ_ONCE(ebc->in_flight)),
+				msecs_to_jiffies(timeout_ms)))
+		return -ETIMEDOUT;
+	return 0;
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_crtc_wait);
+
+/*
  * For CRTC enable and disable: bounded, so a thread stuck elsewhere cannot
- * hang blank or shutdown.
+ * hang blank or shutdown; and over at once while the system is asleep
+ * (rk3026_ebc_crtc_wait()).
  */
 static void ebc_wait_finished(struct rk3026_ebc *ebc, u32 seq)
 {
 	unsigned int ms = rk3026_ebc_wait_timeout_ms(ebc);
 
-	if (rk3026_ebc_wait_seq(ebc, seq, ms, false))
+	if (rk3026_ebc_crtc_wait(ebc, seq, ms))
 		dev_warn(ebc->dev, "refresh thread busy for %u ms, not waiting\n",
 			 ms);
 }
@@ -2187,8 +2252,8 @@ static void ebc_wait_finished(struct rk3026_ebc *ebc, u32 seq)
  *
  * An mxcfb send and a RESET set @plane_resync: plane updates blit only
  * their damage, and the target now holds pixels outside it that the
- * plane's framebuffer may not. The idle cleanup writes no pixel, so it
- * does not.
+ * plane's framebuffer may not. The idle cleanup and the redraw after a
+ * hibernation restore write no pixel, so they do not.
  *
  * The update is stamped with the time it was queued (rk3026_ebc_clock()),
  * for the take's quiet gap (rk3026_ebc_take_ready()).
@@ -2212,7 +2277,8 @@ u32 rk3026_ebc_add_update(struct rk3026_ebc *ebc,
 		}
 		memset(ebc->next_shadow, 0xff, ebc->img_size);
 	}
-	if (upd->source != EBC_SOURCE_PLANE && upd->source != EBC_SOURCE_IDLE)
+	if (upd->source != EBC_SOURCE_PLANE && upd->source != EBC_SOURCE_IDLE &&
+	    upd->source != EBC_SOURCE_RESTORE)
 		ebc->plane_resync = true;
 	merged = rk3026_ebc_pending_add(&ebc->pending, &stamped, &seq);
 	rk3026_ebc_marker_seq_record(&ebc->markers, upd->marker, seq);
@@ -2482,6 +2548,9 @@ static void ebc_crtc_atomic_enable(struct drm_crtc *crtc,
 	 *
 	 * Waiting costs the enabling commit one full RESET (~8 s at 12 MHz), which
 	 * is time the RESET takes regardless; it only moves who blocks for it.
+	 * While the system is asleep the RESET is driven after the resume, and
+	 * the commit does not wait for it (rk3026_ebc_crtc_wait()): the plane
+	 * updates queue behind it all the same.
 	 */
 	mutex_lock(&ebc->image_lock);
 	WRITE_ONCE(ebc->crtc_on, true);
@@ -2510,6 +2579,88 @@ VISIBLE_IF_KUNIT u32 rk3026_ebc_crtc_off(struct rk3026_ebc *ebc)
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_crtc_off);
 
+/*
+ * A system suspend begins (ebc_suspend()): from here no part is taken
+ * (rk3026_ebc_do_refresh()), and the refresh thread looks at nothing but
+ * the rails (rk3026_ebc_thread_step()). Updates sent meanwhile join the
+ * pending set, which keeps its parts, its carry and the carry's retry for
+ * the resume. The flag goes up under @image_lock, the lock of the take, so
+ * a part is either taken before it, and @in_flight, or not taken at all.
+ * A CRTC enable or disable waiting meanwhile is woken: it waits no longer
+ * than for the part in flight (rk3026_ebc_crtc_wait()).
+ */
+VISIBLE_IF_KUNIT void rk3026_ebc_sleep_begin(struct rk3026_ebc *ebc)
+{
+	mutex_lock(&ebc->image_lock);
+	WRITE_ONCE(ebc->suspended, true);
+	mutex_unlock(&ebc->image_lock);
+	wake_up_all(&ebc->marker_wq);
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_sleep_begin);
+
+/*
+ * After rk3026_ebc_sleep_begin(): wait for the part taken before it, if one
+ * is in flight, to finish, its waveform included. No part is taken after
+ * it, so once none is in flight none will be. Bounded by @timeout_ms, the
+ * longest a part takes (rk3026_ebc_part_max_ms()): past it the thread is
+ * stuck outside the EBC.
+ *
+ * Returns 0, or -EBUSY with a part still in flight.
+ */
+VISIBLE_IF_KUNIT int rk3026_ebc_sleep_wait(struct rk3026_ebc *ebc,
+					   unsigned int timeout_ms)
+{
+	if (!wait_event_timeout(ebc->marker_wq, !READ_ONCE(ebc->in_flight),
+				msecs_to_jiffies(timeout_ms)))
+		return -EBUSY;
+	return 0;
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_sleep_wait);
+
+/*
+ * The suspend ends, or fails: parts are taken again, the ones pending
+ * first, from @shadows.prev as the glass kept it.
+ */
+VISIBLE_IF_KUNIT void rk3026_ebc_sleep_end(struct rk3026_ebc *ebc)
+{
+	mutex_lock(&ebc->image_lock);
+	WRITE_ONCE(ebc->suspended, false);
+	mutex_unlock(&ebc->image_lock);
+	wake_up(&ebc->update_wq);
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_sleep_end);
+
+/*
+ * A hibernation restore, before rk3026_ebc_sleep_end(): the images are the
+ * ones saved, but the glass may not be. The kernel that loaded the image
+ * may have bound this driver and drawn with it (the RESET of its CRTC
+ * enable, its console), so @shadows.prev is not evidence: the mark makes
+ * the next part repair the glass first (rk3026_ebc_do_refresh()). With
+ * the CRTC on, a redraw of the whole panel is queued as that part
+ * (EBC_SOURCE_RESTORE): FULL, not auto, of the target as it is, so it
+ * writes no pixel. Updates pending join it, as they would join any part
+ * (rk3026_ebc_pending_add()); a RESET pending is drawn before it, and a
+ * carry keeps its retry. With the CRTC off the next enable RESETs the
+ * panel.
+ *
+ * The thread is parked, so it does not read the mark while it changes.
+ */
+VISIBLE_IF_KUNIT void rk3026_ebc_sleep_restore(struct rk3026_ebc *ebc)
+{
+	struct rk3026_ebc_update upd = {
+		.clip	= DRM_RECT_INIT(0, 0, ebc->width, ebc->height),
+		.mode	= EBC_MODE_FULL,
+		.source	= EBC_SOURCE_RESTORE,
+	};
+
+	mutex_lock(&ebc->image_lock);
+	WRITE_ONCE(ebc->shadows.prev_unknown, true);
+	if (ebc->crtc_on)
+		rk3026_ebc_add_update(ebc, &upd);
+	mutex_unlock(&ebc->image_lock);
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_sleep_restore);
+
 static void ebc_crtc_atomic_disable(struct drm_crtc *crtc,
 				    struct drm_atomic_state *state)
 {
@@ -2519,7 +2670,9 @@ static void ebc_crtc_atomic_disable(struct drm_crtc *crtc,
 	/*
 	 * Let the part in flight and those pending finish, then drop the
 	 * rails now rather than after the idle delay: VCOM first, then the
-	 * high-voltage rails, then logic.
+	 * high-voltage rails, then logic. While the system is asleep only the
+	 * part in flight is waited for; the thread drops the pending ones
+	 * after the resume (rk3026_ebc_crtc_wait()).
 	 */
 	seq = rk3026_ebc_crtc_off(ebc);
 	/*
@@ -2751,6 +2904,29 @@ static void ebc_program_regs(struct rk3026_ebc *ebc)
 	ebc_config_done(ebc);
 }
 
+/*
+ * The pads and the registers, with the clocks running: at probe, and at
+ * resume in case the block lost them in the sleep.
+ */
+static void ebc_hw_setup(struct rk3026_ebc *ebc)
+{
+	/*
+	 * Route the shared display pads to EBC, and put the LVDS block in the
+	 * state the panel needs. All three bits are written, not just the pad
+	 * select -- see the GRF_EBC_SEL_* comment in rk3026_ebc.h.
+	 *
+	 * This driver wrote bit 0 alone until 2026-08-06 and appeared to work,
+	 * because on those boots the register already held 0x301. On a boot from
+	 * a freshly written card it read 0x101 and drew nothing. ⚠️ What put the
+	 * 0x300 there is NOT established -- not this driver, not U-Boot.
+	 */
+	if (ebc->grf)
+		regmap_write(ebc->grf, GRF_EBC_SEL_REG,
+			     (GRF_EBC_SEL_MASK << 16) | GRF_EBC_SEL_MASK);
+
+	ebc_program_regs(ebc);
+}
+
 static int ebc_hw_init(struct rk3026_ebc *ebc)
 {
 	int ret;
@@ -2848,21 +3024,8 @@ static int ebc_hw_init(struct rk3026_ebc *ebc)
 	dev_info(ebc->dev, "dclk %lu Hz (CCF's view; check a scan's frame time)\n",
 		 clk_get_rate(ebc->dclk));
 
-	/*
-	 * Route the shared display pads to EBC, and put the LVDS block in the
-	 * state the panel needs. All three bits are written, not just the pad
-	 * select -- see the GRF_EBC_SEL_* comment in rk3026_ebc.h.
-	 *
-	 * This driver wrote bit 0 alone until 2026-08-06 and appeared to work,
-	 * because on those boots the register already held 0x301. On a boot from
-	 * a freshly written card it read 0x101 and drew nothing. ⚠️ What put the
-	 * 0x300 there is NOT established -- not this driver, not U-Boot.
-	 */
-	if (ebc->grf)
-		regmap_write(ebc->grf, GRF_EBC_SEL_REG,
-			     (GRF_EBC_SEL_MASK << 16) | GRF_EBC_SEL_MASK);
-
-	ebc_program_regs(ebc);
+	ebc->clks_on = true;
+	ebc_hw_setup(ebc);
 	return 0;
 
 err_mclk:
@@ -2874,14 +3037,54 @@ err_hclk:
 	return ret;
 }
 
-static void ebc_hw_fini(void *data)
+static void ebc_clks_off(struct rk3026_ebc *ebc)
 {
-	struct rk3026_ebc *ebc = data;
-
 	clk_disable_unprepare(ebc->dclk);
 	clk_disable_unprepare(ebc->mclk);
 	clk_disable_unprepare(ebc->aclk);
 	clk_disable_unprepare(ebc->hclk);
+	ebc->clks_on = false;
+}
+
+/*
+ * The clocks again after ebc_clks_off(), in ebc_hw_init()'s order; dclk
+ * keeps the parent and rate it was given there.
+ */
+static int ebc_clks_on(struct rk3026_ebc *ebc)
+{
+	int ret;
+
+	ret = clk_prepare_enable(ebc->hclk);
+	if (ret)
+		return ret;
+	ret = clk_prepare_enable(ebc->aclk);
+	if (ret)
+		goto err_hclk;
+	ret = clk_prepare_enable(ebc->mclk);
+	if (ret)
+		goto err_aclk;
+	ret = clk_prepare_enable(ebc->dclk);
+	if (ret)
+		goto err_mclk;
+	ebc->clks_on = true;
+	return 0;
+
+err_mclk:
+	clk_disable_unprepare(ebc->mclk);
+err_aclk:
+	clk_disable_unprepare(ebc->aclk);
+err_hclk:
+	clk_disable_unprepare(ebc->hclk);
+	return ret;
+}
+
+/* Off by now if the device was unbound asleep, after a resume without them. */
+static void ebc_hw_fini(void *data)
+{
+	struct rk3026_ebc *ebc = data;
+
+	if (ebc->clks_on)
+		ebc_clks_off(ebc);
 }
 
 static void ebc_stop_thread(void *data)
@@ -3223,6 +3426,113 @@ static void ebc_shutdown(struct platform_device *pdev)
 	mutex_unlock(&ebc->rails_lock);
 }
 
+/*
+ * System sleep keeps the CRTC, the plane and the images as they are: the
+ * glass holds its picture without power, and the first part after the
+ * resume is driven from @shadows.prev like any other. Hence no
+ * drm_mode_config_helper_suspend(): its CRTC disable would drop the parts
+ * pending, and the enable after the resume would RESET the panel to white.
+ *
+ * The suspend stops the takes (rk3026_ebc_sleep_begin()), waits for the
+ * part in flight, so a waveform always runs to its end, parks the refresh
+ * thread between two passes, and switches off the panel rails, then the
+ * interrupt and the clocks. V3P3, the panel's logic rail, stays with the
+ * CRTC, as when the rails go off between parts. Updates sent while
+ * suspended stay pending and are drawn after the resume. A part that does
+ * not end in time, or rails that do not go off, fail the suspend: neither a
+ * cut waveform nor a sleep with the rails up.
+ */
+static int ebc_suspend(struct device *dev)
+{
+	struct rk3026_ebc *ebc = dev_get_drvdata(dev);
+	unsigned int ms = rk3026_ebc_part_max_ms(ebc);
+	int ret;
+
+	/* Still asleep: the last resume found no clocks. */
+	if (ebc->suspended)
+		return 0;
+
+	rk3026_ebc_sleep_begin(ebc);
+	ret = rk3026_ebc_sleep_wait(ebc, ms);
+	if (ret) {
+		dev_err(dev, "a part still in flight after %u ms\n", ms);
+		goto err_end;
+	}
+	/*
+	 * No part in flight and none to be taken: the thread parks at the
+	 * end of its pass, at most a rails ramp and a sensor read away.
+	 */
+	kthread_park(ebc->refresh_thread);
+
+	mutex_lock(&ebc->rails_lock);
+	ret = ebc_rails_off(ebc);
+	mutex_unlock(&ebc->rails_lock);
+	if (ret)
+		goto err_unpark;
+
+	disable_irq(ebc->irq);
+	ebc_clks_off(ebc);
+	return 0;
+
+err_unpark:
+	kthread_unpark(ebc->refresh_thread);
+err_end:
+	rk3026_ebc_sleep_end(ebc);
+	return ret;
+}
+
+/*
+ * Undo ebc_suspend(). The registers are written again in case the block
+ * lost them; the rails come up for the next part that is driven. Without
+ * the clocks nothing is touched: the driver stays suspended, and the next
+ * resume tries again. Meanwhile a CRTC enable or disable does not wait for
+ * the thread (rk3026_ebc_crtc_wait()), and an unbind leaves the clocks
+ * alone (ebc_hw_fini()).
+ *
+ * Also the thaw of a hibernation, after the image is written: the same
+ * kernel, the glass as it was left.
+ */
+static int ebc_resume(struct device *dev)
+{
+	struct rk3026_ebc *ebc = dev_get_drvdata(dev);
+	int ret;
+
+	ret = ebc_clks_on(ebc);
+	if (ret) {
+		dev_err(dev, "failed to enable the clocks: %d\n", ret);
+		return ret;
+	}
+	ebc_hw_setup(ebc);
+	enable_irq(ebc->irq);
+	rk3026_ebc_sleep_end(ebc);
+	kthread_unpark(ebc->refresh_thread);
+	return 0;
+}
+
+/*
+ * A hibernation restore: a resume whose glass may have been drawn on by the
+ * kernel that loaded the image, so the first part repairs it and the
+ * whole panel is redrawn (rk3026_ebc_sleep_restore()).
+ */
+static int ebc_restore(struct device *dev)
+{
+	rk3026_ebc_sleep_restore(dev_get_drvdata(dev));
+	return ebc_resume(dev);
+}
+
+/*
+ * Hibernation: freeze and poweroff are a suspend, thaw a resume; only the
+ * restore does not trust the glass.
+ */
+static const struct dev_pm_ops ebc_pm_ops = {
+	.suspend	= pm_sleep_ptr(ebc_suspend),
+	.resume		= pm_sleep_ptr(ebc_resume),
+	.freeze		= pm_sleep_ptr(ebc_suspend),
+	.thaw		= pm_sleep_ptr(ebc_resume),
+	.poweroff	= pm_sleep_ptr(ebc_suspend),
+	.restore	= pm_sleep_ptr(ebc_restore),
+};
+
 static const struct of_device_id ebc_of_match[] = {
 	{ .compatible = "rockchip,rk3026-ebc" },
 	{ }
@@ -3236,6 +3546,7 @@ static struct platform_driver ebc_driver = {
 	.driver	= {
 		.name		= DRIVER_NAME,
 		.of_match_table	= ebc_of_match,
+		.pm		= pm_sleep_ptr(&ebc_pm_ops),
 	},
 };
 module_platform_driver(ebc_driver);

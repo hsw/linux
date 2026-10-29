@@ -220,6 +220,7 @@ enum rk3026_ebc_source {
 	EBC_SOURCE_MXCFB,	/* MXCFB_SEND_UPDATE */
 	EBC_SOURCE_ENABLE,	/* the RESET of a CRTC enable */
 	EBC_SOURCE_IDLE,	/* the idle cleanup the refresh thread queues */
+	EBC_SOURCE_RESTORE,	/* the redraw after a hibernation restore */
 };
 
 /* What became of one part (the updates one scan takes). */
@@ -401,8 +402,9 @@ struct rk3026_ebc_gap {
  * (rk3026_ebc_thread_pass()): @now in jiffies and @clock
  * (rk3026_ebc_clock()) of the same pass; the rails up (@rails_on) and their
  * off deadline; the idle cleanup armed and its deadline; the carry's retry
- * armed and its time, on @clock; the take's gap open; and the wait's
- * condition (@woken: rk3026_ebc_thread_woken()).
+ * armed and its time, on @clock; the take's gap open; the system
+ * suspending (@suspended); and the wait's condition (@woken:
+ * rk3026_ebc_thread_woken()).
  */
 struct rk3026_ebc_pass {
 	unsigned long	now;
@@ -414,6 +416,7 @@ struct rk3026_ebc_pass {
 	bool		idle_armed;
 	bool		retry_armed;
 	bool		gap_open;
+	bool		suspended;
 	bool		woken;
 };
 
@@ -748,13 +751,17 @@ static inline bool rk3026_ebc_retry_due(const struct rk3026_ebc_retry *r,
  * lock: a part to take (rk3026_ebc_take_pending()) or the carry's retry due
  * at @now (rk3026_ebc_retry_due(), with @crtc_on). A carry that waits for
  * its retry is not work before it; its time is a deadline of the wait
- * (rk3026_ebc_thread_deadline()).
+ * (rk3026_ebc_thread_deadline()). While the system suspends (@suspended)
+ * nothing is work: the parts stay pending, and the carry keeps its retry,
+ * until the resume.
  */
 static inline bool rk3026_ebc_thread_woken(const struct rk3026_ebc_pending *p,
-					   ktime_t now, bool crtc_on)
+					   ktime_t now, bool crtc_on,
+					   bool suspended)
 {
-	return rk3026_ebc_take_pending(p) ||
-	       rk3026_ebc_retry_due(&p->retry, now, crtc_on);
+	return !suspended &&
+	       (rk3026_ebc_take_pending(p) ||
+		rk3026_ebc_retry_due(&p->retry, now, crtc_on));
 }
 
 /*
@@ -879,6 +886,8 @@ struct rk3026_ebc {
 	 * Written by the refresh thread alone: rk3026_ebc_drive() owns it during
 	 * a waveform, and rk3026_ebc_scan_finish() records the part's outcome
 	 * under @image_lock, never clearing what rk3026_ebc_drive() left set.
+	 * One more writer, while that thread is parked: a hibernation restore
+	 * sets it (rk3026_ebc_sleep_restore()), never clears it.
 	 *
 	 * @pending holds every update sent and not yet taken (a sender blits
 	 * and adds its update in one section, so no snapshot sees pixels
@@ -1008,6 +1017,22 @@ struct rk3026_ebc {
 	 * part, and a sender checks it in the section that adds its update.
 	 */
 	bool			crtc_on;
+	/*
+	 * System sleep (ebc_suspend()): while @suspended no part is taken and
+	 * updates stay pending; @in_flight is a part taken and not yet
+	 * finished, which the suspend waits for. Both under @image_lock; the
+	 * refresh thread, and the CRTC enable's and disable's wait
+	 * (rk3026_ebc_crtc_wait()), read them without it.
+	 */
+	bool			suspended;
+	bool			in_flight;
+	/*
+	 * The clocks are enabled: by ebc_hw_init(), and again by a resume
+	 * that got them (ebc_clks_on()). ebc_hw_fini() disables only these,
+	 * so an unbind after a resume that found no clocks does not disable
+	 * them twice. Probe, remove and the PM callbacks only.
+	 */
+	bool			clks_on;
 
 	const struct firmware	*fw;
 	struct ebc_waveform	*waveform;
@@ -1067,6 +1092,12 @@ void rk3026_ebc_thread_pass(struct rk3026_ebc *ebc, unsigned long now,
 			    struct rk3026_ebc_pass *s);
 u32 rk3026_ebc_setup_us(struct rk3026_ebc *ebc,
 			const struct rk3026_ebc_last *last);
+void rk3026_ebc_sleep_begin(struct rk3026_ebc *ebc);
+int rk3026_ebc_sleep_wait(struct rk3026_ebc *ebc, unsigned int timeout_ms);
+void rk3026_ebc_sleep_end(struct rk3026_ebc *ebc);
+void rk3026_ebc_sleep_restore(struct rk3026_ebc *ebc);
+int rk3026_ebc_crtc_wait(struct rk3026_ebc *ebc, u32 seq,
+			 unsigned int timeout_ms);
 #endif
 
 /* rk3026_ebc_blit.c */

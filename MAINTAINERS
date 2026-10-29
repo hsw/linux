@@ -412,12 +412,6 @@ F:	Documentation/virt/acrn/
 F:	drivers/virt/acrn/
 F:	include/uapi/linux/acrn.h
 
-ACTIVE-SEMI ACT8931 PMU DRIVER
-M:	Sergei Khomenkov <shomenkow@gmail.com>
-S:	Maintained
-F:	Documentation/devicetree/bindings/regulator/active-semi,act8931.yaml
-F:	drivers/regulator/act8931-regulator.c
-
 AD1889 ALSA SOUND DRIVER
 L:	linux-parisc@vger.kernel.org
 S:	Maintained

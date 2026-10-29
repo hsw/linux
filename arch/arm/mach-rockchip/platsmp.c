@@ -43,21 +43,31 @@ static struct reset_control *cpu_rstc[4];
  * restarts a core on the soft reset assert (see pmu_set_power_domain()).
  *
  * rk3026_grf is the one key for both quirks: it is set only when the
- * RK3026 GRF is found, so the reset pulse, the remap set and the remap
- * clears either all run or none does.
+ * RK3026 GRF is found and mapped, so, given the cpu node's resets, the
+ * reset pulse, the remap set and the remap clears either all run or none
+ * does.
  */
 #define RK3026_GRF_SOC_CON0		0x140
 #define RK3026_GRF_IMEM_REMAP_SET	(BIT(28) | BIT(12))
 #define RK3026_GRF_IMEM_REMAP_CLR	BIT(28)
 
-static struct regmap *rk3026_grf;
+static void __iomem *rk3026_grf;
 
+/*
+ * A plain write, not the syscon regmap: setting the remap must not take a
+ * lock, whose unlock ends in SEV (see the "on" path of
+ * pmu_set_power_domain()). Bits 31:16 of GRF_SOC_CON0 are the write-enable
+ * mask of bits 15:0, as drivers/soc/rockchip/grf.c writes the same
+ * register on the RK3036 and RK3128 (FIELD_PREP_WM16_CONST) and the vendor
+ * kernel clears this remap (grf_writel(1 << (12 + 16), GRF_SOC_CON0)), so
+ * the write touches bit 12 only and needs no lock against other GRF users.
+ */
 static void rk3026_imem_remap(bool on)
 {
+	u32 val = on ? RK3026_GRF_IMEM_REMAP_SET : RK3026_GRF_IMEM_REMAP_CLR;
+
 	if (rk3026_grf)
-		regmap_write(rk3026_grf, RK3026_GRF_SOC_CON0,
-			     on ? RK3026_GRF_IMEM_REMAP_SET :
-				  RK3026_GRF_IMEM_REMAP_CLR);
+		writel(val, rk3026_grf + RK3026_GRF_SOC_CON0);
 }
 
 static int pmu_power_domain_is_on(int pd)
@@ -130,10 +140,48 @@ static int pmu_set_power_domain(int pd, bool on)
 		}
 	}
 
-	if (!IS_ERR(rstc) && on) {
-		if (rk3026_grf)
-			reset_control_assert(rstc);
+	if (!IS_ERR(rstc) && on && !rk3026_grf)
 		reset_control_deassert(rstc);
+
+	if (!IS_ERR(rstc) && on && rk3026_grf) {
+		unsigned long flags;
+		int err = 0;
+
+		/*
+		 * RK3026: map the SRAM at 0 right before the assert that
+		 * restarts the core. A core parked by the BootROM waits in WFE
+		 * at a low address; once the SRAM is mapped, any SEV wakes it
+		 * to fetch SRAM contents at that address instead of the
+		 * trampoline. Every spin_unlock ends in SEV, and on the
+		 * dual-core RK3026 this CPU is the only other one running. So
+		 * from the remap write to the assert, run with interrupts off
+		 * (no preemption either) and take no lock: the GRF write is a
+		 * plain writel, and the soft reset controller writes its
+		 * HIWORD-masked register without a lock. That narrows the
+		 * window; with lock debugging it does not close it: lockdep's
+		 * bookkeeping for the reset core's SRCU read-side section takes
+		 * its own lock on a new lock chain, as on the first start, and
+		 * that unlock is an SEV. The new core clears the remap in
+		 * rockchip_secondary_init().
+		 */
+		local_irq_save(flags);
+		rk3026_imem_remap(true);
+		ret = reset_control_assert(rstc);
+		if (!ret)
+			err = reset_control_deassert(rstc);
+		else	/* the core was not restarted: drop the remap */
+			rk3026_imem_remap(false);
+		local_irq_restore(flags);
+
+		if (ret) {
+			pr_err("%s: could not assert reset of core %d: %d\n",
+			       __func__, pd, ret);
+			return ret;
+		}
+		/* the assert has restarted the core: let it come up or time out */
+		if (err)
+			pr_err("%s: could not deassert reset of core %d: %d\n",
+			       __func__, pd, err);
 	}
 
 	return 0;
@@ -158,13 +206,9 @@ static int rockchip_boot_secondary(unsigned int cpu, struct task_struct *idle)
 		return -ENXIO;
 	}
 
-	/* start the core; it clears the remap in rockchip_secondary_init() */
-	rk3026_imem_remap(true);
 	ret = pmu_set_power_domain(0 + cpu, true);
-	if (ret < 0) {
-		rk3026_imem_remap(false);
+	if (ret < 0)
 		return ret;
-	}
 
 	if (read_cpuid_part() != ARM_CPU_PART_CORTEX_A9) {
 		/*
@@ -365,13 +409,23 @@ static void __init rockchip_smp_prepare_cpus(unsigned int max_cpus)
 
 static void __init rk3036_smp_prepare_cpus(unsigned int max_cpus)
 {
-	struct regmap *grf;
+	struct device_node *np;
 
 	has_pmu = false;
 
-	grf = syscon_regmap_lookup_by_compatible("rockchip,rk3026-grf");
-	if (!IS_ERR(grf)) {
-		rk3026_grf = grf;
+	np = of_find_compatible_node(NULL, NULL, "rockchip,rk3026-grf");
+	if (np) {
+		rk3026_grf = of_iomap(np, 0);
+		of_node_put(np);
+		if (!rk3026_grf) {
+			/*
+			 * An RK3026 without its quirks would assert the core
+			 * reset below and restart CPU1 into whatever the
+			 * loader left at 0: start no core at all.
+			 */
+			pr_err("%s: could not map the RK3026 GRF\n", __func__);
+			return;
+		}
 		/* the loader may have left the remap set */
 		rk3026_imem_remap(false);
 	}

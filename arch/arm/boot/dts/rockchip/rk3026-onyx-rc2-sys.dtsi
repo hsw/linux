@@ -98,6 +98,10 @@
  * module loads, so binding writes nothing. Every other output is read
  * back only. No suspend state, no supply of another node: DCDC2 is the
  * DDR rail.
+ *
+ * DCDC1 (VCC_IO), DCDC2 (DDR), LDO1 (touch) and LDO3 (microSD, the root
+ * filesystem) are always-on: none has a consumer here, so a driver that
+ * could switch them would otherwise see them disabled as unused.
  */
 &i2c0 {
 	pmic@5b {
@@ -109,11 +113,13 @@
 			DCDC_REG1 {	/* VCC_IO, 0x3a; 0x3b with Wi-Fi/BT */
 				regulator-min-microvolt = <3400000>;
 				regulator-max-microvolt = <3500000>;
+				regulator-always-on;
 			};
 
 			DCDC_REG2 {	/* DDR, 0x1b */
 				regulator-min-microvolt = <1350000>;
 				regulator-max-microvolt = <1350000>;
+				regulator-always-on;
 			};
 
 			vdd_arm: DCDC_REG3 {	/* ARM, 0x1c at boot */
@@ -127,6 +133,7 @@
 			LDO_REG1 {	/* touch, 0x37 */
 				regulator-min-microvolt = <3100000>;
 				regulator-max-microvolt = <3100000>;
+				regulator-always-on;
 			};
 
 			LDO_REG2 {	/* unused, off, 0x37 */
@@ -137,6 +144,7 @@
 			LDO_REG3 {	/* microSD, 0x37 */
 				regulator-min-microvolt = <3100000>;
 				regulator-max-microvolt = <3100000>;
+				regulator-always-on;
 			};
 
 			LDO_REG4 {	/* panel logic, 0x37 */

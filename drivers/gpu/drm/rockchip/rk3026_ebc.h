@@ -1174,6 +1174,7 @@ void rk3026_ebc_vblank_enable(struct rk3026_ebc *ebc);
 void rk3026_ebc_vblank_disable(struct rk3026_ebc *ebc);
 void rk3026_ebc_crtc_off_event(struct drm_crtc *crtc,
 			       struct drm_atomic_state *state);
+enum hrtimer_restart rk3026_ebc_vblank_timer(struct hrtimer *timer);
 #endif
 
 /* rk3026_ebc_blit.c */

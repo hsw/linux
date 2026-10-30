@@ -2953,7 +2953,8 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_vblank_tick);
  * The core's own vblank timer is not used: its start waits for a running
  * callback under the locks the callback takes.
  */
-static enum hrtimer_restart rk3026_ebc_vblank_timer(struct hrtimer *timer)
+VISIBLE_IF_KUNIT enum hrtimer_restart
+rk3026_ebc_vblank_timer(struct hrtimer *timer)
 {
 	struct rk3026_ebc *ebc = container_of(timer, struct rk3026_ebc,
 					      vblank_timer);
@@ -2970,6 +2971,7 @@ static enum hrtimer_restart rk3026_ebc_vblank_timer(struct hrtimer *timer)
 		return HRTIMER_NORESTART;
 	return READ_ONCE(ebc->vblank_run) ? HRTIMER_RESTART : HRTIMER_NORESTART;
 }
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_vblank_timer);
 
 /*
  * Called by the vblank core with its spinlocks held and interrupts off:

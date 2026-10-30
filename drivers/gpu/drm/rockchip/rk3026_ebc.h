@@ -1051,13 +1051,48 @@ struct rk3026_ebc {
 	 * The commit being applied: rk3026_ebc_commit_begin() clears
 	 * @commit_queued, and its plane update sets it with @commit_seq, the
 	 * seq of the update it queued (rk3026_ebc_plane_update(), under
-	 * @image_lock). Written and read only in the commit tail: the panel
-	 * has one CRTC, and each commit's planes are applied after the
-	 * previous commit's are done
-	 * (drm_atomic_helper_wait_for_dependencies()).
+	 * @image_lock). Written only in the commit tail: the panel has one
+	 * CRTC, and each commit's planes are applied after the previous
+	 * commit's are done (drm_atomic_helper_wait_for_dependencies()), so
+	 * one commit at a time is between its plane update and its flush.
+	 *
+	 * @commit_err: what became of that update if its part finished before
+	 * the commit's flush (a commit tail preempted after its plane update),
+	 * as rk3026_ebc_part_err() says, so the flush that finds it finished
+	 * sets that error on the out-fence the core then signals
+	 * (rk3026_ebc_flip_hold()). The plane update clears it with
+	 * @commit_seq; the refresh thread sets it, under @image_lock and
+	 * @drm.event_lock, at the finish of the part that moves
+	 * @flip_done_seq over @commit_seq (ebc_flip_release()). One slot is
+	 * enough however many parts finish before the flush: only the part
+	 * with the commit's update sets it, the ones after it leave it alone,
+	 * and the next plane update starts a new record. A commit whose
+	 * update was not finished at the flush has its event held and gets
+	 * the error from the send instead.
 	 */
 	u32			commit_seq;
 	bool			commit_queued;
+	int			commit_err;
+
+	/*
+	 * The commit event held until its part has finished
+	 * (rk3026_ebc_flip_hold()), and @flip_seq, the seq of the update its
+	 * commit queued. One slot: the core lets one commit with a pending
+	 * flip_done through per CRTC. Under @drm.event_lock; the refresh
+	 * thread sends it from step 4 of rk3026_ebc_do_refresh(), with
+	 * @image_lock held around it.
+	 *
+	 * @flip_done_seq: @pending.done_seq as the last ebc_flip_release()
+	 * saw it, under @image_lock and @drm.event_lock. The hold tests
+	 * whether a commit's update has finished against it, not against
+	 * @pending.done_seq, which the thread moves before it takes
+	 * @drm.event_lock: so the result of the part (@commit_err) is known
+	 * whenever the update is seen finished, and an update the thread has
+	 * finished but not yet released is held and sent by that release.
+	 */
+	struct drm_pending_vblank_event *flip_event;
+	u32			flip_seq;
+	u32			flip_done_seq;
 
 	/*
 	 * debugfs: the last part, the last driven one, the counters. Under
@@ -1095,6 +1130,8 @@ bool rk3026_ebc_plane_box(const struct drm_plane_state *old_state,
 void rk3026_ebc_commit_begin(struct rk3026_ebc *ebc);
 bool rk3026_ebc_plane_update(struct rk3026_ebc *ebc, const void *src,
 			     unsigned int src_pitch, const struct drm_rect *box);
+bool rk3026_ebc_flip_hold(struct rk3026_ebc *ebc,
+			  struct drm_crtc_state *crtc_state);
 bool rk3026_ebc_idle_tick(struct rk3026_ebc *ebc, unsigned long now);
 int rk3026_ebc_raise_rails(struct rk3026_ebc *ebc);
 ktime_t rk3026_ebc_clock(struct rk3026_ebc *ebc);
@@ -1177,6 +1214,7 @@ void rk3026_ebc_marker_seq_record(struct rk3026_ebc_marker_ring *ring,
 				  u32 marker, u32 seq);
 bool rk3026_ebc_marker_seq_lookup(const struct rk3026_ebc_marker_ring *ring,
 				  u32 marker, u32 *seq);
+int rk3026_ebc_part_err(const struct rk3026_ebc_last *part);
 #if IS_ENABLED(CONFIG_KUNIT)
 unsigned int rk3026_ebc_mode_rank(u32 mode);
 #endif

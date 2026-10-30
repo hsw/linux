@@ -205,6 +205,7 @@ config DRM_RK3026_EBC_NEON
 config DRM_RK3026_EBC_KUNIT_TEST
 	tristate "KUnit tests for the RK3026 EBC" if !KUNIT_ALL_TESTS
 	depends on DRM_RK3026_EBC && KUNIT
+	select DRM_KUNIT_TEST_HELPERS
 	default KUNIT_ALL_TESTS
 	help
 	  This builds unit tests for the RK3026 EBC refresh bookkeeping:

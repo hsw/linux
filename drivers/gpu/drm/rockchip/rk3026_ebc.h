@@ -1213,6 +1213,7 @@ void rk3026_ebc_flip_trace(struct rk3026_ebc *ebc, u32 seq, u32 held_us,
 			   enum rk3026_ebc_flip_why why, int err);
 bool rk3026_ebc_flip_hold(struct rk3026_ebc *ebc,
 			  struct drm_crtc_state *crtc_state);
+int rk3026_ebc_kms_init(struct rk3026_ebc *ebc);
 bool rk3026_ebc_idle_tick(struct rk3026_ebc *ebc, unsigned long now);
 int rk3026_ebc_raise_rails(struct rk3026_ebc *ebc);
 ktime_t rk3026_ebc_clock(struct rk3026_ebc *ebc);

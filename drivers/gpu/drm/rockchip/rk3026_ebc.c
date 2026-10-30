@@ -3621,6 +3621,68 @@ static int ebc_load_waveform(struct rk3026_ebc *ebc)
 	return 0;
 }
 
+/**
+ * rk3026_ebc_kms_init - set up the KMS objects
+ * @ebc: controller, on a DRM device whose mode config is initialised
+ *
+ * The mode config limits and hooks, the primary plane, the CRTC, the
+ * encoder and the connector, and their first states. Touches no
+ * hardware: the CRTC enable powers the panel up.
+ *
+ * Returns 0 or a negative errno.
+ */
+VISIBLE_IF_KUNIT int rk3026_ebc_kms_init(struct rk3026_ebc *ebc)
+{
+	struct drm_device *drm = &ebc->drm;
+	int ret;
+
+	drm->mode_config.funcs = &ebc_mode_config_funcs;
+	drm->mode_config.helper_private = &ebc_mode_config_helper_funcs;
+	drm->mode_config.min_width = ebc->width;
+	drm->mode_config.max_width = ebc->width;
+	drm->mode_config.min_height = ebc->height;
+	drm->mode_config.max_height = ebc->height;
+
+	ret = drm_universal_plane_init(drm, &ebc->plane, 1, &ebc_plane_funcs,
+				       ebc_plane_formats,
+				       ARRAY_SIZE(ebc_plane_formats),
+				       ebc_plane_modifiers,
+				       DRM_PLANE_TYPE_PRIMARY, NULL);
+	if (ret)
+		return ret;
+	drm_plane_helper_add(&ebc->plane, &ebc_plane_helper_funcs);
+	/*
+	 * ebc_plane_atomic_update() blits and queues only the damage. The fbdev
+	 * emulation attaches its damage either way; the property lets KMS
+	 * clients send theirs.
+	 */
+	drm_plane_enable_fb_damage_clips(&ebc->plane);
+
+	ret = drm_crtc_init_with_planes(drm, &ebc->crtc, &ebc->plane, NULL,
+					&ebc_crtc_funcs, NULL);
+	if (ret)
+		return ret;
+	drm_crtc_helper_add(&ebc->crtc, &ebc_crtc_helper_funcs);
+
+	ret = drm_encoder_init(drm, &ebc->encoder, &ebc_encoder_funcs,
+			       DRM_MODE_ENCODER_NONE, NULL);
+	if (ret)
+		return ret;
+	ebc->encoder.possible_crtcs = drm_crtc_mask(&ebc->crtc);
+
+	ret = drm_connector_init(drm, &ebc->connector, &ebc_connector_funcs,
+				 DRM_MODE_CONNECTOR_Unknown);
+	if (ret)
+		return ret;
+	drm_connector_helper_add(&ebc->connector, &ebc_connector_helper_funcs);
+	drm_connector_set_panel_orientation(&ebc->connector, ebc->rotation);
+	drm_connector_attach_encoder(&ebc->connector, &ebc->encoder);
+
+	drm_mode_config_reset(drm);
+	return 0;
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_kms_init);
+
 static int ebc_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -3843,49 +3905,9 @@ static int ebc_probe(struct platform_device *pdev)
 	ret = drmm_mode_config_init(drm);
 	if (ret)
 		return ret;
-	drm->mode_config.funcs = &ebc_mode_config_funcs;
-	drm->mode_config.helper_private = &ebc_mode_config_helper_funcs;
-	drm->mode_config.min_width = ebc->width;
-	drm->mode_config.max_width = ebc->width;
-	drm->mode_config.min_height = ebc->height;
-	drm->mode_config.max_height = ebc->height;
-
-	ret = drm_universal_plane_init(drm, &ebc->plane, 1, &ebc_plane_funcs,
-				       ebc_plane_formats,
-				       ARRAY_SIZE(ebc_plane_formats),
-				       ebc_plane_modifiers,
-				       DRM_PLANE_TYPE_PRIMARY, NULL);
+	ret = rk3026_ebc_kms_init(ebc);
 	if (ret)
 		return ret;
-	drm_plane_helper_add(&ebc->plane, &ebc_plane_helper_funcs);
-	/*
-	 * ebc_plane_atomic_update() blits and queues only the damage. The fbdev
-	 * emulation attaches its damage either way; the property lets KMS
-	 * clients send theirs.
-	 */
-	drm_plane_enable_fb_damage_clips(&ebc->plane);
-
-	ret = drm_crtc_init_with_planes(drm, &ebc->crtc, &ebc->plane, NULL,
-					&ebc_crtc_funcs, NULL);
-	if (ret)
-		return ret;
-	drm_crtc_helper_add(&ebc->crtc, &ebc_crtc_helper_funcs);
-
-	ret = drm_encoder_init(drm, &ebc->encoder, &ebc_encoder_funcs,
-			       DRM_MODE_ENCODER_NONE, NULL);
-	if (ret)
-		return ret;
-	ebc->encoder.possible_crtcs = drm_crtc_mask(&ebc->crtc);
-
-	ret = drm_connector_init(drm, &ebc->connector, &ebc_connector_funcs,
-				 DRM_MODE_CONNECTOR_Unknown);
-	if (ret)
-		return ret;
-	drm_connector_helper_add(&ebc->connector, &ebc_connector_helper_funcs);
-	drm_connector_set_panel_orientation(&ebc->connector, ebc->rotation);
-	drm_connector_attach_encoder(&ebc->connector, &ebc->encoder);
-
-	drm_mode_config_reset(drm);
 
 	ret = drm_dev_register(drm, 0);
 	if (ret)

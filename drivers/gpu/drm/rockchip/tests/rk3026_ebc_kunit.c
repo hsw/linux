@@ -33,6 +33,7 @@
 #include <drm/drm_file.h>
 #include <drm/drm_fourcc.h>
 #include <drm/drm_framebuffer.h>
+#include <drm/drm_kunit_helpers.h>
 #include <drm/drm_plane.h>
 #include <drm/drm_vblank.h>
 
@@ -4289,26 +4290,16 @@ static void t_flip_wd_none(struct work_struct *work)
 {
 }
 
-/*
- * A bare struct rk3026_ebc with what the glue needs and no hardware: with
- * the CRTC off, without a waveform, for a part whose snapshot moves
- * nothing, or with the rails counted as up and no LUT for the part, a part
- * finishes without touching a register or a regulator.
- */
-static struct rk3026_ebc *t_ebc_alloc(struct kunit *test)
+/* The driver state of the glue tests on @ebc, zeroed, of device @dev. */
+static void t_ebc_init(struct kunit *test, struct rk3026_ebc *ebc,
+		       struct device *dev)
 {
-	struct rk3026_ebc *ebc = kunit_kzalloc(test, sizeof(*ebc), GFP_KERNEL);
-
-	KUNIT_ASSERT_NOT_NULL(test, ebc);
-	ebc->dev = kunit_device_register(test, "rk3026-ebc-glue");
-	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, ebc->dev);
+	ebc->dev = dev;
 	mutex_init(&ebc->image_lock);
 	mutex_init(&ebc->rails_lock);
 	init_waitqueue_head(&ebc->update_wq);
 	init_waitqueue_head(&ebc->marker_wq);
-	/* What a held commit event is sent with (rk3026_ebc_flip_hold()). */
-	spin_lock_init(&ebc->drm.event_lock);
-	ebc->crtc.dev = &ebc->drm;
+	/* The commit event holder, its watchdog run by the tests alone. */
 	rk3026_ebc_flip_init(ebc);
 	INIT_DELAYED_WORK(&ebc->flip_wd, t_flip_wd_none);
 	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, t_flip_wd_stop,
@@ -4336,6 +4327,29 @@ static struct rk3026_ebc *t_ebc_alloc(struct kunit *test)
 	 * is a non-plane update), but here the target and the framebuffers
 	 * start in step, so a boxed plane update is taken as it is.
 	 */
+}
+
+/*
+ * A bare struct rk3026_ebc with what the glue needs and no hardware: with
+ * the CRTC off, without a waveform, for a part whose snapshot moves
+ * nothing, or with the rails counted as up and no LUT for the part, a part
+ * finishes without touching a register or a regulator.
+ */
+static struct rk3026_ebc *t_ebc_alloc(struct kunit *test)
+{
+	struct rk3026_ebc *ebc = kunit_kzalloc(test, sizeof(*ebc), GFP_KERNEL);
+	struct device *dev;
+
+	KUNIT_ASSERT_NOT_NULL(test, ebc);
+	dev = kunit_device_register(test, "rk3026-ebc-glue");
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, dev);
+	t_ebc_init(test, ebc, dev);
+	/*
+	 * What a held commit event is sent with (rk3026_ebc_flip_hold()),
+	 * which a DRM device sets up itself (t_kms_ebc()).
+	 */
+	spin_lock_init(&ebc->drm.event_lock);
+	ebc->crtc.dev = &ebc->drm;
 	return ebc;
 }
 
@@ -10411,6 +10425,72 @@ static void ebc_test_glue_flip_take_sleep(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ebc->flip_held, 2);
 }
 
+/*
+ * The glue state of t_ebc_alloc() on a DRM device of KUnit's, with the
+ * driver's KMS objects (rk3026_ebc_kms_init()); not registered, and no
+ * fbdev.
+ */
+static struct rk3026_ebc *t_kms_ebc(struct kunit *test)
+{
+	struct device *dev = drm_kunit_helper_alloc_device(test);
+	struct rk3026_ebc *ebc;
+
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, dev);
+	ebc = drm_kunit_helper_alloc_drm_device(test, dev, struct rk3026_ebc,
+						drm, DRIVER_MODESET |
+						DRIVER_ATOMIC);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, ebc);
+	t_ebc_init(test, ebc, dev);
+	KUNIT_ASSERT_EQ(test, rk3026_ebc_kms_init(ebc), 0);
+	return ebc;
+}
+
+/* @prop is attached to @obj. */
+static bool t_has_prop(struct drm_mode_object *obj, struct drm_property *prop)
+{
+	int i;
+
+	for (i = 0; i < obj->properties->count; i++)
+		if (obj->properties->properties[i] == prop)
+			return true;
+	return false;
+}
+
+/*
+ * One pipe: the primary plane, XRGB8888 first (the fbdev default), with
+ * damage clips; the CRTC on it, the encoder on the CRTC, the connector on
+ * the encoder; the panel's size the only one; each with a state.
+ */
+static void ebc_test_glue_kms_init(struct kunit *test)
+{
+	struct rk3026_ebc *ebc = t_kms_ebc(test);
+	struct drm_mode_config *mc = &ebc->drm.mode_config;
+
+	KUNIT_EXPECT_EQ(test, mc->num_total_plane, 1);
+	KUNIT_EXPECT_EQ(test, mc->num_crtc, 1);
+	KUNIT_EXPECT_EQ(test, mc->num_encoder, 1);
+	KUNIT_EXPECT_EQ(test, mc->num_connector, 1);
+	KUNIT_EXPECT_EQ(test, mc->min_width, T_W);
+	KUNIT_EXPECT_EQ(test, mc->max_width, T_W);
+	KUNIT_EXPECT_EQ(test, mc->min_height, T_H);
+	KUNIT_EXPECT_EQ(test, mc->max_height, T_H);
+
+	KUNIT_EXPECT_EQ(test, ebc->plane.type, DRM_PLANE_TYPE_PRIMARY);
+	KUNIT_ASSERT_GE(test, ebc->plane.format_count, 1);
+	KUNIT_EXPECT_EQ(test, ebc->plane.format_types[0], DRM_FORMAT_XRGB8888);
+	KUNIT_EXPECT_TRUE(test, t_has_prop(&ebc->plane.base,
+					   mc->prop_fb_damage_clips));
+	KUNIT_EXPECT_PTR_EQ(test, ebc->crtc.primary, &ebc->plane);
+	KUNIT_EXPECT_EQ(test, ebc->encoder.possible_crtcs,
+			drm_crtc_mask(&ebc->crtc));
+	KUNIT_EXPECT_EQ(test, ebc->connector.possible_encoders,
+			drm_encoder_mask(&ebc->encoder));
+
+	KUNIT_EXPECT_NOT_NULL(test, ebc->plane.state);
+	KUNIT_EXPECT_NOT_NULL(test, ebc->crtc.state);
+	KUNIT_EXPECT_NOT_NULL(test, ebc->connector.state);
+}
+
 static struct kunit_case rk3026_ebc_glue_test_cases[] = {
 	KUNIT_CASE(ebc_test_glue_add_update),
 	KUNIT_CASE(ebc_test_glue_crtc_off),
@@ -10527,6 +10607,7 @@ static struct kunit_case rk3026_ebc_glue_test_cases[] = {
 	KUNIT_CASE(ebc_test_glue_flip_take_bounds),
 	KUNIT_CASE(ebc_test_glue_flip_take_window),
 	KUNIT_CASE(ebc_test_glue_flip_take_sleep),
+	KUNIT_CASE(ebc_test_glue_kms_init),
 	{}
 };
 

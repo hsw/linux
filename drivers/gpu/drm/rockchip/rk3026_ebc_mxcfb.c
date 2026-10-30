@@ -20,6 +20,7 @@
 #include <linux/uaccess.h>
 
 #include <drm/drm_fb_helper.h>
+#include <drm/drm_fourcc.h>
 #include <drm/drm_managed.h>
 #include <drm/drm_print.h>
 #include <drm/drm_rect.h>
@@ -183,7 +184,8 @@ VISIBLE_IF_KUNIT int rk3026_ebc_mxcfb_send(struct rk3026_ebc *ebc,
 
 	/* A RESET discards the pixels: rk3026_ebc_add_update() whitens them. */
 	if (upd.mode != EBC_MODE_RESET)
-		upd.blit_us = rk3026_ebc_blit_xrgb8888(ebc, src, pitch, &clip);
+		upd.blit_us = rk3026_ebc_blit(ebc, src, pitch,
+					      DRM_FORMAT_XRGB8888, &clip);
 	rk3026_ebc_add_update(ebc, &upd);
 	mutex_unlock(&ebc->image_lock);
 	return 0;

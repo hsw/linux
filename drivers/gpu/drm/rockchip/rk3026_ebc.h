@@ -528,7 +528,7 @@ enum rk3026_ebc_gave_up {
  * update and an mxcfb AUTO + PARTIAL send set it; an update that names its
  * mode leaves it false.
  *
- * @blit_us: what its blit took (rk3026_ebc_blit_xrgb8888()), 0 without one.
+ * @blit_us: what its blit took (rk3026_ebc_blit()), 0 without one.
  *
  * @queued: when it was queued (rk3026_ebc_clock()), set by
  * rk3026_ebc_add_update(), for the take's quiet gap (rk3026_ebc_take_wait()).
@@ -1184,8 +1184,9 @@ static inline struct rk3026_ebc *drm_to_ebc(struct drm_device *drm)
 }
 
 /* rk3026_ebc.c */
-u32 rk3026_ebc_blit_xrgb8888(struct rk3026_ebc *ebc, const void *src,
-			     unsigned int src_pitch, const struct drm_rect *clip);
+u32 rk3026_ebc_blit(struct rk3026_ebc *ebc, const void *src,
+		    unsigned int src_pitch, u32 format,
+		    const struct drm_rect *clip);
 u32 rk3026_ebc_add_update(struct rk3026_ebc *ebc,
 			  const struct rk3026_ebc_update *upd);
 int rk3026_ebc_wait_marker(struct rk3026_ebc *ebc, u32 marker);
@@ -1203,7 +1204,8 @@ bool rk3026_ebc_plane_box(const struct drm_plane_state *old_state,
 			  struct drm_rect *box);
 void rk3026_ebc_commit_begin(struct rk3026_ebc *ebc);
 bool rk3026_ebc_plane_update(struct rk3026_ebc *ebc, const void *src,
-			     unsigned int src_pitch, const struct drm_rect *box);
+			     unsigned int src_pitch, u32 format,
+			     const struct drm_rect *box);
 void rk3026_ebc_flip_init(struct rk3026_ebc *ebc);
 void rk3026_ebc_flip_fini(struct rk3026_ebc *ebc);
 void rk3026_ebc_flip_watchdog_run(struct rk3026_ebc *ebc, unsigned long now);

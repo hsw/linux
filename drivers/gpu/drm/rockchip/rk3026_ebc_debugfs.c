@@ -62,7 +62,7 @@
  * byte with the LEFT pixel in the LOW nibble, rows of width / 2 bytes, top row
  * first, in the controller's scan order (the DT "rotation" is a property of
  * the connector and does not apply here), 0 black and 15 white. That is the
- * layout rk3026_ebc_blit_xrgb8888() writes.
+ * layout rk3026_ebc_blit() writes.
  *
  * Both are the cached shadows, copied at open() under @image_lock. Every
  * write to them takes that lock: a sender blits into next and queues its

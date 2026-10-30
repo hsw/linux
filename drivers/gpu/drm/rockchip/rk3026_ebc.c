@@ -661,7 +661,7 @@ static void ebc_set_dsp_ctrl(struct rk3026_ebc *ebc, u32 mode)
  *
  * Both hold absolute physical addresses, biased by the window origin at two
  * pixels per byte. The row stride is the panel width: the images are packed
- * at width / 2 bytes per line (rk3026_ebc_blit_xrgb8888()), and WIN_VIR, from
+ * at width / 2 bytes per line (rk3026_ebc_blit()), and WIN_VIR, from
  * which the controller takes its line step, is the width as well.
  */
 static void ebc_set_image_addr(struct rk3026_ebc *ebc, u32 x, u32 y)
@@ -842,25 +842,28 @@ static u32 ebc_us_since(ktime_t start)
 }
 
 /**
- * rk3026_ebc_blit_xrgb8888 - pack a damaged region into the target image
+ * rk3026_ebc_blit - pack a damaged region into the target image
  * @ebc: controller
- * @src: XRGB8888 source, top-left of the whole framebuffer
+ * @src: source, top-left of the whole framebuffer
  * @src_pitch: source stride in bytes
+ * @format: source format, one of ebc_plane_formats[]
  * @clip: damaged region, in pixels
  *
  * The panel is 4bpp with two pixels per byte, low nibble first. The clip is
  * widened to an even pixel boundary so byte writes stay whole, and clamped
- * to the panel; rk3026_ebc_blit_convert() converts it.
+ * to the panel; rk3026_ebc_blit_convert() converts it. A format with no
+ * conversion here is a driver bug: it warns once and writes nothing.
  *
  * Writes @next_shadow. Called under @image_lock, in the same section that
  * queues the update, so no snapshot sees the pixels without their update.
  *
  * Returns the time the conversion took in us, rounded up, or 0 if the clip
- * is off the panel; the sender passes it on with the update
- * (&rk3026_ebc_update.blit_us).
+ * is off the panel or nothing was written; the sender passes it on with the
+ * update (&rk3026_ebc_update.blit_us).
  */
-u32 rk3026_ebc_blit_xrgb8888(struct rk3026_ebc *ebc, const void *src,
-			     unsigned int src_pitch, const struct drm_rect *clip)
+u32 rk3026_ebc_blit(struct rk3026_ebc *ebc, const void *src,
+		    unsigned int src_pitch, u32 format,
+		    const struct drm_rect *clip)
 {
 	struct drm_rect r = *clip;
 	ktime_t start;
@@ -870,11 +873,18 @@ u32 rk3026_ebc_blit_xrgb8888(struct rk3026_ebc *ebc, const void *src,
 		return 0;
 
 	start = ktime_get();
-	rk3026_ebc_blit_convert(ebc->next_shadow, src, src_pitch, r.x1, r.x2,
-				r.y1, r.y2, ebc->width);
+	switch (format) {
+	case DRM_FORMAT_XRGB8888:
+		rk3026_ebc_blit_convert(ebc->next_shadow, src, src_pitch,
+					r.x1, r.x2, r.y1, r.y2, ebc->width);
+		break;
+	default:
+		WARN_ON_ONCE(1);
+		return 0;
+	}
 	return ebc_us_since(start);
 }
-EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_blit_xrgb8888);
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_blit);
 
 static void ebc_program_regs(struct rk3026_ebc *ebc);
 static int ebc_rails_off(struct rk3026_ebc *ebc);
@@ -2680,6 +2690,7 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_plane_box);
 VISIBLE_IF_KUNIT bool rk3026_ebc_plane_update(struct rk3026_ebc *ebc,
 					      const void *src,
 					      unsigned int src_pitch,
+					      u32 format,
 					      const struct drm_rect *box)
 {
 	struct rk3026_ebc_update upd = {
@@ -2696,8 +2707,8 @@ VISIBLE_IF_KUNIT bool rk3026_ebc_plane_update(struct rk3026_ebc *ebc,
 		if (ebc->plane_resync)
 			upd.clip = DRM_RECT_INIT(0, 0, ebc->width, ebc->height);
 		ebc->plane_resync = false;
-		upd.blit_us = rk3026_ebc_blit_xrgb8888(ebc, src, src_pitch,
-						       &upd.clip);
+		upd.blit_us = rk3026_ebc_blit(ebc, src, src_pitch, format,
+					      &upd.clip);
 		WRITE_ONCE(ebc->idle_last_plane, jiffies);
 		WRITE_ONCE(ebc->idle_armed, true);
 		ebc->commit_seq = rk3026_ebc_add_update(ebc, &upd);
@@ -2743,7 +2754,8 @@ static void ebc_plane_atomic_update(struct drm_plane *plane,
 		return;
 
 	rk3026_ebc_plane_update(ebc, shadow->data[0].vaddr,
-				new_state->fb->pitches[0], &box);
+				new_state->fb->pitches[0],
+				new_state->fb->format->format, &box);
 
 	drm_dev_exit(idx);
 }

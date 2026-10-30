@@ -11,10 +11,12 @@
 #include <linux/atomic.h>
 #include <linux/bits.h>
 #include <linux/completion.h>
+#include <linux/hrtimer.h>
 #include <linux/ktime.h>
 #include <linux/math.h>
 #include <linux/minmax.h>
 #include <linux/mutex.h>
+#include <linux/spinlock.h>
 #include <linux/types.h>
 #include <linux/wait.h>
 
@@ -824,6 +826,20 @@ struct rk3026_ebc {
 	struct drm_crtc		crtc;
 	struct drm_encoder	encoder;
 	struct drm_connector	connector;
+	/*
+	 * The CRTC's vblank: a timer of its own (rk3026_ebc_vblank_timer()),
+	 * started by .enable_vblank at @vblank_period, the frame duration of
+	 * the CRTC's mode, and cancelled by .disable_vblank, which clears
+	 * @vblank_run. Both run under the vblank core's spinlocks, which the
+	 * callback takes, so neither waits for it. @vblank_lock, inside the
+	 * core's locks, orders @vblank_run and the timer's restart against
+	 * the callback.
+	 */
+	struct hrtimer		vblank_timer;
+	/* @vblank_run, the timer's restart and expiry, @vblank_period. */
+	spinlock_t		vblank_lock;
+	ktime_t			vblank_period;
+	bool			vblank_run;
 
 	struct device		*dev;
 	void __iomem		*regs;
@@ -1038,6 +1054,13 @@ struct rk3026_ebc {
 	bool			suspended;
 	bool			in_flight;
 	/*
+	 * Vblank ticks delivered since probe (rk3026_ebc_vblank_tick()), so
+	 * the tick's wakeups can be counted while nothing waits. Not the
+	 * core's vblank count: that one jumps, on a vblank enable, by the
+	 * ticks the time off would have had.
+	 */
+	atomic64_t		vblank_ticks;
+	/*
 	 * The clocks are enabled: by ebc_hw_init(), and again by a resume
 	 * that got them (ebc_clks_on()). ebc_hw_fini() disables only these,
 	 * so an unbind after a resume that found no clocks does not disable
@@ -1109,6 +1132,10 @@ void rk3026_ebc_sleep_end(struct rk3026_ebc *ebc);
 void rk3026_ebc_sleep_restore(struct rk3026_ebc *ebc);
 int rk3026_ebc_crtc_wait(struct rk3026_ebc *ebc, u32 seq,
 			 unsigned int timeout_ms);
+int rk3026_ebc_crtc_init(struct rk3026_ebc *ebc, struct drm_plane *primary);
+bool rk3026_ebc_vblank_tick(struct drm_crtc *crtc);
+void rk3026_ebc_crtc_off_event(struct drm_crtc *crtc,
+			       struct drm_atomic_state *state);
 #endif
 
 /* rk3026_ebc_blit.c */

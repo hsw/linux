@@ -51,6 +51,8 @@
 #include <drm/drm_managed.h>
 #include <drm/drm_modeset_helper_vtables.h>
 #include <drm/drm_probe_helper.h>
+#include <drm/drm_vblank.h>
+#include <drm/drm_vblank_helper.h>
 
 #include <video/of_display_timing.h>
 
@@ -2514,6 +2516,8 @@ static void ebc_crtc_atomic_enable(struct drm_crtc *crtc,
 		ret = regulator_enable(ebc->v3p3_supply);
 		if (ret) {
 			dev_err(ebc->dev, "failed to enable v3p3: %d\n", ret);
+			/* The tick is not the panel's: an active CRTC has it. */
+			drm_crtc_vblank_on(crtc);
 			return;
 		}
 		ebc->v3p3_on = true;
@@ -2557,6 +2561,12 @@ static void ebc_crtc_atomic_enable(struct drm_crtc *crtc,
 	seq = rk3026_ebc_add_update(ebc, &upd);
 	mutex_unlock(&ebc->image_lock);
 	ebc_wait_finished(ebc, seq);
+
+	/*
+	 * The ticks start after the RESET: the flush arms the enabling
+	 * commit's event on the first tick after it.
+	 */
+	drm_crtc_vblank_on(crtc);
 }
 
 /*
@@ -2661,11 +2671,41 @@ VISIBLE_IF_KUNIT void rk3026_ebc_sleep_restore(struct rk3026_ebc *ebc)
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_sleep_restore);
 
+/*
+ * The event of a commit that turns the CRTC off. Its planes are not
+ * committed (DRM_PLANE_COMMIT_ACTIVE_ONLY in the _rpm tail), so the
+ * flush (drm_crtc_vblank_atomic_flush()) does not run for it, and with
+ * vblank support the core no longer fakes it: ebc_crtc_atomic_disable()
+ * sends it, once the CRTC is off. A modeset that keeps the CRTC active
+ * leaves its event to the flush.
+ */
+VISIBLE_IF_KUNIT void rk3026_ebc_crtc_off_event(struct drm_crtc *crtc,
+						struct drm_atomic_state *state)
+{
+	struct drm_crtc_state *crtc_state =
+		drm_atomic_get_new_crtc_state(state, crtc);
+
+	spin_lock_irq(&crtc->dev->event_lock);
+	if (crtc_state->event && !crtc_state->active) {
+		drm_crtc_send_vblank_event(crtc, crtc_state->event);
+		crtc_state->event = NULL;
+	}
+	spin_unlock_irq(&crtc->dev->event_lock);
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_crtc_off_event);
+
 static void ebc_crtc_atomic_disable(struct drm_crtc *crtc,
 				    struct drm_atomic_state *state)
 {
 	struct rk3026_ebc *ebc = drm_to_ebc(crtc->dev);
 	u32 seq;
+
+	/*
+	 * The ticks stop with the CRTC, before its rails go down; the
+	 * events armed on them are sent now. A modeset that keeps the CRTC
+	 * active turns them on again in ebc_crtc_atomic_enable().
+	 */
+	drm_crtc_vblank_off(crtc);
 
 	/*
 	 * Let the part in flight and those pending finish, then drop the
@@ -2692,6 +2732,155 @@ static void ebc_crtc_atomic_disable(struct drm_crtc *crtc,
 		else
 			ebc->v3p3_on = false;
 	}
+
+	rk3026_ebc_crtc_off_event(crtc, state);
+}
+
+/**
+ * rk3026_ebc_vblank_tick - one tick of the simulated vblank
+ * @crtc: the EBC's CRTC
+ *
+ * The panel has no vertical blank: a scan takes many frames, and the
+ * driver merges what arrives meanwhile into the next one. The vblank is the
+ * core's vblank timer instead (DRM_CRTC_VBLANK_TIMER_FUNCS), a tick at the
+ * rate of the connector's mode (EBC_VBLANK_HZ, rk3026_ebc_vblank_mode_clock())
+ * while anything holds a vblank reference. A tick says only that the
+ * commits before it were taken by the driver: not that the panel shows
+ * them, which the update markers and the mxcfb wait report.
+ *
+ * Every event is armed on the next tick (drm_crtc_vblank_atomic_flush()),
+ * the internal ones of fbcon, fbdev and DirtyFB too, and a blocking commit
+ * waits for one tick after it (drm_atomic_helper_wait_for_vblanks()): up to
+ * a period each, and a whole period when the vblank had been idle, as the
+ * timer's first tick comes a period after it starts. The core turns the
+ * timer off vblank_offdelay after its last user, so an idle panel does not
+ * tick.
+ *
+ * Called in the timer's interrupt context: hardirq, softirq on PREEMPT_RT.
+ *
+ * Return: false once the vblank is off, which stops the timer.
+ */
+VISIBLE_IF_KUNIT bool rk3026_ebc_vblank_tick(struct drm_crtc *crtc)
+{
+	struct rk3026_ebc *ebc = drm_to_ebc(crtc->dev);
+
+	if (!drm_crtc_handle_vblank(crtc))
+		return false;
+	atomic64_inc(&ebc->vblank_ticks);
+	return true;
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_vblank_tick);
+
+/*
+ * The vblank's timer (&rk3026_ebc.vblank_timer): a tick per period while
+ * the vblank core has the vblank enabled. The forward and the decision to
+ * run are under @vblank_lock, against .enable_vblank and .disable_vblank;
+ * the tick is not, as it takes the core's locks, which those two hold. A
+ * callback that an enable restarted meanwhile leaves the timer to that
+ * start, and one whose vblank went off stops, before or after its tick.
+ * The core's own vblank timer is not used: its start waits for a running
+ * callback under the locks the callback takes.
+ */
+static enum hrtimer_restart rk3026_ebc_vblank_timer(struct hrtimer *timer)
+{
+	struct rk3026_ebc *ebc = container_of(timer, struct rk3026_ebc,
+					      vblank_timer);
+	unsigned long flags;
+	bool run;
+
+	spin_lock_irqsave(&ebc->vblank_lock, flags);
+	run = ebc->vblank_run && !hrtimer_is_queued(timer);
+	if (run)
+		hrtimer_forward_now(timer, ebc->vblank_period);
+	spin_unlock_irqrestore(&ebc->vblank_lock, flags);
+
+	if (!run || !rk3026_ebc_vblank_tick(&ebc->crtc))
+		return HRTIMER_NORESTART;
+	return READ_ONCE(ebc->vblank_run) ? HRTIMER_RESTART : HRTIMER_NORESTART;
+}
+
+/*
+ * Called by the vblank core with its spinlocks held and interrupts off:
+ * the period is the frame duration of the CRTC's mode, as the vblank's
+ * timestamps take it. hrtimer_start() also takes a timer whose callback
+ * is still running; that callback then leaves it alone.
+ */
+static int ebc_crtc_enable_vblank(struct drm_crtc *crtc)
+{
+	struct rk3026_ebc *ebc = drm_to_ebc(crtc->dev);
+	struct drm_vblank_crtc *vblank = drm_crtc_vblank_crtc(crtc);
+	unsigned long flags;
+
+	drm_calc_timestamping_constants(crtc, &crtc->mode);
+	if (!vblank->framedur_ns)
+		return -EINVAL;
+
+	spin_lock_irqsave(&ebc->vblank_lock, flags);
+	ebc->vblank_period = ns_to_ktime(vblank->framedur_ns);
+	WRITE_ONCE(ebc->vblank_run, true);
+	hrtimer_start(&ebc->vblank_timer, ebc->vblank_period,
+		      HRTIMER_MODE_REL);
+	spin_unlock_irqrestore(&ebc->vblank_lock, flags);
+	return 0;
+}
+
+/*
+ * Called as .enable_vblank is: only tries to cancel, as a running callback
+ * may wait for the locks held here. That callback sees @vblank_run cleared
+ * and stops, before its tick or after it; one already past both checks
+ * restarts the timer once more, and that expiry stops.
+ */
+static void ebc_crtc_disable_vblank(struct drm_crtc *crtc)
+{
+	struct rk3026_ebc *ebc = drm_to_ebc(crtc->dev);
+	unsigned long flags;
+
+	spin_lock_irqsave(&ebc->vblank_lock, flags);
+	WRITE_ONCE(ebc->vblank_run, false);
+	hrtimer_try_to_cancel(&ebc->vblank_timer);
+	spin_unlock_irqrestore(&ebc->vblank_lock, flags);
+}
+
+/*
+ * The vblank's time is the expiry of the timer's tick, not the moment its
+ * callback ran: the callback forwards the timer before the tick, so the
+ * tick's time is the expiry one period back. With the vblank off it is
+ * now. The expiry and @vblank_period are read under @vblank_lock, as the
+ * callback and .enable_vblank write them: on a 32-bit CPU a 64-bit read
+ * may tear. The core calls this with its vblank_time_lock held, or with
+ * no lock (drm_crtc_next_vblank_start()), where a tick may run meanwhile.
+ */
+static bool ebc_crtc_get_vblank_timestamp(struct drm_crtc *crtc,
+					  int *max_error, ktime_t *vblank_time,
+					  bool in_vblank_irq)
+{
+	struct rk3026_ebc *ebc = drm_to_ebc(crtc->dev);
+	struct drm_vblank_crtc *vblank = drm_crtc_vblank_crtc(crtc);
+	ktime_t expires, period, last;
+	unsigned long flags;
+	u64 count;
+
+	if (!READ_ONCE(vblank->enabled)) {
+		*vblank_time = ktime_get();
+		return true;
+	}
+
+	/* A tick meanwhile forwards the timer: read both again. */
+	do {
+		count = drm_crtc_vblank_count_and_time(crtc, &last);
+		spin_lock_irqsave(&ebc->vblank_lock, flags);
+		expires = hrtimer_get_expires(&ebc->vblank_timer);
+		period = ebc->vblank_period;
+		spin_unlock_irqrestore(&ebc->vblank_lock, flags);
+	} while (count != drm_crtc_vblank_count_and_time(crtc, &last));
+
+	/* Not forwarded since the last tick: that tick's time. */
+	if (!ktime_compare(expires, last)) {
+		*vblank_time = expires;
+		return true;
+	}
+	*vblank_time = ktime_sub(expires, period);
+	return true;
 }
 
 static const struct drm_crtc_funcs ebc_crtc_funcs = {
@@ -2701,12 +2890,88 @@ static const struct drm_crtc_funcs ebc_crtc_funcs = {
 	.destroy		= drm_crtc_cleanup,
 	.atomic_duplicate_state	= drm_atomic_helper_crtc_duplicate_state,
 	.atomic_destroy_state	= drm_atomic_helper_crtc_destroy_state,
+	.enable_vblank		= ebc_crtc_enable_vblank,
+	.disable_vblank		= ebc_crtc_disable_vblank,
+	.get_vblank_timestamp	= ebc_crtc_get_vblank_timestamp,
 };
 
+/*
+ * The CRTC takes only the connector's mode: the panel's size with no
+ * blanking, progressive, at a tick rate within
+ * EBC_VBLANK_HZ_MIN..EBC_VBLANK_HZ_MAX (rk3026_ebc_vblank_mode_clock()).
+ * The vblank timer's period is the frame duration of the CRTC's mode, and
+ * a DRM master may commit a mode of its own: a clock far above the tick's
+ * would fire the timer every few microseconds, one below it would time
+ * out the vblank wait of every blocking commit. Checked for the probed
+ * modes and for every modeset (drm_atomic_helper_check_modeset()).
+ */
+static enum drm_mode_status
+ebc_crtc_mode_valid(struct drm_crtc *crtc, const struct drm_display_mode *mode)
+{
+	struct rk3026_ebc *ebc = drm_to_ebc(crtc->dev);
+	u16 width = ebc->width, height = ebc->height;
+
+	if (mode->hdisplay != width || mode->htotal != width)
+		return MODE_H_ILLEGAL;
+	if (mode->vdisplay != height || mode->vtotal != height)
+		return MODE_V_ILLEGAL;
+	if (mode->flags & DRM_MODE_FLAG_INTERLACE)
+		return MODE_NO_INTERLACE;
+	if (mode->flags & DRM_MODE_FLAG_DBLSCAN)
+		return MODE_NO_DBLESCAN;
+	if (mode->vscan > 1)
+		return MODE_NO_VSCAN;
+	if (mode->clock < rk3026_ebc_vblank_mode_clock(EBC_VBLANK_HZ_MIN,
+						       width, height))
+		return MODE_CLOCK_LOW;
+	if (mode->clock > rk3026_ebc_vblank_mode_clock(EBC_VBLANK_HZ_MAX,
+						       width, height))
+		return MODE_CLOCK_HIGH;
+	return MODE_OK;
+}
+
+/*
+ * Every event is sent exactly once: by the tick, by drm_crtc_vblank_off(),
+ * or at the flush when the vblank is off.
+ */
 static const struct drm_crtc_helper_funcs ebc_crtc_helper_funcs = {
+	.mode_valid		= ebc_crtc_mode_valid,
 	.atomic_enable		= ebc_crtc_atomic_enable,
 	.atomic_disable		= ebc_crtc_atomic_disable,
+	.atomic_flush		= drm_crtc_vblank_atomic_flush,
 };
+
+/* The vblank's timer stops before the DRM device goes. */
+static void ebc_vblank_timer_fini(struct drm_device *drm, void *ptr)
+{
+	hrtimer_cancel(ptr);
+}
+
+/*
+ * The CRTC on @primary, and its vblank: the driver's timer, at the rate of
+ * the mode (rk3026_ebc_vblank_timer()).
+ */
+VISIBLE_IF_KUNIT int rk3026_ebc_crtc_init(struct rk3026_ebc *ebc,
+					  struct drm_plane *primary)
+{
+	int ret;
+
+	ret = drm_crtc_init_with_planes(&ebc->drm, &ebc->crtc, primary, NULL,
+					&ebc_crtc_funcs, NULL);
+	if (ret)
+		return ret;
+	drm_crtc_helper_add(&ebc->crtc, &ebc_crtc_helper_funcs);
+
+	ret = drm_vblank_init(&ebc->drm, 1);
+	if (ret)
+		return ret;
+	spin_lock_init(&ebc->vblank_lock);
+	hrtimer_setup(&ebc->vblank_timer, rk3026_ebc_vblank_timer,
+		      CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+	return drmm_add_action_or_reset(&ebc->drm, ebc_vblank_timer_fini,
+					&ebc->vblank_timer);
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_crtc_init);
 
 static const struct drm_encoder_funcs ebc_encoder_funcs = {
 	.destroy		= drm_encoder_cleanup,
@@ -3379,11 +3644,9 @@ static int ebc_probe(struct platform_device *pdev)
 	 */
 	drm_plane_enable_fb_damage_clips(&ebc->plane);
 
-	ret = drm_crtc_init_with_planes(drm, &ebc->crtc, &ebc->plane, NULL,
-					&ebc_crtc_funcs, NULL);
+	ret = rk3026_ebc_crtc_init(ebc, &ebc->plane);
 	if (ret)
 		return ret;
-	drm_crtc_helper_add(&ebc->crtc, &ebc_crtc_helper_funcs);
 
 	ret = drm_encoder_init(drm, &ebc->encoder, &ebc_encoder_funcs,
 			       DRM_MODE_ENCODER_NONE, NULL);
@@ -3418,6 +3681,15 @@ static void ebc_remove(struct platform_device *pdev)
 
 	drm_dev_unplug(&ebc->drm);
 	drm_atomic_helper_shutdown(&ebc->drm);
+	/*
+	 * The vblank goes off even if the shutdown failed before the CRTC
+	 * disable: a file still open keeps the DRM device, and with it the
+	 * timer, past the unbind. The events armed are sent now, and a later
+	 * reference is refused, so the timer does not start again; a
+	 * callback still running is waited for.
+	 */
+	drm_crtc_vblank_off(&ebc->crtc);
+	hrtimer_cancel(&ebc->vblank_timer);
 }
 
 static void ebc_shutdown(struct platform_device *pdev)

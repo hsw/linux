@@ -11,25 +11,39 @@
 #include <kunit/static_stub.h>
 #include <kunit/test.h>
 
+#include <linux/completion.h>
+#include <linux/delay.h>
 #include <linux/err.h>
 #include <linux/hrtimer.h>
 #include <linux/jiffies.h>
 #include <linux/ktime.h>
 #include <linux/limits.h>
 #include <linux/math.h>
+#include <linux/math64.h>
 #include <linux/minmax.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/prandom.h>
+#include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/unaligned.h>
 #include <linux/wait.h>
 #include <linux/workqueue.h>
 
+#include <drm/drm_atomic.h>
+#include <drm/drm_atomic_state_helper.h>
+#include <drm/drm_atomic_uapi.h>
+#include <drm/drm_connector.h>
 #include <drm/drm_drv.h>
+#include <drm/drm_encoder.h>
 #include <drm/drm_framebuffer.h>
+#include <drm/drm_kunit_helpers.h>
+#include <drm/drm_managed.h>
 #include <drm/drm_modes.h>
+#include <drm/drm_modeset_helper_vtables.h>
+#include <drm/drm_modeset_lock.h>
 #include <drm/drm_plane.h>
+#include <drm/drm_vblank.h>
 
 #if IS_ENABLED(CONFIG_DRM_RK3026_EBC_NEON)
 #include <asm/neon.h>
@@ -9453,6 +9467,429 @@ static struct kunit_suite rk3026_ebc_conv_test_suite = {
 };
 
 kunit_test_suite(rk3026_ebc_conv_test_suite);
+
+/* --- the vblank: the driver's CRTC on a KUnit DRM device --- */
+
+/*
+ * The CRTC as probe sets it up (rk3026_ebc_crtc_init(): the driver's CRTC
+ * funcs, helper funcs and vblank), on a KUnit DRM device with a primary
+ * plane, its state reset (vblank off), and the connector's mode of a
+ * 1448x1072 panel at @hz, which the core's timer takes its period from.
+ * Nothing else of the driver state is set up: the flush, the tick and the
+ * disabling commit's event touch none of it.
+ */
+#define T_VBL_W		1448
+#define T_VBL_H		1072
+
+static struct rk3026_ebc *t_vbl_alloc(struct kunit *test, u32 hz)
+{
+	struct drm_display_mode *mode;
+	struct drm_plane *primary;
+	struct rk3026_ebc *ebc;
+	struct device *dev;
+
+	dev = drm_kunit_helper_alloc_device(test);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, dev);
+	ebc = drm_kunit_helper_alloc_drm_device(test, dev, struct rk3026_ebc,
+						drm,
+						DRIVER_MODESET | DRIVER_ATOMIC);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, ebc);
+	primary = drm_kunit_helper_create_primary_plane(test, &ebc->drm, NULL,
+							NULL, NULL, 0, NULL);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, primary);
+	KUNIT_ASSERT_EQ(test, rk3026_ebc_crtc_init(ebc, primary), 0);
+	drm_mode_config_reset(&ebc->drm);
+
+	mode = &ebc->crtc.mode;
+	mode->hdisplay = T_VBL_W;
+	mode->hsync_start = T_VBL_W;
+	mode->hsync_end = T_VBL_W;
+	mode->htotal = T_VBL_W;
+	mode->vdisplay = T_VBL_H;
+	mode->vsync_start = T_VBL_H;
+	mode->vsync_end = T_VBL_H;
+	mode->vtotal = T_VBL_H;
+	mode->clock = rk3026_ebc_vblank_mode_clock(hz, T_VBL_W, T_VBL_H);
+	drm_mode_set_crtcinfo(mode, CRTC_INTERLACE_HALVE_V);
+	return ebc;
+}
+
+static void t_vbl_release(struct completion *done)
+{
+}
+
+/*
+ * An event as the core gives a commit nobody asked an event for (no file,
+ * a completion): freed by the core once it is sent.
+ */
+static struct drm_pending_vblank_event *
+t_vbl_event(struct kunit *test, struct completion *done)
+{
+	struct drm_pending_vblank_event *e = kzalloc(sizeof(*e), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, e);
+	init_completion(done);
+	e->base.completion = done;
+	e->base.completion_release = t_vbl_release;
+	return e;
+}
+
+/* A commit's state of the CRTC, with @e as its event. */
+static struct drm_crtc_state *
+t_vbl_state(struct kunit *test, struct rk3026_ebc *ebc,
+	    struct drm_modeset_acquire_ctx *ctx,
+	    struct drm_atomic_state **state, struct drm_pending_vblank_event *e)
+{
+	struct drm_crtc_state *crtc_state;
+
+	*state = drm_kunit_helper_atomic_state_alloc(test, &ebc->drm, ctx);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, *state);
+	crtc_state = drm_atomic_get_crtc_state(*state, &ebc->crtc);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, crtc_state);
+	crtc_state->event = e;
+	return crtc_state;
+}
+
+/* The driver's .atomic_flush on @state. */
+static void t_vbl_flush(struct rk3026_ebc *ebc, struct drm_atomic_state *state)
+{
+	ebc->crtc.helper_private->atomic_flush(&ebc->crtc, state);
+}
+
+static void t_vbl_unlock(void *ptr)
+{
+	struct drm_modeset_acquire_ctx *ctx = ptr;
+
+	drm_modeset_drop_locks(ctx);
+	drm_modeset_acquire_fini(ctx);
+}
+
+/* An acquire context, its locks dropped at the end of the test. */
+static struct drm_modeset_acquire_ctx *t_vbl_ctx(struct kunit *test)
+{
+	struct drm_modeset_acquire_ctx *ctx;
+
+	ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	drm_modeset_acquire_init(ctx, 0);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, t_vbl_unlock,
+							ctx), 0);
+	return ctx;
+}
+
+/*
+ * The vblank is off (the CRTC was never enabled, or is off): no reference
+ * can be taken, so the flush sends the event at once and no tick runs.
+ */
+static void ebc_test_vblank_flush_off(struct kunit *test)
+{
+	struct rk3026_ebc *ebc = t_vbl_alloc(test, EBC_VBLANK_HZ);
+	struct drm_modeset_acquire_ctx *ctx = t_vbl_ctx(test);
+	struct drm_crtc_state *crtc_state;
+	struct drm_atomic_state *state;
+	struct completion done;
+
+	crtc_state = t_vbl_state(test, ebc, ctx, &state,
+				 t_vbl_event(test, &done));
+	t_vbl_flush(ebc, state);
+	KUNIT_EXPECT_TRUE(test, completion_done(&done));
+	KUNIT_EXPECT_NULL(test, crtc_state->event);
+	KUNIT_EXPECT_EQ(test, drm_crtc_vblank_get(&ebc->crtc), -EINVAL);
+
+	/* A commit without an event: nothing to send, nothing armed. */
+	t_vbl_flush(ebc, state);
+	KUNIT_EXPECT_NULL(test, crtc_state->event);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&ebc->vblank_ticks), 0);
+}
+
+/*
+ * The vblank is on: the flush takes a reference and arms the event, the
+ * next tick of the core's timer sends it, at the mode's rate, through the
+ * driver's tick. With the vblank off again the timer stops.
+ */
+static void ebc_test_vblank_flush_armed(struct kunit *test)
+{
+	struct rk3026_ebc *ebc = t_vbl_alloc(test, EBC_VBLANK_HZ);
+	u64 period = rk3026_ebc_vblank_period_ns(EBC_VBLANK_HZ);
+	struct drm_crtc *crtc = &ebc->crtc;
+	struct drm_modeset_acquire_ctx *ctx = t_vbl_ctx(test);
+	struct drm_crtc_state *crtc_state;
+	struct drm_atomic_state *state;
+	struct completion done;
+	u64 seq, seq_now, ticks;
+	s64 err;
+	bool sent;
+
+	drm_crtc_vblank_on(crtc);
+	seq = drm_crtc_vblank_count(crtc);
+
+	crtc_state = t_vbl_state(test, ebc, ctx, &state,
+				 t_vbl_event(test, &done));
+	t_vbl_flush(ebc, state);
+	KUNIT_EXPECT_NULL(test, crtc_state->event);
+	/* Armed, not sent: unless a tick came in between, a period later. */
+	spin_lock_irq(&ebc->drm.event_lock);
+	sent = completion_done(&done);
+	seq_now = drm_crtc_vblank_count(crtc);
+	spin_unlock_irq(&ebc->drm.event_lock);
+	KUNIT_EXPECT_TRUE(test, !sent || seq_now != seq);
+
+	/* The timer runs at the period of the mode's rate. */
+	err = (s64)drm_crtc_vblank_crtc(crtc)->framedur_ns - (s64)period;
+	KUNIT_EXPECT_LE(test, abs(err), (s64)div_u64(period, 500));
+
+	KUNIT_ASSERT_TRUE(test, wait_for_completion_timeout(&done,
+							    msecs_to_jiffies(1000)));
+	KUNIT_EXPECT_GT(test, drm_crtc_vblank_count(crtc), seq);
+	KUNIT_EXPECT_GE(test, atomic64_read(&ebc->vblank_ticks), 1);
+
+	/* Off: no further tick once drm_crtc_vblank_off() has returned. */
+	drm_crtc_vblank_off(crtc);
+	ticks = atomic64_read(&ebc->vblank_ticks);
+	msleep(3 * MSEC_PER_SEC / EBC_VBLANK_HZ);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&ebc->vblank_ticks), ticks);
+	KUNIT_EXPECT_EQ(test, drm_crtc_vblank_get(crtc), -EINVAL);
+}
+
+/*
+ * An event armed when the CRTC goes off is sent by drm_crtc_vblank_off()
+ * (ebc_crtc_atomic_disable()), not lost with the tick it waited for. At
+ * 1 Hz the first tick is a second away.
+ */
+static void ebc_test_vblank_off_sends_armed(struct kunit *test)
+{
+	struct rk3026_ebc *ebc = t_vbl_alloc(test, 1);
+	struct drm_modeset_acquire_ctx *ctx = t_vbl_ctx(test);
+	struct drm_atomic_state *state;
+	struct completion done;
+
+	drm_crtc_vblank_on(&ebc->crtc);
+	t_vbl_state(test, ebc, ctx, &state, t_vbl_event(test, &done));
+	t_vbl_flush(ebc, state);
+	KUNIT_EXPECT_TRUE(test, !completion_done(&done) ||
+			  atomic64_read(&ebc->vblank_ticks));
+
+	drm_crtc_vblank_off(&ebc->crtc);
+	KUNIT_EXPECT_TRUE(test, completion_done(&done));
+}
+
+/*
+ * The disabling commit's event (rk3026_ebc_crtc_off_event()): sent once
+ * when the commit turns the CRTC off; left to the flush when the CRTC stays
+ * active (a modeset that re-enables it); nothing without an event.
+ */
+static void ebc_test_vblank_off_event(struct kunit *test)
+{
+	struct rk3026_ebc *ebc = t_vbl_alloc(test, EBC_VBLANK_HZ);
+	struct drm_pending_vblank_event *e;
+	struct drm_modeset_acquire_ctx *ctx = t_vbl_ctx(test);
+	struct drm_crtc_state *crtc_state;
+	struct drm_atomic_state *state;
+	struct completion done;
+
+	crtc_state = t_vbl_state(test, ebc, ctx, &state,
+				 t_vbl_event(test, &done));
+	crtc_state->active = false;
+	rk3026_ebc_crtc_off_event(&ebc->crtc, state);
+	KUNIT_EXPECT_TRUE(test, completion_done(&done));
+	KUNIT_EXPECT_NULL(test, crtc_state->event);
+	rk3026_ebc_crtc_off_event(&ebc->crtc, state);
+	KUNIT_EXPECT_NULL(test, crtc_state->event);
+
+	e = t_vbl_event(test, &done);
+	crtc_state->event = e;
+	crtc_state->active = true;
+	rk3026_ebc_crtc_off_event(&ebc->crtc, state);
+	KUNIT_EXPECT_FALSE(test, completion_done(&done));
+	KUNIT_EXPECT_PTR_EQ(test, crtc_state->event, e);
+	/* The flush sends it: the vblank is off. */
+	t_vbl_flush(ebc, state);
+	KUNIT_EXPECT_TRUE(test, completion_done(&done));
+	KUNIT_EXPECT_NULL(test, crtc_state->event);
+}
+
+static const struct drm_connector_funcs t_vbl_connector_funcs = {
+	.reset			= drm_atomic_helper_connector_reset,
+	.atomic_duplicate_state	= drm_atomic_helper_connector_duplicate_state,
+	.atomic_destroy_state	= drm_atomic_helper_connector_destroy_state,
+};
+
+static const struct drm_connector_helper_funcs t_vbl_connector_helper_funcs = {
+};
+
+/*
+ * An encoder and a connector on the CRTC, as probe adds them, so that a
+ * modeset can be checked as the atomic core checks a commit. Managed by
+ * the DRM device, which outlives them.
+ */
+static struct drm_connector *t_vbl_output(struct kunit *test,
+					  struct rk3026_ebc *ebc)
+{
+	struct drm_connector *connector;
+	struct drm_encoder *encoder;
+
+	encoder = drmm_kzalloc(&ebc->drm, sizeof(*encoder), GFP_KERNEL);
+	connector = drmm_kzalloc(&ebc->drm, sizeof(*connector), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, encoder);
+	KUNIT_ASSERT_NOT_NULL(test, connector);
+	KUNIT_ASSERT_EQ(test, drmm_encoder_init(&ebc->drm, encoder, NULL,
+						DRM_MODE_ENCODER_NONE, NULL), 0);
+	encoder->possible_crtcs = drm_crtc_mask(&ebc->crtc);
+	KUNIT_ASSERT_EQ(test, drmm_connector_init(&ebc->drm, connector,
+						  &t_vbl_connector_funcs,
+						  DRM_MODE_CONNECTOR_Unknown,
+						  NULL), 0);
+	drm_connector_helper_add(connector, &t_vbl_connector_helper_funcs);
+	KUNIT_ASSERT_EQ(test, drm_connector_attach_encoder(connector, encoder),
+			0);
+	drm_mode_config_reset(&ebc->drm);
+	return connector;
+}
+
+/*
+ * A modeset of the CRTC to @mode through @connector, checked as the atomic
+ * core checks a commit (drm_atomic_check_only()), not committed. Its
+ * locks are dropped here, in the test's thread.
+ */
+static int t_vbl_check(struct kunit *test, struct rk3026_ebc *ebc,
+		       struct drm_connector *connector,
+		       const struct drm_display_mode *mode)
+{
+	struct drm_connector_state *conn_state;
+	struct drm_modeset_acquire_ctx ctx;
+	struct drm_crtc_state *crtc_state;
+	struct drm_atomic_state *state;
+	int ret;
+
+	drm_modeset_acquire_init(&ctx, 0);
+	state = drm_kunit_helper_atomic_state_alloc(test, &ebc->drm, &ctx);
+	if (IS_ERR(state)) {
+		ret = PTR_ERR(state);
+		goto out;
+	}
+	conn_state = drm_atomic_get_connector_state(state, connector);
+	if (IS_ERR(conn_state)) {
+		ret = PTR_ERR(conn_state);
+		goto out_state;
+	}
+	ret = drm_atomic_set_crtc_for_connector(conn_state, &ebc->crtc);
+	if (ret)
+		goto out_state;
+	crtc_state = drm_atomic_get_crtc_state(state, &ebc->crtc);
+	if (IS_ERR(crtc_state)) {
+		ret = PTR_ERR(crtc_state);
+		goto out_state;
+	}
+	ret = drm_atomic_set_mode_for_crtc(crtc_state, mode);
+	if (ret)
+		goto out_state;
+	crtc_state->enable = true;
+	crtc_state->active = true;
+	ret = drm_atomic_check_only(state);
+out_state:
+	state->acquire_ctx = NULL;
+out:
+	drm_modeset_drop_locks(&ctx);
+	drm_modeset_acquire_fini(&ctx);
+	return ret;
+}
+
+/*
+ * The CRTC takes the connector's mode at every rate within the clamp and
+ * nothing else (ebc_crtc_mode_valid()): not another size, blanking, an
+ * interlaced, doublescan or multiscan mode, or a clock off the clamp's
+ * rates. A DRM master's own mode is refused by its modeset's atomic check.
+ */
+static void ebc_test_vblank_mode_valid(struct kunit *test)
+{
+	struct rk3026_ebc *ebc = t_vbl_alloc(test, EBC_VBLANK_HZ);
+	const struct drm_crtc_helper_funcs *funcs = ebc->crtc.helper_private;
+	struct drm_crtc *crtc = &ebc->crtc;
+	struct drm_connector *connector;
+	struct drm_display_mode m;
+	u32 hz;
+
+	ebc->width = T_VBL_W;
+	ebc->height = T_VBL_H;
+	connector = t_vbl_output(test, ebc);
+
+	for (hz = EBC_VBLANK_HZ_MIN; hz <= EBC_VBLANK_HZ_MAX; hz++) {
+		t_vblank_mode(&m, hz, T_VBL_W, T_VBL_H);
+		KUNIT_EXPECT_EQ_MSG(test, funcs->mode_valid(crtc, &m), MODE_OK,
+				    "%u Hz", hz);
+	}
+	KUNIT_EXPECT_EQ(test, t_vbl_check(test, ebc, connector, &crtc->mode), 0);
+
+	/* A clock just off the clamp's rates, and far off them. */
+	t_vblank_mode(&m, EBC_VBLANK_HZ_MIN, T_VBL_W, T_VBL_H);
+	m.clock--;
+	KUNIT_EXPECT_EQ(test, funcs->mode_valid(crtc, &m), MODE_CLOCK_LOW);
+	m.clock = 1;
+	KUNIT_EXPECT_EQ(test, funcs->mode_valid(crtc, &m), MODE_CLOCK_LOW);
+	KUNIT_EXPECT_EQ(test, t_vbl_check(test, ebc, connector, &m), -EINVAL);
+	t_vblank_mode(&m, EBC_VBLANK_HZ_MAX, T_VBL_W, T_VBL_H);
+	m.clock++;
+	KUNIT_EXPECT_EQ(test, funcs->mode_valid(crtc, &m), MODE_CLOCK_HIGH);
+	m.clock = INT_MAX;
+	KUNIT_EXPECT_EQ(test, funcs->mode_valid(crtc, &m), MODE_CLOCK_HIGH);
+	KUNIT_EXPECT_EQ(test, t_vbl_check(test, ebc, connector, &m), -EINVAL);
+
+	/* Another size, the other orientation included, or blanking. */
+	t_vblank_mode(&m, EBC_VBLANK_HZ, 800, 600);
+	KUNIT_EXPECT_EQ(test, funcs->mode_valid(crtc, &m), MODE_H_ILLEGAL);
+	KUNIT_EXPECT_EQ(test, t_vbl_check(test, ebc, connector, &m), -EINVAL);
+	t_vblank_mode(&m, EBC_VBLANK_HZ, T_VBL_H, T_VBL_W);
+	KUNIT_EXPECT_EQ(test, funcs->mode_valid(crtc, &m), MODE_H_ILLEGAL);
+	t_vblank_mode(&m, EBC_VBLANK_HZ, T_VBL_W, T_VBL_W);
+	KUNIT_EXPECT_EQ(test, funcs->mode_valid(crtc, &m), MODE_V_ILLEGAL);
+	t_vblank_mode(&m, EBC_VBLANK_HZ, T_VBL_W, T_VBL_H);
+	m.htotal += 16;
+	KUNIT_EXPECT_EQ(test, funcs->mode_valid(crtc, &m), MODE_H_ILLEGAL);
+	t_vblank_mode(&m, EBC_VBLANK_HZ, T_VBL_W, T_VBL_H);
+	m.vtotal += 4;
+	KUNIT_EXPECT_EQ(test, funcs->mode_valid(crtc, &m), MODE_V_ILLEGAL);
+	KUNIT_EXPECT_EQ(test, t_vbl_check(test, ebc, connector, &m), -EINVAL);
+
+	/* Scan modes that change the frame duration. */
+	t_vblank_mode(&m, EBC_VBLANK_HZ, T_VBL_W, T_VBL_H);
+	m.flags = DRM_MODE_FLAG_INTERLACE;
+	KUNIT_EXPECT_EQ(test, funcs->mode_valid(crtc, &m), MODE_NO_INTERLACE);
+	KUNIT_EXPECT_EQ(test, t_vbl_check(test, ebc, connector, &m), -EINVAL);
+	m.flags = DRM_MODE_FLAG_DBLSCAN;
+	KUNIT_EXPECT_EQ(test, funcs->mode_valid(crtc, &m), MODE_NO_DBLESCAN);
+	m.flags = 0;
+	m.vscan = 2;
+	KUNIT_EXPECT_EQ(test, funcs->mode_valid(crtc, &m), MODE_NO_VSCAN);
+}
+
+/*
+ * The tick counts only ticks the core took: with the vblank off it
+ * returns false, which stops the timer, and counts nothing.
+ */
+static void ebc_test_vblank_tick_off(struct kunit *test)
+{
+	struct rk3026_ebc *ebc = t_vbl_alloc(test, EBC_VBLANK_HZ);
+
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_vblank_tick(&ebc->crtc));
+	KUNIT_EXPECT_EQ(test, atomic64_read(&ebc->vblank_ticks), 0);
+}
+
+static struct kunit_case rk3026_ebc_vblank_test_cases[] = {
+	KUNIT_CASE(ebc_test_vblank_flush_off),
+	KUNIT_CASE(ebc_test_vblank_flush_armed),
+	KUNIT_CASE(ebc_test_vblank_off_sends_armed),
+	KUNIT_CASE(ebc_test_vblank_off_event),
+	KUNIT_CASE(ebc_test_vblank_mode_valid),
+	KUNIT_CASE(ebc_test_vblank_tick_off),
+	{}
+};
+
+static struct kunit_suite rk3026_ebc_vblank_test_suite = {
+	.name = "rk3026_ebc_vblank",
+	.test_cases = rk3026_ebc_vblank_test_cases,
+};
+
+kunit_test_suite(rk3026_ebc_vblank_test_suite);
 
 MODULE_DESCRIPTION("KUnit tests for the RK3026 EBC driver");
 MODULE_LICENSE("GPL");

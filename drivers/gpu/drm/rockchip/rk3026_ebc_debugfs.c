@@ -52,6 +52,8 @@
  *                    error but a failure known before the commit's flush).
  *                    Read at the hold, so an event held keeps its point.
  *                    Probe sets "done".
+ *   palette          text, the level of each C8 index
+ *                    (rk3026_ebc_palette_show())
  *
  * flip_held and flip_late are counters, yet files of their own next to
  * flip_timeout_ms rather than lines of "state" (struct rk3026_ebc_stats):
@@ -79,11 +81,14 @@
 #include <linux/debugfs.h>
 #include <linux/err.h>
 #include <linux/fs.h>
+#include <linux/hex.h>
 #include <linux/mm.h>
 #include <linux/overflow.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/string.h>
+
+#include <kunit/visibility.h>
 
 #include "rk3026_ebc.h"
 
@@ -377,6 +382,36 @@ static ssize_t rk3026_ebc_flip_release_write(struct file *file,
 }
 DEFINE_SHOW_STORE_ATTRIBUTE(rk3026_ebc_flip_release);
 
+/*
+ * "palette", apart from "state" so that file keeps its version: the C8
+ * palette as the plane converts it. palette_set is 1 while a C8 plane
+ * takes the levels of the CRTC's GAMMA_LUT (rk3026_ebc_set_palette()), 0
+ * while it takes the rounding grey of R8. palette is the level of each of
+ * the 256 indices, one hex digit each, index 0 first. An mxcfb send never
+ * uses it.
+ */
+VISIBLE_IF_KUNIT int rk3026_ebc_palette_show(struct seq_file *m,
+					     void *unused)
+{
+	struct rk3026_ebc *ebc = m->private;
+	char levels[EBC_PALETTE_SIZE + 1];
+	bool set;
+	int i;
+
+	mutex_lock(&ebc->image_lock);
+	set = ebc->c8_levels != rk3026_ebc_grey_round;
+	for (i = 0; i < EBC_PALETTE_SIZE; i++)
+		levels[i] = hex_asc_lo(ebc->c8_levels[i]);
+	mutex_unlock(&ebc->image_lock);
+	levels[EBC_PALETTE_SIZE] = '\0';
+
+	seq_printf(m, "palette_set %d\n", set);
+	seq_printf(m, "palette %s\n", levels);
+	return 0;
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_palette_show);
+DEFINE_SHOW_ATTRIBUTE(rk3026_ebc_palette);
+
 void rk3026_ebc_debugfs_init(struct rk3026_ebc *ebc)
 {
 	struct dentry *dir = debugfs_create_dir("rk3026-ebc", NULL);
@@ -405,6 +440,7 @@ void rk3026_ebc_debugfs_init(struct rk3026_ebc *ebc)
 	debugfs_create_u32("flip_late", 0444, dir, &ebc->flip_late);
 	debugfs_create_file("flip_release", 0644, dir, ebc,
 			    &rk3026_ebc_flip_release_fops);
+	debugfs_create_file("palette", 0444, dir, ebc, &rk3026_ebc_palette_fops);
 }
 
 void rk3026_ebc_debugfs_fini(struct rk3026_ebc *ebc)

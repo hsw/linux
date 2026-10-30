@@ -15,6 +15,7 @@
 #include <linux/delay.h>
 #include <linux/dma-fence.h>
 #include <linux/err.h>
+#include <linux/hex.h>
 #include <linux/hrtimer.h>
 #include <linux/jiffies.h>
 #include <linux/ktime.h>
@@ -24,6 +25,7 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/prandom.h>
+#include <linux/seq_file.h>
 #include <linux/string.h>
 #include <linux/unaligned.h>
 #include <linux/wait.h>
@@ -8763,6 +8765,69 @@ static void ebc_test_glue_mxcfb_c8(struct kunit *test)
 }
 #endif
 
+#if IS_ENABLED(CONFIG_DEBUG_FS)
+/* What a read of debugfs "palette" of @ebc gives, as one string. */
+static char *t_palette_file(struct kunit *test, struct rk3026_ebc *ebc)
+{
+	struct seq_file m = { .size = 1024, .private = ebc };
+
+	m.buf = kunit_kzalloc(test, m.size, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, m.buf);
+	KUNIT_ASSERT_EQ(test, rk3026_ebc_palette_show(&m, NULL), 0);
+	KUNIT_ASSERT_LT(test, m.count, m.size);
+	m.buf[m.count] = '\0';
+	return m.buf;
+}
+
+/* The text of "palette" for palette_set @set and the levels @levels. */
+static char *t_palette_text(struct kunit *test, int set, const u8 *levels)
+{
+	char *text = kunit_kzalloc(test, 1024, GFP_KERNEL);
+	int i, n;
+
+	KUNIT_ASSERT_NOT_NULL(test, text);
+	n = sprintf(text, "palette_set %d\npalette ", set);
+	for (i = 0; i < EBC_PALETTE_SIZE; i++)
+		text[n++] = hex_asc_lo(levels[i]);
+	text[n] = '\n';
+	return text;
+}
+
+/*
+ * debugfs "palette": 0 and the rounding greys without a palette; 1 and
+ * the console's levels with its palette, the first 16 digits the levels
+ * of its colours; 0 again after a grey ramp.
+ */
+static void ebc_test_glue_debugfs_palette(struct kunit *test)
+{
+	static const char con16[] = "palette_set 1\npalette 0167346a56bc89ef";
+	struct rk3026_ebc *ebc = t_ebc_alloc(test);
+	struct drm_color_lut *lut = kunit_kcalloc(test, EBC_PALETTE_SIZE,
+						  sizeof(*lut), GFP_KERNEL);
+	u8 *levels = kunit_kmalloc(test, EBC_PALETTE_SIZE, GFP_KERNEL);
+	char *text;
+
+	KUNIT_ASSERT_NOT_NULL(test, lut);
+	KUNIT_ASSERT_NOT_NULL(test, levels);
+	t_levels_round(levels);
+	KUNIT_EXPECT_STREQ(test, t_palette_file(test, ebc),
+			   t_palette_text(test, 0, levels));
+
+	t_lut_con16(lut);
+	rk3026_ebc_set_palette(ebc, lut);
+	text = t_palette_file(test, ebc);
+	KUNIT_EXPECT_EQ(test, strncmp(text, con16, strlen(con16)), 0);
+	t_levels_lut(levels, lut);
+	KUNIT_EXPECT_STREQ(test, text, t_palette_text(test, 1, levels));
+
+	t_lut_ramp(lut, 0x100, 0);
+	rk3026_ebc_set_palette(ebc, lut);
+	t_levels_round(levels);
+	KUNIT_EXPECT_STREQ(test, t_palette_file(test, ebc),
+			   t_palette_text(test, 0, levels));
+}
+#endif
+
 /*
  * The policy does not change with the box: a damaged plane part whose
  * changes are all black or white goes DU, one with a grey PART. The
@@ -11503,6 +11568,9 @@ static struct kunit_case rk3026_ebc_glue_test_cases[] = {
 	KUNIT_CASE(ebc_test_glue_palette_swap),
 #if IS_ENABLED(CONFIG_DRM_RK3026_EBC_MXCFB)
 	KUNIT_CASE(ebc_test_glue_mxcfb_c8),
+#endif
+#if IS_ENABLED(CONFIG_DEBUG_FS)
+	KUNIT_CASE(ebc_test_glue_debugfs_palette),
 #endif
 	KUNIT_CASE(ebc_test_glue_plane_box_du),
 	KUNIT_CASE(ebc_test_glue_plane_box_grey),

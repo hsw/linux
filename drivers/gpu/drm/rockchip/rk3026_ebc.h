@@ -1349,6 +1349,10 @@ int rk3026_ebc_rkf_decode(const s16 *left, const s16 *right, int root,
 #if IS_ENABLED(CONFIG_DEBUG_FS)
 void rk3026_ebc_debugfs_init(struct rk3026_ebc *ebc);
 void rk3026_ebc_debugfs_fini(struct rk3026_ebc *ebc);
+#if IS_ENABLED(CONFIG_KUNIT)
+struct seq_file;
+int rk3026_ebc_palette_show(struct seq_file *m, void *unused);
+#endif
 #else
 static inline void rk3026_ebc_debugfs_init(struct rk3026_ebc *ebc) { }
 static inline void rk3026_ebc_debugfs_fini(struct rk3026_ebc *ebc) { }

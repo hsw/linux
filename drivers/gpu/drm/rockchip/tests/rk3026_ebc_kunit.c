@@ -3411,24 +3411,10 @@ static void ebc_test_du_account_reset(struct kunit *test)
 	}
 }
 
-/*
- * The vblank tick's period: NSEC_PER_SEC / rate, rounded down, the rate
- * clamped to 1-60 Hz; 0 is the slowest tick, not a division by zero.
- */
-static void ebc_test_vblank_period(struct kunit *test)
+/* The vblank tick's period at @hz, rounded down. */
+static u64 t_vbl_period_ns(u32 hz)
 {
-	KUNIT_EXPECT_EQ(test, rk3026_ebc_vblank_period_ns(1), 1000000000ULL);
-	KUNIT_EXPECT_EQ(test, rk3026_ebc_vblank_period_ns(10), 100000000ULL);
-	KUNIT_EXPECT_EQ(test, rk3026_ebc_vblank_period_ns(40), 25000000ULL);
-	KUNIT_EXPECT_EQ(test, rk3026_ebc_vblank_period_ns(60), 16666666ULL);
-
-	KUNIT_EXPECT_EQ(test, rk3026_ebc_vblank_period_ns(0), 1000000000ULL);
-	KUNIT_EXPECT_EQ(test, rk3026_ebc_vblank_period_ns(61), 16666666ULL);
-	KUNIT_EXPECT_EQ(test, rk3026_ebc_vblank_period_ns(U32_MAX),
-			16666666ULL);
-
-	KUNIT_EXPECT_GE(test, EBC_VBLANK_HZ, EBC_VBLANK_HZ_MIN);
-	KUNIT_EXPECT_LE(test, EBC_VBLANK_HZ, EBC_VBLANK_HZ_MAX);
+	return div_u64(NSEC_PER_SEC, hz);
 }
 
 /* EPD panel sizes, both scan directions of the RC2's 6" 300 dpi one first. */
@@ -3439,41 +3425,62 @@ static const struct {
 	{ 1872, 1404 }, { 2200, 1650 },
 };
 
-/* The connector's mode as ebc_connector_get_modes() builds it. */
-static void t_vblank_mode(struct drm_display_mode *m, u32 hz, u16 w, u16 h)
+/* A scratch driver state for t_vblank_mode(). */
+static struct rk3026_ebc *t_vblank_mode_ebc(struct kunit *test)
 {
+	struct rk3026_ebc *ebc = kunit_kzalloc(test, sizeof(*ebc), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, ebc);
+	return ebc;
+}
+
+/*
+ * The connector's mode of a @w x @h panel with @hz stored as the rate, as
+ * probe or a debugfs write stores it: built by rk3026_ebc_mode_fill(), as
+ * ebc_connector_get_modes() builds it, on the scratch state @ebc.
+ */
+static void t_vblank_mode(struct rk3026_ebc *ebc, struct drm_display_mode *m,
+			  u32 hz, u16 w, u16 h)
+{
+	ebc->width = w;
+	ebc->height = h;
+	ebc->vblank_hz = hz;
 	memset(m, 0, sizeof(*m));
-	m->hdisplay = w;
-	m->hsync_start = w;
-	m->hsync_end = w;
-	m->htotal = w;
-	m->vdisplay = h;
-	m->vsync_start = h;
-	m->vsync_end = h;
-	m->vtotal = h;
-	m->clock = rk3026_ebc_vblank_mode_clock(hz, m->htotal, m->vtotal);
+	rk3026_ebc_mode_fill(ebc, m);
 }
 
 /*
  * The mode reports the tick: drm_mode_vrefresh() gives every rate back for
  * every panel, and the frame duration the vblank core derives from the mode
  * (drm_calc_timestamping_constants()) is the tick's period within 0.2 %.
+ * The rate is clamped where the mode is built, the one clamp: below
+ * EBC_VBLANK_HZ_MIN the slowest tick (0 too), above EBC_VBLANK_HZ_MAX the
+ * fastest, whatever debugfs stored.
  */
 static void ebc_test_vblank_mode_clock(struct kunit *test)
 {
+	struct rk3026_ebc *ebc = t_vblank_mode_ebc(test);
 	struct drm_display_mode m;
 	unsigned int i;
 	u32 hz;
+
+	KUNIT_EXPECT_EQ(test, EBC_VBLANK_HZ_MIN, 2);
+	KUNIT_EXPECT_GE(test, EBC_VBLANK_HZ, EBC_VBLANK_HZ_MIN);
+	KUNIT_EXPECT_LE(test, EBC_VBLANK_HZ, EBC_VBLANK_HZ_MAX);
 
 	for (i = 0; i < ARRAY_SIZE(t_vblank_panels); i++) {
 		u16 w = t_vblank_panels[i].w, h = t_vblank_panels[i].h;
 
 		for (hz = EBC_VBLANK_HZ_MIN; hz <= EBC_VBLANK_HZ_MAX; hz++) {
-			u64 period = rk3026_ebc_vblank_period_ns(hz);
+			u64 period = t_vbl_period_ns(hz);
 			u64 framedur;
 
-			t_vblank_mode(&m, hz, w, h);
+			t_vblank_mode(ebc, &m, hz, w, h);
 			KUNIT_ASSERT_GT(test, m.clock, 0);
+			KUNIT_EXPECT_EQ(test, m.hdisplay, w);
+			KUNIT_EXPECT_EQ(test, m.htotal, w);
+			KUNIT_EXPECT_EQ(test, m.vdisplay, h);
+			KUNIT_EXPECT_EQ(test, m.vtotal, h);
 			KUNIT_EXPECT_EQ_MSG(test, drm_mode_vrefresh(&m), hz,
 					    "%ux%u", w, h);
 			framedur = div_u64(mul_u32_u32(w, h) * 1000000,
@@ -3488,28 +3495,24 @@ static void ebc_test_vblank_mode_clock(struct kunit *test)
 	KUNIT_EXPECT_EQ(test,
 			rk3026_ebc_vblank_mode_clock(EBC_VBLANK_HZ, 1448, 1072),
 			15523);
-	t_vblank_mode(&m, EBC_VBLANK_HZ, 1448, 1072);
+	t_vblank_mode(ebc, &m, EBC_VBLANK_HZ, 1448, 1072);
 	KUNIT_EXPECT_EQ(test, drm_mode_vrefresh(&m), EBC_VBLANK_HZ);
 
-	/* Rates out of range are clamped as the period's are. */
-	t_vblank_mode(&m, 0, 1448, 1072);
-	KUNIT_EXPECT_EQ(test, drm_mode_vrefresh(&m), 1);
-	t_vblank_mode(&m, 61, 1448, 1072);
-	KUNIT_EXPECT_EQ(test, drm_mode_vrefresh(&m), 60);
-	t_vblank_mode(&m, U32_MAX, 1448, 1072);
-	KUNIT_EXPECT_EQ(test, drm_mode_vrefresh(&m), 60);
+	/* Rates out of the clamp, as debugfs stores them. */
+	t_vblank_mode(ebc, &m, 0, 1448, 1072);
+	KUNIT_EXPECT_EQ(test, drm_mode_vrefresh(&m), EBC_VBLANK_HZ_MIN);
+	t_vblank_mode(ebc, &m, 1, 1448, 1072);
+	KUNIT_EXPECT_EQ(test, drm_mode_vrefresh(&m), EBC_VBLANK_HZ_MIN);
+	t_vblank_mode(ebc, &m, 61, 1448, 1072);
+	KUNIT_EXPECT_EQ(test, drm_mode_vrefresh(&m), EBC_VBLANK_HZ_MAX);
+	t_vblank_mode(ebc, &m, U32_MAX, 1448, 1072);
+	KUNIT_EXPECT_EQ(test, drm_mode_vrefresh(&m), EBC_VBLANK_HZ_MAX);
 
-	/* Never 0 (an invalid mode), never past INT_MAX. */
-	KUNIT_EXPECT_EQ(test, rk3026_ebc_vblank_mode_clock(1, 1, 1), 1);
-	KUNIT_EXPECT_EQ(test, rk3026_ebc_vblank_mode_clock(1, 0, 1072), 1);
+	/* Never 0 (an invalid mode); the largest mode fits an int. */
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_vblank_mode_clock(2, 1, 1), 1);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_vblank_mode_clock(2, 0, 1072), 1);
 	KUNIT_EXPECT_EQ(test, rk3026_ebc_vblank_mode_clock(60, 65535, 65535),
 			257690174);
-	KUNIT_EXPECT_EQ(test,
-			rk3026_ebc_vblank_mode_clock(60, U32_MAX, U32_MAX),
-			INT_MAX);
-	KUNIT_EXPECT_EQ(test,
-			rk3026_ebc_vblank_mode_clock(1, U32_MAX, U32_MAX),
-			INT_MAX);
 }
 
 static struct kunit_case rk3026_ebc_core_test_cases[] = {
@@ -3577,7 +3580,6 @@ static struct kunit_case rk3026_ebc_core_test_cases[] = {
 	KUNIT_CASE(ebc_test_marker_zero),
 	KUNIT_CASE(ebc_test_marker_newest),
 	KUNIT_CASE(ebc_test_marker_eviction),
-	KUNIT_CASE(ebc_test_vblank_period),
 	KUNIT_CASE(ebc_test_vblank_mode_clock),
 	{}
 };
@@ -9505,16 +9507,11 @@ static struct rk3026_ebc *t_vbl_alloc(struct kunit *test, u32 hz)
 	KUNIT_ASSERT_EQ(test, rk3026_ebc_crtc_init(ebc, primary), 0);
 	drm_mode_config_reset(&ebc->drm);
 
+	ebc->width = T_VBL_W;
+	ebc->height = T_VBL_H;
+	ebc->vblank_hz = hz;
 	mode = &ebc->crtc.mode;
-	mode->hdisplay = T_VBL_W;
-	mode->hsync_start = T_VBL_W;
-	mode->hsync_end = T_VBL_W;
-	mode->htotal = T_VBL_W;
-	mode->vdisplay = T_VBL_H;
-	mode->vsync_start = T_VBL_H;
-	mode->vsync_end = T_VBL_H;
-	mode->vtotal = T_VBL_H;
-	mode->clock = rk3026_ebc_vblank_mode_clock(hz, T_VBL_W, T_VBL_H);
+	rk3026_ebc_mode_fill(ebc, mode);
 	drm_mode_set_crtcinfo(mode, CRTC_INTERLACE_HALVE_V);
 	return ebc;
 }
@@ -9615,7 +9612,7 @@ static void ebc_test_vblank_flush_off(struct kunit *test)
 static void ebc_test_vblank_flush_armed(struct kunit *test)
 {
 	struct rk3026_ebc *ebc = t_vbl_alloc(test, EBC_VBLANK_HZ);
-	u64 period = rk3026_ebc_vblank_period_ns(EBC_VBLANK_HZ);
+	u64 period = t_vbl_period_ns(EBC_VBLANK_HZ);
 	struct drm_crtc *crtc = &ebc->crtc;
 	struct drm_modeset_acquire_ctx *ctx = t_vbl_ctx(test);
 	struct drm_crtc_state *crtc_state;
@@ -9659,11 +9656,11 @@ static void ebc_test_vblank_flush_armed(struct kunit *test)
 /*
  * An event armed when the CRTC goes off is sent by drm_crtc_vblank_off()
  * (ebc_crtc_atomic_disable()), not lost with the tick it waited for. At
- * 1 Hz the first tick is a second away.
+ * the slowest rate the first tick is half a second away.
  */
 static void ebc_test_vblank_off_sends_armed(struct kunit *test)
 {
-	struct rk3026_ebc *ebc = t_vbl_alloc(test, 1);
+	struct rk3026_ebc *ebc = t_vbl_alloc(test, EBC_VBLANK_HZ_MIN);
 	struct drm_modeset_acquire_ctx *ctx = t_vbl_ctx(test);
 	struct drm_atomic_state *state;
 	struct completion done;
@@ -9810,6 +9807,7 @@ static void ebc_test_vblank_mode_valid(struct kunit *test)
 	struct rk3026_ebc *ebc = t_vbl_alloc(test, EBC_VBLANK_HZ);
 	const struct drm_crtc_helper_funcs *funcs = ebc->crtc.helper_private;
 	struct drm_crtc *crtc = &ebc->crtc;
+	struct rk3026_ebc *scratch = t_vblank_mode_ebc(test);
 	struct drm_connector *connector;
 	struct drm_display_mode m;
 	u32 hz;
@@ -9819,20 +9817,20 @@ static void ebc_test_vblank_mode_valid(struct kunit *test)
 	connector = t_vbl_output(test, ebc);
 
 	for (hz = EBC_VBLANK_HZ_MIN; hz <= EBC_VBLANK_HZ_MAX; hz++) {
-		t_vblank_mode(&m, hz, T_VBL_W, T_VBL_H);
+		t_vblank_mode(scratch, &m, hz, T_VBL_W, T_VBL_H);
 		KUNIT_EXPECT_EQ_MSG(test, funcs->mode_valid(crtc, &m), MODE_OK,
 				    "%u Hz", hz);
 	}
 	KUNIT_EXPECT_EQ(test, t_vbl_check(test, ebc, connector, &crtc->mode), 0);
 
 	/* A clock just off the clamp's rates, and far off them. */
-	t_vblank_mode(&m, EBC_VBLANK_HZ_MIN, T_VBL_W, T_VBL_H);
+	t_vblank_mode(scratch, &m, EBC_VBLANK_HZ_MIN, T_VBL_W, T_VBL_H);
 	m.clock--;
 	KUNIT_EXPECT_EQ(test, funcs->mode_valid(crtc, &m), MODE_CLOCK_LOW);
 	m.clock = 1;
 	KUNIT_EXPECT_EQ(test, funcs->mode_valid(crtc, &m), MODE_CLOCK_LOW);
 	KUNIT_EXPECT_EQ(test, t_vbl_check(test, ebc, connector, &m), -EINVAL);
-	t_vblank_mode(&m, EBC_VBLANK_HZ_MAX, T_VBL_W, T_VBL_H);
+	t_vblank_mode(scratch, &m, EBC_VBLANK_HZ_MAX, T_VBL_W, T_VBL_H);
 	m.clock++;
 	KUNIT_EXPECT_EQ(test, funcs->mode_valid(crtc, &m), MODE_CLOCK_HIGH);
 	m.clock = INT_MAX;
@@ -9840,23 +9838,23 @@ static void ebc_test_vblank_mode_valid(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, t_vbl_check(test, ebc, connector, &m), -EINVAL);
 
 	/* Another size, the other orientation included, or blanking. */
-	t_vblank_mode(&m, EBC_VBLANK_HZ, 800, 600);
+	t_vblank_mode(scratch, &m, EBC_VBLANK_HZ, 800, 600);
 	KUNIT_EXPECT_EQ(test, funcs->mode_valid(crtc, &m), MODE_H_ILLEGAL);
 	KUNIT_EXPECT_EQ(test, t_vbl_check(test, ebc, connector, &m), -EINVAL);
-	t_vblank_mode(&m, EBC_VBLANK_HZ, T_VBL_H, T_VBL_W);
+	t_vblank_mode(scratch, &m, EBC_VBLANK_HZ, T_VBL_H, T_VBL_W);
 	KUNIT_EXPECT_EQ(test, funcs->mode_valid(crtc, &m), MODE_H_ILLEGAL);
-	t_vblank_mode(&m, EBC_VBLANK_HZ, T_VBL_W, T_VBL_W);
+	t_vblank_mode(scratch, &m, EBC_VBLANK_HZ, T_VBL_W, T_VBL_W);
 	KUNIT_EXPECT_EQ(test, funcs->mode_valid(crtc, &m), MODE_V_ILLEGAL);
-	t_vblank_mode(&m, EBC_VBLANK_HZ, T_VBL_W, T_VBL_H);
+	t_vblank_mode(scratch, &m, EBC_VBLANK_HZ, T_VBL_W, T_VBL_H);
 	m.htotal += 16;
 	KUNIT_EXPECT_EQ(test, funcs->mode_valid(crtc, &m), MODE_H_ILLEGAL);
-	t_vblank_mode(&m, EBC_VBLANK_HZ, T_VBL_W, T_VBL_H);
+	t_vblank_mode(scratch, &m, EBC_VBLANK_HZ, T_VBL_W, T_VBL_H);
 	m.vtotal += 4;
 	KUNIT_EXPECT_EQ(test, funcs->mode_valid(crtc, &m), MODE_V_ILLEGAL);
 	KUNIT_EXPECT_EQ(test, t_vbl_check(test, ebc, connector, &m), -EINVAL);
 
 	/* Scan modes that change the frame duration. */
-	t_vblank_mode(&m, EBC_VBLANK_HZ, T_VBL_W, T_VBL_H);
+	t_vblank_mode(scratch, &m, EBC_VBLANK_HZ, T_VBL_W, T_VBL_H);
 	m.flags = DRM_MODE_FLAG_INTERLACE;
 	KUNIT_EXPECT_EQ(test, funcs->mode_valid(crtc, &m), MODE_NO_INTERLACE);
 	KUNIT_EXPECT_EQ(test, t_vbl_check(test, ebc, connector, &m), -EINVAL);
@@ -9996,6 +9994,62 @@ static void ebc_test_vblank_sleep_off(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atomic64_read(&ebc->vblank_ticks), 0);
 }
 
+/* The core timer's period now, started by a reference of its own. */
+static u64 t_vbl_framedur(struct kunit *test, struct rk3026_ebc *ebc)
+{
+	u64 ns;
+
+	KUNIT_EXPECT_EQ(test, drm_crtc_vblank_get(&ebc->crtc), 0);
+	ns = drm_crtc_vblank_crtc(&ebc->crtc)->framedur_ns;
+	drm_crtc_vblank_put(&ebc->crtc);
+	return ns;
+}
+
+/*
+ * The rate (debugfs vblank_hz): the connector's mode reports the probe
+ * default, then the rate written; the running tick keeps the CRTC's mode,
+ * also across a vblank off and on of the CRTC, until a modeset sets the
+ * reported mode, and then ticks at the new rate. The clamp of a rate out
+ * of range: ebc_test_vblank_mode_clock().
+ */
+static void ebc_test_vblank_rate(struct kunit *test)
+{
+	struct rk3026_ebc *ebc = t_vbl_alloc(test, EBC_VBLANK_HZ);
+	struct drm_crtc *crtc = &ebc->crtc;
+	struct drm_display_mode m = {};
+	u64 p10 = t_vbl_period_ns(EBC_VBLANK_HZ);
+	u64 p40 = t_vbl_period_ns(40);
+
+	KUNIT_EXPECT_EQ(test, drm_mode_vrefresh(&crtc->mode), EBC_VBLANK_HZ);
+	rk3026_ebc_vblank_enable(ebc);
+	KUNIT_EXPECT_LE(test, abs_diff(t_vbl_framedur(test, ebc), p10),
+			div_u64(p10, 500));
+
+	/* As the debugfs write stores it (debugfs_create_u32()). */
+	ebc->vblank_hz = 40;
+	rk3026_ebc_mode_fill(ebc, &m);
+	KUNIT_EXPECT_EQ(test, drm_mode_vrefresh(&m), 40);
+	KUNIT_EXPECT_EQ(test, m.hdisplay, T_VBL_W);
+	KUNIT_EXPECT_EQ(test, m.vdisplay, T_VBL_H);
+	KUNIT_EXPECT_FALSE(test, drm_mode_equal(&m, &crtc->mode));
+
+	/* No modeset: the tick keeps the CRTC's mode. */
+	rk3026_ebc_vblank_disable(ebc);
+	rk3026_ebc_vblank_enable(ebc);
+	KUNIT_EXPECT_EQ(test, drm_mode_vrefresh(&crtc->mode), EBC_VBLANK_HZ);
+	KUNIT_EXPECT_LE(test, abs_diff(t_vbl_framedur(test, ebc), p10),
+			div_u64(p10, 500));
+
+	/* The modeset with the mode reported now, as userspace gives it. */
+	drm_mode_set_crtcinfo(&m, CRTC_INTERLACE_HALVE_V);
+	rk3026_ebc_vblank_disable(ebc);
+	drm_mode_copy(&crtc->mode, &m);
+	rk3026_ebc_vblank_enable(ebc);
+	KUNIT_EXPECT_LE(test, abs_diff(t_vbl_framedur(test, ebc), p40),
+			div_u64(p40, 500));
+	rk3026_ebc_vblank_disable(ebc);
+}
+
 static struct kunit_case rk3026_ebc_vblank_test_cases[] = {
 	KUNIT_CASE(ebc_test_vblank_flush_off),
 	KUNIT_CASE(ebc_test_vblank_flush_armed),
@@ -10005,6 +10059,7 @@ static struct kunit_case rk3026_ebc_vblank_test_cases[] = {
 	KUNIT_CASE(ebc_test_vblank_tick_off),
 	KUNIT_CASE(ebc_test_vblank_sleep),
 	KUNIT_CASE(ebc_test_vblank_sleep_off),
+	KUNIT_CASE(ebc_test_vblank_rate),
 	{}
 };
 

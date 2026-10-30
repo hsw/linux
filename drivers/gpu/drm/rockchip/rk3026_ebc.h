@@ -343,11 +343,17 @@ struct rk3026_ebc_idle {
  * The vblank is simulated: a tick at a fixed rate, not tied to the panel,
  * whose scans take many frames each while the driver merges what arrives in
  * between. EBC_VBLANK_HZ is the rate probe sets and the connector's mode
- * reports (rk3026_ebc_vblank_mode_clock()); rates are clamped to
- * EBC_VBLANK_HZ_MIN..EBC_VBLANK_HZ_MAX (rk3026_ebc_vblank_period_ns()).
+ * reports (rk3026_ebc_vblank_mode_clock()); debugfs may change it. Rates
+ * are clamped to EBC_VBLANK_HZ_MIN..EBC_VBLANK_HZ_MAX where the mode is
+ * built, and the CRTC takes no mode outside them (its .mode_valid). The
+ * lowest is 2 Hz, not 1: a blocking commit waits for one tick after it
+ * (drm_atomic_helper_wait_for_vblanks()) for at most a second, and warns
+ * past it, and after an idle vblank the first tick comes a whole period
+ * after the vblank is enabled, so at 1 Hz every such commit from idle
+ * would reach that limit.
  */
 #define EBC_VBLANK_HZ		10
-#define EBC_VBLANK_HZ_MIN	1
+#define EBC_VBLANK_HZ_MIN	2
 #define EBC_VBLANK_HZ_MAX	60
 
 /*
@@ -1078,6 +1084,15 @@ struct rk3026_ebc {
 	 */
 	atomic64_t		vblank_ticks;
 	/*
+	 * The vblank tick's rate the connector's mode reports
+	 * (rk3026_ebc_mode_fill(), which clamps it): probe sets
+	 * EBC_VBLANK_HZ, debugfs may write any value, and the connector's
+	 * probe reads it with READ_ONCE(). The tick takes its period from
+	 * the CRTC's mode, so a change moves it at the next modeset with the
+	 * mode reported after it, not before.
+	 */
+	u32			vblank_hz;
+	/*
 	 * The clocks are enabled: by ebc_hw_init(), and again by a resume
 	 * that got them (ebc_clks_on()). ebc_hw_fini() disables only these,
 	 * so an unbind after a resume that found no clocks does not disable
@@ -1152,6 +1167,8 @@ void rk3026_ebc_sleep_vblank_off(struct rk3026_ebc *ebc);
 int rk3026_ebc_crtc_wait(struct rk3026_ebc *ebc, u32 seq,
 			 unsigned int timeout_ms);
 int rk3026_ebc_crtc_init(struct rk3026_ebc *ebc, struct drm_plane *primary);
+void rk3026_ebc_mode_fill(struct rk3026_ebc *ebc,
+			  struct drm_display_mode *mode);
 bool rk3026_ebc_vblank_tick(struct drm_crtc *crtc);
 void rk3026_ebc_vblank_enable(struct rk3026_ebc *ebc);
 void rk3026_ebc_vblank_disable(struct rk3026_ebc *ebc);
@@ -1223,8 +1240,7 @@ void rk3026_ebc_marker_seq_record(struct rk3026_ebc_marker_ring *ring,
 				  u32 marker, u32 seq);
 bool rk3026_ebc_marker_seq_lookup(const struct rk3026_ebc_marker_ring *ring,
 				  u32 marker, u32 *seq);
-u64 rk3026_ebc_vblank_period_ns(u32 hz);
-int rk3026_ebc_vblank_mode_clock(u32 hz, u32 htotal, u32 vtotal);
+int rk3026_ebc_vblank_mode_clock(u32 hz, u16 htotal, u16 vtotal);
 #if IS_ENABLED(CONFIG_KUNIT)
 unsigned int rk3026_ebc_mode_rank(u32 mode);
 #endif

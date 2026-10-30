@@ -2912,12 +2912,13 @@ static void ebc_crtc_atomic_disable(struct drm_crtc *crtc,
  * @crtc: the EBC's CRTC
  *
  * The panel has no vertical blank: a scan takes many frames, and the
- * driver merges what arrives meanwhile into the next one. The vblank is the
- * core's vblank timer instead (DRM_CRTC_VBLANK_TIMER_FUNCS), a tick at the
- * rate of the connector's mode (EBC_VBLANK_HZ, rk3026_ebc_vblank_mode_clock())
- * while anything holds a vblank reference. A tick says only that the
- * commits before it were taken by the driver: not that the panel shows
- * them, which the update markers and the mxcfb wait report.
+ * driver merges what arrives meanwhile into the next one. The vblank is a
+ * timer instead (rk3026_ebc_vblank_timer()), a tick at the
+ * rate of the CRTC's mode (&rk3026_ebc.vblank_hz when the connector
+ * reported it, rk3026_ebc_mode_fill()) while anything holds a vblank
+ * reference. A tick says only that the commits before it were taken by the
+ * driver: not that the panel shows them, which the update markers and the
+ * mxcfb wait report.
  *
  * Every event is armed on the next tick (drm_crtc_vblank_atomic_flush()),
  * the internal ones of fbcon, fbdev and DirtyFB too, and a blocking commit
@@ -3148,6 +3149,33 @@ static const struct drm_encoder_funcs ebc_encoder_funcs = {
 	.destroy		= drm_encoder_cleanup,
 };
 
+/*
+ * The connector's one mode: the panel's size, no blanking, and as its
+ * clock not the dot clock (ebc_pixel_rate(), which nothing takes from the
+ * mode) but the one that makes the mode's refresh the vblank tick's rate,
+ * @vblank_hz, clamped (rk3026_ebc_vblank_mode_clock()). Read once, so a
+ * debugfs write meanwhile gives the old rate or the new one; a word needs
+ * no lock against the connector's probe. The rate reaches the tick only
+ * through a modeset with this mode: the timer's period comes from the
+ * CRTC's mode.
+ */
+VISIBLE_IF_KUNIT void rk3026_ebc_mode_fill(struct rk3026_ebc *ebc,
+					   struct drm_display_mode *mode)
+{
+	mode->hdisplay = ebc->width;
+	mode->hsync_start = ebc->width;
+	mode->hsync_end = ebc->width;
+	mode->htotal = ebc->width;
+	mode->vdisplay = ebc->height;
+	mode->vsync_start = ebc->height;
+	mode->vsync_end = ebc->height;
+	mode->vtotal = ebc->height;
+	mode->clock = rk3026_ebc_vblank_mode_clock(READ_ONCE(ebc->vblank_hz),
+						   mode->htotal, mode->vtotal);
+	drm_mode_set_name(mode);
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_mode_fill);
+
 static int ebc_connector_get_modes(struct drm_connector *connector)
 {
 	struct rk3026_ebc *ebc = drm_to_ebc(connector->dev);
@@ -3158,22 +3186,7 @@ static int ebc_connector_get_modes(struct drm_connector *connector)
 		return 0;
 
 	mode->type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED;
-	mode->hdisplay = ebc->width;
-	mode->hsync_start = ebc->width;
-	mode->hsync_end = ebc->width;
-	mode->htotal = ebc->width;
-	mode->vdisplay = ebc->height;
-	mode->vsync_start = ebc->height;
-	mode->vsync_end = ebc->height;
-	mode->vtotal = ebc->height;
-	/*
-	 * Not the dot clock (ebc_pixel_rate(), which nothing takes from the
-	 * mode): the clock that makes the mode's refresh the vblank tick's
-	 * rate, EBC_VBLANK_HZ.
-	 */
-	mode->clock = rk3026_ebc_vblank_mode_clock(EBC_VBLANK_HZ, mode->htotal,
-						   mode->vtotal);
-	drm_mode_set_name(mode);
+	rk3026_ebc_mode_fill(ebc, mode);
 	drm_mode_probed_add(connector, mode);
 
 	return 1;
@@ -3680,6 +3693,8 @@ static int ebc_probe(struct platform_device *pdev)
 	/* A burst of updates is taken once it has been quiet this long. */
 	ebc->take_quiet_us = EBC_TAKE_QUIET_US;
 	ebc->take_cap_ms = EBC_TAKE_CAP_MS;
+	/* The vblank ticks at this rate (rk3026_ebc_mode_fill()). */
+	ebc->vblank_hz = EBC_VBLANK_HZ;
 
 	/* E Ink GDCK_STA / LGONL; no display-timing binding covers them. */
 	if (of_property_read_u32(dev->of_node, "rockchip,gdck-sta",

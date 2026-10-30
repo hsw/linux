@@ -37,6 +37,21 @@
  *                    waits. Probe sets EBC_TAKE_CAP_MS.
  *   timing           text, the blit and snapshot times of the last part and
  *                    the last driven one (rk3026_ebc_timing_show())
+ *   vblank_hz        the vblank tick's rate the connector's mode reports,
+ *                    read-write. Stored as written, clamped to
+ *                    EBC_VBLANK_HZ_MIN..EBC_VBLANK_HZ_MAX where the mode is
+ *                    built (rk3026_ebc_vblank_mode_clock()), so a read gives
+ *                    back the value written. Probe sets EBC_VBLANK_HZ. A
+ *                    write changes only the mode the next probe of the
+ *                    connector reports (GETCONNECTOR): the tick takes its
+ *                    period from the CRTC's mode, so it moves at the next
+ *                    modeset with that mode, and not before. No hotplug
+ *                    event is sent: a client that probes and sets the mode
+ *                    picks the rate up, and that modeset RESETs the panel
+ *                    as any CRTC enable does.
+ *   vblank_ticks     the vblank ticks since probe, read-only
+ *                    (rk3026_ebc_vblank_tick()); it stands still while the
+ *                    vblank is off: idle, the CRTC off, or asleep.
  *
  * Both images are @img_size = width * height / 2 bytes: 4 bpp, two pixels per
  * byte with the LEFT pixel in the LOW nibble, rows of width / 2 bytes, top row
@@ -321,6 +336,16 @@ static int rk3026_ebc_timing_show(struct seq_file *m, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(rk3026_ebc_timing);
 
+static int ebc_vblank_ticks_get(void *data, u64 *val)
+{
+	struct rk3026_ebc *ebc = data;
+
+	*val = atomic64_read(&ebc->vblank_ticks);
+	return 0;
+}
+DEFINE_DEBUGFS_ATTRIBUTE(ebc_vblank_ticks_fops, ebc_vblank_ticks_get, NULL,
+			 "%llu\n");
+
 void rk3026_ebc_debugfs_init(struct rk3026_ebc *ebc)
 {
 	struct dentry *dir = debugfs_create_dir("rk3026-ebc", NULL);
@@ -344,6 +369,9 @@ void rk3026_ebc_debugfs_init(struct rk3026_ebc *ebc)
 	debugfs_create_u32("take_quiet_us", 0644, dir, &ebc->take_quiet_us);
 	debugfs_create_u32("take_cap_ms", 0644, dir, &ebc->take_cap_ms);
 	debugfs_create_file("timing", 0444, dir, ebc, &rk3026_ebc_timing_fops);
+	debugfs_create_u32("vblank_hz", 0644, dir, &ebc->vblank_hz);
+	debugfs_create_file_unsafe("vblank_ticks", 0444, dir, ebc,
+				   &ebc_vblank_ticks_fops);
 }
 
 void rk3026_ebc_debugfs_fini(struct rk3026_ebc *ebc)

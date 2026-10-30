@@ -1,9 +1,10 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
  * Tracepoints of the RK3026 EBC driver: what was queued, what was driven, what
- * was skipped, how each part ended and when the panel rails switched. Mode
- * numbers are the EBC work modes of rk3026_ebc.h (EBC_MODE_*). A part's events
- * carry the seq of its newest update; new keys go at the end of a line.
+ * was skipped, how each part ended, when the panel rails switched and when a
+ * held commit event was sent. Mode numbers are the EBC work modes of
+ * rk3026_ebc.h (EBC_MODE_*). A part's events carry the seq of its newest
+ * update; new keys go at the end of a line.
  */
 #undef TRACE_SYSTEM
 #define TRACE_SYSTEM rk3026_ebc
@@ -29,6 +30,12 @@ TRACE_DEFINE_ENUM(EBC_OUTCOME_NO_RAILS);
 TRACE_DEFINE_ENUM(EBC_OUTCOME_NO_LUT);
 TRACE_DEFINE_ENUM(EBC_OUTCOME_TIMEOUT);
 TRACE_DEFINE_ENUM(EBC_OUTCOME_ABANDONED);
+TRACE_DEFINE_ENUM(EBC_FLIP_DONE);
+TRACE_DEFINE_ENUM(EBC_FLIP_WATCHDOG);
+TRACE_DEFINE_ENUM(EBC_FLIP_OFF);
+TRACE_DEFINE_ENUM(EBC_FLIP_SLEEP);
+TRACE_DEFINE_ENUM(EBC_FLIP_REPLACED);
+TRACE_DEFINE_ENUM(EBC_FLIP_FAILED);
 TRACE_DEFINE_ENUM(EBC_REASON_EXPLICIT);
 TRACE_DEFINE_ENUM(EBC_REASON_AUTO_DU);
 TRACE_DEFINE_ENUM(EBC_REASON_REPAIR_FLOOR);
@@ -73,6 +80,15 @@ TRACE_DEFINE_ENUM(EBC_REASON_AUTO_A2);
 			 { EBC_OUTCOME_NO_LUT,		"no_lut" },	\
 			 { EBC_OUTCOME_TIMEOUT,		"timeout" },	\
 			 { EBC_OUTCOME_ABANDONED,	"abandoned" })
+
+#define ebc_trace_flip_why(w)						\
+	__print_symbolic(w,						\
+			 { EBC_FLIP_DONE,		"done" },	\
+			 { EBC_FLIP_WATCHDOG,		"watchdog" },	\
+			 { EBC_FLIP_OFF,		"off" },	\
+			 { EBC_FLIP_SLEEP,		"sleep" },	\
+			 { EBC_FLIP_REPLACED,		"replaced" },	\
+			 { EBC_FLIP_FAILED,		"failed" })
 
 TRACE_EVENT(rk3026_ebc_update_queue,
 	TP_PROTO(u32 source, u32 mode, const struct drm_rect *clip, u32 marker,
@@ -294,6 +310,39 @@ TRACE_EVENT(rk3026_ebc_rails,
 	),
 	TP_printk("%s epd=%d vcom=%d ret=%d", __entry->on ? "on" : "off",
 		  __entry->epd_on, __entry->vcom_on, __entry->ret)
+);
+
+/*
+ * A commit event held for its part (rk3026_ebc_flip_hold()) was sent: the
+ * seq of the update its commit queued, how long it was held, why now (enum
+ * rk3026_ebc_flip_why) and the error set on its out-fence (0: none). Its
+ * part finished with the frame on the glass (done) or off it (failed, err
+ * from rk3026_ebc_part_err(): -EIO, or -ECANCELED for an update a RESET
+ * whitened), the watchdog sent it late (err -ETIMEDOUT: not confirmed on
+ * the glass), the CRTC went off (also when its part was dropped for it),
+ * a system sleep began, or a second hold found the slot full (replaced, a
+ * bug; err -ETIMEDOUT). Also an event not held because its part had
+ * finished off the glass before the commit's flush: failed, held_us 0, the
+ * core sends it right after.
+ */
+TRACE_EVENT(rk3026_ebc_flip_event,
+	TP_PROTO(u32 seq, u32 held_us, u32 why, int err),
+	TP_ARGS(seq, held_us, why, err),
+	TP_STRUCT__entry(
+		__field(u32, seq)
+		__field(u32, held_us)
+		__field(u32, why)
+		__field(int, err)
+	),
+	TP_fast_assign(
+		__entry->seq = seq;
+		__entry->held_us = held_us;
+		__entry->why = why;
+		__entry->err = err;
+	),
+	TP_printk("seq=%u held_us=%u why=%s err=%d", __entry->seq,
+		  __entry->held_us, ebc_trace_flip_why(__entry->why),
+		  __entry->err)
 );
 
 #endif /* _RK3026_EBC_TRACE_H */

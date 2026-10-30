@@ -17,6 +17,7 @@
 #include <linux/mutex.h>
 #include <linux/types.h>
 #include <linux/wait.h>
+#include <linux/workqueue.h>
 
 #include <drm/drm_connector.h>
 #include <drm/drm_crtc.h>
@@ -223,6 +224,19 @@ enum rk3026_ebc_source {
 	EBC_SOURCE_RESTORE,	/* the redraw after a hibernation restore */
 };
 
+/*
+ * Why a held commit event was sent (rk3026_ebc_flip_hold()): the flip_event
+ * tracepoint.
+ */
+enum rk3026_ebc_flip_why {
+	EBC_FLIP_DONE,		/* its part finished, on the glass */
+	EBC_FLIP_WATCHDOG,	/* the watchdog: late, -ETIMEDOUT */
+	EBC_FLIP_OFF,		/* the CRTC went off */
+	EBC_FLIP_SLEEP,		/* a system sleep, its part not taken */
+	EBC_FLIP_REPLACED,	/* the slot was full (a bug): -ETIMEDOUT */
+	EBC_FLIP_FAILED,	/* finished off the glass: -EIO, -ECANCELED */
+};
+
 /* What became of one part (the updates one scan takes). */
 enum rk3026_ebc_outcome {
 	EBC_OUTCOME_NONE,	/* nothing taken yet */
@@ -336,6 +350,22 @@ struct rk3026_ebc_idle {
 #define EBC_TAKE_QUIET_US	10000
 #define EBC_TAKE_CAP_MS		250
 #define EBC_TAKE_CAP_MAX_MS	1000
+
+/*
+ * How long a commit event is held at most (rk3026_ebc_flip_hold()) before
+ * the watchdog sends it, counted late: above the longest part a plane
+ * commit queues on a known glass (a FULL, ~450 ms at room temperature,
+ * longer when cold), below the 10 s the core waits for a commit's
+ * flip_done before it gives up on it (drm_crtc_commit_wait()), with 2 s
+ * left at the most for the timer's jiffies and the workqueue. A part that
+ * first repairs a glass not known (@shadows.prev_unknown: after a
+ * hibernation restore, or a waveform cut short) runs a RESET before its
+ * waveform and may take longer: its event then goes late. debugfs
+ * flip_timeout_ms changes it, used up to EBC_FLIP_TIMEOUT_MAX_MS; 0 sends
+ * at the watchdog's first run.
+ */
+#define EBC_FLIP_TIMEOUT_MS	5000
+#define EBC_FLIP_TIMEOUT_MAX_MS	8000
 
 /*
  * The next part as rk3026_ebc_take_wait() reads it, under @image_lock:
@@ -1078,9 +1108,16 @@ struct rk3026_ebc {
 	 * The commit event held until its part has finished
 	 * (rk3026_ebc_flip_hold()), and @flip_seq, the seq of the update its
 	 * commit queued. One slot: the core lets one commit with a pending
-	 * flip_done through per CRTC. Under @drm.event_lock; the refresh
-	 * thread sends it from step 4 of rk3026_ebc_do_refresh(), with
-	 * @image_lock held around it.
+	 * flip_done through per CRTC. Under @drm.event_lock;
+	 * ebc_flip_release() sends it under @image_lock too, the watchdog
+	 * @flip_wd without. @flip_held_at is when it was held (ktime_get()).
+	 * @flip_held counts the events held, @flip_late those the watchdog
+	 * sent: written with WRITE_ONCE() under @drm.event_lock, debugfs reads
+	 * them without. @flip_timeout_ms: debugfs may change it, the hold
+	 * reads it with READ_ONCE(). rk3026_ebc_flip_init() sets them up.
+	 * @flip_closed: the remove or the shutdown began
+	 * (rk3026_ebc_flip_fini()), nothing is held any more; set under
+	 * @drm.event_lock.
 	 *
 	 * @flip_done_seq: @pending.done_seq as the last ebc_flip_release()
 	 * saw it, under @image_lock and @drm.event_lock. The hold tests
@@ -1093,6 +1130,12 @@ struct rk3026_ebc {
 	struct drm_pending_vblank_event *flip_event;
 	u32			flip_seq;
 	u32			flip_done_seq;
+	ktime_t			flip_held_at;
+	struct delayed_work	flip_wd;
+	u32			flip_timeout_ms;
+	u32			flip_held;
+	u32			flip_late;
+	bool			flip_closed;
 
 	/*
 	 * debugfs: the last part, the last driven one, the counters. Under
@@ -1130,6 +1173,8 @@ bool rk3026_ebc_plane_box(const struct drm_plane_state *old_state,
 void rk3026_ebc_commit_begin(struct rk3026_ebc *ebc);
 bool rk3026_ebc_plane_update(struct rk3026_ebc *ebc, const void *src,
 			     unsigned int src_pitch, const struct drm_rect *box);
+void rk3026_ebc_flip_init(struct rk3026_ebc *ebc);
+void rk3026_ebc_flip_fini(struct rk3026_ebc *ebc);
 bool rk3026_ebc_flip_hold(struct rk3026_ebc *ebc,
 			  struct drm_crtc_state *crtc_state);
 bool rk3026_ebc_idle_tick(struct rk3026_ebc *ebc, unsigned long now);

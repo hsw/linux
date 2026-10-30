@@ -847,10 +847,12 @@ static u32 ebc_us_since(ktime_t start)
  * @src: XRGB8888 source, top-left of the whole framebuffer
  * @src_pitch: source stride in bytes
  * @clip: damaged region, in pixels
+ * @dither: the conversion the sender asks for; EBC_DITHER_NONE for a plane
+ *	update, which has no way to ask
  *
  * The panel is 4bpp with two pixels per byte, low nibble first. The clip is
  * widened to an even pixel boundary so byte writes stay whole, and clamped
- * to the panel; rk3026_ebc_blit_convert() converts it.
+ * to the panel; rk3026_ebc_blit_dither() converts it.
  *
  * Writes @next_shadow. Called under @image_lock, in the same section that
  * queues the update, so no snapshot sees the pixels without their update.
@@ -860,7 +862,8 @@ static u32 ebc_us_since(ktime_t start)
  * (&rk3026_ebc_update.blit_us).
  */
 u32 rk3026_ebc_blit_xrgb8888(struct rk3026_ebc *ebc, const void *src,
-			     unsigned int src_pitch, const struct drm_rect *clip)
+			     unsigned int src_pitch, const struct drm_rect *clip,
+			     enum rk3026_ebc_dither dither)
 {
 	struct drm_rect r = *clip;
 	ktime_t start;
@@ -870,8 +873,8 @@ u32 rk3026_ebc_blit_xrgb8888(struct rk3026_ebc *ebc, const void *src,
 		return 0;
 
 	start = ktime_get();
-	rk3026_ebc_blit_convert(ebc->next_shadow, src, src_pitch, r.x1, r.x2,
-				r.y1, r.y2, ebc->width);
+	rk3026_ebc_blit_dither(ebc->next_shadow, src, src_pitch, r.x1, r.x2,
+			       r.y1, r.y2, ebc->width, dither);
 	return ebc_us_since(start);
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_blit_xrgb8888);
@@ -2697,7 +2700,8 @@ VISIBLE_IF_KUNIT bool rk3026_ebc_plane_update(struct rk3026_ebc *ebc,
 			upd.clip = DRM_RECT_INIT(0, 0, ebc->width, ebc->height);
 		ebc->plane_resync = false;
 		upd.blit_us = rk3026_ebc_blit_xrgb8888(ebc, src, src_pitch,
-						       &upd.clip);
+						       &upd.clip,
+						       EBC_DITHER_NONE);
 		WRITE_ONCE(ebc->idle_last_plane, jiffies);
 		WRITE_ONCE(ebc->idle_armed, true);
 		ebc->commit_seq = rk3026_ebc_add_update(ebc, &upd);

@@ -250,6 +250,19 @@ enum rk3026_ebc_flip_rel {
 	EBC_FLIP_REL_TAKE,
 };
 
+/*
+ * How rk3026_ebc_blit_xrgb8888() turns the luma into the panel's 16 levels.
+ * NONE takes its top four bits, as every update did before the dithered
+ * conversion; Y4 and Y1 dither it in an 8x8 ordered pattern to the 16
+ * levels or to black and white (rk3026_ebc_blit_dither()). Only an mxcfb
+ * send asks for a dither (EPDC_FLAG_USE_DITHERING_Y1 / _Y4).
+ */
+enum rk3026_ebc_dither {
+	EBC_DITHER_NONE,
+	EBC_DITHER_Y4,
+	EBC_DITHER_Y1,
+};
+
 /* What became of one part (the updates one scan takes). */
 enum rk3026_ebc_outcome {
 	EBC_OUTCOME_NONE,	/* nothing taken yet */
@@ -1185,7 +1198,8 @@ static inline struct rk3026_ebc *drm_to_ebc(struct drm_device *drm)
 
 /* rk3026_ebc.c */
 u32 rk3026_ebc_blit_xrgb8888(struct rk3026_ebc *ebc, const void *src,
-			     unsigned int src_pitch, const struct drm_rect *clip);
+			     unsigned int src_pitch, const struct drm_rect *clip,
+			     enum rk3026_ebc_dither dither);
 u32 rk3026_ebc_add_update(struct rk3026_ebc *ebc,
 			  const struct rk3026_ebc_update *upd);
 int rk3026_ebc_wait_marker(struct rk3026_ebc *ebc, u32 marker);
@@ -1235,6 +1249,13 @@ void rk3026_ebc_blit_rows(u8 *dst, const void *src, unsigned int src_pitch,
 void rk3026_ebc_blit_convert(u8 *dst, const void *src, unsigned int src_pitch,
 			     int x1, int x2, int y1, int y2,
 			     unsigned int width);
+void rk3026_ebc_blit_rows_dither(u8 *dst, const void *src,
+				 unsigned int src_pitch, int x1, int x2,
+				 int y1, int y2, unsigned int width,
+				 unsigned int steps);
+void rk3026_ebc_blit_dither(u8 *dst, const void *src, unsigned int src_pitch,
+			    int x1, int x2, int y1, int y2, unsigned int width,
+			    enum rk3026_ebc_dither dither);
 const char *rk3026_ebc_blit_impl(void);
 
 /* rk3026_ebc_core.c */

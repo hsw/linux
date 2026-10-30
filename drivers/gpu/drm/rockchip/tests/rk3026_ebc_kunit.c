@@ -7827,6 +7827,20 @@ static void ebc_test_glue_sleep_crtc_wait(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk3026_ebc_crtc_wait(ebc, off, 0), 0);
 }
 
+/* The reference rows of the conversion @dither. */
+static void t_ref_rows(enum rk3026_ebc_dither dither, u8 *dst,
+		       const void *src, unsigned int src_pitch, int x1, int x2,
+		       int y1, int y2, unsigned int width)
+{
+	if (dither == EBC_DITHER_NONE)
+		rk3026_ebc_ref_blit_rows(dst, src, src_pitch, x1, x2, y1, y2,
+					 width);
+	else
+		rk3026_ebc_ref_blit_rows_dither(dst, src, src_pitch, x1, x2,
+						y1, y2, width,
+						dither == EBC_DITHER_Y1 ? 1 : 15);
+}
+
 #if IS_ENABLED(CONFIG_DRM_RK3026_EBC_MXCFB)
 /* The part one mxcfb send queued, taken as the refresh thread takes it. */
 static int t_mxcfb_part(struct rk3026_ebc *ebc, const u32 *src,
@@ -8038,13 +8052,15 @@ static void ebc_test_glue_blit_time(struct kunit *test)
 	KUNIT_EXPECT_STREQ(test, rk3026_ebc_blit_impl(), t_blit_impl());
 
 	mutex_lock(&ebc->image_lock);
-	us = rk3026_ebc_blit_xrgb8888(ebc, black, T_W * 4, &off);
+	us = rk3026_ebc_blit_xrgb8888(ebc, black, T_W * 4, &off,
+				      EBC_DITHER_NONE);
 	mutex_unlock(&ebc->image_lock);
 	KUNIT_EXPECT_EQ(test, us, 0);
 	t_expect_white(test, ebc->next_shadow);
 
 	mutex_lock(&ebc->image_lock);
-	us = rk3026_ebc_blit_xrgb8888(ebc, black, T_W * 4, &t_panel);
+	us = rk3026_ebc_blit_xrgb8888(ebc, black, T_W * 4, &t_panel,
+				      EBC_DITHER_NONE);
 	mutex_unlock(&ebc->image_lock);
 	KUNIT_EXPECT_GE(test, us, 1);
 
@@ -11398,15 +11414,17 @@ static struct rk3026_ebc *t_blit_ebc(struct kunit *test, const struct t_fix *f)
 }
 
 /*
- * Every clip on one source: the reference rows on the clip widened as the
- * driver widens it and rk3026_ebc_blit_xrgb8888() write the same target
- * over the same junk, guards included. False after the first difference.
+ * Every clip on one source, with every conversion: the reference rows of
+ * the conversion on the clip widened as the driver widens it and
+ * rk3026_ebc_blit_xrgb8888() write the same target over the same junk,
+ * guards included. False after the first difference.
  */
 static bool t_ref_blit_src(struct kunit *test, const struct t_fix *f,
 			   struct rk3026_ebc *ebc, u8 *ref, const u8 *src,
 			   unsigned int pitch, const struct drm_rect *clips,
 			   int n, struct rnd_state *rs)
 {
+	unsigned int dither;
 	int c;
 
 	for (c = 0; c < n; c++) {
@@ -11414,19 +11432,22 @@ static bool t_ref_blit_src(struct kunit *test, const struct t_fix *f,
 		struct drm_rect w;
 		int diff;
 
-		prandom_bytes_state(rs, ref, t_fix_size(f));
-		memcpy(ebc->next_shadow, ref, t_fix_size(f));
-		if (t_widen(f, r, &w))
-			rk3026_ebc_ref_blit_rows(ref, src, pitch, w.x1, w.x2,
-						 w.y1, w.y2, f->w);
-		mutex_lock(&ebc->image_lock);
-		rk3026_ebc_blit_xrgb8888(ebc, src, pitch, r);
-		mutex_unlock(&ebc->image_lock);
-		diff = t_fix_diff(f, ref, ebc->next_shadow);
-		if (diff != INT_MAX) {
-			KUNIT_FAIL(test, "%s pitch %u clip " DRM_RECT_FMT
-				   ": byte %d", f->name, pitch,
-				   DRM_RECT_ARG(r), diff);
+		for (dither = EBC_DITHER_NONE; dither <= EBC_DITHER_Y1;
+		     dither++) {
+			prandom_bytes_state(rs, ref, t_fix_size(f));
+			memcpy(ebc->next_shadow, ref, t_fix_size(f));
+			if (t_widen(f, r, &w))
+				t_ref_rows(dither, ref, src, pitch, w.x1, w.x2,
+					   w.y1, w.y2, f->w);
+			mutex_lock(&ebc->image_lock);
+			rk3026_ebc_blit_xrgb8888(ebc, src, pitch, r, dither);
+			mutex_unlock(&ebc->image_lock);
+			diff = t_fix_diff(f, ref, ebc->next_shadow);
+			if (diff == INT_MAX)
+				continue;
+			KUNIT_FAIL(test, "%s dither %u pitch %u clip "
+				   DRM_RECT_FMT ": byte %d", f->name, dither,
+				   pitch, DRM_RECT_ARG(r), diff);
 			return false;
 		}
 	}
@@ -11436,7 +11457,10 @@ static bool t_ref_blit_src(struct kunit *test, const struct t_fix *f,
 /*
  * rk3026_ebc_blit_xrgb8888() widens and clamps the clip to whole bytes and
  * writes the bytes of the per-pixel reference loop, on every fixture,
- * source set, dense and padded source pitch, and clip.
+ * source set, dense and padded source pitch, and clip (odd edges, clips
+ * partly or wholly off the image, empty ones), for every conversion:
+ * without a dither the bytes of the plain reference, which predates the
+ * dither, with one those of the dither's.
  */
 static void ebc_test_ref_blit(struct kunit *test)
 {
@@ -11724,6 +11748,164 @@ static void ebc_test_blit_convert(struct kunit *test)
 			return;
 }
 
+/* rk3026_ebc_blit_rows_dither() on 15 steps and on one, in t_rows_fn shape. */
+static void t_rows_y4(u8 *dst, const void *src, unsigned int src_pitch,
+		      int x1, int x2, int y1, int y2, unsigned int width)
+{
+	rk3026_ebc_blit_rows_dither(dst, src, src_pitch, x1, x2, y1, y2,
+				    width, 15);
+}
+
+static void t_rows_y1(u8 *dst, const void *src, unsigned int src_pitch,
+		      int x1, int x2, int y1, int y2, unsigned int width)
+{
+	rk3026_ebc_blit_rows_dither(dst, src, src_pitch, x1, x2, y1, y2,
+				    width, 1);
+}
+
+/* Their per-pixel references. */
+static void t_ref_rows_y4(u8 *dst, const void *src, unsigned int src_pitch,
+			  int x1, int x2, int y1, int y2, unsigned int width)
+{
+	rk3026_ebc_ref_blit_rows_dither(dst, src, src_pitch, x1, x2, y1, y2,
+					width, 15);
+}
+
+static void t_ref_rows_y1(u8 *dst, const void *src, unsigned int src_pitch,
+			  int x1, int x2, int y1, int y2, unsigned int width)
+{
+	rk3026_ebc_ref_blit_rows_dither(dst, src, src_pitch, x1, x2, y1, y2,
+					width, 1);
+}
+
+/* The dither rows' 4-px stores and 2-px tail from every start. */
+static void ebc_test_blit_dither_tails(struct kunit *test)
+{
+	t_rows_tails(test, t_rows_y4, t_ref_rows_y4);
+	t_rows_tails(test, t_rows_y1, t_ref_rows_y1);
+}
+
+/* Nibble (@x, @y) of an image @w pixels wide. */
+static u8 t_nibble(const u8 *img, int w, int x, int y)
+{
+	return (img[(y * w + x) / 2] >> (4 * (x & 1))) & 0xf;
+}
+
+/*
+ * One flat grey @g on a 16x16 image, four tiles of the matrix, @steps
+ * steps: only the two levels around @g * @steps / 255, every tile alike,
+ * the upper one on f * 64 / 255 cells of a tile to within half a cell,
+ * f = @g * @steps mod 255; with f = 0 the bytes of the plain blit. False
+ * after the first failure.
+ */
+static bool t_dither_flat(struct kunit *test, u32 *src, unsigned int g,
+			  unsigned int steps)
+{
+	unsigned int lo = g * steps / 255, f = g * steps % 255;
+	u8 nlo = lo * (15 / steps), nhi = min(lo + 1, steps) * (15 / steps);
+	unsigned int tile[4] = {}, i;
+	u8 out[16 * 8], plain[16 * 8];
+	int x, y;
+
+	for (i = 0; i < 16 * 16; i++)
+		src[i] = (i * 37 & 0xff) << 24 | g * 0x010101;
+	rk3026_ebc_blit_rows_dither(out, src, 16 * 4, 0, 16, 0, 16, 16, steps);
+	rk3026_ebc_blit_rows(plain, src, 16 * 4, 0, 16, 0, 16, 16);
+
+	for (y = 0; y < 16; y++) {
+		for (x = 0; x < 16; x++) {
+			u8 n = t_nibble(out, 16, x, y);
+
+			if (n == nhi && n != nlo) {
+				tile[y / 8 * 2 + x / 8]++;
+			} else if (n != nlo) {
+				KUNIT_FAIL(test, "steps %u grey %u (%d, %d): %u, not %u or %u",
+					   steps, g, x, y, n, nlo, nhi);
+				return false;
+			}
+		}
+	}
+	for (i = 1; i < 4; i++) {
+		if (tile[i] != tile[0]) {
+			KUNIT_FAIL(test, "steps %u grey %u: tile %u has %u, tile 0 %u",
+				   steps, g, i, tile[i], tile[0]);
+			return false;
+		}
+	}
+	if (abs((int)(255 * tile[0]) - (int)(64 * f)) > 127) {
+		KUNIT_FAIL(test, "steps %u grey %u: %u upper cells, f %u",
+			   steps, g, tile[0], f);
+		return false;
+	}
+	if (!f && memcmp(out, plain, sizeof(out))) {
+		KUNIT_FAIL(test, "steps %u grey %u: not the plain bytes",
+			   steps, g);
+		return false;
+	}
+	return true;
+}
+
+/*
+ * Every grey, dithered to the 16 levels and to black and white: Y4 draws
+ * the two levels around it and Y1 black and white, in proportions that
+ * keep the mean grey, the same in every 8x8 tile; the grey of a level
+ * (17 n for Y4, 0 and 255 for Y1) is drawn flat, as the plain blit draws
+ * it. The X byte plays no part.
+ */
+static void ebc_test_dither_levels(struct kunit *test)
+{
+	u32 *src = kunit_kmalloc(test, 16 * 16 * 4, GFP_KERNEL);
+	unsigned int g;
+
+	KUNIT_ASSERT_NOT_NULL(test, src);
+	for (g = 0; g < 256; g++)
+		if (!t_dither_flat(test, src, g, 15) ||
+		    !t_dither_flat(test, src, g, 1))
+			return;
+}
+
+/*
+ * The pattern is anchored to the image: a 64x16 image converted at once
+ * and as a grid of updates with odd edges (each widened to whole bytes,
+ * so neighbours overlap by a column) gives the same bytes, for Y4 and Y1.
+ */
+static void ebc_test_dither_tiling(struct kunit *test)
+{
+	static const struct t_fix f = { "64x16", 64, 16 };
+	static const int xs[] = { 0, 3, 13, 30, 47, 64 };
+	static const int ys[] = { 0, 5, 11, 16 };
+	struct rk3026_ebc *ebc = t_blit_ebc(test, &f);
+	unsigned int pitch = f.w * 4;
+	u8 *whole = t_fix_img(test, &f);
+	u8 *src = kunit_kmalloc(test, (size_t)pitch * f.h, GFP_KERNEL);
+	const struct drm_rect all = DRM_RECT_INIT(0, 0, f.w, f.h);
+	unsigned int dither, i, j;
+
+	KUNIT_ASSERT_NOT_NULL(test, src);
+	t_src_fill(src, pitch, &f, T_SRC_RANDOM, 5);
+	for (dither = EBC_DITHER_Y4; dither <= EBC_DITHER_Y1; dither++) {
+		mutex_lock(&ebc->image_lock);
+		memset(ebc->next_shadow, 0x5a, t_fix_size(&f));
+		rk3026_ebc_blit_xrgb8888(ebc, src, pitch, &all, dither);
+		memcpy(whole, ebc->next_shadow, t_fix_size(&f));
+		memset(ebc->next_shadow, 0xa5, t_fix_size(&f));
+		for (j = 0; j + 1 < ARRAY_SIZE(ys); j++) {
+			for (i = 0; i + 1 < ARRAY_SIZE(xs); i++) {
+				struct drm_rect r = {
+					.x1 = xs[i], .x2 = xs[i + 1],
+					.y1 = ys[j], .y2 = ys[j + 1],
+				};
+
+				rk3026_ebc_blit_xrgb8888(ebc, src, pitch, &r,
+							 dither);
+			}
+		}
+		mutex_unlock(&ebc->image_lock);
+		KUNIT_EXPECT_EQ_MSG(test, t_fix_diff(&f, whole, ebc->next_shadow),
+				    INT_MAX, "dither %u", dither);
+	}
+}
+
 static struct kunit_case rk3026_ebc_conv_test_cases[] = {
 	KUNIT_CASE(ebc_test_ref_snapshot),
 	KUNIT_CASE(ebc_test_snapshot_nibble_pairs),
@@ -11736,6 +11918,9 @@ static struct kunit_case rk3026_ebc_conv_test_cases[] = {
 	KUNIT_CASE(ebc_test_blit_neon_rows),
 	KUNIT_CASE(ebc_test_blit_neon_tails),
 	KUNIT_CASE(ebc_test_blit_convert),
+	KUNIT_CASE(ebc_test_blit_dither_tails),
+	KUNIT_CASE(ebc_test_dither_levels),
+	KUNIT_CASE(ebc_test_dither_tiling),
 	{}
 };
 

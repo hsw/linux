@@ -2288,7 +2288,8 @@ u32 rk3026_ebc_add_update(struct rk3026_ebc *ebc,
 	trace_rk3026_ebc_update_queue(upd->source, upd->mode, &upd->clip,
 				      upd->marker, upd->temp, upd->temp_valid,
 				      merged,
-				      rk3026_ebc_pending_parts(&ebc->pending));
+				      rk3026_ebc_pending_parts(&ebc->pending),
+				      upd->blit_us);
 
 	wake_up(&ebc->update_wq);
 	return seq;

@@ -76,8 +76,10 @@ TRACE_DEFINE_ENUM(EBC_REASON_AUTO_A2);
 
 TRACE_EVENT(rk3026_ebc_update_queue,
 	TP_PROTO(u32 source, u32 mode, const struct drm_rect *clip, u32 marker,
-		 int temp, bool temp_valid, bool coalesced, unsigned int queued),
-	TP_ARGS(source, mode, clip, marker, temp, temp_valid, coalesced, queued),
+		 int temp, bool temp_valid, bool coalesced, unsigned int queued,
+		 u32 blit_us),
+	TP_ARGS(source, mode, clip, marker, temp, temp_valid, coalesced, queued,
+		blit_us),
 	TP_STRUCT__entry(
 		__field(u32, source)
 		__field(u32, mode)
@@ -90,6 +92,7 @@ TRACE_EVENT(rk3026_ebc_update_queue,
 		__field(bool, temp_valid)
 		__field(bool, coalesced)
 		__field(unsigned int, queued)
+		__field(u32, blit_us)
 	),
 	TP_fast_assign(
 		__entry->source = source;
@@ -103,12 +106,14 @@ TRACE_EVENT(rk3026_ebc_update_queue,
 		__entry->temp_valid = temp_valid;
 		__entry->coalesced = coalesced;
 		__entry->queued = queued;
+		__entry->blit_us = blit_us;
 	),
-	TP_printk("source=%s mode=%u(%s) clip=%d,%d-%d,%d marker=%u temp=%d temp_valid=%d coalesced=%d queued=%u",
+	TP_printk("source=%s mode=%u(%s) clip=%d,%d-%d,%d marker=%u temp=%d temp_valid=%d coalesced=%d queued=%u blit_us=%u",
 		  ebc_trace_source(__entry->source), __entry->mode,
 		  ebc_trace_mode(__entry->mode), __entry->x1, __entry->y1,
 		  __entry->x2, __entry->y2, __entry->marker, __entry->temp,
-		  __entry->temp_valid, __entry->coalesced, __entry->queued)
+		  __entry->temp_valid, __entry->coalesced, __entry->queued,
+		  __entry->blit_us)
 );
 
 #define ebc_trace_reason(r)						\

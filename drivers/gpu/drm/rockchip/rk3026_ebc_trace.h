@@ -36,6 +36,7 @@ TRACE_DEFINE_ENUM(EBC_FLIP_OFF);
 TRACE_DEFINE_ENUM(EBC_FLIP_SLEEP);
 TRACE_DEFINE_ENUM(EBC_FLIP_REPLACED);
 TRACE_DEFINE_ENUM(EBC_FLIP_FAILED);
+TRACE_DEFINE_ENUM(EBC_FLIP_TAKE);
 TRACE_DEFINE_ENUM(EBC_REASON_EXPLICIT);
 TRACE_DEFINE_ENUM(EBC_REASON_AUTO_DU);
 TRACE_DEFINE_ENUM(EBC_REASON_REPAIR_FLOOR);
@@ -88,7 +89,8 @@ TRACE_DEFINE_ENUM(EBC_REASON_AUTO_A2);
 			 { EBC_FLIP_OFF,		"off" },	\
 			 { EBC_FLIP_SLEEP,		"sleep" },	\
 			 { EBC_FLIP_REPLACED,		"replaced" },	\
-			 { EBC_FLIP_FAILED,		"failed" })
+			 { EBC_FLIP_FAILED,		"failed" },	\
+			 { EBC_FLIP_TAKE,		"take" })
 
 TRACE_EVENT(rk3026_ebc_update_queue,
 	TP_PROTO(u32 source, u32 mode, const struct drm_rect *clip, u32 marker,
@@ -145,8 +147,10 @@ TRACE_EVENT(rk3026_ebc_update_queue,
  * appended to the line: its newest update's seq, its box in panel
  * coordinates, the pixels its snapshot changes, the DU budget spent at its
  * take, the time from the take to this waveform (@setup_us,
- * rk3026_ebc_setup_us()), the time the take waited for a quiet gap and the
- * retries of a carried part.
+ * rk3026_ebc_setup_us()), the time the take waited for a quiet gap, the
+ * retries of a carried part and the take's own time (taken_us, the
+ * monotonic clock in microseconds, as the trace_clock "mono" stamps the
+ * events: a commit event sent at the take is not before it).
  */
 TRACE_EVENT(rk3026_ebc_scan_start,
 	TP_PROTO(const struct rk3026_ebc_last *last, u32 mode, u32 lut_mode,
@@ -171,6 +175,7 @@ TRACE_EVENT(rk3026_ebc_scan_start,
 		__field(u32, setup_us)
 		__field(u32, gap_us)
 		__field(u32, tries)
+		__field(s64, taken_us)
 	),
 	TP_fast_assign(
 		__entry->mode = mode;
@@ -191,8 +196,9 @@ TRACE_EVENT(rk3026_ebc_scan_start,
 		__entry->setup_us = setup_us;
 		__entry->gap_us = last->gap_us;
 		__entry->tries = last->tries;
+		__entry->taken_us = ktime_to_us(last->taken);
 	),
-	TP_printk("mode=%u(%s) lut_mode=%u(%s) temp=%d frames=%u marker=%u merged=%u repair=%d reason=%s seq=%u box=%d,%d-%d,%d changed_px=%u du_area=%u setup_us=%u gap_us=%u tries=%u",
+	TP_printk("mode=%u(%s) lut_mode=%u(%s) temp=%d frames=%u marker=%u merged=%u repair=%d reason=%s seq=%u box=%d,%d-%d,%d changed_px=%u du_area=%u setup_us=%u gap_us=%u tries=%u taken_us=%lld",
 		  __entry->mode, ebc_trace_mode(__entry->mode),
 		  __entry->lut_mode, ebc_trace_mode(__entry->lut_mode),
 		  __entry->temp, __entry->frames, __entry->marker,
@@ -200,7 +206,7 @@ TRACE_EVENT(rk3026_ebc_scan_start,
 		  ebc_trace_reason(__entry->reason), __entry->seq,
 		  __entry->x1, __entry->y1, __entry->x2, __entry->y2,
 		  __entry->changed_px, __entry->du_area, __entry->setup_us,
-		  __entry->gap_us, __entry->tries)
+		  __entry->gap_us, __entry->tries, __entry->taken_us)
 );
 
 /* A waveform ends; @seq is its part's (a repair RESET's too). */
@@ -231,8 +237,9 @@ TRACE_EVENT(rk3026_ebc_scan_end,
 
 /*
  * A part was taken and nothing was driven for it: skipped as identical,
- * dropped or carried (the reason). Its seq, box and the pixels its snapshot
- * changes (0 if none was built) are appended.
+ * dropped or carried (the reason). Its seq, box, the pixels its snapshot
+ * changes (0 if none was built) and the take's time (taken_us, as in
+ * rk3026_ebc_scan_start) are appended.
  */
 TRACE_EVENT(rk3026_ebc_skip,
 	TP_PROTO(const struct rk3026_ebc_last *last),
@@ -247,6 +254,7 @@ TRACE_EVENT(rk3026_ebc_skip,
 		__field(int, x2)
 		__field(int, y2)
 		__field(u32, changed_px)
+		__field(s64, taken_us)
 	),
 	TP_fast_assign(
 		__entry->mode = last->asked_mode;
@@ -258,12 +266,13 @@ TRACE_EVENT(rk3026_ebc_skip,
 		__entry->x2 = last->clip.x2;
 		__entry->y2 = last->clip.y2;
 		__entry->changed_px = last->changed_px;
+		__entry->taken_us = ktime_to_us(last->taken);
 	),
-	TP_printk("mode=%u(%s) marker=%u reason=%s seq=%u box=%d,%d-%d,%d changed_px=%u",
+	TP_printk("mode=%u(%s) marker=%u reason=%s seq=%u box=%d,%d-%d,%d changed_px=%u taken_us=%lld",
 		  __entry->mode, ebc_trace_mode(__entry->mode),
 		  __entry->marker, ebc_trace_outcome(__entry->reason),
 		  __entry->seq, __entry->x1, __entry->y1, __entry->x2,
-		  __entry->y2, __entry->changed_px)
+		  __entry->y2, __entry->changed_px, __entry->taken_us)
 );
 
 /*
@@ -323,7 +332,9 @@ TRACE_EVENT(rk3026_ebc_rails,
  * the driver goes away, a system sleep began, or a second hold found the
  * slot full (replaced: watchdog late, err -ETIMEDOUT). Also an event not held
  * because its part had finished off the glass before the commit's flush:
- * failed, held_us 0, the core sends it right after.
+ * failed, held_us 0, the core sends it right after. An event held to the
+ * take (debugfs flip_release "take") goes when its part is taken (take);
+ * its err is 0 for every why but that failed one.
  */
 TRACE_EVENT(rk3026_ebc_flip_event,
 	TP_PROTO(u32 seq, u32 held_us, u32 why, int err),

@@ -21,6 +21,7 @@
 
 #include <drm/drm_fb_helper.h>
 #include <drm/drm_fourcc.h>
+#include <drm/drm_framebuffer.h>
 #include <drm/drm_managed.h>
 #include <drm/drm_print.h>
 #include <drm/drm_rect.h>
@@ -117,24 +118,57 @@ VISIBLE_IF_KUNIT u32 rk3026_ebc_mxcfb_to_ebc_mode(u32 waveform_mode,
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_mxcfb_to_ebc_mode);
 
-/*
- * One MXCFB_SEND_UPDATE request, already copied in: the region clamped to
- * the panel, the waveform and the flags mapped
- * (rk3026_ebc_mxcfb_to_ebc_mode()), and, in one @image_lock section, the
- * client's pixels converted from @src, its framebuffer with @pitch bytes
- * per row, and the update queued.
+/**
+ * rk3026_ebc_mxcfb_send - one MXCFB_SEND_UPDATE request
+ * @ebc: controller
+ * @src: the fbdev's framebuffer, top-left
+ * @pitch: its bytes per row
+ * @format: its format, XRGB8888 or C8
+ * @req: the request, already copied in
  *
- * Returns 0, -EINVAL if nothing of the region is on the panel, or -EBUSY
- * with the CRTC off.
+ * The region is clamped to the panel, the waveform and the flags mapped
+ * (rk3026_ebc_mxcfb_to_ebc_mode()), and, in one @image_lock section, the
+ * client's pixels converted from @src and the update queued.
+ *
+ * A C8 byte has two meanings on this driver. Through the fbdev and the
+ * plane (the console, a KMS client) it is an index into the CRTC's
+ * GAMMA_LUT, the palette the console loads with FBIOPUTCMAP. Here it is a
+ * luminance, 0 black to 255 white, as on an i.MX EPDC 8-bit fbdev, which
+ * is what an mxcfb client writes: it converts as R8, rounded to the
+ * nearest of the 16 levels, whatever palette is set, so a client that
+ * dithers to the greys 17 k gets level k exactly and needs no palette.
+ *
+ * The plane still reads the same buffer as indices whenever it blits it:
+ * the fbdev's damage of an mmap write before the client's first send,
+ * and the whole-panel redraw once the last client has closed the fbdev
+ * (@plane_resync). With the console's palette set, the greys 1 to 15 a
+ * client leaves there then show as the console's colours, not as dark
+ * greys, until the console redraws.
+ *
+ * Returns 0, -EINVAL if the format is neither or nothing of the region is
+ * on the panel, or -EBUSY with the CRTC off.
  */
 VISIBLE_IF_KUNIT int rk3026_ebc_mxcfb_send(struct rk3026_ebc *ebc,
 					   const void *src, unsigned int pitch,
+					   u32 format,
 					   const struct mxcfb_update_data *req)
 {
 	struct rk3026_ebc_update upd;
 	struct drm_rect clip;
+	u32 blit_format;
 	bool auto_mode;
 	u32 mode;
+
+	switch (format) {
+	case DRM_FORMAT_XRGB8888:
+		blit_format = format;
+		break;
+	case DRM_FORMAT_C8:
+		blit_format = DRM_FORMAT_R8;
+		break;
+	default:
+		return -EINVAL;
+	}
 
 	clip.x1 = min_t(u32, req->update_region.left, ebc->width);
 	clip.y1 = min_t(u32, req->update_region.top, ebc->height);
@@ -184,8 +218,8 @@ VISIBLE_IF_KUNIT int rk3026_ebc_mxcfb_send(struct rk3026_ebc *ebc,
 
 	/* A RESET discards the pixels: rk3026_ebc_add_update() whitens them. */
 	if (upd.mode != EBC_MODE_RESET)
-		upd.blit_us = rk3026_ebc_blit(ebc, src, pitch,
-					      DRM_FORMAT_XRGB8888, &clip);
+		upd.blit_us = rk3026_ebc_blit(ebc, src, pitch, blit_format,
+					      &clip);
 	rk3026_ebc_add_update(ebc, &upd);
 	mutex_unlock(&ebc->image_lock);
 	return 0;
@@ -195,20 +229,16 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_mxcfb_send);
 static int mxcfb_send_update(struct rk3026_ebc *ebc, struct fb_info *info,
 			     unsigned long arg)
 {
+	struct drm_fb_helper *helper = info->par;
 	struct mxcfb_update_data req;
 
 	if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
 		return -EFAULT;
 
-	/*
-	 * The send reads XRGB8888, four bytes a pixel: an 8-bit fbdev (C8,
-	 * "video=...-8") is refused rather than read past its end.
-	 */
-	if (info->var.bits_per_pixel != 32)
-		return -EINVAL;
-
+	/* XRGB8888 by default, C8 with "video=<connector>:-8". */
 	return rk3026_ebc_mxcfb_send(ebc, info->screen_buffer,
-				     info->fix.line_length, &req);
+				     info->fix.line_length,
+				     helper->fb->format->format, &req);
 }
 
 /*

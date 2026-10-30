@@ -7783,18 +7783,31 @@ static void ebc_test_glue_sleep_crtc_wait(struct kunit *test)
 }
 
 #if IS_ENABLED(CONFIG_DRM_RK3026_EBC_MXCFB)
-/* The part one mxcfb send queued, taken as the refresh thread takes it. */
-static int t_mxcfb_part(struct rk3026_ebc *ebc, const u32 *src,
-			const struct mxcfb_update_data *req,
-			struct rk3026_ebc_set *part)
+/*
+ * The part one mxcfb send from a @format fbdev queued, taken as the
+ * refresh thread takes it.
+ */
+static int t_mxcfb_part_fmt(struct rk3026_ebc *ebc, const void *src,
+			    unsigned int pitch, u32 format,
+			    const struct mxcfb_update_data *req,
+			    struct rk3026_ebc_set *part)
 {
-	int ret = rk3026_ebc_mxcfb_send(ebc, src, T_W * 4, req);
+	int ret = rk3026_ebc_mxcfb_send(ebc, src, pitch, format, req);
 
 	memset(part, 0, sizeof(*part));
 	mutex_lock(&ebc->image_lock);
 	rk3026_ebc_pending_take(&ebc->pending, part);
 	mutex_unlock(&ebc->image_lock);
 	return ret;
+}
+
+/* The same from the default XRGB8888 fbdev. */
+static int t_mxcfb_part(struct rk3026_ebc *ebc, const u32 *src,
+			const struct mxcfb_update_data *req,
+			struct rk3026_ebc_set *part)
+{
+	return t_mxcfb_part_fmt(ebc, src, T_W * 4, DRM_FORMAT_XRGB8888, req,
+				part);
 }
 
 /*
@@ -8645,6 +8658,110 @@ static void ebc_test_glue_palette_swap(struct kunit *test)
 							&t_panel));
 	t_expect_c8_img(test, ebc->next_shadow, fb, T_W, new_levels);
 }
+
+#if IS_ENABLED(CONFIG_DRM_RK3026_EBC_MXCFB)
+/*
+ * An mxcfb send from a C8 fbdev: each byte a grey, rounded as R8 is, the
+ * greys 17 k level k exactly, with the console's palette set as without,
+ * where a plane update of the same bytes takes the palette's levels. The
+ * odd box is widened to whole bytes, the rest of the target left alone.
+ * An XRGB8888 send converts the same with a palette as without. Any other
+ * format is refused and claims and queues nothing.
+ */
+static void ebc_test_glue_mxcfb_c8(struct kunit *test)
+{
+	const unsigned int pitch = T_W + 5;
+	struct rk3026_ebc *ebc = t_policy_ebc(test);
+	struct drm_color_lut *lut = kunit_kcalloc(test, EBC_PALETTE_SIZE,
+						  sizeof(*lut), GFP_KERNEL);
+	u8 *levels = kunit_kmalloc(test, EBC_PALETTE_SIZE, GFP_KERNEL);
+	u8 *fb = t_grey_fb(test, pitch);
+	u8 *bare = kunit_kmalloc(test, T_SIZE, GFP_KERNEL);
+	u32 *xrgb = t_plane_fb(test, 0);
+	struct mxcfb_update_data req = {
+		.update_region = { .left = 3, .top = 1, .width = 9,
+				   .height = 3 },
+		.waveform_mode = MXCFB_WAVEFORM_MODE_GC16,
+		.update_mode = MXCFB_UPDATE_MODE_PARTIAL,
+		.update_marker = 3,
+		.temp = MXCFB_TEMP_USE_AMBIENT,
+	};
+	struct rk3026_ebc_set part;
+	int i, x;
+
+	KUNIT_ASSERT_NOT_NULL(test, lut);
+	KUNIT_ASSERT_NOT_NULL(test, levels);
+	KUNIT_ASSERT_NOT_NULL(test, bare);
+
+	/* The plane: the bytes are indices into the console's palette. */
+	t_lut_con16(lut);
+	rk3026_ebc_set_palette(ebc, lut);
+	KUNIT_ASSERT_PTR_EQ(test, ebc->c8_levels, (const u8 *)ebc->palette);
+	t_levels_lut(levels, lut);
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, fb, pitch,
+							DRM_FORMAT_C8,
+							&t_panel));
+	t_expect_c8_img(test, ebc->next_shadow, fb, pitch, levels);
+	mutex_lock(&ebc->image_lock);
+	rk3026_ebc_pending_take(&ebc->pending, &part);
+	mutex_unlock(&ebc->image_lock);
+
+	/* The send: the same bytes are greys, the palette not used. */
+	t_img_fill(ebc->next_shadow, 15);
+	KUNIT_EXPECT_EQ(test, t_mxcfb_part_fmt(ebc, fb, pitch, DRM_FORMAT_C8,
+					       &req, &part), 0);
+	KUNIT_EXPECT_TRUE(test, ebc->mxcfb_active);
+	KUNIT_EXPECT_EQ(test, part.merged, 1);
+	KUNIT_EXPECT_TRUE(test, drm_rect_equals(&part.box, &t_odd_box));
+	KUNIT_EXPECT_EQ(test, part.mode, EBC_MODE_PART);
+	KUNIT_EXPECT_EQ(test, part.marker, 3);
+	KUNIT_EXPECT_GE(test, part.blit_us, 1);
+	t_expect_grey_box(test, ebc->next_shadow, fb, pitch, &t_odd_wide);
+
+	/* The whole panel: 17 k is level k, every pixel rounded. */
+	req.update_region = (struct mxcfb_rect) { .width = T_W,
+						  .height = T_H };
+	KUNIT_EXPECT_EQ(test, t_mxcfb_part_fmt(ebc, fb, pitch, DRM_FORMAT_C8,
+					       &req, &part), 0);
+	for (x = 0; x < T_W; x++) {
+		KUNIT_EXPECT_EQ_MSG(test, t_px(ebc->next_shadow, x, 0), x,
+				    "grey %d", 17 * x);
+		KUNIT_EXPECT_EQ_MSG(test, t_px(ebc->next_shadow, x, 3),
+				    (x + 3) % 16, "grey %d",
+				    17 * ((x + 3) % 16));
+	}
+	t_levels_round(levels);
+	t_expect_c8_img(test, ebc->next_shadow, fb, pitch, levels);
+
+	/* Without the palette: the same bytes. */
+	memcpy(bare, ebc->next_shadow, T_SIZE);
+	rk3026_ebc_set_palette(ebc, NULL);
+	t_img_fill(ebc->next_shadow, 15);
+	KUNIT_EXPECT_EQ(test, t_mxcfb_part_fmt(ebc, fb, pitch, DRM_FORMAT_C8,
+					       &req, &part), 0);
+	KUNIT_EXPECT_MEMEQ(test, ebc->next_shadow, bare, T_SIZE);
+
+	/* XRGB8888 without the palette, then with it: the same bytes. */
+	for (i = 0; i < T_W * T_H; i++)
+		xrgb[i] = i * 0x2f1b07;
+	KUNIT_EXPECT_EQ(test, t_mxcfb_part(ebc, xrgb, &req, &part), 0);
+	memcpy(bare, ebc->next_shadow, T_SIZE);
+	rk3026_ebc_set_palette(ebc, lut);
+	t_img_fill(ebc->next_shadow, 15);
+	KUNIT_EXPECT_EQ(test, t_mxcfb_part(ebc, xrgb, &req, &part), 0);
+	KUNIT_EXPECT_MEMEQ(test, ebc->next_shadow, bare, T_SIZE);
+
+	/* Another format: refused, the panel not claimed, nothing queued. */
+	ebc->mxcfb_active = false;
+	t_img_fill(ebc->next_shadow, 15);
+	KUNIT_EXPECT_EQ(test, t_mxcfb_part_fmt(ebc, xrgb, T_W * 2,
+					       DRM_FORMAT_RGB565, &req, &part),
+			-EINVAL);
+	KUNIT_EXPECT_EQ(test, part.merged, 0);
+	KUNIT_EXPECT_FALSE(test, ebc->mxcfb_active);
+	t_expect_white(test, ebc->next_shadow);
+}
+#endif
 
 /*
  * The policy does not change with the box: a damaged plane part whose
@@ -11384,6 +11501,9 @@ static struct kunit_case rk3026_ebc_glue_test_cases[] = {
 	KUNIT_CASE(ebc_test_glue_plane_r8),
 	KUNIT_CASE(ebc_test_glue_plane_c8),
 	KUNIT_CASE(ebc_test_glue_palette_swap),
+#if IS_ENABLED(CONFIG_DRM_RK3026_EBC_MXCFB)
+	KUNIT_CASE(ebc_test_glue_mxcfb_c8),
+#endif
 	KUNIT_CASE(ebc_test_glue_plane_box_du),
 	KUNIT_CASE(ebc_test_glue_plane_box_grey),
 	KUNIT_CASE(ebc_test_glue_flip_hold),

@@ -1362,7 +1362,7 @@ struct mxcfb_update_data;
 u32 rk3026_ebc_mxcfb_to_ebc_mode(u32 waveform_mode, u32 update_mode,
 				 u32 flags, bool *auto_mode);
 int rk3026_ebc_mxcfb_send(struct rk3026_ebc *ebc, const void *src,
-			  unsigned int pitch,
+			  unsigned int pitch, u32 format,
 			  const struct mxcfb_update_data *req);
 #endif
 #else

@@ -307,6 +307,28 @@ bool rk3026_ebc_pending_take(struct rk3026_ebc_pending *p,
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_pending_take);
 
+/**
+ * rk3026_ebc_flip_holds - whether a commit's CRTC event waits for the take
+ * @e: the commit's CRTC event, or NULL
+ * @queued: the commit queued a plane update (&rk3026_ebc.commit_queued)
+ *
+ * Only an event userspace asked for is held: a page flip event (it has a
+ * file) or an out-fence. The core gives every other commit an internal
+ * event, and fbcon, fbdev writes and DirtyFB are such commits; they keep
+ * the event at once, so none waits for the panel to take its own update
+ * (one behind a held event still waits for that event,
+ * rk3026_ebc_flip_hold()). A commit that queued nothing (no damage, or an
+ * mxcfb client owns the panel) has no part to wait for.
+ *
+ * Return: true if @e is to be held.
+ */
+bool rk3026_ebc_flip_holds(const struct drm_pending_vblank_event *e,
+			   bool queued)
+{
+	return e && (e->base.file_priv || e->base.fence) && queued;
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_flip_holds);
+
 /* What ebc_snap_word() collects over the box, see there. */
 struct ebc_snap_acc {
 	u32 over_grey;

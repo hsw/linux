@@ -1383,6 +1383,41 @@ static enum rk3026_ebc_repair_due ebc_repair_by(struct rk3026_ebc *ebc,
 }
 
 /*
+ * Send the held event and empty the slot, under &drm_device.event_lock.
+ * The EBC has no vblank, so drm_crtc_send_vblank_event() stamps it frame 0
+ * at the current time; the send completes the commit's flip_done and
+ * signals its out-fence, if it has one.
+ */
+static void ebc_flip_send(struct rk3026_ebc *ebc)
+{
+	lockdep_assert_held(&ebc->drm.event_lock);
+	drm_crtc_send_vblank_event(&ebc->crtc, ebc->flip_event);
+	ebc->flip_event = NULL;
+}
+
+/*
+ * A part was taken (rk3026_ebc_do_refresh(), under @image_lock): the held
+ * event goes once @pending.taken_seq has reached the update its commit
+ * queued, and not at the take of a part before it. Parts are taken in seq
+ * order, and a part's seq is that of the newest update in it; seqs wrap
+ * (rk3026_ebc_seq_done()). A part that is taken but not driven (the CRTC
+ * off, no waveform, nothing to move) counts too: the panel is done with the
+ * commit's update as far as it will ever be. Only records and sends; never
+ * waits.
+ */
+static void ebc_flip_taken(struct rk3026_ebc *ebc)
+{
+	unsigned long flags;
+
+	lockdep_assert_held(&ebc->image_lock);
+	spin_lock_irqsave(&ebc->drm.event_lock, flags);
+	if (ebc->flip_event &&
+	    rk3026_ebc_seq_done(ebc->pending.taken_seq, ebc->flip_seq))
+		ebc_flip_send(ebc);
+	spin_unlock_irqrestore(&ebc->drm.event_lock, flags);
+}
+
+/*
  * Take the next part and drive it onto the panel, if anything is pending.
  * Runs only on the refresh thread.
  *
@@ -1396,7 +1431,8 @@ static enum rk3026_ebc_repair_due ebc_repair_by(struct rk3026_ebc *ebc,
  *     the rails stay as they are;
  *  2. under @image_lock: the part is taken (rk3026_ebc_pending_take(): what
  *     was sent before a RESET, then the RESET alone, then what was sent
- *     after it), and its snapshot is built into @shadows.scan from
+ *     after it), a flip event held for an update in it is sent
+ *     (ebc_flip_taken()), and its snapshot is built into @shadows.scan from
  *     @shadows.prev and the target (@next_shadow, or @pre_shadow for what
  *     was sent before a pending RESET). Senders may blit into @next_shadow
  *     and add to @pending as soon as the lock is dropped: the snapshot is
@@ -1423,7 +1459,7 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 	enum rk3026_ebc_repair_due repair = EBC_REPAIR_NOT_DUE;
 	enum rk3026_ebc_repair repair_result = EBC_REPAIR_NONE;
 	struct rk3026_ebc_shadows *sh = &ebc->shadows;
-	ktime_t start = ktime_get(), snap_start;
+	ktime_t start = ktime_get(), snap_start, taken;
 	enum rk3026_ebc_reason reason;
 	struct rk3026_ebc_du_budget budget;
 	struct rk3026_ebc_a2 a2 = { 0 };
@@ -1482,6 +1518,13 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 	rk3026_ebc_pending_take(&ebc->pending, &part);
 	/* Until the finish below; a suspend waits for it (ebc_suspend()). */
 	WRITE_ONCE(ebc->in_flight, true);
+	/*
+	 * The flip event of the commit whose update this part takes, sent
+	 * after the take's time is read: the setup_us of the part's waveforms
+	 * counts from that time, and so never puts the take after its event.
+	 */
+	taken = rk3026_ebc_clock(ebc);
+	ebc_flip_taken(ebc);
 
 	/*
 	 * Taken while @pre_split, the part is the @pending.pre a RESET was sent
@@ -1492,7 +1535,7 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 	ebc->pre_split = false;
 
 	memset(last, 0, sizeof(*last));
-	last->taken = rk3026_ebc_clock(ebc);
+	last->taken = taken;
 	last->seq = part.seq;
 	last->du_area = ebc->du_area;
 	last->clip = part.box;
@@ -2699,19 +2742,94 @@ static void ebc_crtc_atomic_disable(struct drm_crtc *crtc,
 	}
 }
 
-/*
- * A commit starts with no update queued; rk3026_ebc_plane_update() records
- * the one it queues (@commit_queued, @commit_seq). The core calls this in
- * drm_atomic_helper_commit_planes() before the plane updates, for a commit
- * that holds the CRTC while it is active. A plane in a commit always pulls
- * its CRTC in, and only a commit that holds the CRTC carries its event.
+/**
+ * rk3026_ebc_flip_hold - hold a commit's CRTC event until its part is taken
+ * @ebc: controller
+ * @event: &drm_crtc_state.event of the commit being applied
+ *
+ * The EBC has no vblank, so the core would send the event right after the
+ * plane update has blitted and queued the damage
+ * (drm_atomic_helper_fake_vblank()), before the panel has even started on
+ * it: a client that paces itself on page flip events, or waits on its
+ * out-fence, would then render as fast as it can, and its commits would
+ * only merge into the part ahead. Instead the event of a commit that queued
+ * an update is held here, and sent when the refresh thread takes the part
+ * with that update into a waveform (rk3026_ebc_do_refresh()).
+ *
+ * The event then means "taken into the waveform": the panel has started on
+ * the commit's update, and the next commit's update goes to the part after
+ * it. It does not mean the update is on the glass, which is one waveform
+ * later. A client that commits on each event stays one frame ahead of the
+ * panel and is paced by it.
+ *
+ * Only an event userspace asked for is held (rk3026_ebc_flip_holds()): the
+ * internal events the core gives other commits stay, and fbcon, fbdev
+ * writes and DirtyFB keep their immediate completion. Holding those too
+ * would make every such commit wait for the panel, a different question
+ * (whether DirtyFB should block for X), not this one. Such a commit made
+ * behind a held event still waits for it: its commit tail waits for the
+ * flip_done of the commit before it on the plane
+ * (drm_atomic_helper_wait_for_dependencies()), so a DirtyFB ioctl or the
+ * fbdev damage worker blocks until that commit's part is taken, one take
+ * at most. Nothing is held for a commit that queued nothing: no damage, or
+ * an mxcfb client owns the panel.
+ *
+ * Called from the CRTC's .atomic_flush, after the plane update. The record
+ * of the commit, @commit_queued, is read and cleared here, whatever the
+ * outcome, so the next commit starts with nothing recorded. The flush ends
+ * every commit whose plane update ran: with drm_atomic_helper_commit_tail_rpm()
+ * the core applies the planes with DRM_PLANE_COMMIT_ACTIVE_ONLY, and
+ * drm_atomic_helper_commit_planes() then updates a plane only when its CRTC
+ * is active in the new state, the condition it flushes that CRTC on; a plane
+ * in a commit always pulls its CRTC in. The thread
+ * may have taken the part already, between the plane update and here; the
+ * event is not held then. Its take moved @pending.taken_seq before it
+ * looked at the slot under &drm_device.event_lock, so a take after this
+ * look finds the event held. One slot is enough: a commit waits for its
+ * predecessor's event before its planes are applied
+ * (drm_atomic_helper_wait_for_dependencies()), and a nonblocking one is
+ * refused while it is pending. A full slot is a bug: the old event is sent
+ * first, so neither is lost.
+ *
+ * Return: true if the event is held, and *@event is NULL; false if it was
+ * left in *@event, for the fake vblank of the commit tail.
  */
-static void ebc_crtc_atomic_begin(struct drm_crtc *crtc,
-				  struct drm_atomic_state *state)
+VISIBLE_IF_KUNIT bool rk3026_ebc_flip_hold(struct rk3026_ebc *ebc,
+					   struct drm_pending_vblank_event **event)
 {
-	struct rk3026_ebc *ebc = drm_to_ebc(crtc->dev);
+	unsigned long flags;
+	bool queued = ebc->commit_queued, held = false;
 
 	ebc->commit_queued = false;
+	spin_lock_irqsave(&ebc->drm.event_lock, flags);
+	if (!rk3026_ebc_flip_holds(*event, queued) ||
+	    rk3026_ebc_seq_done(READ_ONCE(ebc->pending.taken_seq),
+				ebc->commit_seq))
+		goto out;
+
+	if (WARN_ONCE(ebc->flip_event,
+		      "flip event of update %u still held at the commit of %u\n",
+		      ebc->flip_seq, ebc->commit_seq))
+		ebc_flip_send(ebc);
+	ebc->flip_event = *event;
+	ebc->flip_seq = ebc->commit_seq;
+	ebc->flip_held_at = rk3026_ebc_clock(ebc);
+	*event = NULL;
+	held = true;
+out:
+	spin_unlock_irqrestore(&ebc->drm.event_lock, flags);
+	return held;
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_flip_hold);
+
+/* The commit's planes are applied: hold its event (rk3026_ebc_flip_hold()). */
+static void ebc_crtc_atomic_flush(struct drm_crtc *crtc,
+				  struct drm_atomic_state *state)
+{
+	struct drm_crtc_state *crtc_state =
+		drm_atomic_get_new_crtc_state(state, crtc);
+
+	rk3026_ebc_flip_hold(drm_to_ebc(crtc->dev), &crtc_state->event);
 }
 
 static const struct drm_crtc_funcs ebc_crtc_funcs = {
@@ -2724,7 +2842,7 @@ static const struct drm_crtc_funcs ebc_crtc_funcs = {
 };
 
 static const struct drm_crtc_helper_funcs ebc_crtc_helper_funcs = {
-	.atomic_begin		= ebc_crtc_atomic_begin,
+	.atomic_flush		= ebc_crtc_atomic_flush,
 	.atomic_enable		= ebc_crtc_atomic_enable,
 	.atomic_disable		= ebc_crtc_atomic_disable,
 };

@@ -24,6 +24,7 @@
 #include <drm/drm_encoder.h>
 #include <drm/drm_plane.h>
 #include <drm/drm_rect.h>
+#include <drm/drm_vblank.h>
 
 #include <video/display_timing.h>
 
@@ -1048,15 +1049,29 @@ struct rk3026_ebc {
 	bool			mxcfb_active;
 
 	/*
-	 * The commit being applied: ebc_crtc_atomic_begin() clears
-	 * @commit_queued; rk3026_ebc_plane_update() sets it when it queued an
-	 * update, and @commit_seq to that update's seq. Written and read only
-	 * in the commit tail: the panel has one CRTC, and a commit's planes
-	 * are applied only after the previous commit's are done
+	 * The commit being applied: rk3026_ebc_plane_update() sets
+	 * @commit_queued when it queued an update, and @commit_seq to that
+	 * update's seq; rk3026_ebc_flip_hold(), at the commit's flush, reads
+	 * and clears @commit_queued. Written and read only in the commit tail:
+	 * the panel has one CRTC, and a commit's planes are applied only after
+	 * the previous commit's are done
 	 * (drm_atomic_helper_wait_for_dependencies()).
 	 */
 	u32			commit_seq;
 	bool			commit_queued;
+
+	/*
+	 * The CRTC event of a page flip or an out-fence, held from the commit
+	 * (rk3026_ebc_flip_hold()) until the refresh thread takes the part
+	 * with the commit's update into a waveform (rk3026_ebc_do_refresh()):
+	 * @flip_seq is that update's seq, @flip_held_at when the event was
+	 * held. One slot: a commit waits for its predecessor's event before
+	 * its planes are applied. Under &drm_device.event_lock, which nests
+	 * inside @image_lock and never the other way round.
+	 */
+	struct drm_pending_vblank_event	*flip_event;
+	u32			flip_seq;
+	ktime_t			flip_held_at;
 
 	/*
 	 * debugfs: the last part, the last driven one, the counters. Under
@@ -1093,6 +1108,8 @@ bool rk3026_ebc_plane_box(const struct drm_plane_state *old_state,
 			  struct drm_rect *box);
 bool rk3026_ebc_plane_update(struct rk3026_ebc *ebc, const void *src,
 			     unsigned int src_pitch, const struct drm_rect *box);
+bool rk3026_ebc_flip_hold(struct rk3026_ebc *ebc,
+			  struct drm_pending_vblank_event **event);
 bool rk3026_ebc_idle_tick(struct rk3026_ebc *ebc, unsigned long now);
 int rk3026_ebc_raise_rails(struct rk3026_ebc *ebc);
 ktime_t rk3026_ebc_clock(struct rk3026_ebc *ebc);
@@ -1128,6 +1145,8 @@ bool rk3026_ebc_pending_peek(const struct rk3026_ebc_pending *p,
 			     struct rk3026_ebc_set *part);
 bool rk3026_ebc_pending_take(struct rk3026_ebc_pending *p,
 			     struct rk3026_ebc_set *part);
+bool rk3026_ebc_flip_holds(const struct drm_pending_vblank_event *e,
+			   bool queued);
 bool rk3026_ebc_build_snapshot(const struct rk3026_ebc_shadows *sh,
 			       const u8 *next, const struct drm_rect *box,
 			       u32 *mode, bool *two_level, bool *over_grey,

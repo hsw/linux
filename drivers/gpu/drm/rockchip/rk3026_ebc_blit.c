@@ -22,6 +22,7 @@
  * rk3026_ebc_grey_round[] maps a grey to the nearest of the panel's 16
  * levels, so the greys k * 17 that a 16-level dither emits stay exactly
  * level k; NEON computes that table's levels instead of looking them up.
+ * A C8 palette becomes such a table in rk3026_ebc_palette_levels().
  */
 
 #include <linux/compiler.h>
@@ -303,10 +304,38 @@ bool rk3026_ebc_blit_grey_convert(u8 *dst, const void *src,
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_blit_grey_convert);
 
 /**
+ * rk3026_ebc_palette_levels - the level of each C8 index under a palette
+ * @levels: returns EBC_PALETTE_SIZE levels, 0 to 15
+ * @lut: the palette, EBC_PALETTE_SIZE entries (the CRTC's GAMMA_LUT)
+ *
+ * An entry is taken at 8 bits a component, the top byte of each 16-bit
+ * value, its grey is the luma of the XRGB8888 conversion, and
+ * rk3026_ebc_grey_round[] rounds that grey to the nearest level. An index
+ * thus shows as its colour would in XRGB8888, but rounded rather than cut
+ * to the top four bits, and a grey ramp, entry i = i * 0x101 as
+ * drm_crtc_fill_palette_8() fills it or i << 8 as the legacy gamma table
+ * starts, gives the rounding table itself.
+ */
+void rk3026_ebc_palette_levels(u8 *levels, const struct drm_color_lut *lut)
+{
+	unsigned int i;
+
+	for (i = 0; i < EBC_PALETTE_SIZE; i++) {
+		u32 p = (lut[i].red >> 8) << 16 | (lut[i].green >> 8) << 8 |
+			lut[i].blue >> 8;
+
+		levels[i] = rk3026_ebc_grey_round[ebc_luma(p) >> 24];
+	}
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_palette_levels);
+
+/**
  * rk3026_ebc_blit_impl - the XRGB8888 conversion rk3026_ebc_blit() runs
  *
  * For the probe line and debugfs "timing", so a measured blit time says
- * which loop it is from.
+ * which loop it is from. R8, and C8 without a palette, take NEON under the
+ * same conditions; a C8 palette always takes the scalar table rows
+ * (rk3026_ebc_blit_grey_convert()), whatever this says.
  *
  * Returns "neon" if rk3026_ebc_blit_convert() takes the NEON rows for a
  * clip of 16 pixels or more in process context, else "scalar".

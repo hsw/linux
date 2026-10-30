@@ -317,7 +317,8 @@ DEFINE_SHOW_ATTRIBUTE(rk3026_ebc_du_state);
 
 /*
  * "timing", apart from "state" so that file keeps its version: blit_impl is
- * the conversion (rk3026_ebc_blit_impl()); *_blit_us is what the newest
+ * the conversion (rk3026_ebc_blit_impl(); the scalar table rows for a C8
+ * plane with a palette, whatever it says); *_blit_us is what the newest
  * update of the part took to convert on its sender, *_snap_us the snapshot
  * the refresh thread built for it, in us rounded up, 0 for none. last_* and
  * scan_* are the records of "state".

@@ -12,6 +12,7 @@
 #include <kunit/test.h>
 
 #include <linux/completion.h>
+#include <linux/delay.h>
 #include <linux/dma-fence.h>
 #include <linux/err.h>
 #include <linux/hrtimer.h>
@@ -28,13 +29,19 @@
 #include <linux/wait.h>
 #include <linux/workqueue.h>
 
+#include <drm/drm_atomic.h>
+#include <drm/drm_atomic_helper.h>
+#include <drm/drm_atomic_uapi.h>
 #include <drm/drm_crtc.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_file.h>
 #include <drm/drm_fourcc.h>
 #include <drm/drm_framebuffer.h>
 #include <drm/drm_kunit_helpers.h>
+#include <drm/drm_modeset_lock.h>
+#include <drm/drm_modes.h>
 #include <drm/drm_plane.h>
+#include <drm/drm_property.h>
 #include <drm/drm_vblank.h>
 
 #if IS_ENABLED(CONFIG_DRM_RK3026_EBC_NEON)
@@ -4322,6 +4329,7 @@ static void t_ebc_init(struct kunit *test, struct rk3026_ebc *ebc,
 	ebc->du_cleanup_idle_ms = EBC_DU_CLEANUP_IDLE_MS;
 	/* A2 off for plane parts. */
 	ebc->a2_max_area = 0;
+	ebc->c8_levels = rk3026_ebc_grey_round;
 	/*
 	 * plane_resync stays false: after probe it is true (the probe RESET
 	 * is a non-plane update), but here the target and the framebuffers
@@ -8245,6 +8253,18 @@ static u8 t_grey_level(unsigned int g)
 	return (g + 8) / 17;
 }
 
+/*
+ * The rounded level of each of the EBC_PALETTE_SIZE 8-bit greys, worked
+ * out apart from the driver's table.
+ */
+static void t_levels_round(u8 *levels)
+{
+	int g;
+
+	for (g = 0; g < EBC_PALETTE_SIZE; g++)
+		levels[g] = t_grey_level(g);
+}
+
 /* An odd box of the 8-bit framebuffer tests, and the box widened to bytes. */
 static const struct drm_rect t_odd_box = DRM_RECT_INIT(3, 1, 9, 3);
 static const struct drm_rect t_odd_wide = DRM_RECT_INIT(2, 1, 10, 3);
@@ -8293,6 +8313,138 @@ static void t_expect_grey_box(struct kunit *test, const u8 *img,
 }
 
 /*
+ * The console's 16 colours, the fbdev default palette (fb_default_cmap()
+ * of 16 entries), red, green and blue at 16 bits.
+ */
+static const u16 t_con16[3][16] = {
+	{ 0x0000, 0x0000, 0x0000, 0x0000, 0xaaaa, 0xaaaa, 0xaaaa, 0xaaaa,
+	  0x5555, 0x5555, 0x5555, 0x5555, 0xffff, 0xffff, 0xffff, 0xffff },
+	{ 0x0000, 0x0000, 0xaaaa, 0xaaaa, 0x0000, 0x0000, 0x5555, 0xaaaa,
+	  0x5555, 0x5555, 0xffff, 0xffff, 0x5555, 0x5555, 0xffff, 0xffff },
+	{ 0x0000, 0xaaaa, 0x0000, 0xaaaa, 0x0000, 0xaaaa, 0x0000, 0xaaaa,
+	  0x5555, 0xffff, 0x5555, 0xffff, 0x5555, 0xffff, 0x5555, 0xffff },
+};
+
+/*
+ * Their levels: the background 0 black, the normal text 7 light grey at
+ * 10, dark grey 8 at 5, the bright white 15 at 15, the dim colours low.
+ */
+static const u8 t_con16_levels[16] = {
+	0, 1, 6, 7, 3, 4, 6, 10, 5, 6, 11, 12, 8, 9, 14, 15,
+};
+
+/*
+ * The GAMMA_LUT the fbdev emulation commits for the console's palette: its
+ * 16 colours, the rest from the legacy gamma table, i << 8 from the start.
+ */
+static void t_lut_con16(struct drm_color_lut *lut)
+{
+	int i;
+
+	for (i = 0; i < EBC_PALETTE_SIZE; i++) {
+		lut[i].red = i < 16 ? t_con16[0][i] : i << 8;
+		lut[i].green = i < 16 ? t_con16[1][i] : i << 8;
+		lut[i].blue = i < 16 ? t_con16[2][i] : i << 8;
+	}
+}
+
+/* A grey ramp, entry i = i * @mul + @add on every component. */
+static void t_lut_ramp(struct drm_color_lut *lut, u16 mul, u16 add)
+{
+	int i;
+
+	for (i = 0; i < EBC_PALETTE_SIZE; i++) {
+		lut[i].red = i * mul + add;
+		lut[i].green = lut[i].red;
+		lut[i].blue = lut[i].red;
+	}
+}
+
+/*
+ * The grey ramps (mul, add) that give the rounding table: i * 0x101 as
+ * drm_crtc_fill_palette_8() fills it, i << 8 as the legacy gamma table
+ * starts, and i << 8 | 0xff.
+ */
+static const u16 t_grey_ramps[][2] = {
+	{ 0x101, 0 }, { 0x100, 0 }, { 0x100, 0xff },
+};
+
+/* A random palette from @seed, each component 16 random bits. */
+static void t_lut_rand(struct drm_color_lut *lut, u32 seed)
+{
+	struct rnd_state rs;
+	int i;
+
+	prandom_seed_state(&rs, seed);
+	for (i = 0; i < EBC_PALETTE_SIZE; i++) {
+		u32 r = prandom_u32_state(&rs);
+
+		lut[i].red = r;
+		lut[i].green = r >> 16;
+		lut[i].blue = prandom_u32_state(&rs);
+	}
+}
+
+/*
+ * The level of a palette entry, the slow way: its luma at 8 bits a
+ * component, (77 R + 150 G + 29 B) / 256 rounded down as the XRGB8888
+ * conversion takes it, and the level whose grey 17 k is nearest (no tie:
+ * 17 is odd).
+ */
+static u8 t_lut_ref_level(const struct drm_color_lut *e)
+{
+	int y = (77 * (e->red >> 8) + 150 * (e->green >> 8) +
+		 29 * (e->blue >> 8)) >> 8;
+	int l, best = 0;
+
+	for (l = 1; l < 16; l++)
+		if (abs(y - 17 * l) < abs(y - 17 * best))
+			best = l;
+	return best;
+}
+
+/* The levels of the EBC_PALETTE_SIZE entries of @lut, the slow way. */
+static void t_levels_lut(u8 *levels, const struct drm_color_lut *lut)
+{
+	int i;
+
+	for (i = 0; i < EBC_PALETTE_SIZE; i++)
+		levels[i] = t_lut_ref_level(&lut[i]);
+}
+
+/*
+ * A C8 framebuffer of the panel at @pitch: indices 0 to 15 on the first
+ * row, spread over 0 to 255 below, padding 0xff.
+ */
+static u8 *t_c8_fb(struct kunit *test, unsigned int pitch)
+{
+	u8 *fb = kunit_kmalloc(test, pitch * T_H, GFP_KERNEL);
+	int x, y;
+
+	KUNIT_ASSERT_NOT_NULL(test, fb);
+	for (y = 0; y < T_H; y++)
+		for (x = 0; x < (int)pitch; x++)
+			fb[y * pitch + x] = x >= T_W ? 0xff :
+					    y ? (y * T_W + x) * 37 : x;
+	return fb;
+}
+
+/* Every pixel of @img is levels[index] of its index in the C8 @fb. */
+static void t_expect_c8_img(struct kunit *test, const u8 *img, const u8 *fb,
+			    unsigned int pitch, const u8 *levels)
+{
+	int x, y;
+
+	for (y = 0; y < T_H; y++)
+		for (x = 0; x < T_W; x++)
+			KUNIT_EXPECT_EQ_MSG(test, t_px(img, x, y),
+					    levels[fb[y * pitch + x]],
+					    "pixel %d,%d index %u", x, y,
+					    fb[y * pitch + x]);
+	t_expect_guard(test, img);
+}
+
+/*
  * An R8 plane: one byte a pixel at the framebuffer's pitch, wider than the
  * panel here, each grey rounded to the nearest level, where XRGB8888 takes
  * the top four bits of the luma. The blit widens an odd box to whole
@@ -8332,6 +8484,166 @@ static void ebc_test_glue_plane_r8(struct kunit *test)
 							&t_odd_box));
 	t_expect_box_img(test, ebc->next_shadow, &t_panel, 2, 2);
 	KUNIT_EXPECT_FALSE(test, ebc->plane_resync);
+}
+
+/*
+ * A C8 plane: one index a pixel at the framebuffer's pitch. Without a
+ * palette an index blits as the grey of R8; with the console's palette as
+ * the level of its colour. XRGB8888 and R8 blit the same bytes with a
+ * palette set as without. A grey ramp is not kept as a palette, and no
+ * LUT drops it.
+ */
+static void ebc_test_glue_plane_c8(struct kunit *test)
+{
+	const unsigned int pitch = T_W + 5;
+	struct rk3026_ebc *ebc = t_ebc_alloc(test);
+	struct drm_color_lut *lut = kunit_kcalloc(test, EBC_PALETTE_SIZE,
+						  sizeof(*lut), GFP_KERNEL);
+	u8 *levels = kunit_kmalloc(test, EBC_PALETTE_SIZE, GFP_KERNEL);
+	u8 *bare = kunit_kmalloc(test, T_SIZE, GFP_KERNEL);
+	u32 *xrgb = t_plane_fb(test, 0);
+	u8 *fb = t_c8_fb(test, pitch);
+	unsigned int r;
+	int i, x;
+
+	KUNIT_ASSERT_NOT_NULL(test, lut);
+	KUNIT_ASSERT_NOT_NULL(test, levels);
+	KUNIT_ASSERT_NOT_NULL(test, bare);
+
+	/* No palette: the index is a grey, rounded. */
+	t_levels_round(levels);
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, fb, pitch,
+							DRM_FORMAT_C8,
+							&t_panel));
+	t_expect_c8_img(test, ebc->next_shadow, fb, pitch, levels);
+
+	/* The console's palette: its levels, the rest of the table grey. */
+	t_lut_con16(lut);
+	rk3026_ebc_set_palette(ebc, lut);
+	KUNIT_EXPECT_PTR_EQ(test, ebc->c8_levels, (const u8 *)ebc->palette);
+	t_levels_lut(levels, lut);
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, fb, pitch,
+							DRM_FORMAT_C8,
+							&t_panel));
+	t_expect_c8_img(test, ebc->next_shadow, fb, pitch, levels);
+	for (x = 0; x < 16; x++)
+		KUNIT_EXPECT_EQ_MSG(test, t_px(ebc->next_shadow, x, 0),
+				    t_con16_levels[x], "colour %d", x);
+
+	/* XRGB8888 with the palette set, then without: the same bytes. */
+	for (i = 0; i < T_W * T_H; i++)
+		xrgb[i] = i * 0x2f1b07;
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, xrgb, &t_panel));
+	memcpy(bare, ebc->next_shadow, T_SIZE);
+	rk3026_ebc_set_palette(ebc, NULL);
+	KUNIT_EXPECT_PTR_EQ(test, ebc->c8_levels,
+			    (const u8 *)rk3026_ebc_grey_round);
+	t_img_fill(ebc->next_shadow, 15);
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, xrgb, &t_panel));
+	KUNIT_EXPECT_MEMEQ(test, ebc->next_shadow, bare, T_SIZE);
+
+	/* R8 the same way: the bytes of C8 without a palette. */
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, fb, pitch,
+							DRM_FORMAT_R8,
+							&t_panel));
+	memcpy(bare, ebc->next_shadow, T_SIZE);
+	rk3026_ebc_set_palette(ebc, lut);
+	t_img_fill(ebc->next_shadow, 15);
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, fb, pitch,
+							DRM_FORMAT_R8,
+							&t_panel));
+	KUNIT_EXPECT_MEMEQ(test, ebc->next_shadow, bare, T_SIZE);
+
+	/*
+	 * A grey ramp gives the rounding table: not kept, C8 is R8 again,
+	 * through rk3026_ebc_grey_round itself (the NEON rows).
+	 */
+	for (r = 0; r < ARRAY_SIZE(t_grey_ramps); r++) {
+		rk3026_ebc_set_palette(ebc, lut);
+		KUNIT_ASSERT_PTR_EQ(test, ebc->c8_levels,
+				    (const u8 *)ebc->palette);
+		t_lut_ramp(lut, t_grey_ramps[r][0], t_grey_ramps[r][1]);
+		rk3026_ebc_set_palette(ebc, lut);
+		KUNIT_EXPECT_PTR_EQ_MSG(test, ebc->c8_levels,
+					(const u8 *)rk3026_ebc_grey_round,
+					"ramp %u", r);
+		t_img_fill(ebc->next_shadow, 15);
+		KUNIT_ASSERT_TRUE(test,
+				  rk3026_ebc_plane_update(ebc, fb, pitch,
+							  DRM_FORMAT_C8,
+							  &t_panel));
+		KUNIT_EXPECT_MEMEQ_MSG(test, ebc->next_shadow, bare, T_SIZE,
+				       "ramp %u", r);
+		t_lut_con16(lut);
+	}
+}
+
+struct t_palette_work {
+	struct work_struct work;
+	struct completion started;
+	struct rk3026_ebc *ebc;
+	const struct drm_color_lut *lut;
+};
+
+static void t_palette_work_fn(struct work_struct *work)
+{
+	struct t_palette_work *w = container_of(work, struct t_palette_work,
+						work);
+
+	complete(&w->started);
+	rk3026_ebc_set_palette(w->ebc, w->lut);
+}
+
+/*
+ * A new palette waits for image_lock. A swap started while the lock is
+ * held, as a blit holds it, is still running after a while, and a C8 blit
+ * under the lock takes the old table; once the lock is released, the new
+ * one.
+ */
+static void ebc_test_glue_palette_swap(struct kunit *test)
+{
+	struct rk3026_ebc *ebc = t_ebc_alloc(test);
+	struct drm_color_lut *old = kunit_kcalloc(test, EBC_PALETTE_SIZE,
+						  sizeof(*old), GFP_KERNEL);
+	struct drm_color_lut *new = kunit_kcalloc(test, EBC_PALETTE_SIZE,
+						  sizeof(*new), GFP_KERNEL);
+	struct t_palette_work *w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
+	u8 *old_levels = kunit_kmalloc(test, EBC_PALETTE_SIZE, GFP_KERNEL);
+	u8 *new_levels = kunit_kmalloc(test, EBC_PALETTE_SIZE, GFP_KERNEL);
+	u8 *fb = t_c8_fb(test, T_W);
+	unsigned long started;
+
+	KUNIT_ASSERT_NOT_NULL(test, old);
+	KUNIT_ASSERT_NOT_NULL(test, new);
+	KUNIT_ASSERT_NOT_NULL(test, w);
+	KUNIT_ASSERT_NOT_NULL(test, old_levels);
+	KUNIT_ASSERT_NOT_NULL(test, new_levels);
+	t_lut_con16(old);
+	t_lut_rand(new, 41);
+	t_levels_lut(old_levels, old);
+	t_levels_lut(new_levels, new);
+	rk3026_ebc_set_palette(ebc, old);
+
+	w->ebc = ebc;
+	w->lut = new;
+	init_completion(&w->started);
+	INIT_WORK(&w->work, t_palette_work_fn);
+	mutex_lock(&ebc->image_lock);
+	queue_work(system_dfl_wq, &w->work);
+	started = wait_for_completion_timeout(&w->started, 5 * HZ);
+	KUNIT_EXPECT_NE(test, started, 0);
+	msleep(20);
+	KUNIT_EXPECT_TRUE(test, work_busy(&w->work) & WORK_BUSY_RUNNING);
+	rk3026_ebc_blit(ebc, fb, T_W, DRM_FORMAT_C8, &t_panel);
+	mutex_unlock(&ebc->image_lock);
+	t_expect_c8_img(test, ebc->next_shadow, fb, T_W, old_levels);
+
+	flush_work(&w->work);
+	KUNIT_EXPECT_PTR_EQ(test, ebc->c8_levels, (const u8 *)ebc->palette);
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, fb, T_W,
+							DRM_FORMAT_C8,
+							&t_panel));
+	t_expect_c8_img(test, ebc->next_shadow, fb, T_W, new_levels);
 }
 
 /*
@@ -10586,6 +10898,409 @@ static void ebc_test_glue_kms_init(struct kunit *test)
 	KUNIT_EXPECT_NOT_NULL(test, ebc->connector.state);
 }
 
+static void t_kms_fb_destroy(struct drm_framebuffer *fb)
+{
+	drm_framebuffer_cleanup(fb);
+	kfree(fb);
+}
+
+static const struct drm_framebuffer_funcs t_kms_fb_funcs = {
+	.destroy = t_kms_fb_destroy,
+};
+
+static void t_kms_fb_put(void *fb)
+{
+	drm_framebuffer_put(fb);
+}
+
+/*
+ * A framebuffer of the panel's size in @format on the device of @ebc, with
+ * no memory behind it: the state tests check it, nothing blits it. Its
+ * last reference goes with the plane state that holds it.
+ */
+static struct drm_framebuffer *t_kms_fb(struct kunit *test,
+					struct rk3026_ebc *ebc, u32 format)
+{
+	struct drm_framebuffer *fb = kzalloc(sizeof(*fb), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, fb);
+	fb->dev = &ebc->drm;
+	fb->format = drm_format_info(format);
+	fb->width = T_W;
+	fb->height = T_H;
+	fb->pitches[0] = T_W * fb->format->cpp[0];
+	fb->modifier = DRM_FORMAT_MOD_LINEAR;
+	KUNIT_ASSERT_EQ(test, drm_framebuffer_init(&ebc->drm, fb,
+						   &t_kms_fb_funcs), 0);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, t_kms_fb_put,
+							fb), 0);
+	return fb;
+}
+
+/*
+ * An acquire context for the test's states, held from here (lockdep counts
+ * the context itself) until t_kms_ctx_fini(), which the case calls on
+ * every path: the test's cleanup runs in another task, which may not
+ * release the locks, so no assertion may end the case in between.
+ */
+static struct drm_modeset_acquire_ctx *t_kms_ctx(struct kunit *test)
+{
+	struct drm_modeset_acquire_ctx *ctx;
+
+	ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	drm_modeset_acquire_init(ctx, 0);
+	return ctx;
+}
+
+static void t_kms_ctx_fini(struct drm_modeset_acquire_ctx *ctx)
+{
+	drm_modeset_drop_locks(ctx);
+	drm_modeset_acquire_fini(ctx);
+}
+
+/*
+ * The connector's current state holds a reference to it while it is on a
+ * CRTC (drm_atomic_set_crtc_for_connector()): drop it, as a commit that
+ * turns the pipe off would, so the device's teardown frees the connector.
+ */
+static void t_kms_off(void *connector)
+{
+	struct drm_connector *c = connector;
+
+	c->state->crtc = NULL;
+	drm_connector_put(c);
+}
+
+/*
+ * The pipe on, made current without a commit: the CRTC active in the
+ * panel's mode, the connector on it, the primary plane showing @fb whole.
+ * Checked as a commit is, then swapped in; no hook of the commit runs.
+ * Under the locks of @ctx: false after a failure, which it reports.
+ */
+static bool t_kms_on(struct kunit *test, struct rk3026_ebc *ebc,
+		     struct drm_modeset_acquire_ctx *ctx,
+		     struct drm_framebuffer *fb)
+{
+	struct drm_display_mode mode = {
+		DRM_MODE("panel", DRM_MODE_TYPE_DRIVER, 1000, T_W, T_W, T_W,
+			 T_W, 0, T_H, T_H, T_H, T_H, 0, 0)
+	};
+	struct drm_connector_state *conn_state;
+	struct drm_plane_state *plane_state;
+	struct drm_crtc_state *crtc_state;
+	struct drm_atomic_state *state;
+	int ret;
+
+	state = drm_kunit_helper_atomic_state_alloc(test, &ebc->drm, ctx);
+	if (IS_ERR(state)) {
+		ret = PTR_ERR(state);
+		goto fail;
+	}
+	crtc_state = drm_atomic_get_crtc_state(state, &ebc->crtc);
+	if (IS_ERR(crtc_state)) {
+		ret = PTR_ERR(crtc_state);
+		goto fail;
+	}
+	ret = drm_atomic_set_mode_for_crtc(crtc_state, &mode);
+	if (ret)
+		goto fail;
+	crtc_state->active = true;
+
+	conn_state = drm_atomic_get_connector_state(state, &ebc->connector);
+	if (IS_ERR(conn_state)) {
+		ret = PTR_ERR(conn_state);
+		goto fail;
+	}
+	ret = drm_atomic_set_crtc_for_connector(conn_state, &ebc->crtc);
+	if (ret)
+		goto fail;
+
+	plane_state = drm_atomic_get_plane_state(state, &ebc->plane);
+	if (IS_ERR(plane_state)) {
+		ret = PTR_ERR(plane_state);
+		goto fail;
+	}
+	ret = drm_atomic_set_crtc_for_plane(plane_state, &ebc->crtc);
+	if (ret)
+		goto fail;
+	drm_atomic_set_fb_for_plane(plane_state, fb);
+	plane_state->crtc_w = T_W;
+	plane_state->crtc_h = T_H;
+	plane_state->src_w = T_W << 16;
+	plane_state->src_h = T_H << 16;
+
+	ret = drm_atomic_check_only(state);
+	if (ret)
+		goto fail;
+	ret = drm_atomic_helper_swap_state(state, false);
+	if (ret)
+		goto fail;
+	ret = kunit_add_action_or_reset(test, t_kms_off, &ebc->connector);
+	if (ret)
+		goto fail;
+	return true;
+
+fail:
+	KUNIT_FAIL(test, "pipe on: %d", ret);
+	return false;
+}
+
+/* A damage clip inside the panel, on whole bytes. */
+static const struct drm_rect t_clip = {
+	.x1 = 4, .y1 = 1, .x2 = 8, .y2 = 3,
+};
+
+/*
+ * The primary plane into @state with one damage clip, @damage, and @fb
+ * for its framebuffer if not NULL, as a KMS client's commit sets them.
+ * Returns 0 or an error.
+ */
+static int t_kms_damage(struct rk3026_ebc *ebc, struct drm_atomic_state *state,
+			struct drm_framebuffer *fb,
+			const struct drm_rect *damage)
+{
+	const struct drm_mode_rect clip = {
+		.x1 = damage->x1, .y1 = damage->y1,
+		.x2 = damage->x2, .y2 = damage->y2,
+	};
+	struct drm_plane_state *plane_state;
+	struct drm_property_blob *blob;
+
+	plane_state = drm_atomic_get_plane_state(state, &ebc->plane);
+	if (IS_ERR(plane_state))
+		return PTR_ERR(plane_state);
+	if (fb)
+		drm_atomic_set_fb_for_plane(plane_state, fb);
+	blob = drm_property_create_blob(&ebc->drm, sizeof(clip), &clip);
+	if (IS_ERR(blob))
+		return PTR_ERR(blob);
+	drm_property_replace_blob(&plane_state->fb_damage_clips, blob);
+	drm_property_blob_put(blob);
+	return 0;
+}
+
+/*
+ * A commit that sets the CRTC's GAMMA_LUT to @n entries of @lut, or to
+ * none with @n < 0: of the CRTC alone, as the fbdev emulation's
+ * FBIOPUTCMAP does, or with @damage also of the primary plane, with that
+ * damage clip and @fb if not NULL (t_kms_damage()). Under the locks of
+ * @ctx; returns the result of the check and the state checked in @statep,
+ * or an error it reports and NULL.
+ */
+static int t_kms_lut(struct kunit *test, struct rk3026_ebc *ebc,
+		     struct drm_modeset_acquire_ctx *ctx,
+		     const struct drm_color_lut *lut, int n,
+		     struct drm_framebuffer *fb, const struct drm_rect *damage,
+		     struct drm_atomic_state **statep)
+{
+	struct drm_property_blob *blob = NULL;
+	struct drm_crtc_state *crtc_state;
+	struct drm_atomic_state *state;
+	int ret;
+
+	*statep = NULL;
+	state = drm_kunit_helper_atomic_state_alloc(test, &ebc->drm, ctx);
+	if (IS_ERR(state)) {
+		ret = PTR_ERR(state);
+		goto fail;
+	}
+	crtc_state = drm_atomic_get_crtc_state(state, &ebc->crtc);
+	if (IS_ERR(crtc_state)) {
+		ret = PTR_ERR(crtc_state);
+		goto fail;
+	}
+	if (n >= 0) {
+		blob = drm_property_create_blob(&ebc->drm, n * sizeof(*lut),
+						lut);
+		if (IS_ERR(blob)) {
+			ret = PTR_ERR(blob);
+			goto fail;
+		}
+	}
+	drm_property_replace_blob(&crtc_state->gamma_lut, blob);
+	drm_property_blob_put(blob);
+	crtc_state->color_mgmt_changed = true;
+	if (damage) {
+		ret = t_kms_damage(ebc, state, fb, damage);
+		if (ret)
+			goto fail;
+	}
+	*statep = state;
+	return drm_atomic_check_only(state);
+
+fail:
+	KUNIT_FAIL(test, "LUT commit of %d entries: %d", n, ret);
+	return ret;
+}
+
+/*
+ * A GAMMA_LUT is the C8 palette, of exactly 256 entries. A commit that
+ * changes it alone, the console's FBIOPUTCMAP, takes the primary plane in
+ * with no damage clips, so the plane redraws the whole panel; the CRTC's
+ * atomic_begin takes the LUT's levels before the plane blits, and the C8
+ * pixels already on the panel come out in the new levels. So does a LUT
+ * committed with a client's damage clip on the C8 plane: the clip is
+ * ignored. An XRGB8888 plane, which the LUT does not touch, keeps its
+ * clip, and so does a later commit of damage alone. A commit that leaves
+ * the LUT alone does not take the plane in.
+ */
+static void ebc_test_glue_kms_palette(struct kunit *test)
+{
+	struct rk3026_ebc *ebc = t_kms_ebc(test);
+	struct drm_framebuffer *fb = t_kms_fb(test, ebc, DRM_FORMAT_C8);
+	struct drm_framebuffer *xrgb = t_kms_fb(test, ebc, DRM_FORMAT_XRGB8888);
+	struct drm_color_lut *lut = kunit_kcalloc(test, EBC_PALETTE_SIZE + 1,
+						  sizeof(*lut), GFP_KERNEL);
+	u8 *levels = kunit_kmalloc(test, EBC_PALETTE_SIZE, GFP_KERNEL);
+	u8 *bytes = t_c8_fb(test, T_W);
+	const struct drm_crtc_helper_funcs *funcs = ebc->crtc.helper_private;
+	struct drm_modeset_acquire_ctx *ctx;
+	struct drm_plane_state *plane_state;
+	struct drm_crtc_state *crtc_state;
+	struct drm_atomic_state *state;
+	struct drm_rect box;
+
+	KUNIT_ASSERT_NOT_NULL(test, lut);
+	KUNIT_ASSERT_NOT_NULL(test, levels);
+	t_lut_con16(lut);
+
+	/* No palette yet: the C8 pixels on the panel are rounded greys. */
+	t_levels_round(levels);
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, bytes, T_W,
+							DRM_FORMAT_C8,
+							&t_panel));
+	t_expect_c8_img(test, ebc->next_shadow, bytes, T_W, levels);
+
+	/* The modeset locks from here: no assertion before t_kms_ctx_fini(). */
+	ctx = t_kms_ctx(test);
+	if (!t_kms_on(test, ebc, ctx, fb))
+		goto out;
+	KUNIT_EXPECT_TRUE(test, ebc->crtc.state->active);
+	KUNIT_EXPECT_EQ(test, ebc->crtc.state->plane_mask,
+			drm_plane_mask(&ebc->plane));
+
+	/* 256 entries, or none; 255 and 257 refused. */
+	KUNIT_EXPECT_EQ(test, t_kms_lut(test, ebc, ctx, lut,
+					EBC_PALETTE_SIZE - 1, NULL, NULL,
+					&state),
+			-EINVAL);
+	KUNIT_EXPECT_EQ(test, t_kms_lut(test, ebc, ctx, lut,
+					EBC_PALETTE_SIZE + 1, NULL, NULL,
+					&state),
+			-EINVAL);
+	KUNIT_EXPECT_EQ(test, t_kms_lut(test, ebc, ctx, lut, -1, NULL, NULL,
+					&state), 0);
+
+	if (t_kms_lut(test, ebc, ctx, lut, EBC_PALETTE_SIZE, NULL, NULL,
+		      &state)) {
+		KUNIT_FAIL(test, "a 256-entry LUT refused");
+		goto out;
+	}
+	plane_state = drm_atomic_get_new_plane_state(state, &ebc->plane);
+	if (!plane_state) {
+		KUNIT_FAIL(test, "the plane is not in the LUT's commit");
+		goto out;
+	}
+	KUNIT_EXPECT_NULL(test, plane_state->fb_damage_clips);
+	KUNIT_EXPECT_TRUE(test, plane_state->visible);
+	if (!rk3026_ebc_plane_box(ebc->plane.state, plane_state, T_W, T_H,
+				  &box)) {
+		KUNIT_FAIL(test, "no box for the LUT's commit");
+		goto out;
+	}
+	KUNIT_EXPECT_TRUE(test, drm_rect_equals(&box, &t_panel));
+
+	funcs->atomic_begin(&ebc->crtc, state);
+	KUNIT_EXPECT_PTR_EQ(test, ebc->c8_levels, (const u8 *)ebc->palette);
+	t_levels_lut(levels, lut);
+	KUNIT_EXPECT_MEMEQ(test, ebc->palette, levels, EBC_PALETTE_SIZE);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_plane_update(ebc, bytes, T_W,
+							DRM_FORMAT_C8, &box));
+	t_expect_c8_img(test, ebc->next_shadow, bytes, T_W, levels);
+
+	/*
+	 * Another LUT with a damage clip on the C8 plane: the core keeps the
+	 * clip (it drops clips on a modeset only), the plane ignores it, and
+	 * every pixel outside it changes level too. Made current, so the
+	 * next commits start from a plane state that ignored its clips.
+	 */
+	t_lut_rand(lut, 1);
+	if (t_kms_lut(test, ebc, ctx, lut, EBC_PALETTE_SIZE, NULL, &t_clip,
+		      &state)) {
+		KUNIT_FAIL(test, "a LUT with a damage clip refused");
+		goto out;
+	}
+	plane_state = drm_atomic_get_new_plane_state(state, &ebc->plane);
+	KUNIT_EXPECT_NOT_NULL(test, plane_state->fb_damage_clips);
+	KUNIT_EXPECT_TRUE(test, plane_state->ignore_damage_clips);
+	if (!rk3026_ebc_plane_box(ebc->plane.state, plane_state, T_W, T_H,
+				  &box)) {
+		KUNIT_FAIL(test, "no box for the LUT with a damage clip");
+		goto out;
+	}
+	KUNIT_EXPECT_TRUE(test, drm_rect_equals(&box, &t_panel));
+	funcs->atomic_begin(&ebc->crtc, state);
+	t_levels_lut(levels, lut);
+	KUNIT_EXPECT_MEMEQ(test, ebc->palette, levels, EBC_PALETTE_SIZE);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_plane_update(ebc, bytes, T_W,
+							DRM_FORMAT_C8, &box));
+	t_expect_c8_img(test, ebc->next_shadow, bytes, T_W, levels);
+	if (drm_atomic_helper_swap_state(state, false)) {
+		KUNIT_FAIL(test, "LUT with a damage clip not made current");
+		goto out;
+	}
+
+	/* A LUT with a damage clip on an XRGB8888 plane: the clip stands. */
+	t_lut_rand(lut, 2);
+	if (t_kms_lut(test, ebc, ctx, lut, EBC_PALETTE_SIZE, xrgb, &t_clip,
+		      &state)) {
+		KUNIT_FAIL(test, "a LUT with an XRGB8888 plane refused");
+		goto out;
+	}
+	plane_state = drm_atomic_get_new_plane_state(state, &ebc->plane);
+	KUNIT_EXPECT_FALSE(test, plane_state->ignore_damage_clips);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_plane_box(ebc->plane.state,
+						     plane_state, T_W, T_H,
+						     &box));
+	KUNIT_EXPECT_TRUE(test, drm_rect_equals(&box, &t_clip));
+
+	/* A damage clip alone on the C8 plane: the clip stands. */
+	state = drm_kunit_helper_atomic_state_alloc(test, &ebc->drm, ctx);
+	if (IS_ERR(state)) {
+		KUNIT_FAIL(test, "state: %pe", state);
+		goto out;
+	}
+	if (t_kms_damage(ebc, state, NULL, &t_clip)) {
+		KUNIT_FAIL(test, "no plane state for a damage clip");
+		goto out;
+	}
+	KUNIT_EXPECT_EQ(test, drm_atomic_check_only(state), 0);
+	plane_state = drm_atomic_get_new_plane_state(state, &ebc->plane);
+	KUNIT_EXPECT_FALSE(test, plane_state->ignore_damage_clips);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_plane_box(ebc->plane.state,
+						     plane_state, T_W, T_H,
+						     &box));
+	KUNIT_EXPECT_TRUE(test, drm_rect_equals(&box, &t_clip));
+
+	/* The LUT left alone: the CRTC is in the commit, the plane is not. */
+	state = drm_kunit_helper_atomic_state_alloc(test, &ebc->drm, ctx);
+	if (IS_ERR(state)) {
+		KUNIT_FAIL(test, "state: %pe", state);
+		goto out;
+	}
+	crtc_state = drm_atomic_get_crtc_state(state, &ebc->crtc);
+	if (IS_ERR(crtc_state)) {
+		KUNIT_FAIL(test, "CRTC state: %pe", crtc_state);
+		goto out;
+	}
+	KUNIT_EXPECT_EQ(test, drm_atomic_check_only(state), 0);
+	KUNIT_EXPECT_NULL(test, drm_atomic_get_new_plane_state(state,
+							       &ebc->plane));
+out:
+	t_kms_ctx_fini(ctx);
+}
+
 static struct kunit_case rk3026_ebc_glue_test_cases[] = {
 	KUNIT_CASE(ebc_test_glue_add_update),
 	KUNIT_CASE(ebc_test_glue_crtc_off),
@@ -10667,6 +11382,8 @@ static struct kunit_case rk3026_ebc_glue_test_cases[] = {
 	KUNIT_CASE(ebc_test_glue_plane_box_merge),
 	KUNIT_CASE(ebc_test_glue_plane_resync),
 	KUNIT_CASE(ebc_test_glue_plane_r8),
+	KUNIT_CASE(ebc_test_glue_plane_c8),
+	KUNIT_CASE(ebc_test_glue_palette_swap),
 	KUNIT_CASE(ebc_test_glue_plane_box_du),
 	KUNIT_CASE(ebc_test_glue_plane_box_grey),
 	KUNIT_CASE(ebc_test_glue_flip_hold),
@@ -10704,6 +11421,7 @@ static struct kunit_case rk3026_ebc_glue_test_cases[] = {
 	KUNIT_CASE(ebc_test_glue_flip_take_window),
 	KUNIT_CASE(ebc_test_glue_flip_take_sleep),
 	KUNIT_CASE(ebc_test_glue_kms_init),
+	KUNIT_CASE(ebc_test_glue_kms_palette),
 	{}
 };
 
@@ -12199,6 +12917,45 @@ static void ebc_test_ref_blit_r8(struct kunit *test)
 	t_blit_sets(test, &t_grey_srcs, &t_blit_r8);
 }
 
+/*
+ * rk3026_ebc_palette_levels(): grey ramps give the rounding table, the
+ * console's colours their readable levels, and every entry of random
+ * palettes the nearest level to its luma.
+ */
+static void ebc_test_palette_levels(struct kunit *test)
+{
+	struct drm_color_lut *lut = kunit_kcalloc(test, EBC_PALETTE_SIZE,
+						  sizeof(*lut), GFP_KERNEL);
+	u8 *levels = kunit_kmalloc(test, EBC_PALETTE_SIZE, GFP_KERNEL);
+	unsigned int i, r;
+	u32 seed;
+
+	KUNIT_ASSERT_NOT_NULL(test, lut);
+	KUNIT_ASSERT_NOT_NULL(test, levels);
+
+	for (r = 0; r < ARRAY_SIZE(t_grey_ramps); r++) {
+		t_lut_ramp(lut, t_grey_ramps[r][0], t_grey_ramps[r][1]);
+		rk3026_ebc_palette_levels(levels, lut);
+		KUNIT_EXPECT_MEMEQ_MSG(test, levels, rk3026_ebc_grey_round,
+				       EBC_PALETTE_SIZE, "ramp %u", r);
+	}
+
+	t_lut_con16(lut);
+	rk3026_ebc_palette_levels(levels, lut);
+	KUNIT_EXPECT_MEMEQ(test, levels, t_con16_levels, 16);
+	KUNIT_EXPECT_MEMEQ(test, levels + 16, rk3026_ebc_grey_round + 16,
+			   EBC_PALETTE_SIZE - 16);
+
+	for (seed = 1; seed <= 4; seed++) {
+		t_lut_rand(lut, seed);
+		rk3026_ebc_palette_levels(levels, lut);
+		for (i = 0; i < EBC_PALETTE_SIZE; i++)
+			KUNIT_EXPECT_EQ_MSG(test, levels[i],
+					    t_lut_ref_level(&lut[i]),
+					    "seed %u entry %u", seed, i);
+	}
+}
+
 static struct kunit_case rk3026_ebc_conv_test_cases[] = {
 	KUNIT_CASE(ebc_test_ref_snapshot),
 	KUNIT_CASE(ebc_test_snapshot_nibble_pairs),
@@ -12218,6 +12975,7 @@ static struct kunit_case rk3026_ebc_conv_test_cases[] = {
 	KUNIT_CASE(ebc_test_grey_neon_tails),
 	KUNIT_CASE(ebc_test_grey_convert),
 	KUNIT_CASE(ebc_test_ref_blit_r8),
+	KUNIT_CASE(ebc_test_palette_levels),
 	{}
 };
 

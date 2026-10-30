@@ -41,6 +41,7 @@
 #include <drm/clients/drm_client_setup.h>
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
+#include <drm/drm_color_mgmt.h>
 #include <drm/drm_damage_helper.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_fb_helper.h>
@@ -52,6 +53,7 @@
 #include <drm/drm_gem_shmem_helper.h>
 #include <drm/drm_managed.h>
 #include <drm/drm_modeset_helper_vtables.h>
+#include <drm/drm_print.h>
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_vblank.h>
 
@@ -853,8 +855,10 @@ static u32 ebc_us_since(ktime_t start)
  * widened to an even pixel boundary so byte writes stay whole, and clamped
  * to the panel. XRGB8888 goes through rk3026_ebc_blit_convert(), the top
  * four bits of the luma; R8 through rk3026_ebc_blit_grey_convert() with the
- * rounding table, the nearest of the 16 levels. A format with no conversion
- * here is a driver bug: it warns once and writes nothing.
+ * rounding table, the nearest of the 16 levels; C8 the same way with
+ * @c8_levels, the palette's levels while one is set, else as R8. A format
+ * with no conversion here is a driver bug: it warns once and writes
+ * nothing.
  *
  * Writes @next_shadow. Called under @image_lock, in the same section that
  * queues the update, so no snapshot sees the pixels without their update.
@@ -868,6 +872,7 @@ u32 rk3026_ebc_blit(struct rk3026_ebc *ebc, const void *src,
 		    const struct drm_rect *clip)
 {
 	struct drm_rect r = *clip;
+	const u8 *levels;
 	ktime_t start;
 
 	lockdep_assert_held(&ebc->image_lock);
@@ -881,9 +886,12 @@ u32 rk3026_ebc_blit(struct rk3026_ebc *ebc, const void *src,
 					r.x1, r.x2, r.y1, r.y2, ebc->width);
 		break;
 	case DRM_FORMAT_R8:
+	case DRM_FORMAT_C8:
+		levels = format == DRM_FORMAT_C8 ? ebc->c8_levels :
+			 rk3026_ebc_grey_round;
 		rk3026_ebc_blit_grey_convert(ebc->next_shadow, src, src_pitch,
 					     r.x1, r.x2, r.y1, r.y2, ebc->width,
-					     rk3026_ebc_grey_round);
+					     levels);
 		break;
 	default:
 		WARN_ON_ONCE(1);
@@ -2611,12 +2619,16 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_wait_marker);
 
 /*
  * XRGB8888 first, the format of the fbdev emulation and of most clients.
- * R8 is grey for clients that render in grey already: one byte a pixel,
- * rounded to the nearest panel level rather than cut to its top four bits,
- * so the greys k * 17 of a client dithering to 16 levels stay exact.
+ * C8 is indexed through the CRTC's GAMMA_LUT as its palette, each colour
+ * shown as the nearest level to its luma (rk3026_ebc_set_palette()); it
+ * is also the 8-bit fbdev format a "video=...-8" command line picks. R8 is
+ * grey for clients that render in grey already: one byte a pixel, rounded
+ * to the nearest panel level rather than cut to its top four bits, so the
+ * greys k * 17 of a client dithering to 16 levels stay exact.
  */
 static const u32 ebc_plane_formats[] = {
 	DRM_FORMAT_XRGB8888,
+	DRM_FORMAT_C8,
 	DRM_FORMAT_R8,
 };
 
@@ -2636,6 +2648,15 @@ static int ebc_plane_atomic_check(struct drm_plane *plane,
 		return 0;
 
 	crtc_state = drm_atomic_get_new_crtc_state(state, new_state->crtc);
+	/*
+	 * A new palette changes C8 pixels anywhere on the panel, so the
+	 * commit redraws the whole plane, whatever damage clips a client
+	 * sent with it. The flag is copied with the state: set either way.
+	 */
+	new_state->ignore_damage_clips = crtc_state->color_mgmt_changed &&
+					 new_state->fb &&
+					 new_state->fb->format->format ==
+					 DRM_FORMAT_C8;
 	return drm_atomic_helper_check_plane_state(new_state, crtc_state,
 						   DRM_PLANE_NO_SCALING,
 						   DRM_PLANE_NO_SCALING,
@@ -2653,7 +2674,8 @@ static int ebc_plane_atomic_check(struct drm_plane *plane,
  * The commit's damage merged into one rectangle
  * (drm_atomic_helper_damage_merged()): what fbcon drew, the rows an fb0 mmap
  * writer dirtied, a KMS client's FB_DAMAGE_CLIPS. With no damage clips, after
- * a modeset or with a new source rectangle, that is the whole plane. The
+ * a modeset, with a new source rectangle or with a new palette under a C8
+ * framebuffer (ebc_plane_atomic_check()), that is the whole plane. The
  * framebuffer has the panel's size (mode_config min = max) and the plane
  * covers the CRTC unscaled (ebc_plane_atomic_check()), so the source is the
  * whole framebuffer at 0,0 and the damage is in panel coordinates. The box
@@ -2733,6 +2755,43 @@ VISIBLE_IF_KUNIT bool rk3026_ebc_plane_update(struct rk3026_ebc *ebc,
 	return queue;
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_plane_update);
+
+/**
+ * rk3026_ebc_set_palette - take a new C8 palette
+ * @ebc: controller
+ * @lut: the CRTC's GAMMA_LUT, EBC_PALETTE_SIZE entries, or NULL for none
+ *
+ * The levels of @lut (rk3026_ebc_palette_levels()) become @palette and
+ * @c8_levels in one @image_lock section, so a blit sees the old table or
+ * the new one, never part of each. A palette whose levels are the rounding
+ * table, a grey ramp for one, is not kept: @c8_levels is then
+ * rk3026_ebc_grey_round itself and C8 blits as R8, with NEON where the CPU
+ * has it.
+ *
+ * Only C8 reads the table. XRGB8888 and R8 pass the GAMMA_LUT by: the
+ * panel has no colour to correct, a tone curve for them is a feature of
+ * its own, and the palette a C8 fbdev leaves in the CRTC state (the
+ * console's 16 colours) would garble a client that takes the CRTC over in
+ * XRGB8888 without a LUT of its own.
+ */
+VISIBLE_IF_KUNIT void rk3026_ebc_set_palette(struct rk3026_ebc *ebc,
+					     const struct drm_color_lut *lut)
+{
+	u8 levels[EBC_PALETTE_SIZE];
+	bool set = false;
+
+	if (lut) {
+		rk3026_ebc_palette_levels(levels, lut);
+		set = memcmp(levels, rk3026_ebc_grey_round, sizeof(levels)) != 0;
+	}
+
+	mutex_lock(&ebc->image_lock);
+	if (set)
+		memcpy(ebc->palette, levels, sizeof(levels));
+	ebc->c8_levels = set ? ebc->palette : rk3026_ebc_grey_round;
+	mutex_unlock(&ebc->image_lock);
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_set_palette);
 
 static void ebc_plane_atomic_update(struct drm_plane *plane,
 				    struct drm_atomic_state *state)
@@ -3009,6 +3068,25 @@ static void ebc_crtc_atomic_disable(struct drm_crtc *crtc,
 	}
 }
 
+/* The GAMMA_LUT is a C8 palette, one entry per index. */
+static int ebc_crtc_atomic_check(struct drm_crtc *crtc,
+				 struct drm_atomic_state *state)
+{
+	struct drm_crtc_state *crtc_state =
+		drm_atomic_get_new_crtc_state(state, crtc);
+	const struct drm_property_blob *lut = crtc_state->gamma_lut;
+
+	if (crtc_state->color_mgmt_changed && lut &&
+	    drm_color_lut_size(lut) != EBC_PALETTE_SIZE) {
+		drm_dbg_atomic(crtc->dev,
+			       "[CRTC:%d:%s] GAMMA_LUT of %d entries, not %d\n",
+			       crtc->base.id, crtc->name,
+			       drm_color_lut_size(lut), EBC_PALETTE_SIZE);
+		return -EINVAL;
+	}
+	return 0;
+}
+
 /**
  * rk3026_ebc_commit_begin - start the record of a commit's update
  * @ebc: the device
@@ -3028,10 +3106,22 @@ VISIBLE_IF_KUNIT void rk3026_ebc_commit_begin(struct rk3026_ebc *ebc)
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_commit_begin);
 
+/*
+ * Before the planes of the commit blit: a commit starts with no update
+ * queued (rk3026_ebc_commit_begin()), and the palette of their C8 blits is
+ * the commit's GAMMA_LUT. Taken on every commit with the CRTC on, so one
+ * that changed the LUT while the CRTC was off is caught up by the enable.
+ */
 static void ebc_crtc_atomic_begin(struct drm_crtc *crtc,
 				  struct drm_atomic_state *state)
 {
-	rk3026_ebc_commit_begin(drm_to_ebc(crtc->dev));
+	struct drm_crtc_state *crtc_state =
+		drm_atomic_get_new_crtc_state(state, crtc);
+	struct rk3026_ebc *ebc = drm_to_ebc(crtc->dev);
+
+	rk3026_ebc_commit_begin(ebc);
+	rk3026_ebc_set_palette(ebc, crtc_state->gamma_lut ?
+			       crtc_state->gamma_lut->data : NULL);
 }
 
 /**
@@ -3207,6 +3297,7 @@ static const struct drm_crtc_funcs ebc_crtc_funcs = {
 };
 
 static const struct drm_crtc_helper_funcs ebc_crtc_helper_funcs = {
+	.atomic_check		= ebc_crtc_atomic_check,
 	.atomic_begin		= ebc_crtc_atomic_begin,
 	.atomic_flush		= ebc_crtc_atomic_flush,
 	.atomic_enable		= ebc_crtc_atomic_enable,
@@ -3254,9 +3345,48 @@ static const struct drm_connector_helper_funcs ebc_connector_helper_funcs = {
 	.get_modes		= ebc_connector_get_modes,
 };
 
+/*
+ * A new palette changes the picture of a C8 plane without a new
+ * framebuffer or damage: the fbdev emulation's FBIOPUTCMAP commits the
+ * CRTC alone. Its planes join the commit before the helper checks them,
+ * so they are checked like any other, and a C8 plane redraws the whole
+ * panel with the new table, whatever damage clips a client sent in the
+ * same commit (ebc_plane_atomic_check()). An XRGB8888 or R8
+ * plane redraws the same pixels, a part skipped as identical: those
+ * formats do not apply the LUT (rk3026_ebc_set_palette()), which the
+ * atomic debug log says.
+ */
+static int ebc_atomic_check(struct drm_device *drm,
+			    struct drm_atomic_state *state)
+{
+	const struct drm_plane_state *plane_state;
+	struct drm_crtc_state *crtc_state;
+	struct drm_plane *plane;
+	struct drm_crtc *crtc;
+	int i, ret;
+
+	for_each_new_crtc_in_state(state, crtc, crtc_state, i) {
+		if (!crtc_state->color_mgmt_changed)
+			continue;
+		ret = drm_atomic_add_affected_planes(state, crtc);
+		if (ret)
+			return ret;
+		if (!crtc_state->gamma_lut)
+			continue;
+		drm_atomic_crtc_state_for_each_plane_state(plane, plane_state,
+							   crtc_state)
+			if (plane_state->fb &&
+			    plane_state->fb->format->format != DRM_FORMAT_C8)
+				drm_dbg_atomic(drm, "[PLANE:%d:%s] %p4cc ignores GAMMA_LUT\n",
+					       plane->base.id, plane->name,
+					       &plane_state->fb->format->format);
+	}
+	return drm_atomic_helper_check(drm, state);
+}
+
 static const struct drm_mode_config_funcs ebc_mode_config_funcs = {
 	.fb_create		= drm_gem_fb_create_with_dirty,
-	.atomic_check		= drm_atomic_helper_check,
+	.atomic_check		= ebc_atomic_check,
 	.atomic_commit		= drm_atomic_helper_commit,
 };
 
@@ -3677,6 +3807,14 @@ VISIBLE_IF_KUNIT int rk3026_ebc_kms_init(struct rk3026_ebc *ebc)
 	if (ret)
 		return ret;
 	drm_crtc_helper_add(&ebc->crtc, &ebc_crtc_helper_funcs);
+	/*
+	 * The C8 palette: GAMMA_LUT for KMS clients, and the legacy gamma
+	 * table the fbdev emulation's FBIOPUTCMAP goes through.
+	 */
+	ret = drm_mode_crtc_set_gamma_size(&ebc->crtc, EBC_PALETTE_SIZE);
+	if (ret)
+		return ret;
+	drm_crtc_enable_color_mgmt(&ebc->crtc, 0, false, EBC_PALETTE_SIZE);
 
 	ret = drm_encoder_init(drm, &ebc->encoder, &ebc_encoder_funcs,
 			       DRM_MODE_ENCODER_NONE, NULL);
@@ -3803,6 +3941,8 @@ static int ebc_probe(struct platform_device *pdev)
 	ebc->du_cleanup_idle_ms = EBC_DU_CLEANUP_IDLE_MS;
 	/* No A2 for plane parts until its ghosting is measured. */
 	ebc->a2_max_area = 0;
+	/* No C8 palette until a GAMMA_LUT brings one. */
+	ebc->c8_levels = rk3026_ebc_grey_round;
 	/* A burst of updates is taken once it has been quiet this long. */
 	ebc->take_quiet_us = EBC_TAKE_QUIET_US;
 	ebc->take_cap_ms = EBC_TAKE_CAP_MS;

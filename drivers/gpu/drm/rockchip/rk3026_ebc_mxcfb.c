@@ -200,6 +200,13 @@ static int mxcfb_send_update(struct rk3026_ebc *ebc, struct fb_info *info,
 	if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
 		return -EFAULT;
 
+	/*
+	 * The send reads XRGB8888, four bytes a pixel: an 8-bit fbdev (C8,
+	 * "video=...-8") is refused rather than read past its end.
+	 */
+	if (info->var.bits_per_pixel != 32)
+		return -EINVAL;
+
 	return rk3026_ebc_mxcfb_send(ebc, info->screen_buffer,
 				     info->fix.line_length, &req);
 }

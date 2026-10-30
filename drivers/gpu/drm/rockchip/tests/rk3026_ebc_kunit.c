@@ -12057,6 +12057,67 @@ static void ebc_test_dither_tiling(struct kunit *test)
 	}
 }
 
+/* rk3026_ebc_blit_dither() for Y4 and Y1, in t_rows_fn shape. */
+static void t_dither_y4(u8 *dst, const void *src, unsigned int src_pitch,
+			int x1, int x2, int y1, int y2, unsigned int width)
+{
+	rk3026_ebc_blit_dither(dst, src, src_pitch, x1, x2, y1, y2, width,
+			       EBC_DITHER_Y4);
+}
+
+static void t_dither_y1(u8 *dst, const void *src, unsigned int src_pitch,
+			int x1, int x2, int y1, int y2, unsigned int width)
+{
+	rk3026_ebc_blit_dither(dst, src, src_pitch, x1, x2, y1, y2, width,
+			       EBC_DITHER_Y1);
+}
+
+/*
+ * rk3026_ebc_blit_dither() writes the bytes of the scalar dither rows on
+ * any kernel: on every fixture, source set, pitch and clip, every row
+ * start and length (16-px blocks and every tail), and row ranges inside
+ * and across the 64-row NEON bands. With the NEON rows built in it takes
+ * them for clips of 16 px and more, and they must be able to run here;
+ * without them the case only shows that the dispatch reaches the scalar
+ * rows.
+ */
+static void ebc_test_blit_dither_neon(struct kunit *test)
+{
+	static const struct t_fix f = { "48x200", 48, 200 };
+	static const struct {
+		int x1, x2, y1, y2;
+	} r[] = {
+		{ 0, 48, 0, 200 }, { 2, 46, 1, 130 }, { 0, 48, 63, 65 },
+		{ 6, 38, 5, 69 }, { 16, 32, 199, 200 }, { 2, 16, 0, 200 },
+	};
+	unsigned int pitch = f.w * 4;
+	u8 *out = t_fix_img(test, &f);
+	u8 *ref = t_fix_img(test, &f);
+	u8 *src = kunit_kmalloc(test, (size_t)pitch * f.h, GFP_KERNEL);
+	struct rnd_state rs;
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, src);
+	if (IS_ENABLED(CONFIG_DRM_RK3026_EBC_NEON) && !t_neon_ready(test))
+		return;
+	t_rows_sets(test, t_dither_y4, t_rows_y4);
+	t_rows_sets(test, t_dither_y1, t_rows_y1);
+	t_rows_tails(test, t_dither_y4, t_rows_y4);
+	t_rows_tails(test, t_dither_y1, t_rows_y1);
+
+	t_src_fill(src, pitch, &f, T_SRC_RANDOM, 78);
+	prandom_seed_state(&rs, 7800);
+	for (i = 0; i < ARRAY_SIZE(r); i++) {
+		if (!t_rows_vs_ref(test, &f, t_dither_y4, t_rows_y4, out, ref,
+				   src, pitch, r[i].x1, r[i].x2, r[i].y1,
+				   r[i].y2, &rs) ||
+		    !t_rows_vs_ref(test, &f, t_dither_y1, t_rows_y1, out, ref,
+				   src, pitch, r[i].x1, r[i].x2, r[i].y1,
+				   r[i].y2, &rs))
+			return;
+	}
+}
+
 static struct kunit_case rk3026_ebc_conv_test_cases[] = {
 	KUNIT_CASE(ebc_test_ref_snapshot),
 	KUNIT_CASE(ebc_test_snapshot_nibble_pairs),
@@ -12072,6 +12133,7 @@ static struct kunit_case rk3026_ebc_conv_test_cases[] = {
 	KUNIT_CASE(ebc_test_blit_dither_tails),
 	KUNIT_CASE(ebc_test_dither_levels),
 	KUNIT_CASE(ebc_test_dither_tiling),
+	KUNIT_CASE(ebc_test_blit_dither_neon),
 	{}
 };
 

@@ -18,6 +18,10 @@
  * tested, so every page costs about the same; on the RK3026 (Cortex-A9 at
  * 600 MHz, with the L2 cache controller's prefetch and line-fill options
  * set as the vendor firmware sets them) that is the memory floor.
+ *
+ * rk3026_ebc_blit_rows_dither_neon() writes the bytes of
+ * rk3026_ebc_blit_rows_dither() the same way, with the dither's few
+ * operations per pixel on the u16 luma lanes.
  */
 
 #include <arm_neon.h>
@@ -89,4 +93,132 @@ void rk3026_ebc_blit_rows_neon(unsigned char *dst, const void *src,
 		for (; n > 0; n -= 2, s += 8, d++)
 			*d = ebc_neon_nibble(s) | ebc_neon_nibble(s + 4) << 4;
 	}
+}
+
+/*
+ * One dithered level as rk3026_ebc_blit_rows_dither() takes it: the luma
+ * of the pixel at @s, (L * @steps + @t) / 255, as a nibble.
+ */
+static __always_inline unsigned char ebc_neon_dither1(const unsigned char *s,
+						      unsigned int t,
+						      unsigned int steps)
+{
+	unsigned int v = ((77 * s[2] + 150 * s[1] + 29 * s[0]) >> 8) * steps + t;
+
+	return ((v + (v >> 8) + 1) >> 8) * (15 / steps);
+}
+
+/*
+ * Sixteen pixels at @s into eight dithered bytes, pixel 0 in the low
+ * nibble; @t holds the thresholds of the sixteen columns. The luma as in
+ * ebc_neon_pack16(), narrowed to its byte L; v = L * @steps + t in u16
+ * lanes; the level (v + (v >> 8) + 1) >> 8, narrowed again; times 15 for
+ * one step; vuzp.8 and vsli.8 #4 pack the pairs.
+ */
+static __always_inline uint8x8_t ebc_neon_dither16(const unsigned char *s,
+						   uint8x16_t t,
+						   unsigned int steps)
+{
+	const uint8x8_t k77 = vdup_n_u8(77);
+	const uint8x8_t k150 = vdup_n_u8(150);
+	const uint8x8_t k29 = vdup_n_u8(29);
+	const uint16x8_t one = vdupq_n_u16(1);
+	uint8x16x4_t v = vld4q_u8(s);	/* val[0] B, [1] G, [2] R, [3] X */
+	uint16x8_t lo, hi;
+	uint8x8_t llo, lhi;
+	uint8x8x2_t eo;
+
+	lo = vmull_u8(vget_low_u8(v.val[2]), k77);
+	hi = vmull_u8(vget_high_u8(v.val[2]), k77);
+	lo = vmlal_u8(lo, vget_low_u8(v.val[1]), k150);
+	hi = vmlal_u8(hi, vget_high_u8(v.val[1]), k150);
+	lo = vmlal_u8(lo, vget_low_u8(v.val[0]), k29);
+	hi = vmlal_u8(hi, vget_high_u8(v.val[0]), k29);
+	llo = vshrn_n_u16(lo, 8);
+	lhi = vshrn_n_u16(hi, 8);
+	if (steps == 1) {
+		lo = vaddl_u8(llo, vget_low_u8(t));
+		hi = vaddl_u8(lhi, vget_high_u8(t));
+	} else {
+		lo = vmlal_u8(vmovl_u8(vget_low_u8(t)), llo, vdup_n_u8(15));
+		hi = vmlal_u8(vmovl_u8(vget_high_u8(t)), lhi, vdup_n_u8(15));
+	}
+	lo = vsraq_n_u16(vaddq_u16(lo, one), lo, 8);
+	hi = vsraq_n_u16(vaddq_u16(hi, one), hi, 8);
+	llo = vshrn_n_u16(lo, 8);
+	lhi = vshrn_n_u16(hi, 8);
+	if (steps == 1) {
+		llo = vmul_u8(llo, vdup_n_u8(15));
+		lhi = vmul_u8(lhi, vdup_n_u8(15));
+	}
+	eo = vuzp_u8(llo, lhi);	/* even, odd */
+	return vsli_n_u8(eo.val[0], eo.val[1], 4);
+}
+
+/* rk3026_ebc_blit_rows_dither_neon() for a constant @steps. */
+static __always_inline void ebc_neon_dither_rows(unsigned char *dst,
+						 const void *src,
+						 unsigned int src_pitch,
+						 int x1, int x2, int y1,
+						 int y2, unsigned int width,
+						 const unsigned char *thr,
+						 unsigned int steps)
+{
+	const uint8x8_t lanes = vcreate_u8(0x0706050403020100ULL);
+	/* Lane j takes column (x1 + j) mod 8 of a threshold row. */
+	const uint8x8_t idx = vand_u8(vadd_u8(vdup_n_u8(x1 & 7), lanes),
+				      vdup_n_u8(7));
+	int x, y;
+
+	for (y = y1; y < y2; y++) {
+		const unsigned char *s = (const unsigned char *)src +
+				   (size_t)y * src_pitch + x1 * 4;
+		const unsigned char *t = thr + (y & 7) * 8;
+		unsigned char *d = dst + ((size_t)y * width + x1) / 2;
+		uint8x8_t t8 = vtbl1_u8(vld1_u8(t), idx);
+		uint8x16_t t16 = vcombine_u8(t8, t8);
+
+		/* Blocks of 16 keep the phase of the 8-px threshold row. */
+		for (x = x1; x2 - x >= 16; x += 16, s += 64, d += 8) {
+			__builtin_prefetch(s + 256);
+			__builtin_prefetch(s + 256 + 32);
+			vst1_u8(d, ebc_neon_dither16(s, t16, steps));
+		}
+		for (; x < x2; x += 2, s += 8, d++)
+			*d = ebc_neon_dither1(s, t[x & 7], steps) |
+			     ebc_neon_dither1(s + 4, t[(x + 1) & 7], steps) << 4;
+	}
+}
+
+/**
+ * rk3026_ebc_blit_rows_dither_neon - rk3026_ebc_blit_rows_dither() with NEON
+ * @dst: target image, @width / 2 bytes per row, low nibble first
+ * @src: XRGB8888 source, top-left of the whole framebuffer
+ * @src_pitch: source stride in bytes
+ * @x1: first column, even
+ * @x2: end column, even, at most @width, above @x1
+ * @y1: first row
+ * @y2: end row, above @y1
+ * @width: image width in pixels
+ * @thr: the 8x8 threshold matrix, row-major
+ * @steps: 15 to dither to the 16 levels, 1 to black and white
+ *
+ * Writes the same bytes as rk3026_ebc_blit_rows_dither() with the same
+ * thresholds, and only those. Sixteen pixels at a time, as
+ * rk3026_ebc_blit_rows_neon(); a row's last 2 to 14 pixels two at a time.
+ *
+ * Call only between kernel_neon_begin() and kernel_neon_end().
+ */
+void rk3026_ebc_blit_rows_dither_neon(unsigned char *dst, const void *src,
+				      unsigned int src_pitch, int x1, int x2,
+				      int y1, int y2, unsigned int width,
+				      const unsigned char *thr,
+				      unsigned int steps)
+{
+	if (steps == 1)
+		ebc_neon_dither_rows(dst, src, src_pitch, x1, x2, y1, y2, width,
+				     thr, 1);
+	else
+		ebc_neon_dither_rows(dst, src, src_pitch, x1, x2, y1, y2, width,
+				     thr, 15);
 }

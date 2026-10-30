@@ -296,6 +296,37 @@ void rk3026_ebc_blit_rows_dither(u8 *dst, const void *src,
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_blit_rows_dither);
 
+#if IS_ENABLED(CONFIG_DRM_RK3026_EBC_NEON)
+/* ebc_blit_neon() for the dither rows, on @steps steps. */
+static bool ebc_dither_neon(u8 *dst, const void *src, unsigned int src_pitch,
+			    int x1, int x2, int y1, int y2, unsigned int width,
+			    unsigned int steps)
+{
+	int y;
+
+	if (x2 - x1 < 16 || !ebc_neon_cpu() || !may_use_simd())
+		return false;
+
+	for (y = y1; y < y2; y += EBC_NEON_BAND_ROWS) {
+		int end = min(y + EBC_NEON_BAND_ROWS, y2);
+
+		scoped_ksimd()
+			rk3026_ebc_blit_rows_dither_neon(dst, src, src_pitch,
+							 x1, x2, y, end, width,
+							 &ebc_dither_t[0][0],
+							 steps);
+	}
+	return true;
+}
+#else
+static bool ebc_dither_neon(u8 *dst, const void *src, unsigned int src_pitch,
+			    int x1, int x2, int y1, int y2, unsigned int width,
+			    unsigned int steps)
+{
+	return false;
+}
+#endif
+
 /**
  * rk3026_ebc_blit_dither - convert XRGB8888 rows as an update asks
  * @dst: target image, @width / 2 bytes per row, low nibble first
@@ -309,21 +340,25 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_blit_rows_dither);
  * @dither: the conversion
  *
  * rk3026_ebc_blit_convert() for EBC_DITHER_NONE, so an update that asks
- * for no dither gets the bytes it got before the dither existed;
- * rk3026_ebc_blit_rows_dither() on 15 steps for EBC_DITHER_Y4 and on one
- * step for EBC_DITHER_Y1.
+ * for no dither gets the bytes it got before the dither existed; the
+ * dither on 15 steps for EBC_DITHER_Y4 and on one step for EBC_DITHER_Y1,
+ * with rk3026_ebc_blit_rows_dither_neon() where rk3026_ebc_blit_convert()
+ * would take the NEON rows, else rk3026_ebc_blit_rows_dither(). Both
+ * write the same bytes.
  */
 void rk3026_ebc_blit_dither(u8 *dst, const void *src, unsigned int src_pitch,
 			    int x1, int x2, int y1, int y2, unsigned int width,
 			    enum rk3026_ebc_dither dither)
 {
+	unsigned int steps = dither == EBC_DITHER_Y1 ? 1 : 15;
+
 	if (dither == EBC_DITHER_NONE)
 		rk3026_ebc_blit_convert(dst, src, src_pitch, x1, x2, y1, y2,
 					width);
-	else
+	else if (!ebc_dither_neon(dst, src, src_pitch, x1, x2, y1, y2, width,
+				  steps))
 		rk3026_ebc_blit_rows_dither(dst, src, src_pitch, x1, x2, y1,
-					    y2, width,
-					    dither == EBC_DITHER_Y1 ? 1 : 15);
+					    y2, width, steps);
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_blit_dither);
 
@@ -333,8 +368,9 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_blit_dither);
  * For the probe line and debugfs "timing", so a measured blit time says
  * which loop it is from.
  *
- * Returns "neon" if rk3026_ebc_blit_convert() takes the NEON rows for a
- * clip of 16 pixels or more in process context, else "scalar".
+ * Returns "neon" if rk3026_ebc_blit_convert() and rk3026_ebc_blit_dither()
+ * take the NEON rows for a clip of 16 pixels or more in process context,
+ * else "scalar".
  */
 const char *rk3026_ebc_blit_impl(void)
 {

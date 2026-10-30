@@ -1356,6 +1356,30 @@ settle:
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_scan_finish);
 
 /**
+ * rk3026_ebc_flip_holds - whether a commit's CRTC event waits for its part
+ * @e: the commit's CRTC event
+ * @queued: the commit queued a plane update (&rk3026_ebc.commit_queued)
+ *
+ * Only an event userspace asked for is held: a page flip event (it has a
+ * file) or an out-fence. The core gives every other commit an internal
+ * event, and fbcon, fbdev writes and DirtyFB are such commits; they keep
+ * the event at once, so none waits for the panel to finish its own update
+ * (one behind a held event still waits for that event,
+ * rk3026_ebc_flip_hold()). A commit that queued nothing (no damage, or an
+ * mxcfb client owns the panel) has no part to wait for. The caller holds
+ * &drm_device.event_lock: the close of the DRM file clears @e's file there
+ * (drm_events_release()).
+ *
+ * Return: true if @e is to be held.
+ */
+bool rk3026_ebc_flip_holds(const struct drm_pending_vblank_event *e,
+			   bool queued)
+{
+	return (e->base.file_priv || e->base.fence) && queued;
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_flip_holds);
+
+/**
  * rk3026_ebc_marker_seq_record - remember which seq a marker was queued with
  * @ring: marker ring
  * @marker: the client's marker; 0 is never recorded

@@ -3757,10 +3757,77 @@ static void ebc_test_mxcfb_auto_resolve(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, reason, EBC_REASON_EXPLICIT);
 }
 
+#define T_Y1		EPDC_FLAG_USE_DITHERING_Y1
+#define T_Y4		EPDC_FLAG_USE_DITHERING_Y4
+#define T_D8		EPDC_FLAG_USE_DITHERING_NTX_D8
+#define T_DITHER	(T_Y1 | T_Y4 | T_D8)
+
+/*
+ * The dither flags pick the conversion, NTX_D8 as Y4, Y1 over both,
+ * whatever else is set, and never the mode: every case of the waveform
+ * map gives the same mode and auto_mode with them set, cleared or toggled.
+ */
+static void ebc_test_mxcfb_dither_flags(struct kunit *test)
+{
+	unsigned int i, j;
+
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_dither(0), EBC_DITHER_NONE);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_dither(T_Y4), EBC_DITHER_Y4);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_dither(T_Y1), EBC_DITHER_Y1);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_dither(T_D8), EBC_DITHER_Y4);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_dither(T_Y4 | T_D8),
+			EBC_DITHER_Y4);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_dither(T_Y1 | T_Y4),
+			EBC_DITHER_Y1);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_dither(T_Y1 | T_D8),
+			EBC_DITHER_Y1);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_dither(T_DITHER),
+			EBC_DITHER_Y1);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_dither(T_MONO | T_Y1),
+			EBC_DITHER_Y1);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_dither(T_MONO | T_D8),
+			EBC_DITHER_Y4);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_dither(T_MONO), EBC_DITHER_NONE);
+	/* no other bit: neither its neighbours nor every other bit at once */
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_dither(T_D8 >> 1 | T_D8 << 1),
+			EBC_DITHER_NONE);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_dither(~T_DITHER),
+			EBC_DITHER_NONE);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_dither(~T_Y1), EBC_DITHER_Y4);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_dither(~(T_Y1 | T_Y4)),
+			EBC_DITHER_Y4);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_dither(~(T_Y1 | T_D8)),
+			EBC_DITHER_Y4);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_dither(~0u), EBC_DITHER_Y1);
+
+	for (i = 0; i < ARRAY_SIZE(t_mxcfb_cases); i++) {
+		const struct t_mxcfb *c = &t_mxcfb_cases[i];
+		const u32 flags[] = {
+			c->flags | T_DITHER, c->flags & ~T_DITHER,
+			c->flags ^ T_Y1, c->flags ^ T_Y4, c->flags ^ T_D8,
+		};
+
+		for (j = 0; j < ARRAY_SIZE(flags); j++) {
+			bool auto_mode = !c->auto_mode;
+
+			KUNIT_EXPECT_EQ_MSG(test,
+					    rk3026_ebc_mxcfb_to_ebc_mode(c->waveform,
+									 c->update_mode,
+									 flags[j],
+									 &auto_mode),
+					    c->mode, "%s flags %#x", c->desc,
+					    flags[j]);
+			KUNIT_EXPECT_EQ_MSG(test, auto_mode, c->auto_mode,
+					    "%s flags %#x", c->desc, flags[j]);
+		}
+	}
+}
+
 static struct kunit_case rk3026_ebc_mxcfb_test_cases[] = {
 	KUNIT_CASE_PARAM(ebc_test_mxcfb_map, t_mxcfb_gen_params),
 	KUNIT_CASE(ebc_test_mxcfb_full_class),
 	KUNIT_CASE(ebc_test_mxcfb_auto_resolve),
+	KUNIT_CASE(ebc_test_mxcfb_dither_flags),
 	{}
 };
 
@@ -7940,6 +8007,89 @@ static void ebc_test_glue_mxcfb_send(struct kunit *test)
 	t_expect_white(test, ebc->next_shadow);
 	KUNIT_EXPECT_EQ(test, ebc->stats.updates, 4);
 }
+
+/*
+ * @ebc's target after one send of @flags on @req's region of @src equals
+ * the target before it with the reference rows of @dither on the region
+ * widened to whole bytes: the rest of the panel untouched. The part it
+ * queued in @part.
+ */
+static void t_mxcfb_dither_send(struct kunit *test, struct rk3026_ebc *ebc,
+				const u32 *src, struct mxcfb_update_data *req,
+				u32 flags, enum rk3026_ebc_dither dither,
+				struct rk3026_ebc_set *part)
+{
+	const struct mxcfb_rect *r = &req->update_region;
+	int x1 = r->left & ~1, x2 = round_up(r->left + r->width, 2);
+	u8 ref[T_SIZE];
+
+	memset(ebc->next_shadow, 0x5a, T_SIZE);
+	memcpy(ref, ebc->next_shadow, T_SIZE);
+	t_ref_rows(dither, ref, src, T_W * 4, x1, x2, r->top,
+		   r->top + r->height, T_W);
+	req->flags = flags;
+	KUNIT_EXPECT_EQ(test, t_mxcfb_part(ebc, src, req, part), 0);
+	KUNIT_EXPECT_MEMEQ_MSG(test, ebc->next_shadow, ref, T_SIZE,
+			       "flags %#x", flags);
+}
+
+/*
+ * A send converts its region with the dither its flags ask for: the plain
+ * bytes without a dither flag, whatever else is set, Y4 and Y1 dithered,
+ * NTX_D8 as Y4, Y1 over Y4 and NTX_D8, and Y1 with FORCE_MONOCHROME in DU;
+ * on an odd region, widened to whole bytes. A plane update afterwards
+ * converts plainly.
+ */
+static void ebc_test_glue_mxcfb_dither(struct kunit *test)
+{
+	struct rk3026_ebc *ebc = t_policy_ebc(test);
+	u32 *src = t_plane_fb(test, 0);
+	struct mxcfb_update_data req = {
+		.update_region = { .left = 3, .top = 1, .width = 10,
+				   .height = 4 },
+		.waveform_mode = MXCFB_WAVEFORM_MODE_GC16,
+		.update_mode = MXCFB_UPDATE_MODE_PARTIAL,
+		.temp = MXCFB_TEMP_USE_AMBIENT,
+	};
+	struct rk3026_ebc_set part;
+	struct rnd_state rs;
+	u8 ref[T_SIZE];
+	int i;
+
+	prandom_seed_state(&rs, 4242);
+	for (i = 0; i < T_W * T_H; i++)
+		src[i] = prandom_u32_state(&rs);
+
+	t_mxcfb_dither_send(test, ebc, src, &req, 0, EBC_DITHER_NONE, &part);
+	t_mxcfb_dither_send(test, ebc, src, &req, ~T_DITHER,
+			    EBC_DITHER_NONE, &part);
+	t_mxcfb_dither_send(test, ebc, src, &req, T_Y4, EBC_DITHER_Y4, &part);
+	KUNIT_EXPECT_EQ(test, part.mode, EBC_MODE_PART);
+	t_mxcfb_dither_send(test, ebc, src, &req, T_Y1, EBC_DITHER_Y1, &part);
+	KUNIT_EXPECT_EQ(test, part.mode, EBC_MODE_PART);
+	t_mxcfb_dither_send(test, ebc, src, &req, T_Y1 | T_Y4,
+			    EBC_DITHER_Y1, &part);
+	t_mxcfb_dither_send(test, ebc, src, &req, T_D8, EBC_DITHER_Y4, &part);
+	KUNIT_EXPECT_EQ(test, part.mode, EBC_MODE_PART);
+	t_mxcfb_dither_send(test, ebc, src, &req, T_Y4 | T_D8,
+			    EBC_DITHER_Y4, &part);
+	t_mxcfb_dither_send(test, ebc, src, &req, T_Y1 | T_D8,
+			    EBC_DITHER_Y1, &part);
+
+	req.waveform_mode = MXCFB_WAVEFORM_MODE_AUTO;
+	t_mxcfb_dither_send(test, ebc, src, &req, T_MONO | T_Y1,
+			    EBC_DITHER_Y1, &part);
+	KUNIT_EXPECT_EQ(test, part.mode, EBC_MODE_BLACK_WHITE);
+	KUNIT_EXPECT_FALSE(test, part.auto_ok);
+
+	/* The plane path: no flags, the plain bytes over the whole panel. */
+	ebc->mxcfb_active = false;
+	memset(ebc->next_shadow, 0x5a, T_SIZE);
+	rk3026_ebc_ref_blit_rows(ref, src, T_W * 4, 0, T_W, 0, T_H, T_W);
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, src, T_W * 4,
+							&t_panel));
+	KUNIT_EXPECT_MEMEQ(test, ebc->next_shadow, ref, T_SIZE);
+}
 #endif
 /*
  * The CPU time of a part in its record: the blit of its newest update, as
@@ -10574,6 +10724,7 @@ static struct kunit_case rk3026_ebc_glue_test_cases[] = {
 	KUNIT_CASE(ebc_test_glue_sleep_crtc_wait),
 #if IS_ENABLED(CONFIG_DRM_RK3026_EBC_MXCFB)
 	KUNIT_CASE(ebc_test_glue_mxcfb_send),
+	KUNIT_CASE(ebc_test_glue_mxcfb_dither),
 #endif
 	KUNIT_CASE(ebc_test_glue_timing),
 	KUNIT_CASE(ebc_test_glue_timing_skipped),

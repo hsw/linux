@@ -72,8 +72,18 @@ static_assert(sizeof(struct mxcfb_update_data) == 64);
 #define MXCFB_WAVEFORM_MODE_REAGLD	7
 #define MXCFB_WAVEFORM_MODE_AUTO	257
 
-/* flags: only FORCE_MONOCHROME (as in i.MX mxcfb.h) is read. */
+/*
+ * flags, with the values of i.MX mxcfb.h (and of KOReader's
+ * mxcfb_kobo_h.lua and mxcfb_cervantes_h.lua): FORCE_MONOCHROME, and the
+ * dither requests USE_DITHERING_Y1 (to black and white), USE_DITHERING_Y4
+ * (to the 16 grey levels) and USE_DITHERING_NTX_D8 (a dither request of
+ * the Netronix-based readers' kernels: Kobo, PocketBook, Cervantes). No
+ * other bit is read.
+ */
 #define EPDC_FLAG_FORCE_MONOCHROME	0x02
+#define EPDC_FLAG_USE_DITHERING_Y1	0x2000
+#define EPDC_FLAG_USE_DITHERING_Y4	0x4000
+#define EPDC_FLAG_USE_DITHERING_NTX_D8	0x100000
 
 /* temp: read the panel thermometer instead of using the supplied value */
 #define MXCFB_TEMP_USE_AMBIENT		0x1000

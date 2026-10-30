@@ -187,10 +187,14 @@ config DRM_RK3026_EBC_MXCFB
 	  Add the i.MX EPDC ("mxcfb") MXCFB_SEND_UPDATE and
 	  MXCFB_WAIT_FOR_UPDATE_COMPLETE ioctls to the emulated fbdev, so
 	  e-reader userspace can pick a waveform mode, supply a panel
-	  temperature and wait for a refresh to finish. This is not an
-	  upstream interface; without it every update takes the plane
-	  path, whose waveform the driver picks from the content, so
-	  the display keeps working without client-chosen modes,
+	  temperature and wait for a refresh to finish. On an 8-bit (C8)
+	  fbdev a send takes each byte as grey, as i.MX does, not as an
+	  index into the palette; a redraw of the same bytes through the
+	  plane, with the first plane update after the client exits, takes
+	  them as indices again.
+	  This is not an upstream interface; without it every update takes
+	  the plane path, whose waveform the driver picks from the content,
+	  so the display keeps working without client-chosen modes,
 	  temperatures or completion waits.
 
 config DRM_RK3026_EBC_NEON

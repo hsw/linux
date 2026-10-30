@@ -2234,7 +2234,8 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_wait_marker);
  * C8 is indexed through the CRTC's GAMMA_LUT as its palette, each colour
  * shown as the nearest level to its luma (rk3026_ebc_load_palette()); it
  * is also the 8-bit fbdev format of "video=<connector>:<width>x<height>-8"
- * on the command line, the mode before the "-8" required. R8 is grey for
+ * on the command line, the mode before the "-8" required (an mxcfb send
+ * takes its bytes as grey instead, rk3026_ebc_mxcfb_send()). R8 is grey for
  * clients that render in grey already: one byte a pixel, rounded to the
  * nearest panel level rather than cut to its top four bits, so the greys
  * k * 17 of a client dithering to 16 levels stay exact.

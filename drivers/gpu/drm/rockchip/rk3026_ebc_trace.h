@@ -1,9 +1,10 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
  * Tracepoints of the RK3026 EBC driver: what was queued, what was driven, what
- * was skipped, how each part ended and when the panel rails switched. Mode
- * numbers are the EBC work modes of rk3026_ebc.h (EBC_MODE_*). A part's events
- * carry the seq of its newest update; new keys go at the end of a line.
+ * was skipped, how each part ended, when the panel rails switched and when a
+ * held flip event was sent. Mode numbers are the EBC work modes of
+ * rk3026_ebc.h (EBC_MODE_*). A part's events carry the seq of its newest
+ * update; new keys go at the end of a line.
  */
 #undef TRACE_SYSTEM
 #define TRACE_SYSTEM rk3026_ebc
@@ -29,6 +30,11 @@ TRACE_DEFINE_ENUM(EBC_OUTCOME_NO_RAILS);
 TRACE_DEFINE_ENUM(EBC_OUTCOME_NO_LUT);
 TRACE_DEFINE_ENUM(EBC_OUTCOME_TIMEOUT);
 TRACE_DEFINE_ENUM(EBC_OUTCOME_ABANDONED);
+TRACE_DEFINE_ENUM(EBC_FLIP_REASON_TAKE);
+TRACE_DEFINE_ENUM(EBC_FLIP_REASON_WATCHDOG);
+TRACE_DEFINE_ENUM(EBC_FLIP_REASON_OFF);
+TRACE_DEFINE_ENUM(EBC_FLIP_REASON_SLEEP);
+TRACE_DEFINE_ENUM(EBC_FLIP_REASON_REPLACED);
 TRACE_DEFINE_ENUM(EBC_REASON_EXPLICIT);
 TRACE_DEFINE_ENUM(EBC_REASON_AUTO_DU);
 TRACE_DEFINE_ENUM(EBC_REASON_REPAIR_FLOOR);
@@ -73,6 +79,14 @@ TRACE_DEFINE_ENUM(EBC_REASON_AUTO_A2);
 			 { EBC_OUTCOME_NO_LUT,		"no_lut" },	\
 			 { EBC_OUTCOME_TIMEOUT,		"timeout" },	\
 			 { EBC_OUTCOME_ABANDONED,	"abandoned" })
+
+#define ebc_trace_flip_reason(r)					\
+	__print_symbolic(r,						\
+			 { EBC_FLIP_REASON_TAKE,	"take" },	\
+			 { EBC_FLIP_REASON_WATCHDOG,	"watchdog" },	\
+			 { EBC_FLIP_REASON_OFF,		"off" },	\
+			 { EBC_FLIP_REASON_SLEEP,	"sleep" },	\
+			 { EBC_FLIP_REASON_REPLACED,	"replaced" })
 
 TRACE_EVENT(rk3026_ebc_update_queue,
 	TP_PROTO(u32 source, u32 mode, const struct drm_rect *clip, u32 marker,
@@ -129,8 +143,10 @@ TRACE_EVENT(rk3026_ebc_update_queue,
  * appended to the line: its newest update's seq, its box in panel
  * coordinates, the pixels its snapshot changes, the DU budget spent at its
  * take, the time from the take to this waveform (@setup_us,
- * rk3026_ebc_setup_us()), the time the take waited for a quiet gap and the
- * retries of a carried part.
+ * rk3026_ebc_setup_us()), the time the take waited for a quiet gap, the
+ * retries of a carried part and the take's own time (taken_us, the
+ * monotonic clock in microseconds, as the trace_clock "mono" stamps the
+ * events: a flip event sent at the take is not before it).
  */
 TRACE_EVENT(rk3026_ebc_scan_start,
 	TP_PROTO(const struct rk3026_ebc_last *last, u32 mode, u32 lut_mode,
@@ -155,6 +171,7 @@ TRACE_EVENT(rk3026_ebc_scan_start,
 		__field(u32, setup_us)
 		__field(u32, gap_us)
 		__field(u32, tries)
+		__field(s64, taken_us)
 	),
 	TP_fast_assign(
 		__entry->mode = mode;
@@ -175,8 +192,9 @@ TRACE_EVENT(rk3026_ebc_scan_start,
 		__entry->setup_us = setup_us;
 		__entry->gap_us = last->gap_us;
 		__entry->tries = last->tries;
+		__entry->taken_us = ktime_to_us(last->taken);
 	),
-	TP_printk("mode=%u(%s) lut_mode=%u(%s) temp=%d frames=%u marker=%u merged=%u repair=%d reason=%s seq=%u box=%d,%d-%d,%d changed_px=%u du_area=%u setup_us=%u gap_us=%u tries=%u",
+	TP_printk("mode=%u(%s) lut_mode=%u(%s) temp=%d frames=%u marker=%u merged=%u repair=%d reason=%s seq=%u box=%d,%d-%d,%d changed_px=%u du_area=%u setup_us=%u gap_us=%u tries=%u taken_us=%lld",
 		  __entry->mode, ebc_trace_mode(__entry->mode),
 		  __entry->lut_mode, ebc_trace_mode(__entry->lut_mode),
 		  __entry->temp, __entry->frames, __entry->marker,
@@ -184,7 +202,7 @@ TRACE_EVENT(rk3026_ebc_scan_start,
 		  ebc_trace_reason(__entry->reason), __entry->seq,
 		  __entry->x1, __entry->y1, __entry->x2, __entry->y2,
 		  __entry->changed_px, __entry->du_area, __entry->setup_us,
-		  __entry->gap_us, __entry->tries)
+		  __entry->gap_us, __entry->tries, __entry->taken_us)
 );
 
 /* A waveform ends; @seq is its part's (a repair RESET's too). */
@@ -215,8 +233,9 @@ TRACE_EVENT(rk3026_ebc_scan_end,
 
 /*
  * A part was taken and nothing was driven for it: skipped as identical,
- * dropped or carried (the reason). Its seq, box and the pixels its snapshot
- * changes (0 if none was built) are appended.
+ * dropped or carried (the reason). Its seq, box, the pixels its snapshot
+ * changes (0 if none was built) and the take's time (taken_us, as in
+ * rk3026_ebc_scan_start) are appended.
  */
 TRACE_EVENT(rk3026_ebc_skip,
 	TP_PROTO(const struct rk3026_ebc_last *last),
@@ -231,6 +250,7 @@ TRACE_EVENT(rk3026_ebc_skip,
 		__field(int, x2)
 		__field(int, y2)
 		__field(u32, changed_px)
+		__field(s64, taken_us)
 	),
 	TP_fast_assign(
 		__entry->mode = last->asked_mode;
@@ -242,12 +262,13 @@ TRACE_EVENT(rk3026_ebc_skip,
 		__entry->x2 = last->clip.x2;
 		__entry->y2 = last->clip.y2;
 		__entry->changed_px = last->changed_px;
+		__entry->taken_us = ktime_to_us(last->taken);
 	),
-	TP_printk("mode=%u(%s) marker=%u reason=%s seq=%u box=%d,%d-%d,%d changed_px=%u",
+	TP_printk("mode=%u(%s) marker=%u reason=%s seq=%u box=%d,%d-%d,%d changed_px=%u taken_us=%lld",
 		  __entry->mode, ebc_trace_mode(__entry->mode),
 		  __entry->marker, ebc_trace_outcome(__entry->reason),
 		  __entry->seq, __entry->x1, __entry->y1, __entry->x2,
-		  __entry->y2, __entry->changed_px)
+		  __entry->y2, __entry->changed_px, __entry->taken_us)
 );
 
 /*
@@ -294,6 +315,30 @@ TRACE_EVENT(rk3026_ebc_rails,
 	),
 	TP_printk("%s epd=%d vcom=%d ret=%d", __entry->on ? "on" : "off",
 		  __entry->epd_on, __entry->vcom_on, __entry->ret)
+);
+
+/*
+ * A flip event held for its part (rk3026_ebc_flip_hold()) was sent: the seq
+ * of the update its commit queued, how long it was held, and why now (enum
+ * rk3026_ebc_flip_reason): its part was taken (take), the watchdog sent it
+ * late, the CRTC went off, a system sleep began, or a second hold found the
+ * slot full (replaced: the core gave up waiting for a commit).
+ */
+TRACE_EVENT(rk3026_ebc_flip_event,
+	TP_PROTO(u32 seq, u32 held_us, u32 why),
+	TP_ARGS(seq, held_us, why),
+	TP_STRUCT__entry(
+		__field(u32, seq)
+		__field(u32, held_us)
+		__field(u32, why)
+	),
+	TP_fast_assign(
+		__entry->seq = seq;
+		__entry->held_us = held_us;
+		__entry->why = why;
+	),
+	TP_printk("seq=%u held_us=%u why=%s", __entry->seq, __entry->held_us,
+		  ebc_trace_flip_reason(__entry->why))
 );
 
 #endif /* _RK3026_EBC_TRACE_H */

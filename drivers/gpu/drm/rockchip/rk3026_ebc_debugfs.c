@@ -37,6 +37,19 @@
  *                    waits. Probe sets EBC_TAKE_CAP_MS.
  *   timing           text, the blit and snapshot times of the last part and
  *                    the last driven one (rk3026_ebc_timing_show())
+ *   flip_timeout_ms  how long a flip event is held at most before the
+ *                    watchdog sends it (rk3026_ebc_flip_hold()), read-write;
+ *                    used up to EBC_FLIP_TIMEOUT_MAX_MS, 0: at the
+ *                    watchdog's first run. Read at the hold. Probe sets
+ *                    EBC_FLIP_TIMEOUT_MS.
+ *   flip_held        the flip events held until their part's take,
+ *                    whoever sent them, read-only
+ *   flip_late        of those, the ones the watchdog sent, read-only
+ *
+ * flip_held and flip_late are counters, yet files of their own next to
+ * flip_timeout_ms rather than lines of "state" (struct rk3026_ebc_stats):
+ * the three describe the flip event holder alone, and a test of flip event
+ * pacing reads them as one set, whichever way the kernel holds the events.
  *
  * Both images are @img_size = width * height / 2 bytes: 4 bpp, two pixels per
  * byte with the LEFT pixel in the LOW nibble, rows of width / 2 bytes, top row
@@ -344,6 +357,9 @@ void rk3026_ebc_debugfs_init(struct rk3026_ebc *ebc)
 	debugfs_create_u32("take_quiet_us", 0644, dir, &ebc->take_quiet_us);
 	debugfs_create_u32("take_cap_ms", 0644, dir, &ebc->take_cap_ms);
 	debugfs_create_file("timing", 0444, dir, ebc, &rk3026_ebc_timing_fops);
+	debugfs_create_u32("flip_timeout_ms", 0644, dir, &ebc->flip_timeout_ms);
+	debugfs_create_u32("flip_held", 0444, dir, &ebc->flip_held);
+	debugfs_create_u32("flip_late", 0444, dir, &ebc->flip_late);
 }
 
 void rk3026_ebc_debugfs_fini(struct rk3026_ebc *ebc)

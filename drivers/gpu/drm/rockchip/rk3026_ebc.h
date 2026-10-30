@@ -208,6 +208,9 @@
 
 struct clk;
 struct dentry;
+struct drm_clip_rect;
+struct drm_fb_helper;
+struct drm_fb_helper_funcs;
 struct fb_info;
 struct fb_ops;
 struct firmware;
@@ -1048,6 +1051,16 @@ struct rk3026_ebc {
 	bool			mxcfb_active;
 
 	/*
+	 * fbdev damage commits (rk3026_ebc_fbdev_fb_dirty()). @fbdev_funcs
+	 * are the fbdev emulation's own callbacks, wrapped by the driver's;
+	 * set once by ebc_fbdev_probe(). @fbdev_console_lock: commit under
+	 * the console lock. Off at probe; debugfs may change it, and the
+	 * damage worker reads it with READ_ONCE().
+	 */
+	const struct drm_fb_helper_funcs *fbdev_funcs;
+	bool			fbdev_console_lock;
+
+	/*
 	 * debugfs: the last part, the last driven one, the counters. Under
 	 * @image_lock.
 	 */
@@ -1098,6 +1111,10 @@ void rk3026_ebc_sleep_end(struct rk3026_ebc *ebc);
 void rk3026_ebc_sleep_restore(struct rk3026_ebc *ebc);
 int rk3026_ebc_crtc_wait(struct rk3026_ebc *ebc, u32 seq,
 			 unsigned int timeout_ms);
+#if IS_ENABLED(CONFIG_DRM_FBDEV_EMULATION)
+int rk3026_ebc_fbdev_fb_dirty(struct drm_fb_helper *helper,
+			      struct drm_clip_rect *clip);
+#endif
 #endif
 
 /* rk3026_ebc_blit.c */

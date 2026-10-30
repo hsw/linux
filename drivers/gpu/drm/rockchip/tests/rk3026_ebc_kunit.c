@@ -2,15 +2,17 @@
 /*
  * KUnit tests for the RK3026 EBC refresh bookkeeping (rk3026_ebc_core.c),
  * the waveform container bounds (rk3026_ebc_waveform.c), the mxcfb waveform
- * map (rk3026_ebc_mxcfb.c), the refresh thread's glue (rk3026_ebc.c), and
- * the snapshot and the blit against the per-pixel references of
- * rk3026_ebc_kunit_ref.c, and the NEON blit against the scalar one.
+ * map (rk3026_ebc_mxcfb.c), the refresh thread's glue and the fbdev damage
+ * commit (rk3026_ebc.c), and the snapshot and the blit against the
+ * per-pixel references of rk3026_ebc_kunit_ref.c, and the NEON blit against
+ * the scalar one.
  */
 
 #include <kunit/device.h>
 #include <kunit/static_stub.h>
 #include <kunit/test.h>
 
+#include <linux/console.h>
 #include <linux/err.h>
 #include <linux/hrtimer.h>
 #include <linux/jiffies.h>
@@ -27,6 +29,7 @@
 #include <linux/workqueue.h>
 
 #include <drm/drm_drv.h>
+#include <drm/drm_fb_helper.h>
 #include <drm/drm_framebuffer.h>
 #include <drm/drm_plane.h>
 
@@ -8216,6 +8219,128 @@ static struct kunit_suite rk3026_ebc_glue_test_suite = {
 };
 
 kunit_test_suite(rk3026_ebc_glue_test_suite);
+
+#if IS_ENABLED(CONFIG_DRM_FBDEV_EMULATION)
+
+/* --- fbdev damage commits (rk3026_ebc_fbdev_fb_dirty()) --- */
+
+/* What the wrapped fb_dirty saw: its calls, the clip, the console lock. */
+static struct {
+	unsigned int calls;
+	struct drm_clip_rect clip;
+	bool console_locked;
+	int ret;
+} t_dirty;
+
+static int t_fb_dirty(struct drm_fb_helper *helper, struct drm_clip_rect *clip)
+{
+	t_dirty.calls++;
+	t_dirty.clip = *clip;
+	t_dirty.console_locked = is_console_locked();
+	return t_dirty.ret;
+}
+
+static const struct drm_fb_helper_funcs t_fbdev_funcs = {
+	.fb_dirty = t_fb_dirty,
+};
+
+/* A helper on a bare controller, with @pending as its damage not yet taken. */
+static struct drm_fb_helper *t_fbdev(struct kunit *test,
+				     struct rk3026_ebc *ebc,
+				     struct drm_clip_rect pending)
+{
+	struct drm_fb_helper *helper = kunit_kzalloc(test, sizeof(*helper),
+						     GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, helper);
+	helper->dev = &ebc->drm;
+	spin_lock_init(&helper->damage_lock);
+	helper->damage_clip = pending;
+	ebc->fbdev_funcs = &t_fbdev_funcs;
+	memset(&t_dirty, 0, sizeof(t_dirty));
+	return helper;
+}
+
+static const struct drm_clip_rect t_no_damage = {
+	.x1 = USHRT_MAX, .y1 = USHRT_MAX, .x2 = 0, .y2 = 0,
+};
+
+static void t_expect_clip(struct kunit *test, const struct drm_clip_rect *c,
+			  unsigned short x1, unsigned short y1,
+			  unsigned short x2, unsigned short y2)
+{
+	KUNIT_EXPECT_EQ(test, c->x1, x1);
+	KUNIT_EXPECT_EQ(test, c->y1, y1);
+	KUNIT_EXPECT_EQ(test, c->x2, x2);
+	KUNIT_EXPECT_EQ(test, c->y2, y2);
+}
+
+/* Off (the default): the clip goes through as it is, nothing else moves. */
+static void ebc_test_fbdev_dirty_off(struct kunit *test)
+{
+	struct rk3026_ebc *ebc = t_ebc_alloc(test);
+	struct drm_clip_rect pending = { 0, 900, 32, 1072 };
+	struct drm_fb_helper *helper = t_fbdev(test, ebc, pending);
+	struct drm_clip_rect clip = { 0, 48, 32, 1072 };
+
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_fbdev_fb_dirty(helper, &clip), 0);
+	KUNIT_EXPECT_EQ(test, t_dirty.calls, 1);
+	t_expect_clip(test, &t_dirty.clip, 0, 48, 32, 1072);
+	t_expect_clip(test, &helper->damage_clip, 0, 900, 32, 1072);
+}
+
+/*
+ * On: the commit runs under the console lock, with the damage reported
+ * since the worker took its clip folded in and taken off the helper; the
+ * wrapped call's error comes back, with the folded clip for the worker
+ * to put back.
+ */
+static void ebc_test_fbdev_dirty_locked(struct kunit *test)
+{
+	struct rk3026_ebc *ebc = t_ebc_alloc(test);
+	struct drm_clip_rect pending = { 64, 16, 96, 1072 };
+	struct drm_fb_helper *helper = t_fbdev(test, ebc, pending);
+	struct drm_clip_rect clip = { 0, 48, 32, 1000 };
+
+	ebc->fbdev_console_lock = true;
+	t_dirty.ret = -EIO;
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_fbdev_fb_dirty(helper, &clip), -EIO);
+	KUNIT_EXPECT_EQ(test, t_dirty.calls, 1);
+	KUNIT_EXPECT_TRUE(test, t_dirty.console_locked);
+	t_expect_clip(test, &t_dirty.clip, 0, 16, 96, 1072);
+	t_expect_clip(test, &clip, 0, 16, 96, 1072);
+	t_expect_clip(test, &helper->damage_clip, USHRT_MAX, USHRT_MAX, 0, 0);
+}
+
+/* On, with no damage pending: the clip stays as the worker took it. */
+static void ebc_test_fbdev_dirty_locked_quiet(struct kunit *test)
+{
+	struct rk3026_ebc *ebc = t_ebc_alloc(test);
+	struct drm_fb_helper *helper = t_fbdev(test, ebc, t_no_damage);
+	struct drm_clip_rect clip = { 0, 48, 32, 1072 };
+
+	ebc->fbdev_console_lock = true;
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_fbdev_fb_dirty(helper, &clip), 0);
+	KUNIT_EXPECT_TRUE(test, t_dirty.console_locked);
+	t_expect_clip(test, &t_dirty.clip, 0, 48, 32, 1072);
+	t_expect_clip(test, &helper->damage_clip, USHRT_MAX, USHRT_MAX, 0, 0);
+}
+
+static struct kunit_case rk3026_ebc_fbdev_test_cases[] = {
+	KUNIT_CASE(ebc_test_fbdev_dirty_off),
+	KUNIT_CASE(ebc_test_fbdev_dirty_locked),
+	KUNIT_CASE(ebc_test_fbdev_dirty_locked_quiet),
+	{}
+};
+
+static struct kunit_suite rk3026_ebc_fbdev_test_suite = {
+	.name = "rk3026_ebc_fbdev",
+	.test_cases = rk3026_ebc_fbdev_test_cases,
+};
+
+kunit_test_suite(rk3026_ebc_fbdev_test_suite);
+
+#endif /* CONFIG_DRM_FBDEV_EMULATION */
 
 /* --- the conversion: fixtures and generators --- */
 

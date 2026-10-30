@@ -343,6 +343,8 @@ void rk3026_ebc_debugfs_init(struct rk3026_ebc *ebc)
 	debugfs_create_u32("a2_max_area", 0644, dir, &ebc->a2_max_area);
 	debugfs_create_u32("take_quiet_us", 0644, dir, &ebc->take_quiet_us);
 	debugfs_create_u32("take_cap_ms", 0644, dir, &ebc->take_cap_ms);
+	debugfs_create_bool("fbdev_console_lock", 0644, dir,
+			    &ebc->fbdev_console_lock);
 	debugfs_create_file("timing", 0444, dir, ebc, &rk3026_ebc_timing_fops);
 }
 

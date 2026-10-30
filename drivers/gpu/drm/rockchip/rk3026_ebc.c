@@ -2406,6 +2406,10 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_plane_box);
  * makes the thread take the new deadline. The end of its scan stamps it
  * again (rk3026_ebc_do_refresh()).
  *
+ * The queued update is recorded as the commit's (@commit_seq,
+ * @commit_queued), for its event; nothing is recorded when nothing was
+ * queued.
+ *
  * Returns true if the update was queued.
  */
 VISIBLE_IF_KUNIT bool rk3026_ebc_plane_update(struct rk3026_ebc *ebc,
@@ -2431,7 +2435,8 @@ VISIBLE_IF_KUNIT bool rk3026_ebc_plane_update(struct rk3026_ebc *ebc,
 						       &upd.clip);
 		WRITE_ONCE(ebc->idle_last_plane, jiffies);
 		WRITE_ONCE(ebc->idle_armed, true);
-		rk3026_ebc_add_update(ebc, &upd);
+		ebc->commit_seq = rk3026_ebc_add_update(ebc, &upd);
+		ebc->commit_queued = true;
 	}
 	mutex_unlock(&ebc->image_lock);
 	return queue;
@@ -2694,6 +2699,31 @@ static void ebc_crtc_atomic_disable(struct drm_crtc *crtc,
 	}
 }
 
+/**
+ * rk3026_ebc_commit_begin - start the record of a commit's update
+ * @ebc: the device
+ *
+ * A commit starts with no update queued: its plane update records the one
+ * it queues (rk3026_ebc_plane_update(): @commit_queued, @commit_seq). The
+ * core calls .atomic_begin before the plane updates of every commit that
+ * holds the CRTC while it is active, CRTC-only commits too
+ * (drm_atomic_helper_commit_planes(), DRM_PLANE_COMMIT_ACTIVE_ONLY in
+ * drm_atomic_helper_commit_tail_rpm()). A plane update holds the CRTC of
+ * its plane (drm_atomic_get_plane_state()), and a commit that does not
+ * hold the CRTC carries no CRTC event either.
+ */
+VISIBLE_IF_KUNIT void rk3026_ebc_commit_begin(struct rk3026_ebc *ebc)
+{
+	ebc->commit_queued = false;
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_commit_begin);
+
+static void ebc_crtc_atomic_begin(struct drm_crtc *crtc,
+				  struct drm_atomic_state *state)
+{
+	rk3026_ebc_commit_begin(drm_to_ebc(crtc->dev));
+}
+
 static const struct drm_crtc_funcs ebc_crtc_funcs = {
 	.set_config		= drm_atomic_helper_set_config,
 	.page_flip		= drm_atomic_helper_page_flip,
@@ -2704,6 +2734,7 @@ static const struct drm_crtc_funcs ebc_crtc_funcs = {
 };
 
 static const struct drm_crtc_helper_funcs ebc_crtc_helper_funcs = {
+	.atomic_begin		= ebc_crtc_atomic_begin,
 	.atomic_enable		= ebc_crtc_atomic_enable,
 	.atomic_disable		= ebc_crtc_atomic_disable,
 };

@@ -1048,6 +1048,20 @@ struct rk3026_ebc {
 	bool			mxcfb_active;
 
 	/*
+	 * The commit being applied: rk3026_ebc_commit_begin() clears
+	 * @commit_queued, and its plane update sets it with @commit_seq, the
+	 * seq of the update it queued (rk3026_ebc_plane_update(), under
+	 * @image_lock). Nothing is recorded for a plane update that queued
+	 * nothing: @commit_seq keeps the last update queued. Written only in
+	 * the commit tail: the panel has one CRTC and one plane, and each
+	 * commit's planes are applied after the previous commit's are done
+	 * (drm_atomic_helper_wait_for_dependencies()), so one commit at a
+	 * time is between its begin and its flush.
+	 */
+	u32			commit_seq;
+	bool			commit_queued;
+
+	/*
 	 * debugfs: the last part, the last driven one, the counters. Under
 	 * @image_lock.
 	 */
@@ -1080,6 +1094,7 @@ bool rk3026_ebc_plane_box(const struct drm_plane_state *old_state,
 			  const struct drm_plane_state *new_state,
 			  unsigned int width, unsigned int height,
 			  struct drm_rect *box);
+void rk3026_ebc_commit_begin(struct rk3026_ebc *ebc);
 bool rk3026_ebc_plane_update(struct rk3026_ebc *ebc, const void *src,
 			     unsigned int src_pitch, const struct drm_rect *box);
 bool rk3026_ebc_idle_tick(struct rk3026_ebc *ebc, unsigned long now);

@@ -1077,9 +1077,24 @@ struct rk3026_ebc {
 	 * commit's planes are applied after the previous commit's are done
 	 * (drm_atomic_helper_wait_for_dependencies()), so one commit at a
 	 * time is between its begin and its flush.
+	 *
+	 * @commit_err: what became of that update if its part finished before
+	 * the commit's flush (a commit tail preempted after its plane update),
+	 * as rk3026_ebc_part_err() says, so the flush that finds it finished
+	 * sets that error on the out-fence the core then signals
+	 * (rk3026_ebc_flip_hold()). The plane update clears it with
+	 * @commit_seq; the refresh thread sets it, under @image_lock and
+	 * @drm.event_lock, at the finish of the part that moves
+	 * @flip_done_seq over @commit_seq (ebc_flip_check_locked()). One
+	 * slot is enough however many parts finish before the flush: only
+	 * the part with the commit's update sets it, the ones after it leave
+	 * it alone, and the next plane update starts a new record. A commit
+	 * whose update was not finished at the flush has its event held and
+	 * gets the error from the send instead.
 	 */
 	u32			commit_seq;
 	bool			commit_queued;
+	int			commit_err;
 
 	/*
 	 * The commit event held until its part has finished
@@ -1096,9 +1111,18 @@ struct rk3026_ebc {
 	 * @flip_closed: the remove or the shutdown began
 	 * (rk3026_ebc_flip_fini()), nothing is held any more; set under
 	 * @drm.event_lock.
+	 *
+	 * @flip_done_seq: @pending.done_seq as the last ebc_flip_check_locked()
+	 * saw it, under @image_lock and @drm.event_lock. The hold tests
+	 * whether a commit's update has finished against it, not against
+	 * @pending.done_seq, which the thread moves before it takes
+	 * @drm.event_lock: so the result of the part (@commit_err) is known
+	 * whenever the update is seen finished, and an update the thread has
+	 * finished but not yet released is held and sent by that release.
 	 */
 	struct drm_pending_vblank_event *flip_event;
 	u32			flip_seq;
+	u32			flip_done_seq;
 	unsigned long		flip_due;
 	struct delayed_work	flip_wd;
 	u32			flip_timeout_ms;
@@ -1229,6 +1253,7 @@ bool rk3026_ebc_marker_seq_lookup(const struct rk3026_ebc_marker_ring *ring,
 				  u32 marker, u32 *seq);
 bool rk3026_ebc_flip_holds(const struct drm_pending_vblank_event *e,
 			   bool queued);
+int rk3026_ebc_part_err(const struct rk3026_ebc_last *part);
 #if IS_ENABLED(CONFIG_KUNIT)
 unsigned int rk3026_ebc_mode_rank(u32 mode);
 #endif

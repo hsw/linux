@@ -1426,6 +1426,41 @@ int rk3026_ebc_part_err(const struct rk3026_ebc_last *part)
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_part_err);
 
+/* The debugfs flip_release names of the release points. */
+const char * const rk3026_ebc_flip_rel_names[] = {
+	[EBC_FLIP_REL_DONE] = "done",
+	[EBC_FLIP_REL_TAKE] = "take",
+};
+
+/**
+ * rk3026_ebc_flip_rel_parse - the release point a debugfs flip_release
+ *	write names
+ * @buf: the text written, NUL-terminated at @len
+ * @len: its length
+ * @rel: set to the point named
+ *
+ * "done" (EBC_FLIP_REL_DONE) or "take" (EBC_FLIP_REL_TAKE), one trailing
+ * newline allowed; nothing else: no prefix, no NUL inside, no case
+ * folding, no number. The debugfs write copies the text from userspace
+ * and refuses one not written at the start of the file.
+ *
+ * Return: 0, or -EINVAL. @rel is left as it was unless 0.
+ */
+int rk3026_ebc_flip_rel_parse(const char *buf, size_t len,
+			      enum rk3026_ebc_flip_rel *rel)
+{
+	int i;
+
+	if (strlen(buf) != len)
+		return -EINVAL;
+	i = sysfs_match_string(rk3026_ebc_flip_rel_names, buf);
+	if (i < 0)
+		return -EINVAL;
+	*rel = i;
+	return 0;
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_flip_rel_parse);
+
 /**
  * rk3026_ebc_marker_seq_record - remember which seq a marker was queued with
  * @ring: marker ring

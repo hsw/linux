@@ -227,15 +227,27 @@ enum rk3026_ebc_source {
 
 /*
  * Why a held commit event was sent (rk3026_ebc_flip_hold()): the flip_event
- * tracepoint.
+ * tracepoint. The errors are those of an event held to the finish
+ * (EBC_FLIP_REL_DONE); one held to the take gets none (ebc_flip_send()).
  */
 enum rk3026_ebc_flip_why {
 	EBC_FLIP_DONE,		/* its part finished, on the glass */
-	EBC_FLIP_WATCHDOG,	/* the watchdog: late, -ETIMEDOUT */
+	EBC_FLIP_WATCHDOG,	/* the watchdog: late, -ETIMEDOUT if done */
 	EBC_FLIP_OFF,		/* the CRTC went off, or the driver goes away */
 	EBC_FLIP_SLEEP,		/* a system sleep, its part not taken */
 	EBC_FLIP_REPLACED,	/* slot full (watchdog late): as WATCHDOG */
 	EBC_FLIP_FAILED,	/* finished off the glass: -EIO, -ECANCELED */
+	EBC_FLIP_TAKE,		/* its part was taken (EBC_FLIP_REL_TAKE) */
+};
+
+/*
+ * Where the refresh thread sends a held commit event (rk3026_ebc_flip_hold()),
+ * debugfs flip_release: at the finish of its part (DONE, as probe sets it),
+ * or at the take of that part (TAKE), when its waveform starts.
+ */
+enum rk3026_ebc_flip_rel {
+	EBC_FLIP_REL_DONE,
+	EBC_FLIP_REL_TAKE,
 };
 
 /* What became of one part (the updates one scan takes). */
@@ -1110,16 +1122,16 @@ struct rk3026_ebc {
 	int			commit_err;
 
 	/*
-	 * The commit event held until its part has finished
+	 * The commit event held until its part has finished, or is taken
 	 * (rk3026_ebc_flip_hold()), and @flip_seq, the seq of the update its
 	 * commit queued. One slot: the core holds a second commit back until
 	 * this flip_done (10 s at most). Under @drm.event_lock; the refresh
-	 * thread sends it from step 4 of rk3026_ebc_do_refresh(), and the
-	 * CRTC off, the sleep and rk3026_ebc_flip_fini() send it
-	 * (ebc_flip_send_held()), with @image_lock held around it; the
-	 * watchdog @flip_wd sends it without. @flip_held_at is when it was
-	 * held (rk3026_ebc_clock()), @flip_due when the watchdog sends it
-	 * (jiffies).
+	 * thread sends it from step 4 of rk3026_ebc_do_refresh() (step 2, the
+	 * take, for a hold with EBC_FLIP_REL_TAKE), and the CRTC off, the
+	 * sleep and rk3026_ebc_flip_fini() send it (ebc_flip_send_held()),
+	 * with @image_lock held around it; the watchdog @flip_wd sends it
+	 * without. @flip_held_at is when it was held (rk3026_ebc_clock()),
+	 * @flip_due when the watchdog sends it (jiffies).
 	 *
 	 * @flip_timeout_ms: the watchdog's bound, EBC_FLIP_TIMEOUT_MS at probe
 	 * (rk3026_ebc_flip_init()); debugfs may change it, the hold reads it
@@ -1128,6 +1140,12 @@ struct rk3026_ebc {
 	 * @drm.event_lock, debugfs reads them without. @flip_closed: the
 	 * remove or the shutdown began (rk3026_ebc_flip_fini()), nothing is
 	 * held any more; set under @drm.event_lock.
+	 *
+	 * @flip_release: where a hold is released (debugfs flip_release),
+	 * EBC_FLIP_REL_DONE at probe; the hold reads it once with READ_ONCE()
+	 * into @flip_rel, the point of the event held, so a change reaches the
+	 * next hold, never the one in the slot. @flip_rel is under
+	 * @drm.event_lock with the slot.
 	 *
 	 * @flip_done_seq: @pending.done_seq as the last ebc_flip_check_locked()
 	 * saw it, under @image_lock and @drm.event_lock. The hold tests
@@ -1147,6 +1165,8 @@ struct rk3026_ebc {
 	u32			flip_held;
 	u32			flip_late;
 	bool			flip_closed;
+	enum rk3026_ebc_flip_rel flip_release;
+	enum rk3026_ebc_flip_rel flip_rel;
 
 	/*
 	 * debugfs: the last part, the last driven one, the counters. Under
@@ -1276,6 +1296,9 @@ bool rk3026_ebc_marker_seq_lookup(const struct rk3026_ebc_marker_ring *ring,
 bool rk3026_ebc_flip_holds(const struct drm_pending_vblank_event *e,
 			   bool queued);
 int rk3026_ebc_part_err(const struct rk3026_ebc_last *part);
+extern const char * const rk3026_ebc_flip_rel_names[];
+int rk3026_ebc_flip_rel_parse(const char *buf, size_t len,
+			      enum rk3026_ebc_flip_rel *rel);
 #if IS_ENABLED(CONFIG_KUNIT)
 unsigned int rk3026_ebc_mode_rank(u32 mode);
 #endif

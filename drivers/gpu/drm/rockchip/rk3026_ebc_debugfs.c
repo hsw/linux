@@ -45,6 +45,13 @@
  *   flip_held        the commit events held (rk3026_ebc_flip_hold()),
  *                    whoever sent them, read-only
  *   flip_late        of those, the ones the watchdog sent, read-only
+ *   flip_release     where a held commit event is sent, read-write text:
+ *                    "done" at the finish of its part (the frame is on the
+ *                    glass, or its out-fence has an error), "take" at the
+ *                    take of that part (its waveform starts; no fence
+ *                    error but a failure known before the commit's flush).
+ *                    Read at the hold, so an event held keeps its point.
+ *                    Probe sets "done".
  *
  * flip_held and flip_late are counters, yet files of their own next to
  * flip_timeout_ms rather than lines of "state" (struct rk3026_ebc_stats):
@@ -70,11 +77,13 @@
  */
 
 #include <linux/debugfs.h>
+#include <linux/err.h>
 #include <linux/fs.h>
 #include <linux/mm.h>
 #include <linux/overflow.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
+#include <linux/string.h>
 
 #include "rk3026_ebc.h"
 
@@ -334,6 +343,39 @@ static int rk3026_ebc_timing_show(struct seq_file *m, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(rk3026_ebc_timing);
 
+static int rk3026_ebc_flip_release_show(struct seq_file *m, void *data)
+{
+	struct rk3026_ebc *ebc = m->private;
+
+	seq_printf(m, "%s\n",
+		   rk3026_ebc_flip_rel_names[READ_ONCE(ebc->flip_release)]);
+	return 0;
+}
+
+static ssize_t rk3026_ebc_flip_release_write(struct file *file,
+					     const char __user *ubuf,
+					     size_t count, loff_t *ppos)
+{
+	struct rk3026_ebc *ebc = ((struct seq_file *)file->private_data)->private;
+	enum rk3026_ebc_flip_rel rel;
+	char *buf;
+	int ret;
+
+	/* Written whole at the start of the file; no name needs a page. */
+	if (*ppos || count >= PAGE_SIZE)
+		return -EINVAL;
+	buf = memdup_user_nul(ubuf, count);
+	if (IS_ERR(buf))
+		return PTR_ERR(buf);
+	ret = rk3026_ebc_flip_rel_parse(buf, count, &rel);
+	kfree(buf);
+	if (ret)
+		return ret;
+	WRITE_ONCE(ebc->flip_release, rel);
+	return count;
+}
+DEFINE_SHOW_STORE_ATTRIBUTE(rk3026_ebc_flip_release);
+
 void rk3026_ebc_debugfs_init(struct rk3026_ebc *ebc)
 {
 	struct dentry *dir = debugfs_create_dir("rk3026-ebc", NULL);
@@ -360,6 +402,8 @@ void rk3026_ebc_debugfs_init(struct rk3026_ebc *ebc)
 	debugfs_create_u32("flip_timeout_ms", 0644, dir, &ebc->flip_timeout_ms);
 	debugfs_create_u32("flip_held", 0444, dir, &ebc->flip_held);
 	debugfs_create_u32("flip_late", 0444, dir, &ebc->flip_late);
+	debugfs_create_file("flip_release", 0644, dir, ebc,
+			    &rk3026_ebc_flip_release_fops);
 }
 
 void rk3026_ebc_debugfs_fini(struct rk3026_ebc *ebc)

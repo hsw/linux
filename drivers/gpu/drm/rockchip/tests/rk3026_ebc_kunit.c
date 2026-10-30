@@ -31,6 +31,7 @@
 #include <drm/drm_crtc.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_file.h>
+#include <drm/drm_fourcc.h>
 #include <drm/drm_framebuffer.h>
 #include <drm/drm_plane.h>
 #include <drm/drm_vblank.h>
@@ -4656,6 +4657,14 @@ static void ebc_test_glue_wait_timeout(struct kunit *test)
 			EBC_TAKE_CAP_MAX_MS);
 }
 
+/* A plane update from the dense XRGB8888 framebuffer @fb of the panel. */
+static bool t_plane_xrgb(struct rk3026_ebc *ebc, const u32 *fb,
+			 const struct drm_rect *box)
+{
+	return rk3026_ebc_plane_update(ebc, fb, T_W * 4, DRM_FORMAT_XRGB8888,
+				       box);
+}
+
 /* A plane update leaves the panel to an mxcfb client. */
 static void ebc_test_glue_plane_update(struct kunit *test)
 {
@@ -4667,16 +4676,14 @@ static void ebc_test_glue_plane_update(struct kunit *test)
 
 	/* An mxcfb client owns the panel: no blit, no update. */
 	ebc->mxcfb_active = true;
-	KUNIT_EXPECT_FALSE(test, rk3026_ebc_plane_update(ebc, fb, T_W * 4,
-							 &t_panel));
+	KUNIT_EXPECT_FALSE(test, t_plane_xrgb(ebc, fb, &t_panel));
 	t_expect_white(test, ebc->next_shadow);
 	KUNIT_EXPECT_EQ(test, ebc->stats.updates, 0);
 	KUNIT_EXPECT_FALSE(test, rk3026_ebc_work_pending(&ebc->pending));
 
 	/* None: the whole framebuffer (black), the whole panel, FULL. */
 	ebc->mxcfb_active = false;
-	KUNIT_EXPECT_TRUE(test, rk3026_ebc_plane_update(ebc, fb, T_W * 4,
-							&t_panel));
+	KUNIT_EXPECT_TRUE(test, t_plane_xrgb(ebc, fb, &t_panel));
 	for (i = 0; i < T_SIZE; i++)
 		KUNIT_EXPECT_EQ(test, ebc->next_shadow[i], 0);
 	t_expect_guard(test, ebc->next_shadow);
@@ -4715,8 +4722,7 @@ static void ebc_test_glue_plane_update_seq(struct kunit *test)
 	rk3026_ebc_commit_begin(ebc);
 	KUNIT_EXPECT_FALSE(test, ebc->commit_queued);
 	KUNIT_EXPECT_EQ(test, ebc->commit_seq, 0xdeadbeef);
-	KUNIT_EXPECT_FALSE(test, rk3026_ebc_plane_update(ebc, fb, T_W * 4,
-							 &box));
+	KUNIT_EXPECT_FALSE(test, t_plane_xrgb(ebc, fb, &box));
 	KUNIT_EXPECT_FALSE(test, ebc->commit_queued);
 	KUNIT_EXPECT_EQ(test, ebc->commit_seq, 0xdeadbeef);
 	KUNIT_EXPECT_FALSE(test, rk3026_ebc_work_pending(&ebc->pending));
@@ -4724,8 +4730,7 @@ static void ebc_test_glue_plane_update_seq(struct kunit *test)
 
 	/* Queued: the seq of the update, the newest pending one. */
 	ebc->mxcfb_active = false;
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, fb, T_W * 4,
-							&box));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, fb, &box));
 	KUNIT_EXPECT_TRUE(test, ebc->commit_queued);
 	KUNIT_EXPECT_EQ(test, ebc->commit_seq, ebc->pending.queued_seq);
 	KUNIT_EXPECT_NE(test, ebc->commit_seq, ebc->pending.done_seq);
@@ -4735,8 +4740,7 @@ static void ebc_test_glue_plane_update_seq(struct kunit *test)
 	rk3026_ebc_commit_begin(ebc);
 	KUNIT_EXPECT_FALSE(test, ebc->commit_queued);
 	KUNIT_EXPECT_EQ(test, ebc->commit_seq, first);
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, fb, T_W * 4,
-							&t_panel));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, fb, &t_panel));
 	KUNIT_EXPECT_TRUE(test, ebc->commit_queued);
 	KUNIT_EXPECT_EQ(test, ebc->commit_seq, first + 1);
 	KUNIT_EXPECT_EQ(test, ebc->commit_seq, ebc->pending.queued_seq);
@@ -4750,8 +4754,7 @@ static void ebc_test_glue_plane_update_seq(struct kunit *test)
 	/* The panel claimed again: the commit records nothing. */
 	ebc->mxcfb_active = true;
 	rk3026_ebc_commit_begin(ebc);
-	KUNIT_EXPECT_FALSE(test, rk3026_ebc_plane_update(ebc, fb, T_W * 4,
-							 &box));
+	KUNIT_EXPECT_FALSE(test, t_plane_xrgb(ebc, fb, &box));
 	KUNIT_EXPECT_FALSE(test, ebc->commit_queued);
 	KUNIT_EXPECT_EQ(test, ebc->commit_seq, first + 1);
 	KUNIT_EXPECT_EQ(test, ebc->pending.queued_seq, first + 1);
@@ -4809,8 +4812,7 @@ static void ebc_test_glue_auto_du(struct kunit *test)
 	 * whole panel does not spend it and takes no cleanup.
 	 */
 	ebc->du_cleanup_area = 2 * T_W * T_H;
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
-							&t_panel));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, black, &t_panel));
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_EQ(test, last.asked_mode, EBC_MODE_FULL);
 	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_BLACK_WHITE);
@@ -4832,8 +4834,7 @@ static void ebc_test_glue_auto_du(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, ebc->shadows.prev_unknown);
 
 	/* The next plane part takes the carry in: FULL, as it was asked. */
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
-							&t_panel));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, black, &t_panel));
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_FULL);
 	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_EXPLICIT);
@@ -4849,8 +4850,7 @@ static void ebc_test_glue_auto_grey(struct kunit *test)
 	u32 *grey = t_plane_fb(test, 0x808080);
 	struct rk3026_ebc_last last;
 
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, grey, T_W * 4,
-							&t_panel));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, grey, &t_panel));
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_EQ(test, last.asked_mode, EBC_MODE_FULL);
 	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_PART);
@@ -4875,8 +4875,7 @@ static void ebc_test_glue_auto_skipped(struct kunit *test)
 	u32 *white = t_plane_fb(test, 0xffffff);
 	struct rk3026_ebc_last last;
 
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, white, T_W * 4,
-							&t_panel));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, white, &t_panel));
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_SKIPPED);
 	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_FULL);
@@ -4940,8 +4939,7 @@ static void ebc_test_glue_du_cleanup(struct kunit *test)
 	struct rk3026_ebc_last last;
 
 	ebc->du_area = ebc->du_cleanup_area;
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
-							&t_panel));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, black, &t_panel));
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_EQ(test, last.asked_mode, EBC_MODE_FULL);
 	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_FULL);
@@ -4966,8 +4964,7 @@ static void t_du_budget_left(struct kunit *test, u32 limit, u32 area)
 	t_fb_box(box, r.x1, r.y1, r.x2, r.y2, 0);
 	ebc->du_cleanup_area = limit;
 	ebc->du_area = area;
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, box, T_W * 4,
-							&r));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, box, &r));
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_BLACK_WHITE);
 	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_AUTO_DU);
@@ -4999,8 +4996,7 @@ static void ebc_test_glue_du_skipped(struct kunit *test)
 	struct rk3026_ebc_last last;
 
 	ebc->du_area = ebc->du_cleanup_area;
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, white, T_W * 4,
-							&t_panel));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, white, &t_panel));
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_SKIPPED);
 	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_FULL);
@@ -5180,8 +5176,7 @@ static void ebc_test_glue_force_mode(struct kunit *test)
 	ebc->du_cleanup_ceiling = 0;
 
 	WRITE_ONCE(ebc->force_mode, EBC_MODE_FULL);
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
-							&t_panel));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, black, &t_panel));
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
 	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_FULL);
@@ -5192,8 +5187,7 @@ static void ebc_test_glue_force_mode(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ebc->shadows.prev[0], 0);
 
 	WRITE_ONCE(ebc->force_mode, -1);
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, white, T_W * 4,
-							&t_panel));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, white, &t_panel));
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
 	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_BLACK_WHITE);
@@ -5224,8 +5218,7 @@ static void ebc_test_glue_du_driven(struct kunit *test)
 	t_fb_box(box, 4, 2, 8, 4, 0);
 
 	ebc->du_cleanup_area = 2 * T_W * T_H;
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
-							&t_panel));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, black, &t_panel));
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
 	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_BLACK_WHITE);
@@ -5233,16 +5226,14 @@ static void ebc_test_glue_du_driven(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ebc->du_area, T_W * T_H);
 	KUNIT_EXPECT_EQ(test, ebc->shadows.prev[0], 0);
 
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, white, T_W * 4,
-							&t_panel));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, white, &t_panel));
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
 	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_FULL);
 	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_CLEANUP_BIG);
 	KUNIT_EXPECT_EQ(test, ebc->du_area, 0);
 
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, box, T_W * 4,
-							&t_panel));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, box, &t_panel));
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
 	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_BLACK_WHITE);
@@ -5272,8 +5263,7 @@ static void ebc_test_glue_part_driven(struct kunit *test)
 	t_fb_box(box, 4, 2, 8, 4, 0x808080);
 
 	ebc->du_area = 50;
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, box, T_W * 4,
-							&t_panel));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, box, &t_panel));
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
 	KUNIT_EXPECT_EQ(test, last.asked_mode, EBC_MODE_FULL);
@@ -5285,8 +5275,7 @@ static void ebc_test_glue_part_driven(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, t_px(ebc->shadows.prev, 3, 2), 15);
 
 	ebc->du_area = ebc->du_cleanup_area;
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, grey, T_W * 4,
-							&t_panel));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, grey, &t_panel));
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
 	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_FULL);
@@ -5328,24 +5317,21 @@ static void ebc_test_glue_du_big(struct kunit *test)
 	KUNIT_ASSERT_LT(test, 1, ebc->du_cleanup_big_area);
 
 	ebc->du_area = ebc->du_cleanup_area;
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, box, T_W * 4,
-							&r1));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, box, &r1));
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
 	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_BLACK_WHITE);
 	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_AUTO_DU);
 	KUNIT_EXPECT_EQ(test, ebc->du_area, ebc->du_cleanup_area + 8);
 
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, boxes, T_W * 4,
-							&r2));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, boxes, &r2));
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
 	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_PART);
 	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_AUTO_PART);
 	KUNIT_EXPECT_EQ(test, ebc->du_area, ebc->du_cleanup_area + 8);
 
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, grey, T_W * 4,
-							&t_panel));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, grey, &t_panel));
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
 	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_FULL);
@@ -5353,8 +5339,7 @@ static void ebc_test_glue_du_big(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ebc->du_area, 0);
 
 	ebc->du_area = ebc->du_cleanup_area;
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, dot, T_W * 4,
-							&t_panel));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, dot, &t_panel));
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
 	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_BLACK_WHITE);
@@ -5389,16 +5374,14 @@ static void ebc_test_glue_du_ceiling(struct kunit *test)
 	KUNIT_ASSERT_GT(test, ebc->du_cleanup_ceiling, ebc->du_cleanup_area);
 
 	ebc->du_area = ebc->du_cleanup_ceiling - 1;
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, box, T_W * 4,
-							&r1));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, box, &r1));
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
 	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_BLACK_WHITE);
 	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_AUTO_DU);
 	KUNIT_EXPECT_EQ(test, ebc->du_area, ebc->du_cleanup_ceiling + 7);
 
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, boxes, T_W * 4,
-							&r2));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, boxes, &r2));
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
 	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_FULL);
@@ -5444,8 +5427,7 @@ static void t_a2_box(struct kunit *test, struct rk3026_ebc *ebc, u32 max_area,
 
 	t_fb_box(box, 4, 2, 8, 4, 0);
 	ebc->a2_max_area = max_area;
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, box, T_W * 4,
-							&r));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, box, &r));
 	rk3026_ebc_do_refresh(ebc, last);
 	KUNIT_EXPECT_EQ(test, last->outcome, EBC_OUTCOME_DRIVEN);
 	KUNIT_EXPECT_EQ(test, ebc->du_area, 8);
@@ -5504,8 +5486,7 @@ static void t_a2_draw(struct kunit *test, struct rk3026_ebc *ebc, u32 *fb,
 {
 	struct drm_rect r = { .x1 = x1, .y1 = y1, .x2 = x2, .y2 = y2 };
 
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, fb, T_W * 4,
-							&r));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, fb, &r));
 	rk3026_ebc_do_refresh(ebc, last);
 	KUNIT_EXPECT_EQ(test, last->outcome, EBC_OUTCOME_DRIVEN);
 }
@@ -5621,8 +5602,7 @@ static void ebc_test_glue_idle_cleanup(struct kunit *test)
 
 	/* No part is big: the black panel spends the budget in DU. */
 	ebc->du_cleanup_big_area = U32_MAX;
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
-							&t_panel));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, black, &t_panel));
 	KUNIT_EXPECT_TRUE(test, ebc->idle_armed);
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_BLACK_WHITE);
@@ -5678,8 +5658,7 @@ static void ebc_test_glue_idle_not_due(struct kunit *test)
 	struct rk3026_ebc_last last;
 
 	t_fb_box(box, 4, 2, 8, 4, 0);
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, box, T_W * 4,
-							&t_panel));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, box, &t_panel));
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_EQ(test, ebc->du_area, 8);
 	KUNIT_EXPECT_FALSE(test, rk3026_ebc_idle_tick(ebc, t_idle_at(ebc)));
@@ -5687,22 +5666,19 @@ static void ebc_test_glue_idle_not_due(struct kunit *test)
 
 	/* Spent, then an mxcfb client takes the panel. */
 	ebc->du_area = ebc->du_cleanup_area;
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, box, T_W * 4,
-							&t_panel));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, box, &t_panel));
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_SKIPPED);
 	KUNIT_EXPECT_TRUE(test, ebc->idle_armed);
 	ebc->mxcfb_active = true;
 	KUNIT_EXPECT_FALSE(test, rk3026_ebc_idle_tick(ebc, t_idle_at(ebc)));
 	KUNIT_EXPECT_FALSE(test, ebc->idle_armed);
-	KUNIT_EXPECT_FALSE(test, rk3026_ebc_plane_update(ebc, box, T_W * 4,
-							 &t_panel));
+	KUNIT_EXPECT_FALSE(test, t_plane_xrgb(ebc, box, &t_panel));
 	KUNIT_EXPECT_FALSE(test, ebc->idle_armed);
 
 	/* The client gone, the CRTC off. */
 	ebc->mxcfb_active = false;
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, box, T_W * 4,
-							&t_panel));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, box, &t_panel));
 	rk3026_ebc_do_refresh(ebc, &last);
 	ebc->crtc_on = false;
 	KUNIT_EXPECT_FALSE(test, rk3026_ebc_idle_tick(ebc, t_idle_at(ebc)));
@@ -5737,8 +5713,7 @@ static void ebc_test_glue_idle_carried(struct kunit *test)
 	t_fb_box(box, 4, 2, 8, 4, 0xffffff);
 	/* No part is big: the black panel spends the budget in DU. */
 	ebc->du_cleanup_big_area = U32_MAX;
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
-							&t_panel));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, black, &t_panel));
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_EQ(test, ebc->du_area, T_W * T_H);
 
@@ -5756,8 +5731,7 @@ static void ebc_test_glue_idle_carried(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, rk3026_ebc_work_pending(&ebc->pending));
 
 	ebc->waveform = wf;
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, box, T_W * 4,
-							&r));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, box, &r));
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
 	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_BLACK_WHITE);
@@ -5805,8 +5779,7 @@ static void ebc_test_glue_idle_busy(struct kunit *test)
 	t_fb_box(box2, 4, 2, 8, 4, 0xffffff);
 	t_fb_box(box2, 4, 2, 6, 4, 0);
 	ebc->du_cleanup_big_area = U32_MAX;
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
-							&t_panel));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, black, &t_panel));
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_ASSERT_EQ(test, ebc->du_area, T_W * T_H);
 	KUNIT_ASSERT_TRUE(test, ebc->idle_armed);
@@ -5819,8 +5792,7 @@ static void ebc_test_glue_idle_busy(struct kunit *test)
 	ebc->shadows.prev_unknown = false;
 
 	/* A part pending; its scan arms the cleanup again, stamped later. */
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, box, T_W * 4,
-							&r));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, box, &r));
 	KUNIT_EXPECT_FALSE(test, rk3026_ebc_idle_tick(ebc, t_idle_at(ebc)));
 	KUNIT_EXPECT_FALSE(test, ebc->idle_armed);
 	KUNIT_ASSERT_TRUE(test, rk3026_ebc_work_pending(&ebc->pending));
@@ -5837,8 +5809,7 @@ static void ebc_test_glue_idle_busy(struct kunit *test)
 
 	/* A carry waiting: a part not drawn for want of a LUT. */
 	ebc->waveform = t_rkf_wf(test, ebc->dev, &reset, 1, 0);
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, box2, T_W * 4,
-							&r));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, box2, &r));
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_NO_LUT);
 	KUNIT_ASSERT_TRUE(test, ebc->pending.carry.merged);
@@ -5867,8 +5838,7 @@ static void ebc_test_glue_du_repaired(struct kunit *test)
 
 	ebc->du_area = 50;
 	ebc->shadows.prev_unknown = true;
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
-							&t_panel));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, black, &t_panel));
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_TRUE(test, last.repaired);
 	KUNIT_EXPECT_EQ(test, d.n, 1);
@@ -5929,8 +5899,7 @@ static void ebc_test_glue_repair_no_reset(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, rk3026_ebc_seq_finished(&ebc->pending, seq));
 
 	/* Black over the glass the FULL left: two-level, DU, as usual. */
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
-							&t_panel));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, black, &t_panel));
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_ASSERT_EQ(test, d.n, 4);
 	KUNIT_EXPECT_EQ(test, d.mode[3], EBC_MODE_BLACK_WHITE);
@@ -5940,8 +5909,7 @@ static void ebc_test_glue_repair_no_reset(struct kunit *test)
 	/* The FULL cut short: the mark stays, and the next part repairs. */
 	kunit_activate_static_stub(test, rk3026_ebc_drive, t_drive_timeout);
 	ebc->shadows.prev_unknown = true;
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, white, T_W * 4,
-							&t_panel));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, white, &t_panel));
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_TIMEOUT);
 	KUNIT_ASSERT_EQ(test, d.n, 5);
@@ -5949,8 +5917,7 @@ static void ebc_test_glue_repair_no_reset(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, ebc->shadows.prev_unknown);
 
 	kunit_activate_static_stub(test, rk3026_ebc_drive, t_drive_ok);
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
-							&t_panel));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, black, &t_panel));
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
 	KUNIT_ASSERT_EQ(test, d.n, 6);
@@ -5989,8 +5956,7 @@ static void ebc_test_glue_part_record(struct kunit *test)
 	kunit_activate_static_stub(test, rk3026_ebc_clock, t_clock);
 	ebc->du_cleanup_area = 2 * T_W * T_H;
 	ebc->du_area = 5;
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
-							&t_panel));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, black, &t_panel));
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
 	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_BLACK_WHITE);
@@ -6009,8 +5975,7 @@ static void ebc_test_glue_part_record(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ebc->last.seq, last.seq);
 	KUNIT_EXPECT_EQ(test, ebc->last.changed_px, T_W * T_H);
 
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
-							&t_panel));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, black, &t_panel));
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_SKIPPED);
 	KUNIT_EXPECT_EQ(test, last.seq, ebc->pending.queued_seq);
@@ -6019,8 +5984,7 @@ static void ebc_test_glue_part_record(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, d.n, 1);
 
 	ebc->crtc_on = false;
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, white, T_W * 4,
-							&t_panel));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, white, &t_panel));
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_CRTC_OFF);
 	KUNIT_EXPECT_EQ(test, last.seq, ebc->pending.queued_seq);
@@ -6032,8 +5996,7 @@ static void ebc_test_glue_part_record(struct kunit *test)
 	ebc->shadows.prev_unknown = true;
 	d.now = ktime_add_ms(t0, 500);
 	d.drive_time[1] = ms_to_ktime(7);
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, white, T_W * 4,
-							&t_panel));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, white, &t_panel));
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_TRUE(test, last.repaired);
 	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
@@ -6052,8 +6015,7 @@ static int t_rails(struct rk3026_ebc *ebc)
 	struct t_drives *d = kunit_get_current_test()->priv;
 
 	if (!d->rails++ && d->rails_fb)
-		rk3026_ebc_plane_update(ebc, d->rails_fb, T_W * 4,
-					&d->rails_box);
+		t_plane_xrgb(ebc, d->rails_fb, &d->rails_box);
 	if (d->rails == 1 && d->rails_reset)
 		t_send(ebc, &t_panel, EBC_MODE_RESET, 0, EBC_SOURCE_ENABLE);
 	if (d->rails == 1 && d->rails_suspend)
@@ -6096,21 +6058,18 @@ static void ebc_test_glue_rails_not_raised(struct kunit *test)
 	u32 *black = t_plane_fb(test, 0);
 	struct rk3026_ebc_last last;
 
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, white, T_W * 4,
-							&t_panel));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, white, &t_panel));
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_SKIPPED);
 
 	ebc->crtc_on = false;
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
-							&t_panel));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, black, &t_panel));
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_CRTC_OFF);
 
 	ebc->crtc_on = true;
 	ebc->waveform = NULL;
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
-							&t_panel));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, black, &t_panel));
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_NO_WAVEFORM);
 	KUNIT_EXPECT_TRUE(test, ebc->pending.carry.merged);
@@ -6122,8 +6081,7 @@ static void ebc_test_glue_rails_not_raised(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, d.n, 0);
 
 	ebc->waveform = wf;
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
-							&t_panel));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, black, &t_panel));
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
 	KUNIT_EXPECT_EQ(test, d.rails, 1);
@@ -6152,7 +6110,7 @@ static void ebc_test_glue_rails_before_take(struct kunit *test)
 	t_fb_box(fb, 8, 2, 12, 4, 0);
 	d.rails_fb = fb;
 	d.rails_box = DRM_RECT_INIT(8, 2, 4, 2);
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, fb, T_W * 4, &a));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, fb, &a));
 	first = ebc->pending.queued_seq;
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_EQ(test, d.rails, 1);
@@ -6175,7 +6133,7 @@ static void ebc_test_glue_rails_before_take(struct kunit *test)
 
 	d.rails_fb = NULL;
 	t_fb_box(fb, 4, 4, 6, 6, 0);
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, fb, T_W * 4, &c));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, fb, &c));
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_EQ(test, d.rails, 2);
 	KUNIT_EXPECT_EQ(test, last.merged, 1);
@@ -6197,8 +6155,7 @@ static void ebc_test_glue_rails_fail(struct kunit *test)
 	u32 seq;
 
 	d.rails_ret = -EIO;
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
-							&t_panel));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, black, &t_panel));
 	seq = ebc->pending.queued_seq;
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_NO_RAILS);
@@ -6330,8 +6287,8 @@ static unsigned int t_gap_run(struct kunit *test, struct rk3026_ebc *ebc,
 		if (ktime_after(next, d->now))
 			d->now = next;
 		KUNIT_EXPECT_TRUE(test,
-				  rk3026_ebc_plane_update(ebc, fb, T_W * 4,
-							  &boxes[*sent % nboxes]));
+				  t_plane_xrgb(ebc, fb,
+					       &boxes[*sent % nboxes]));
 		(*sent)++;
 		KUNIT_EXPECT_TRUE(test,
 				  rk3026_ebc_gap_woken(&ebc->pending,
@@ -6361,8 +6318,7 @@ static void ebc_test_glue_gap_burst(struct kunit *test)
 	for (i = 0; i < T_H; i++)
 		rows[i] = DRM_RECT_INIT(0, i, T_W, 1);
 	d.ramp = ms_to_ktime(4);
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
-							&rows[0]));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, black, &rows[0]));
 	looks = t_gap_run(test, ebc, &d, black, rows, T_H, T_H, 2000, &sent);
 	KUNIT_EXPECT_EQ(test, sent, T_H);
 	KUNIT_EXPECT_EQ(test, looks, T_H + 1);
@@ -6399,7 +6355,7 @@ static void ebc_test_glue_gap_lone(struct kunit *test)
 
 	d.ramp = ms_to_ktime(42);
 	t_fb_box(fb, 4, 2, 6, 4, 0);
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, fb, T_W * 4, &a));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, fb, &a));
 	KUNIT_EXPECT_FALSE(test, rk3026_ebc_take_ready(ebc, d.now));
 	KUNIT_EXPECT_EQ(test, d.rails, 1);
 	KUNIT_EXPECT_TRUE(test, ebc->epd_on);
@@ -6411,7 +6367,7 @@ static void ebc_test_glue_gap_lone(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, d.n, 1);
 
 	t_fb_box(fb, 8, 2, 10, 4, 0);
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, fb, T_W * 4, &b));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, fb, &b));
 	KUNIT_EXPECT_TRUE(test, rk3026_ebc_take_ready(ebc, d.now));
 	KUNIT_EXPECT_FALSE(test, ebc->gap.open);
 	rk3026_ebc_do_refresh(ebc, &last);
@@ -6424,7 +6380,7 @@ static void ebc_test_glue_gap_lone(struct kunit *test)
 	ebc->rails_on = false;
 	d.rails = 0;
 	t_fb_box(fb, 4, 2, 6, 4, 0xffffff);
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, fb, T_W * 4, &a));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, fb, &a));
 	t_send(ebc, &b, EBC_MODE_FULL, 9, EBC_SOURCE_MXCFB);
 	KUNIT_EXPECT_TRUE(test, rk3026_ebc_take_ready(ebc, d.now));
 	KUNIT_EXPECT_FALSE(test, ebc->gap.open);
@@ -6439,8 +6395,8 @@ static void ebc_test_glue_gap_lone(struct kunit *test)
 	d.rails = 0;
 	ebc->take_quiet_us = 0;
 	t_fb_box(fb, 4, 2, 6, 4, 0);
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, fb, T_W * 4, &a));
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, fb, T_W * 4, &a));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, fb, &a));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, fb, &a));
 	KUNIT_EXPECT_TRUE(test, rk3026_ebc_take_ready(ebc, d.now));
 	KUNIT_EXPECT_EQ(test, d.rails, 0);
 }
@@ -6465,7 +6421,7 @@ static void ebc_test_glue_gap_ramp_past(struct kunit *test)
 
 	d.ramp = ms_to_ktime(37);
 	t_fb_box(fb, 4, 2, 6, 4, 0);
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, fb, T_W * 4, &a));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, fb, &a));
 	KUNIT_EXPECT_EQ(test, t_gap_run(test, ebc, &d, fb, &a, 1, 1, 0, &sent),
 			2);
 	KUNIT_EXPECT_EQ(test, d.rails, 1);
@@ -6480,7 +6436,7 @@ static void ebc_test_glue_gap_ramp_past(struct kunit *test)
 
 	d.now = ktime_add_ms(t0, 200);
 	t_fb_box(fb, 8, 2, 10, 4, 0);
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, fb, T_W * 4, &b));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, fb, &b));
 	sent = 1;
 	KUNIT_EXPECT_EQ(test, t_gap_run(test, ebc, &d, fb, &b, 1, 1, 0, &sent),
 			1);
@@ -6517,8 +6473,7 @@ static void ebc_test_glue_gap_cursor_blink(struct kunit *test)
 		ebc->rails_on = false;
 		d.now = ktime_add_ms(t0, 210 * i);
 		t_fb_box(fb, 4, 2, 6, 4, i ? 0xffffff : 0);
-		KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, fb,
-								T_W * 4, &c));
+		KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, fb, &c));
 		sent = 1;
 		KUNIT_EXPECT_EQ(test, t_gap_run(test, ebc, &d, fb, &c, 1, 1, 0,
 						&sent), 2);
@@ -6579,10 +6534,8 @@ static void ebc_test_glue_gap_not_driven(struct kunit *test)
 	u32 *black = t_plane_fb(test, 0);
 	struct rk3026_ebc_last last;
 
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, white, T_W * 4,
-							&t_panel));
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, white, T_W * 4,
-							&t_panel));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, white, &t_panel));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, white, &t_panel));
 	KUNIT_EXPECT_TRUE(test, rk3026_ebc_take_ready(ebc, d.now));
 	KUNIT_EXPECT_FALSE(test, ebc->gap.open);
 	rk3026_ebc_do_refresh(ebc, &last);
@@ -6590,8 +6543,7 @@ static void ebc_test_glue_gap_not_driven(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, d.rails, 0);
 	KUNIT_EXPECT_FALSE(test, ebc->epd_on);
 
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
-							&t_panel));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, black, &t_panel));
 	KUNIT_EXPECT_FALSE(test, rk3026_ebc_take_ready(ebc, d.now));
 	KUNIT_EXPECT_TRUE(test, ebc->gap.open);
 	KUNIT_EXPECT_EQ(test, d.rails, 1);
@@ -6633,10 +6585,8 @@ static void ebc_test_glue_gap_cap(struct kunit *test)
 	ebc->vcom_on = true;
 	ebc->rails_on = true;
 	ebc->rails_off_at = jiffies + msecs_to_jiffies(200);
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
-							&box));
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
-							&box));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, black, &box));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, black, &box));
 	looks = t_gap_run(test, ebc, &d, black, &box, 1, 1000, 4000, &sent);
 	KUNIT_EXPECT_EQ(test, ktime_us_delta(d.now, t0), 250000);
 	/* Sends at 8, 12, ... 248 ms: 61 of them, and the two at the start. */
@@ -6651,10 +6601,8 @@ static void ebc_test_glue_gap_cap(struct kunit *test)
 	d.now = ktime_add_ms(d.now, 1000);
 	t0 = d.now;
 	sent = 2;
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, white, T_W * 4,
-							&box));
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, white, T_W * 4,
-							&box));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, white, &box));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, white, &box));
 	ebc->take_done = ktime_add_ms(t0, 100);
 	t_gap_run(test, ebc, &d, white, &box, 1, 1000, 4000, &sent);
 	KUNIT_EXPECT_EQ(test, ktime_us_delta(d.now, t0), 350000);
@@ -6682,7 +6630,7 @@ static void ebc_test_glue_gap_exempt(struct kunit *test)
 
 	t_fb_box(fb, 4, 2, 6, 4, 0);
 	t_send(ebc, &t_panel, EBC_MODE_FULL, 0, EBC_SOURCE_IDLE);
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, fb, T_W * 4, &a));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, fb, &a));
 	KUNIT_EXPECT_TRUE(test, rk3026_ebc_take_ready(ebc, d.now));
 	KUNIT_EXPECT_FALSE(test, ebc->gap.open);
 	KUNIT_EXPECT_EQ(test, d.rails, 0);
@@ -6697,7 +6645,7 @@ static void ebc_test_glue_gap_exempt(struct kunit *test)
 	ebc->vcom_on = false;
 	ebc->rails_on = false;
 	t_fb_box(fb, 4, 2, 6, 4, 0xffffff);
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, fb, T_W * 4, &a));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, fb, &a));
 	KUNIT_EXPECT_FALSE(test, rk3026_ebc_take_ready(ebc, d.now));
 	KUNIT_EXPECT_TRUE(test, ebc->gap.open);
 	KUNIT_EXPECT_EQ(test, d.rails, 2);
@@ -6739,8 +6687,7 @@ static void ebc_test_glue_gap_big_full(struct kunit *test)
 	ebc->epd_on = true;
 	ebc->vcom_on = true;
 	ebc->rails_on = true;
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
-							&big));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, black, &big));
 	KUNIT_EXPECT_FALSE(test, rk3026_ebc_take_ready(ebc, d.now));
 	KUNIT_EXPECT_TRUE(test, ebc->gap.open);
 	KUNIT_EXPECT_EQ(test, ebc->gap.at, ktime_add_us(t0, EBC_TAKE_QUIET_US));
@@ -6750,8 +6697,7 @@ static void ebc_test_glue_gap_big_full(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
 	KUNIT_EXPECT_EQ(test, last.gap_us, EBC_TAKE_QUIET_US);
 
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
-							&small));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, black, &small));
 	KUNIT_EXPECT_TRUE(test, rk3026_ebc_take_ready(ebc, d.now));
 	KUNIT_EXPECT_FALSE(test, ebc->gap.open);
 	rk3026_ebc_do_refresh(ebc, &last);
@@ -6759,8 +6705,7 @@ static void ebc_test_glue_gap_big_full(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, last.gap_us, 0);
 
 	ebc->du_area = ebc->du_cleanup_ceiling;
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, white, T_W * 4,
-							&small));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, white, &small));
 	KUNIT_EXPECT_FALSE(test, rk3026_ebc_take_ready(ebc, d.now));
 	KUNIT_EXPECT_TRUE(test, ebc->gap.open);
 	d.now = ebc->gap.at;
@@ -6794,7 +6739,7 @@ static void ebc_test_glue_gap_retry(struct kunit *test)
 
 	d.rails_ret = -EIO;
 	t_fb_box(fb, 0, 0, 4, 2, 0);
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, fb, T_W * 4, &a));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, fb, &a));
 	s1 = ebc->pending.queued_seq;
 	KUNIT_EXPECT_TRUE(test, rk3026_ebc_take_ready(ebc, d.now));
 	rk3026_ebc_do_refresh(ebc, &last);
@@ -6805,8 +6750,8 @@ static void ebc_test_glue_gap_retry(struct kunit *test)
 	d.rails_ret = 0;
 	d.now = ktime_add_ms(t0, 95);
 	t_fb_box(fb, 8, 2, 12, 4, 0);
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, fb, T_W * 4, &b));
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, fb, T_W * 4, &b));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, fb, &b));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, fb, &b));
 	KUNIT_EXPECT_FALSE(test, rk3026_ebc_take_ready(ebc, d.now));
 	KUNIT_EXPECT_TRUE(test, ebc->gap.open);
 	KUNIT_EXPECT_EQ(test, ebc->gap.at, ktime_add_ms(t0, 100));
@@ -7085,8 +7030,7 @@ static void ebc_test_glue_wait_bound(struct kunit *test)
 	d.drive_time[1] = ms_to_ktime(EBC_RETRY_SPAN_MS - 100 - 1);
 	d.drive_time[2] = ms_to_ktime(part_ms);
 
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
-							&t_panel));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, black, &t_panel));
 	seq = ebc->pending.queued_seq;
 	/*
 	 * In flight, before a RESET, the RESET: done at their longest; a
@@ -7094,8 +7038,7 @@ static void ebc_test_glue_wait_bound(struct kunit *test)
 	 */
 	d.now = ktime_add_ms(t0, 3 * part_ms);
 	ebc->take_done = d.now;
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
-							&t_panel));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, black, &t_panel));
 	KUNIT_EXPECT_FALSE(test, rk3026_ebc_take_ready(ebc, d.now));
 	KUNIT_EXPECT_EQ(test, ebc->gap.at,
 			ktime_add_ms(d.now, EBC_TAKE_CAP_MAX_MS));
@@ -7148,8 +7091,7 @@ static void ebc_test_glue_rails_exempt(struct kunit *test)
 	ebc->vcom_on = false;
 	ebc->rails_on = false;
 	ebc->shadows.prev_unknown = true;
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, white, T_W * 4,
-							&t_panel));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, white, &t_panel));
 	KUNIT_EXPECT_FALSE(test, rk3026_ebc_take_ready(ebc, d.now));
 	KUNIT_EXPECT_TRUE(test, ebc->gap.open);
 	KUNIT_EXPECT_EQ(test, d.rails, 2);
@@ -7224,8 +7166,7 @@ static void ebc_test_glue_retry_failing(struct kunit *test)
 
 	d.rails_ret = -EIO;
 	ebc->pending.retry.failing = true;
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
-							&t_panel));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, black, &t_panel));
 	seq = ebc->pending.queued_seq;
 	KUNIT_EXPECT_TRUE(test, rk3026_ebc_take_ready(ebc, d.now));
 	KUNIT_EXPECT_FALSE(test, ebc->gap.open);
@@ -7270,8 +7211,7 @@ static void ebc_test_glue_retry_once(struct kunit *test)
 	u32 seq;
 
 	d.rails_ret = -EIO;
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
-							&t_panel));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, black, &t_panel));
 	seq = ebc->pending.queued_seq;
 	KUNIT_EXPECT_TRUE(test, t_woken(ebc, &d));
 	KUNIT_EXPECT_TRUE(test, rk3026_ebc_take_ready(ebc, d.now));
@@ -7470,8 +7410,7 @@ static void ebc_test_glue_sleep_holds(struct kunit *test)
 	u32 seq;
 
 	ebc->du_cleanup_area = 2 * T_W * T_H;
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
-							&t_panel));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, black, &t_panel));
 	seq = ebc->pending.queued_seq;
 	rk3026_ebc_sleep_begin(ebc);
 	KUNIT_EXPECT_EQ(test, rk3026_ebc_sleep_wait(ebc, 0), 0);
@@ -7491,8 +7430,7 @@ static void ebc_test_glue_sleep_holds(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, rk3026_ebc_seq_finished(&ebc->pending, seq));
 	t_expect_white(test, ebc->shadows.prev);
 
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
-							&r));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, black, &r));
 	seq = ebc->pending.queued_seq;
 	KUNIT_EXPECT_EQ(test, rk3026_ebc_pending_parts(&ebc->pending), 1);
 
@@ -7528,8 +7466,7 @@ static void ebc_test_glue_sleep_rails_ramp(struct kunit *test)
 
 	ebc->du_cleanup_area = 2 * T_W * T_H;
 	d.rails_suspend = true;
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
-							&t_panel));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, black, &t_panel));
 	seq = ebc->pending.queued_seq;
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_TRUE(test, ebc->suspended);
@@ -7589,8 +7526,7 @@ static void ebc_test_glue_sleep_mid_waveform(struct kunit *test)
 
 	ebc->du_cleanup_area = 2 * T_W * T_H;
 	kunit_activate_static_stub(test, rk3026_ebc_drive, t_drive_suspend);
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
-							&t_panel));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, black, &t_panel));
 	seq = ebc->pending.queued_seq;
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_TRUE(test, ebc->suspended);
@@ -7602,8 +7538,7 @@ static void ebc_test_glue_sleep_mid_waveform(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ebc->shadows.prev[0], 0);
 
 	kunit_activate_static_stub(test, rk3026_ebc_drive, t_drive_ok);
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, white, T_W * 4,
-							&t_panel));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, white, &t_panel));
 	seq = ebc->pending.queued_seq;
 	last.outcome = EBC_OUTCOME_NONE;
 	rk3026_ebc_do_refresh(ebc, &last);
@@ -7644,8 +7579,7 @@ static void ebc_test_glue_sleep_carry(struct kunit *test)
 	kunit_activate_static_stub(test, rk3026_ebc_read_temp, t_temp);
 	d.temp = 10;
 	d.rails_ret = -EIO;
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
-							&t_panel));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, black, &t_panel));
 	seq = ebc->pending.queued_seq;
 	KUNIT_EXPECT_TRUE(test, rk3026_ebc_take_ready(ebc, d.now));
 	rk3026_ebc_do_refresh(ebc, &last);
@@ -7712,7 +7646,7 @@ static void ebc_test_glue_sleep_gap_ramp(struct kunit *test)
 	d.ramp = ms_to_ktime(42);
 	d.rails_suspend = true;
 	t_fb_box(fb, 4, 2, 6, 4, 0);
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, fb, T_W * 4, &a));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, fb, &a));
 	seq = ebc->pending.queued_seq;
 	KUNIT_EXPECT_FALSE(test, rk3026_ebc_take_ready(ebc, d.now));
 	KUNIT_EXPECT_TRUE(test, ebc->suspended);
@@ -7781,8 +7715,7 @@ static void ebc_test_glue_sleep_restore(struct kunit *test)
 
 	ebc->du_cleanup_area = 2 * T_W * T_H;
 	KUNIT_ASSERT_TRUE(test, ebc->crtc_on);
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
-							&t_panel));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, black, &t_panel));
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_ASSERT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
 	KUNIT_ASSERT_EQ(test, d.n, 1);
@@ -7868,8 +7801,7 @@ static void ebc_test_glue_sleep_crtc_wait(struct kunit *test)
 
 	ebc->du_cleanup_area = 2 * T_W * T_H;
 	kunit_activate_static_stub(test, rk3026_ebc_drive, t_drive_crtc_wait);
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
-							&t_panel));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, black, &t_panel));
 	seq = ebc->pending.queued_seq;
 	KUNIT_EXPECT_EQ(test, rk3026_ebc_crtc_wait(ebc, seq, 0), -ETIMEDOUT);
 	rk3026_ebc_do_refresh(ebc, &last);
@@ -7879,8 +7811,7 @@ static void ebc_test_glue_sleep_crtc_wait(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk3026_ebc_crtc_wait(ebc, seq, 0), 0);
 
 	kunit_activate_static_stub(test, rk3026_ebc_drive, t_drive_ok);
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, white, T_W * 4,
-							&t_panel));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, white, &t_panel));
 	seq2 = ebc->pending.queued_seq;
 	KUNIT_EXPECT_EQ(test, rk3026_ebc_crtc_wait(ebc, seq2, 0), 0);
 	KUNIT_EXPECT_FALSE(test, rk3026_ebc_seq_finished(&ebc->pending, seq2));
@@ -8116,18 +8047,18 @@ static void ebc_test_glue_blit_time(struct kunit *test)
 	KUNIT_EXPECT_STREQ(test, rk3026_ebc_blit_impl(), t_blit_impl());
 
 	mutex_lock(&ebc->image_lock);
-	us = rk3026_ebc_blit_xrgb8888(ebc, black, T_W * 4, &off);
+	us = rk3026_ebc_blit(ebc, black, T_W * 4, DRM_FORMAT_XRGB8888, &off);
 	mutex_unlock(&ebc->image_lock);
 	KUNIT_EXPECT_EQ(test, us, 0);
 	t_expect_white(test, ebc->next_shadow);
 
 	mutex_lock(&ebc->image_lock);
-	us = rk3026_ebc_blit_xrgb8888(ebc, black, T_W * 4, &t_panel);
+	us = rk3026_ebc_blit(ebc, black, T_W * 4, DRM_FORMAT_XRGB8888,
+			     &t_panel);
 	mutex_unlock(&ebc->image_lock);
 	KUNIT_EXPECT_GE(test, us, 1);
 
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
-							&t_panel));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, black, &t_panel));
 	KUNIT_EXPECT_GE(test, ebc->pending.pre.blit_us, 1);
 }
 
@@ -8330,8 +8261,7 @@ static void ebc_test_glue_plane_box_update(struct kunit *test)
 	struct rk3026_ebc_set *pre = &ebc->pending.pre;
 
 	t_img_fill(ebc->next_shadow, 3);
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
-							&box));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, black, &box));
 	t_expect_box_img(test, ebc->next_shadow, &box, 0, 3);
 	KUNIT_EXPECT_EQ(test, ebc->stats.updates, 1);
 	KUNIT_EXPECT_EQ(test, pre->merged, 1);
@@ -8355,8 +8285,7 @@ static void ebc_test_glue_plane_box_merge(struct kunit *test)
 	u32 *black = t_plane_fb(test, 0);
 	struct rk3026_ebc_set *pre = &ebc->pending.pre;
 
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
-							&box));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, black, &box));
 	t_send(ebc, &clip, EBC_MODE_PART, 0, EBC_SOURCE_MXCFB);
 	KUNIT_EXPECT_EQ(test, rk3026_ebc_pending_parts(&ebc->pending), 1);
 	KUNIT_EXPECT_EQ(test, pre->merged, 2);
@@ -8385,29 +8314,25 @@ static void ebc_test_glue_plane_resync(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, ebc->plane_resync);
 
 	ebc->mxcfb_active = true;
-	KUNIT_EXPECT_FALSE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
-							 &box));
+	KUNIT_EXPECT_FALSE(test, t_plane_xrgb(ebc, black, &box));
 	t_expect_white(test, ebc->next_shadow);
 	KUNIT_EXPECT_EQ(test, ebc->stats.updates, 1);
 	KUNIT_EXPECT_TRUE(test, ebc->plane_resync);
 
 	ebc->mxcfb_active = false;
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
-							&box));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, black, &box));
 	t_expect_box_img(test, ebc->next_shadow, &t_panel, 0, 0);
 	KUNIT_EXPECT_TRUE(test, drm_rect_equals(&pre->box, &t_panel));
 	KUNIT_EXPECT_FALSE(test, ebc->plane_resync);
 
 	t_img_fill(ebc->next_shadow, 3);
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
-							&box));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, black, &box));
 	t_expect_box_img(test, ebc->next_shadow, &box, 0, 3);
 
 	/* A RESET's white fill is another writer. */
 	t_send(ebc, &t_panel, EBC_MODE_RESET, 0, EBC_SOURCE_ENABLE);
 	KUNIT_EXPECT_TRUE(test, ebc->plane_resync);
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
-							&box));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, black, &box));
 	t_expect_box_img(test, ebc->next_shadow, &t_panel, 0, 0);
 	KUNIT_EXPECT_FALSE(test, ebc->plane_resync);
 }
@@ -8424,8 +8349,7 @@ static void ebc_test_glue_plane_box_du(struct kunit *test)
 	u32 *black = t_plane_fb(test, 0);
 	struct rk3026_ebc_last last;
 
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
-							&box));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, black, &box));
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_EQ(test, last.asked_mode, EBC_MODE_FULL);
 	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_BLACK_WHITE);
@@ -8442,8 +8366,7 @@ static void ebc_test_glue_plane_box_grey(struct kunit *test)
 	u32 *grey = t_plane_fb(test, 0x808080);
 	struct rk3026_ebc_last last;
 
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, grey, T_W * 4,
-							&box));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, grey, &box));
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_PART);
 	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_AUTO_PART);
@@ -8579,7 +8502,7 @@ static bool t_flip_commit(struct rk3026_ebc *ebc, const u32 *fb,
 
 	rk3026_ebc_commit_begin(ebc);
 	if (fb)
-		rk3026_ebc_plane_update(ebc, fb, T_W * 4, &t_panel);
+		t_plane_xrgb(ebc, fb, &t_panel);
 	return t_flip_flush(test, ebc, e);
 }
 
@@ -9003,7 +8926,7 @@ static struct dma_fence *t_flip_preempted(struct kunit *test,
 	*ep = t_flip_event(test, f, true, fence);
 	*fp = f;
 	rk3026_ebc_commit_begin(ebc);
-	queued = rk3026_ebc_plane_update(ebc, fb, T_W * 4, &t_panel);
+	queued = t_plane_xrgb(ebc, fb, &t_panel);
 	KUNIT_ASSERT_TRUE(test, queued);
 	return fence;
 }
@@ -10087,8 +10010,7 @@ static void ebc_test_glue_flip_driven(struct kunit *test)
 	kunit_activate_static_stub(test, rk3026_ebc_drive, t_drive_flip);
 	ebc->flip_release = EBC_FLIP_REL_TAKE;
 	rk3026_ebc_commit_begin(ebc);
-	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
-							&box));
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, black, &box));
 	seq = ebc->commit_seq;
 	KUNIT_ASSERT_TRUE(test, t_flip_flush(test, ebc, e));
 	/* An update sent after the commit joins the same part. */
@@ -11504,7 +11426,7 @@ static void ebc_test_snapshot_two_level_positions(struct kunit *test)
 	}
 }
 
-/* A bare struct rk3026_ebc for rk3026_ebc_blit_xrgb8888() on @f. */
+/* A bare struct rk3026_ebc for rk3026_ebc_blit() on @f. */
 static struct rk3026_ebc *t_blit_ebc(struct kunit *test, const struct t_fix *f)
 {
 	struct rk3026_ebc *ebc = kunit_kzalloc(test, sizeof(*ebc), GFP_KERNEL);
@@ -11519,8 +11441,8 @@ static struct rk3026_ebc *t_blit_ebc(struct kunit *test, const struct t_fix *f)
 
 /*
  * Every clip on one source: the reference rows on the clip widened as the
- * driver widens it and rk3026_ebc_blit_xrgb8888() write the same target
- * over the same junk, guards included. False after the first difference.
+ * driver widens it and rk3026_ebc_blit() write the same target over the
+ * same junk, guards included. False after the first difference.
  */
 static bool t_ref_blit_src(struct kunit *test, const struct t_fix *f,
 			   struct rk3026_ebc *ebc, u8 *ref, const u8 *src,
@@ -11540,7 +11462,7 @@ static bool t_ref_blit_src(struct kunit *test, const struct t_fix *f,
 			rk3026_ebc_ref_blit_rows(ref, src, pitch, w.x1, w.x2,
 						 w.y1, w.y2, f->w);
 		mutex_lock(&ebc->image_lock);
-		rk3026_ebc_blit_xrgb8888(ebc, src, pitch, r);
+		rk3026_ebc_blit(ebc, src, pitch, DRM_FORMAT_XRGB8888, r);
 		mutex_unlock(&ebc->image_lock);
 		diff = t_fix_diff(f, ref, ebc->next_shadow);
 		if (diff != INT_MAX) {
@@ -11554,7 +11476,7 @@ static bool t_ref_blit_src(struct kunit *test, const struct t_fix *f,
 }
 
 /*
- * rk3026_ebc_blit_xrgb8888() widens and clamps the clip to whole bytes and
+ * rk3026_ebc_blit() widens and clamps the clip to whole bytes and
  * writes the bytes of the per-pixel reference loop, on every fixture,
  * source set, dense and padded source pitch, and clip.
  */
@@ -11629,7 +11551,7 @@ static bool t_rows_vs_ref(struct kunit *test, const struct t_fix *f,
 
 /*
  * @rows against @ref_rows on one source and every non-empty clip of
- * @clips, widened and clamped as rk3026_ebc_blit_xrgb8888() does.
+ * @clips, widened and clamped as rk3026_ebc_blit() does.
  */
 static bool t_rows_clips(struct kunit *test, const struct t_fix *f,
 			 t_rows_fn *rows, t_rows_fn *ref_rows, u8 *out,

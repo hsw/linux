@@ -35,6 +35,7 @@
 #include <linux/reset.h>
 #include <linux/thermal.h>
 #include <linux/unaligned.h>
+#include <linux/workqueue.h>
 
 #include <drm/clients/drm_client_setup.h>
 #include <drm/drm_atomic.h>
@@ -51,6 +52,7 @@
 #include <drm/drm_managed.h>
 #include <drm/drm_modeset_helper_vtables.h>
 #include <drm/drm_probe_helper.h>
+#include <drm/drm_vblank.h>
 
 #include <video/of_display_timing.h>
 
@@ -1383,6 +1385,158 @@ static enum rk3026_ebc_repair_due ebc_repair_by(struct rk3026_ebc *ebc,
 }
 
 /*
+ * Send the held commit event and empty the slot, under @drm.event_lock.
+ * The EBC has no vblank, so drm_crtc_send_vblank_event() stamps it frame 0
+ * at the current time; the core completes the commit's flip_done and
+ * signals its out-fence with it. The watchdog is stopped, without
+ * waiting for a run already started: that run finds the slot empty, or
+ * holding a later event not yet due (rk3026_ebc_flip_watchdog_run()).
+ */
+static void ebc_flip_send(struct rk3026_ebc *ebc)
+{
+	lockdep_assert_held(&ebc->drm.event_lock);
+
+	cancel_delayed_work(&ebc->flip_wd);
+	drm_crtc_send_vblank_event(&ebc->crtc, ebc->flip_event);
+	ebc->flip_event = NULL;
+}
+
+/*
+ * Send the held commit event (rk3026_ebc_flip_hold()) once its part has
+ * finished, under @image_lock, which @pending.done_seq moves under, and
+ * @drm.event_lock. Only sends: the event never waits for the panel. The
+ * refresh thread checks after rk3026_ebc_scan_finish(), the one place
+ * @pending.done_seq moves.
+ */
+static void ebc_flip_check_locked(struct rk3026_ebc *ebc)
+{
+	lockdep_assert_held(&ebc->image_lock);
+	lockdep_assert_held(&ebc->drm.event_lock);
+	if (ebc->flip_event &&
+	    rk3026_ebc_seq_done(ebc->pending.done_seq, ebc->flip_seq))
+		ebc_flip_send(ebc);
+}
+
+/*
+ * The refresh thread's check at the finish of every part (step 4 of
+ * rk3026_ebc_do_refresh()), under @image_lock (ebc_flip_check_locked()).
+ */
+static void ebc_flip_check(struct rk3026_ebc *ebc)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&ebc->drm.event_lock, flags);
+	ebc_flip_check_locked(ebc);
+	spin_unlock_irqrestore(&ebc->drm.event_lock, flags);
+}
+
+/*
+ * A held event goes out now, whatever its part does: the CRTC went off, a
+ * system sleep is under way, or the driver goes away, and no part is taken
+ * before the next enable or the resume. Under @image_lock.
+ */
+static void ebc_flip_send_held(struct rk3026_ebc *ebc)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&ebc->drm.event_lock, flags);
+	if (ebc->flip_event)
+		ebc_flip_send(ebc);
+	spin_unlock_irqrestore(&ebc->drm.event_lock, flags);
+}
+
+/**
+ * rk3026_ebc_flip_watchdog_run - send a held commit event that is overdue
+ * @ebc: the device
+ * @now: jiffies
+ *
+ * The watchdog's run (@flip_wd, armed by rk3026_ebc_flip_hold() for
+ * @flip_due). If the part of the held event has not finished by then (a
+ * carry waiting for its rails, a refresh thread stuck, a long repair), the
+ * event is sent late rather than let the core's commit wait time out: the
+ * frame is not confirmed done, and its part may still put it on the glass.
+ * A run that lost the race with a send finds the slot empty, or holding a
+ * later event that is not due yet: that one is left held, and the watchdog
+ * armed again for its time. Takes only @drm.event_lock, never @image_lock.
+ */
+VISIBLE_IF_KUNIT void rk3026_ebc_flip_watchdog_run(struct rk3026_ebc *ebc,
+						   unsigned long now)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&ebc->drm.event_lock, flags);
+	if (ebc->flip_event) {
+		/*
+		 * An event not due yet is armed for again. Defensive only:
+		 * the hold of a later event armed the watchdog for it
+		 * already, and a timer never runs early.
+		 */
+		if (time_after_eq(now, ebc->flip_due))
+			ebc_flip_send(ebc);
+		else
+			mod_delayed_work(system_dfl_wq, &ebc->flip_wd,
+					 ebc->flip_due - now);
+	}
+	spin_unlock_irqrestore(&ebc->drm.event_lock, flags);
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_flip_watchdog_run);
+
+static void ebc_flip_watchdog(struct work_struct *work)
+{
+	struct rk3026_ebc *ebc = container_of(to_delayed_work(work),
+					      struct rk3026_ebc, flip_wd);
+
+	rk3026_ebc_flip_watchdog_run(ebc, jiffies);
+}
+
+/**
+ * rk3026_ebc_flip_init - set up the commit event holder
+ * @ebc: the device
+ *
+ * At probe, before the CRTC can take a commit: the watchdog and its default
+ * bound (EBC_FLIP_TIMEOUT_MS). The remove and the shutdown stop it
+ * (rk3026_ebc_flip_fini()).
+ */
+VISIBLE_IF_KUNIT void rk3026_ebc_flip_init(struct rk3026_ebc *ebc)
+{
+	INIT_DELAYED_WORK(&ebc->flip_wd, ebc_flip_watchdog);
+	ebc->flip_timeout_ms = EBC_FLIP_TIMEOUT_MS;
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_flip_init);
+
+/**
+ * rk3026_ebc_flip_fini - stop the commit event holder for good
+ * @ebc: the device
+ *
+ * At remove and at shutdown, after the CRTC disable. A commit tail that
+ * the disable's commit did not wait for (drm_atomic_helper_shutdown()
+ * failed before it) can still reach .atomic_flush; the tail keeps the
+ * DRM device, not the memory the watchdog runs on. From here
+ * rk3026_ebc_flip_hold() holds nothing (@flip_closed): a commit after the
+ * shutdown gets its event at once. Then the watchdog is stopped and what
+ * is still held is sent, with its out-fence. Only the hold arms the
+ * watchdog for a new event, under @drm.event_lock after it looked at
+ * @flip_closed: a hold before this function's section of that lock armed
+ * it before the cancel, one after arms nothing, and the watchdog's own run
+ * arms it again only for an event still held, which the cancel waits out.
+ * So no watchdog runs past the remove or the shutdown. Running it twice
+ * does no harm: the second finds the slot empty and the watchdog idle.
+ */
+VISIBLE_IF_KUNIT void rk3026_ebc_flip_fini(struct rk3026_ebc *ebc)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&ebc->drm.event_lock, flags);
+	ebc->flip_closed = true;
+	spin_unlock_irqrestore(&ebc->drm.event_lock, flags);
+	cancel_delayed_work_sync(&ebc->flip_wd);
+	mutex_lock(&ebc->image_lock);
+	ebc_flip_send_held(ebc);
+	mutex_unlock(&ebc->image_lock);
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_flip_fini);
+
+/*
  * Take the next part and drive it onto the panel, if anything is pending.
  * Runs only on the refresh thread.
  *
@@ -1407,8 +1561,9 @@ static enum rk3026_ebc_repair_due ebc_repair_by(struct rk3026_ebc *ebc,
  *     shows now and moves @pending.done_seq over the part, or arms the
  *     retry of a carry, the DU cleanup budget follows it
  *     (rk3026_ebc_du_account()), and the record is published and traced
- *     (part_done) with them. The waiters on the part's updates are woken
- *     then, and @prev_virt follows.
+ *     (part_done) with them. A commit event held for an update in the
+ *     part is sent (ebc_flip_check()), the waiters on the part's updates
+ *     are woken then, and @prev_virt follows.
  *
  * The part is the carry alone at its retry (rk3026_ebc_retry_ready()).
  *
@@ -1776,6 +1931,8 @@ finish:
 	WRITE_ONCE(ebc->in_flight, false);
 	ebc_publish(ebc, last, start);
 	trace_rk3026_ebc_part_done(last, ebc->du_area);
+	/* After the move of @pending.done_seq: see rk3026_ebc_flip_hold(). */
+	ebc_flip_check(ebc);
 	mutex_unlock(&ebc->image_lock);
 
 	/*
@@ -2568,8 +2725,14 @@ static void ebc_crtc_atomic_enable(struct drm_crtc *crtc,
  * The CRTC goes off: no new waveform from here on, the refresh thread drops
  * what it takes, and mxcfb sends are refused. The thread is woken, so a
  * carry waiting for its retry is dropped and an open gap ends now, not at
- * their time (rk3026_ebc_gap_woken()). Returns the newest seq, for the
- * disable's wait.
+ * their time (rk3026_ebc_gap_woken()). A commit event still held for its
+ * part is sent now, still under @image_lock, the lock of the take: the
+ * part is dropped, or waits for the resume of a sleep, and the refresh
+ * thread cannot take it between the two. The send never waits.
+ * The disable's commit waited for that event first
+ * (drm_atomic_helper_wait_for_dependencies()), so this is a fallback
+ * (rk3026_ebc_flip_hold()). Returns the newest seq, for the disable's
+ * wait.
  */
 VISIBLE_IF_KUNIT u32 rk3026_ebc_crtc_off(struct rk3026_ebc *ebc)
 {
@@ -2578,6 +2741,7 @@ VISIBLE_IF_KUNIT u32 rk3026_ebc_crtc_off(struct rk3026_ebc *ebc)
 	mutex_lock(&ebc->image_lock);
 	WRITE_ONCE(ebc->crtc_on, false);
 	seq = ebc->pending.queued_seq;
+	ebc_flip_send_held(ebc);
 	mutex_unlock(&ebc->image_lock);
 	wake_up(&ebc->update_wq);
 	return seq;
@@ -2592,7 +2756,9 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_crtc_off);
  * the resume. The flag goes up under @image_lock, the lock of the take, so
  * a part is either taken before it, and @in_flight, or not taken at all.
  * A CRTC enable or disable waiting meanwhile is woken: it waits no longer
- * than for the part in flight (rk3026_ebc_crtc_wait()).
+ * than for the part in flight (rk3026_ebc_crtc_wait()). From here no
+ * commit event is held (rk3026_ebc_flip_hold()); one held already is sent
+ * by rk3026_ebc_sleep_wait().
  */
 VISIBLE_IF_KUNIT void rk3026_ebc_sleep_begin(struct rk3026_ebc *ebc)
 {
@@ -2610,6 +2776,12 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_sleep_begin);
  * longest a part takes (rk3026_ebc_part_max_ms()): past it the thread is
  * stuck outside the EBC.
  *
+ * The part in flight sent a commit event held for it at its finish, under
+ * @image_lock after it cleared @in_flight; one still held, for a part that
+ * waits for the resume, is sent now rather than after it. With a part
+ * still in flight the suspend fails, and the event stays held for that
+ * part.
+ *
  * Returns 0, or -EBUSY with a part still in flight.
  */
 VISIBLE_IF_KUNIT int rk3026_ebc_sleep_wait(struct rk3026_ebc *ebc,
@@ -2618,6 +2790,9 @@ VISIBLE_IF_KUNIT int rk3026_ebc_sleep_wait(struct rk3026_ebc *ebc,
 	if (!wait_event_timeout(ebc->marker_wq, !READ_ONCE(ebc->in_flight),
 				msecs_to_jiffies(timeout_ms)))
 		return -EBUSY;
+	mutex_lock(&ebc->image_lock);
+	ebc_flip_send_held(ebc);
+	mutex_unlock(&ebc->image_lock);
 	return 0;
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_sleep_wait);
@@ -2724,6 +2899,123 @@ static void ebc_crtc_atomic_begin(struct drm_crtc *crtc,
 	rk3026_ebc_commit_begin(drm_to_ebc(crtc->dev));
 }
 
+/**
+ * rk3026_ebc_flip_hold - hold a commit's event until its part has finished
+ * @ebc: the device
+ * @crtc_state: the commit's new CRTC state, with its event or none
+ *
+ * The CRTC's .atomic_flush, at the end of a commit's plane updates. The
+ * event userspace asked for, as a flip event (DRM_MODE_PAGE_FLIP_EVENT:
+ * @event->base.file_priv) or an out-fence (@event->base.fence), of a
+ * commit that queued an update (@commit_queued) not finished yet is held
+ * (rk3026_ebc_flip_holds()): taken from @crtc_state, so the core neither
+ * sends it nor arms its fake vblank for it. Any other event goes out at
+ * once, as before. The refresh thread sends a held event when the part
+ * with that update has finished (ebc_flip_check()): driven to its end,
+ * skipped for want of a change, dropped with the CRTC off, or a carry
+ * drawn by a retry or given up. The event and the out-fence then say the
+ * panel is done with the frame, where the immediate event said only that
+ * it was queued; a frame merged into a part with later updates is done
+ * with that part.
+ *
+ * The core lets the next nonblocking commit through only after this
+ * flip_done, so a client that waits for its events draws one frame per
+ * waveform; and every later commit's tail waits for it
+ * (drm_atomic_helper_wait_for_dependencies()), so a blocking internal
+ * commit (fbcon, fbdev writes, DirtyFB) waits behind a held event for up
+ * to one part.
+ *
+ * A held event waits for its part no longer than @flip_timeout_ms, clamped
+ * to EBC_FLIP_TIMEOUT_MAX_MS: the watchdog then sends it late, within the
+ * 10 s the core waits for a commit's flip_done, its part not done. A
+ * system sleep sends it once no part is in flight
+ * (rk3026_ebc_sleep_wait()); a CRTC disable, whose commit waited for it
+ * first, sends it as a fallback (rk3026_ebc_crtc_off()), and so do the
+ * remove and the shutdown (rk3026_ebc_flip_fini()), as the core sends the
+ * events of a CRTC that goes off. An event sent so says no more than the
+ * core's own event would: its frame is drawn after the resume or the next
+ * enable, if at all.
+ *
+ * Returns true if the event is held, taken from @crtc_state; false leaves it
+ * there for the core.
+ */
+VISIBLE_IF_KUNIT bool rk3026_ebc_flip_hold(struct rk3026_ebc *ebc,
+					   struct drm_crtc_state *crtc_state)
+{
+	struct drm_pending_vblank_event *event = crtc_state->event;
+	unsigned long flags, timeout;
+	bool held = false;
+
+	if (!event)
+		return false;
+
+	/*
+	 * Not held, and sent by the core's fake vblank at once:
+	 * - internal events (no file and no fence): the core's own for
+	 *   commits that asked for none (fbcon, fbdev writes, DirtyFB).
+	 *   Holding them would make each of those wait for the panel.
+	 * - a commit that queued no update: no damage, or an mxcfb client
+	 *   owns the panel.
+	 * - an update already finished: the refresh thread may finish a part
+	 *   (skipped, dropped, or failed) before the commit gets here.
+	 * - a commit during a system sleep (@suspended): no part is taken
+	 *   until the resume. A nonblocking commit's tail runs on an unfrozen
+	 *   worker and can get here after rk3026_ebc_sleep_begin(); so does
+	 *   every commit while a resume that found no clocks left the device
+	 *   suspended.
+	 * - after the remove or the shutdown began (@flip_closed,
+	 *   rk3026_ebc_flip_fini()): the watchdog must not be armed by a
+	 *   commit tail that drm_atomic_helper_shutdown() did not wait for.
+	 *
+	 * Under @drm.event_lock: the close of the DRM file clears @file_priv
+	 * there (drm_events_release()). The thread moves @pending.done_seq
+	 * before it looks at the slot under the lock, so an update is either
+	 * seen finished here or its event seen held there; so is @suspended,
+	 * set before the sleep's send takes the lock; @flip_closed is set
+	 * under it.
+	 */
+	spin_lock_irqsave(&ebc->drm.event_lock, flags);
+	if (!rk3026_ebc_flip_holds(event, ebc->commit_queued))
+		goto out;
+	if (!rk3026_ebc_seq_done(READ_ONCE(ebc->pending.done_seq),
+				 ebc->commit_seq) &&
+	    !ebc->flip_closed && !READ_ONCE(ebc->suspended)) {
+		/*
+		 * The core lets no second commit with an event through before
+		 * the first one's flip_done, or not before its 10 s wait for it
+		 * ends (unreachable with the watchdog); send the old one, not
+		 * confirmed on the glass, rather than lose it.
+		 */
+		if (ebc->flip_event) {
+			dev_warn_ratelimited(ebc->dev,
+					     "flip event (seq %u) still held\n",
+					     ebc->flip_seq);
+			ebc_flip_send(ebc);
+		}
+		ebc->flip_event = event;
+		ebc->flip_seq = ebc->commit_seq;
+		timeout = msecs_to_jiffies(min(READ_ONCE(ebc->flip_timeout_ms),
+					       EBC_FLIP_TIMEOUT_MAX_MS));
+		ebc->flip_due = jiffies + timeout;
+		mod_delayed_work(system_dfl_wq, &ebc->flip_wd, timeout);
+		held = true;
+	}
+out:
+	spin_unlock_irqrestore(&ebc->drm.event_lock, flags);
+	if (held)
+		crtc_state->event = NULL;
+	return held;
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_flip_hold);
+
+/* The commit's planes are applied: hold its event (rk3026_ebc_flip_hold()). */
+static void ebc_crtc_atomic_flush(struct drm_crtc *crtc,
+				  struct drm_atomic_state *state)
+{
+	rk3026_ebc_flip_hold(drm_to_ebc(crtc->dev),
+			     drm_atomic_get_new_crtc_state(state, crtc));
+}
+
 static const struct drm_crtc_funcs ebc_crtc_funcs = {
 	.set_config		= drm_atomic_helper_set_config,
 	.page_flip		= drm_atomic_helper_page_flip,
@@ -2735,6 +3027,7 @@ static const struct drm_crtc_funcs ebc_crtc_funcs = {
 
 static const struct drm_crtc_helper_funcs ebc_crtc_helper_funcs = {
 	.atomic_begin		= ebc_crtc_atomic_begin,
+	.atomic_flush		= ebc_crtc_atomic_flush,
 	.atomic_enable		= ebc_crtc_atomic_enable,
 	.atomic_disable		= ebc_crtc_atomic_disable,
 };
@@ -3208,6 +3501,7 @@ static int ebc_probe(struct platform_device *pdev)
 	init_completion(&ebc->frame_done);
 	init_waitqueue_head(&ebc->update_wq);
 	init_waitqueue_head(&ebc->marker_wq);
+	rk3026_ebc_flip_init(ebc);
 	ret = drmm_mutex_init(drm, &ebc->image_lock);
 	if (ret)
 		return ret;
@@ -3443,6 +3737,12 @@ static void ebc_remove(struct platform_device *pdev)
 
 	drm_dev_unplug(&ebc->drm);
 	drm_atomic_helper_shutdown(&ebc->drm);
+	/*
+	 * The CRTC disable's commit waited for a held event, or sent it. A
+	 * shutdown that failed before the disable left a held event, and a
+	 * commit tail it did not wait for may still offer one.
+	 */
+	rk3026_ebc_flip_fini(ebc);
 }
 
 static void ebc_shutdown(struct platform_device *pdev)
@@ -3450,6 +3750,8 @@ static void ebc_shutdown(struct platform_device *pdev)
 	struct rk3026_ebc *ebc = platform_get_drvdata(pdev);
 
 	drm_atomic_helper_shutdown(&ebc->drm);
+	/* As at remove: no event held, no watchdog left armed. */
+	rk3026_ebc_flip_fini(ebc);
 
 	/* Last chance for a rails-off that failed at CRTC disable. */
 	mutex_lock(&ebc->rails_lock);

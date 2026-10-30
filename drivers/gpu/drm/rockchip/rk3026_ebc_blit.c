@@ -4,7 +4,7 @@
  *
  * Every plane and mxcfb update converts its damage here, under @image_lock,
  * so this loop is most of the CPU time of a refresh. It is a pure function
- * of the source rows; rk3026_ebc_blit_xrgb8888() in rk3026_ebc.c widens the
+ * of the source rows; rk3026_ebc_blit() in rk3026_ebc.c widens the
  * clip and passes the target image.
  *
  * The grey is the BT.601 luma, (77 R + 150 G + 29 B) / 256 rounded down,
@@ -177,7 +177,7 @@ void rk3026_ebc_blit_convert(u8 *dst, const void *src, unsigned int src_pitch,
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_blit_convert);
 
 /**
- * rk3026_ebc_blit_impl - the conversion rk3026_ebc_blit_xrgb8888() runs
+ * rk3026_ebc_blit_impl - the conversion rk3026_ebc_blit() runs
  *
  * For the probe line and debugfs "timing", so a measured blit time says
  * which loop it is from.

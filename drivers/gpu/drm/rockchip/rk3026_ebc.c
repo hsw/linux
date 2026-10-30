@@ -39,6 +39,7 @@
 #include <drm/clients/drm_client_setup.h>
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
+#include <drm/drm_client_event.h>
 #include <drm/drm_damage_helper.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_fb_helper.h>
@@ -50,6 +51,7 @@
 #include <drm/drm_gem_shmem_helper.h>
 #include <drm/drm_managed.h>
 #include <drm/drm_modeset_helper_vtables.h>
+#include <drm/drm_modeset_lock.h>
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_vblank.h>
 #include <drm/drm_vblank_helper.h>
@@ -2492,6 +2494,63 @@ static const struct drm_plane_helper_funcs ebc_plane_helper_funcs = {
 	.atomic_update		= ebc_plane_atomic_update,
 };
 
+/*
+ * The vblank goes on with an off delay of two ticks of the CRTC's mode, not
+ * the core's default (vblankoffdelay, 5 s): the timer then stops two
+ * periods after its last user, the event of the last commit or the wait of
+ * a blocking one, instead of ticking for seconds after every page; a commit
+ * within the delay finds it running. The core counts the ticks missed
+ * while it was off from the timestamps (max_vblank_count is 0). The rate
+ * is the one mode_valid allowed; clamped only so the division is safe.
+ */
+static void ebc_crtc_vblank_on(struct rk3026_ebc *ebc)
+{
+	struct drm_crtc *crtc = &ebc->crtc;
+	int hz = clamp(drm_mode_vrefresh(&crtc->mode), EBC_VBLANK_HZ_MIN,
+		       EBC_VBLANK_HZ_MAX);
+	struct drm_vblank_crtc_config config = {
+		.offdelay_ms		= DIV_ROUND_UP(2 * MSEC_PER_SEC, hz),
+		.disable_immediate	= crtc->dev->vblank_disable_immediate,
+	};
+
+	drm_crtc_vblank_on_config(crtc, &config);
+}
+
+/*
+ * The CRTC's vblank goes on (@vblank_on), at the end of the CRTC enable;
+ * while the system sleeps it stays off until the resume
+ * (rk3026_ebc_sleep_end()). Under @image_lock, the lock of @suspended, so
+ * a suspend or resume sees the vblank and the flag agree.
+ */
+VISIBLE_IF_KUNIT void rk3026_ebc_vblank_enable(struct rk3026_ebc *ebc)
+{
+	mutex_lock(&ebc->image_lock);
+	ebc->vblank_on = true;
+	if (!ebc->suspended)
+		ebc_crtc_vblank_on(ebc);
+	mutex_unlock(&ebc->image_lock);
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_vblank_enable);
+
+/*
+ * The CRTC's vblank goes off, first thing in the CRTC disable and again at
+ * the remove (ebc_remove()): the events armed on it are sent now
+ * (drm_crtc_vblank_off()), and a resume does not turn it on again.
+ * drm_crtc_vblank_off() is harmless on a vblank already off, as it is
+ * while the system sleeps or after the CRTC disable. The timer's
+ * callback, if one still runs, is waited for here, outside the core's
+ * locks, so none is left running or queued.
+ */
+VISIBLE_IF_KUNIT void rk3026_ebc_vblank_disable(struct rk3026_ebc *ebc)
+{
+	mutex_lock(&ebc->image_lock);
+	ebc->vblank_on = false;
+	drm_crtc_vblank_off(&ebc->crtc);
+	hrtimer_cancel(&ebc->vblank_timer);
+	mutex_unlock(&ebc->image_lock);
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_vblank_disable);
+
 static void ebc_crtc_atomic_enable(struct drm_crtc *crtc,
 				   struct drm_atomic_state *state)
 {
@@ -2517,7 +2576,7 @@ static void ebc_crtc_atomic_enable(struct drm_crtc *crtc,
 		if (ret) {
 			dev_err(ebc->dev, "failed to enable v3p3: %d\n", ret);
 			/* The tick is not the panel's: an active CRTC has it. */
-			drm_crtc_vblank_on(crtc);
+			rk3026_ebc_vblank_enable(ebc);
 			return;
 		}
 		ebc->v3p3_on = true;
@@ -2566,7 +2625,7 @@ static void ebc_crtc_atomic_enable(struct drm_crtc *crtc,
 	 * The ticks start after the RESET: the flush arms the enabling
 	 * commit's event on the first tick after it.
 	 */
-	drm_crtc_vblank_on(crtc);
+	rk3026_ebc_vblank_enable(ebc);
 }
 
 /*
@@ -2628,17 +2687,129 @@ VISIBLE_IF_KUNIT int rk3026_ebc_sleep_wait(struct rk3026_ebc *ebc,
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_sleep_wait);
 
 /*
+ * The CRTC's commits whose tail has not finished. A tail waits for a tick
+ * after its flush (drm_atomic_helper_wait_for_vblanks()) with a vblank
+ * reference of its own, and a vblank turned off under that wait does not
+ * tick again: the wait would time out, with a WARN, a second later.
+ *
+ * With @suspended up a tail ends within the part in flight: a CRTC enable
+ * or disable waits for no more (rk3026_ebc_crtc_wait()), so each commit is
+ * waited for as long as a part takes (rk3026_ebc_part_max_ms()), and two
+ * seconds for its vblank wait and the rails. Past that it is stuck: the
+ * wait warns and gives up, as the later commits of the CRTC wait for that
+ * one (drm_atomic_helper_wait_for_dependencies()). The vblank then goes
+ * off all the same, and the stuck tail's vblank wait times out.
+ */
+static void ebc_wait_commits(struct rk3026_ebc *ebc)
+{
+	unsigned long timeout = msecs_to_jiffies(rk3026_ebc_part_max_ms(ebc) +
+						 2 * MSEC_PER_SEC);
+	struct drm_crtc *crtc = &ebc->crtc;
+	struct drm_crtc_commit *commit, *found;
+	unsigned long done;
+
+	for (;;) {
+		found = NULL;
+		spin_lock(&crtc->commit_lock);
+		list_for_each_entry(commit, &crtc->commit_list, commit_entry) {
+			if (!try_wait_for_completion(&commit->cleanup_done)) {
+				found = drm_crtc_commit_get(commit);
+				break;
+			}
+		}
+		spin_unlock(&crtc->commit_lock);
+		if (!found)
+			return;
+
+		done = wait_for_completion_timeout(&found->cleanup_done,
+						   timeout);
+		drm_crtc_commit_put(found);
+		if (!done) {
+			dev_warn(ebc->dev, "a commit still in flight at suspend\n");
+			return;
+		}
+	}
+}
+
+/*
+ * After rk3026_ebc_sleep_begin(): the vblank goes off for the sleep, so no
+ * tick runs or wakes the system meanwhile. drm_crtc_vblank_off() sends the
+ * events armed on it and cancels the timer, whose callback is then waited
+ * for, outside the core's locks, so no expiry stays queued; until the
+ * resume no reference is taken: a commit sends its event at once
+ * (drm_crtc_vblank_atomic_flush()) and does not wait for a tick. Only
+ * while the CRTC's vblank is meant to run (@vblank_on): an off CRTC's
+ * vblank stays as it is.
+ *
+ * The DRM clients are suspended first (drm_client_dev_suspend()), before
+ * any lock is taken: fbdev's damage worker waits for a tick before its
+ * commit (drm_client_modeset_wait_for_vblank()), with no commit listed
+ * yet, and a vblank turned off under that wait would not tick again. The
+ * suspend of the fbdev client cancels the worker, but fbcon's suspend
+ * then clears its cursor and queues it again while fbdev still runs
+ * (drm_fb_helper_set_suspend_unlocked()); once fbdev is suspended a new
+ * one draws nothing, so the last one is waited for here.
+ *
+ * Every modeset lock is held, so no commit is set up meanwhile, and the
+ * commits in flight finish their tail first (ebc_wait_commits()). Their
+ * waits end, as @suspended is up: a CRTC enable's waits for no RESET, a
+ * disable's only for the part in flight (rk3026_ebc_crtc_wait()); a tail
+ * stuck past that bound is not waited for further. A CRTC enable that ran
+ * after rk3026_ebc_sleep_begin() did not turn the vblank on
+ * (rk3026_ebc_vblank_enable()); turning it off again is harmless.
+ */
+VISIBLE_IF_KUNIT void rk3026_ebc_sleep_vblank_off(struct rk3026_ebc *ebc)
+{
+	struct drm_device *drm = &ebc->drm;
+	struct drm_modeset_acquire_ctx ctx;
+	int ret;
+
+	drm_client_dev_suspend(drm);
+	ebc->clients_suspended = true;
+	if (drm->fb_helper)
+		flush_work(&drm->fb_helper->damage_work);
+	DRM_MODESET_LOCK_ALL_BEGIN(drm, ctx, 0, ret);
+	ebc_wait_commits(ebc);
+	mutex_lock(&ebc->image_lock);
+	if (ebc->vblank_on)
+		drm_crtc_vblank_off(&ebc->crtc);
+	hrtimer_cancel(&ebc->vblank_timer);
+	mutex_unlock(&ebc->image_lock);
+	DRM_MODESET_LOCK_ALL_END(drm, ctx, ret);
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_sleep_vblank_off);
+
+/*
  * The suspend ends, or fails: parts are taken again, the ones pending
- * first, from @shadows.prev as the glass kept it.
+ * first, from @shadows.prev as the glass kept it, and the vblank of an
+ * enabled CRTC ticks again (@vblank_on). An enable or disable of the CRTC
+ * meanwhile is what @vblank_on says now.
  */
 VISIBLE_IF_KUNIT void rk3026_ebc_sleep_end(struct rk3026_ebc *ebc)
 {
 	mutex_lock(&ebc->image_lock);
 	WRITE_ONCE(ebc->suspended, false);
+	if (ebc->vblank_on)
+		ebc_crtc_vblank_on(ebc);
 	mutex_unlock(&ebc->image_lock);
 	wake_up(&ebc->update_wq);
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_sleep_end);
+
+/*
+ * After rk3026_ebc_sleep_end(), with the refresh thread running: the DRM
+ * clients that the suspend suspended resume (drm_client_dev_resume()).
+ * fbcon's redraw at the resume may enable a blanked CRTC at once
+ * (fb_pan_display()), and that enable waits for the thread's RESET.
+ */
+VISIBLE_IF_KUNIT void rk3026_ebc_sleep_resume_clients(struct rk3026_ebc *ebc)
+{
+	if (!ebc->clients_suspended)
+		return;
+	ebc->clients_suspended = false;
+	drm_client_dev_resume(&ebc->drm);
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_sleep_resume_clients);
 
 /*
  * A hibernation restore, before rk3026_ebc_sleep_end(): the images are the
@@ -2705,7 +2876,7 @@ static void ebc_crtc_atomic_disable(struct drm_crtc *crtc,
 	 * events armed on them are sent now. A modeset that keeps the CRTC
 	 * active turns them on again in ebc_crtc_atomic_enable().
 	 */
-	drm_crtc_vblank_off(crtc);
+	rk3026_ebc_vblank_disable(ebc);
 
 	/*
 	 * Let the part in flight and those pending finish, then drop the
@@ -2753,8 +2924,8 @@ static void ebc_crtc_atomic_disable(struct drm_crtc *crtc,
  * waits for one tick after it (drm_atomic_helper_wait_for_vblanks()): up to
  * a period each, and a whole period when the vblank had been idle, as the
  * timer's first tick comes a period after it starts. The core turns the
- * timer off vblank_offdelay after its last user, so an idle panel does not
- * tick.
+ * timer off two periods after its last user (ebc_crtc_vblank_on()), so an
+ * idle panel does not tick.
  *
  * Called in the timer's interrupt context: hardirq, softirq on PREEMPT_RT.
  *
@@ -3688,8 +3859,7 @@ static void ebc_remove(struct platform_device *pdev)
 	 * reference is refused, so the timer does not start again; a
 	 * callback still running is waited for.
 	 */
-	drm_crtc_vblank_off(&ebc->crtc);
-	hrtimer_cancel(&ebc->vblank_timer);
+	rk3026_ebc_vblank_disable(ebc);
 }
 
 static void ebc_shutdown(struct platform_device *pdev)
@@ -3711,14 +3881,15 @@ static void ebc_shutdown(struct platform_device *pdev)
  * drm_mode_config_helper_suspend(): its CRTC disable would drop the parts
  * pending, and the enable after the resume would RESET the panel to white.
  *
- * The suspend stops the takes (rk3026_ebc_sleep_begin()), waits for the
+ * The suspend stops the takes (rk3026_ebc_sleep_begin()), the DRM clients
+ * and the vblank's ticks (rk3026_ebc_sleep_vblank_off()), waits for the
  * part in flight, so a waveform always runs to its end, parks the refresh
  * thread between two passes, and switches off the panel rails, then the
  * interrupt and the clocks. V3P3, the panel's logic rail, stays with the
  * CRTC, as when the rails go off between parts. Updates sent while
  * suspended stay pending and are drawn after the resume. A part that does
- * not end in time, or rails that do not go off, fail the suspend: neither a
- * cut waveform nor a sleep with the rails up.
+ * not end in time, or rails that do not go off, fail the suspend: neither
+ * a cut waveform nor a sleep with the rails up.
  */
 static int ebc_suspend(struct device *dev)
 {
@@ -3731,6 +3902,7 @@ static int ebc_suspend(struct device *dev)
 		return 0;
 
 	rk3026_ebc_sleep_begin(ebc);
+	rk3026_ebc_sleep_vblank_off(ebc);
 	ret = rk3026_ebc_sleep_wait(ebc, ms);
 	if (ret) {
 		dev_err(dev, "a part still in flight after %u ms\n", ms);
@@ -3756,6 +3928,7 @@ err_unpark:
 	kthread_unpark(ebc->refresh_thread);
 err_end:
 	rk3026_ebc_sleep_end(ebc);
+	rk3026_ebc_sleep_resume_clients(ebc);
 	return ret;
 }
 
@@ -3784,6 +3957,7 @@ static int ebc_resume(struct device *dev)
 	enable_irq(ebc->irq);
 	rk3026_ebc_sleep_end(ebc);
 	kthread_unpark(ebc->refresh_thread);
+	rk3026_ebc_sleep_resume_clients(ebc);
 	return 0;
 }
 

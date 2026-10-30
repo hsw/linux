@@ -831,9 +831,11 @@ struct rk3026_ebc {
 	 * started by .enable_vblank at @vblank_period, the frame duration of
 	 * the CRTC's mode, and cancelled by .disable_vblank, which clears
 	 * @vblank_run. Both run under the vblank core's spinlocks, which the
-	 * callback takes, so neither waits for it. @vblank_lock, inside the
-	 * core's locks, orders @vblank_run and the timer's restart against
-	 * the callback.
+	 * callback takes, so neither waits for it: the driver's vblank off
+	 * does, after them (rk3026_ebc_vblank_disable(),
+	 * rk3026_ebc_sleep_vblank_off()). @vblank_lock, inside the core's
+	 * locks, orders @vblank_run and the timer's restart against the
+	 * callback.
 	 */
 	struct hrtimer		vblank_timer;
 	/* @vblank_run, the timer's restart and expiry, @vblank_period. */
@@ -1054,6 +1056,21 @@ struct rk3026_ebc {
 	bool			suspended;
 	bool			in_flight;
 	/*
+	 * The CRTC's vblank is meant to run: from the end of the CRTC enable
+	 * to the start of its disable (rk3026_ebc_vblank_enable()). While
+	 * @suspended it is held off all the same (rk3026_ebc_sleep_vblank_off())
+	 * and turned on again at the resume (rk3026_ebc_sleep_end()). Under
+	 * @image_lock, with the vblank's own on/off, so a CRTC enable or
+	 * disable and a suspend or resume agree on it.
+	 */
+	bool			vblank_on;
+	/*
+	 * The suspend suspended the DRM clients
+	 * (rk3026_ebc_sleep_vblank_off()), so its end resumes them
+	 * (rk3026_ebc_sleep_resume_clients()). PM callbacks only.
+	 */
+	bool			clients_suspended;
+	/*
 	 * Vblank ticks delivered since probe (rk3026_ebc_vblank_tick()), so
 	 * the tick's wakeups can be counted while nothing waits. Not the
 	 * core's vblank count: that one jumps, on a vblank enable, by the
@@ -1129,11 +1146,15 @@ u32 rk3026_ebc_setup_us(struct rk3026_ebc *ebc,
 void rk3026_ebc_sleep_begin(struct rk3026_ebc *ebc);
 int rk3026_ebc_sleep_wait(struct rk3026_ebc *ebc, unsigned int timeout_ms);
 void rk3026_ebc_sleep_end(struct rk3026_ebc *ebc);
+void rk3026_ebc_sleep_resume_clients(struct rk3026_ebc *ebc);
 void rk3026_ebc_sleep_restore(struct rk3026_ebc *ebc);
+void rk3026_ebc_sleep_vblank_off(struct rk3026_ebc *ebc);
 int rk3026_ebc_crtc_wait(struct rk3026_ebc *ebc, u32 seq,
 			 unsigned int timeout_ms);
 int rk3026_ebc_crtc_init(struct rk3026_ebc *ebc, struct drm_plane *primary);
 bool rk3026_ebc_vblank_tick(struct drm_crtc *crtc);
+void rk3026_ebc_vblank_enable(struct rk3026_ebc *ebc);
+void rk3026_ebc_vblank_disable(struct rk3026_ebc *ebc);
 void rk3026_ebc_crtc_off_event(struct drm_crtc *crtc,
 			       struct drm_atomic_state *state);
 #endif

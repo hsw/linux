@@ -9475,8 +9475,10 @@ kunit_test_suite(rk3026_ebc_conv_test_suite);
  * funcs, helper funcs and vblank), on a KUnit DRM device with a primary
  * plane, its state reset (vblank off), and the connector's mode of a
  * 1448x1072 panel at @hz, which the core's timer takes its period from.
- * Nothing else of the driver state is set up: the flush, the tick and the
- * disabling commit's event touch none of it.
+ * Of the driver state only what the vblank's on/off across system sleep
+ * takes (@image_lock, the wait queues rk3026_ebc_sleep_begin() and _end()
+ * wake): the flush, the tick and the disabling commit's event touch none
+ * of it.
  */
 #define T_VBL_W		1448
 #define T_VBL_H		1072
@@ -9494,6 +9496,9 @@ static struct rk3026_ebc *t_vbl_alloc(struct kunit *test, u32 hz)
 						drm,
 						DRIVER_MODESET | DRIVER_ATOMIC);
 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, ebc);
+	mutex_init(&ebc->image_lock);
+	init_waitqueue_head(&ebc->update_wq);
+	init_waitqueue_head(&ebc->marker_wq);
 	primary = drm_kunit_helper_create_primary_plane(test, &ebc->drm, NULL,
 							NULL, NULL, 0, NULL);
 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, primary);
@@ -9874,6 +9879,123 @@ static void ebc_test_vblank_tick_off(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atomic64_read(&ebc->vblank_ticks), 0);
 }
 
+/* The vblank is on: a reference can be taken. Dropped again at once. */
+static bool t_vbl_live(struct rk3026_ebc *ebc)
+{
+	if (drm_crtc_vblank_get(&ebc->crtc))
+		return false;
+	drm_crtc_vblank_put(&ebc->crtc);
+	return true;
+}
+
+/*
+ * A flush with a new event on a fresh state, its locks dropped after it
+ * (rk3026_ebc_sleep_vblank_off() takes every modeset lock). True when the
+ * flush armed the event, false when it sent it at once.
+ */
+static bool t_vbl_commit(struct kunit *test, struct rk3026_ebc *ebc,
+			 struct drm_modeset_acquire_ctx *ctx,
+			 struct completion *done)
+{
+	struct drm_crtc_state *crtc_state;
+	struct drm_atomic_state *state;
+	bool sent;
+
+	crtc_state = t_vbl_state(test, ebc, ctx, &state,
+				 t_vbl_event(test, done));
+	t_vbl_flush(ebc, state);
+	KUNIT_EXPECT_NULL(test, crtc_state->event);
+	drm_modeset_drop_locks(ctx);
+	spin_lock_irq(&ebc->drm.event_lock);
+	sent = completion_done(done);
+	spin_unlock_irq(&ebc->drm.event_lock);
+	return !sent;
+}
+
+/*
+ * System sleep with the CRTC on (ebc_suspend(), ebc_resume()): the
+ * vblank goes off after rk3026_ebc_sleep_begin(), sending the event armed
+ * on it; asleep no reference is taken, so a commit's event is sent at once
+ * and no tick runs, a CRTC enable included; the resume turns it on again,
+ * and its ticks send the next armed event.
+ */
+static void ebc_test_vblank_sleep(struct kunit *test)
+{
+	struct rk3026_ebc *ebc = t_vbl_alloc(test, EBC_VBLANK_HZ);
+	struct drm_modeset_acquire_ctx *ctx = t_vbl_ctx(test);
+	struct completion done;
+	u64 ticks;
+
+	rk3026_ebc_vblank_enable(ebc);
+	KUNIT_EXPECT_TRUE(test, ebc->vblank_on);
+	KUNIT_EXPECT_TRUE(test, t_vbl_live(ebc));
+	/* Armed: unless a tick of the timer the reference started came first. */
+	KUNIT_EXPECT_TRUE(test, t_vbl_commit(test, ebc, ctx, &done) ||
+			  atomic64_read(&ebc->vblank_ticks));
+
+	rk3026_ebc_sleep_begin(ebc);
+	rk3026_ebc_sleep_vblank_off(ebc);
+	KUNIT_EXPECT_TRUE(test, completion_done(&done));
+	KUNIT_EXPECT_FALSE(test, t_vbl_live(ebc));
+	KUNIT_EXPECT_FALSE(test,
+			   READ_ONCE(drm_crtc_vblank_crtc(&ebc->crtc)->enabled));
+	ticks = atomic64_read(&ebc->vblank_ticks);
+
+	/* Asleep: sent at once, nothing armed. */
+	KUNIT_EXPECT_FALSE(test, t_vbl_commit(test, ebc, ctx, &done));
+	/* A modeset meanwhile: off, then on again, still held off. */
+	rk3026_ebc_vblank_disable(ebc);
+	rk3026_ebc_vblank_enable(ebc);
+	KUNIT_EXPECT_TRUE(test, ebc->vblank_on);
+	KUNIT_EXPECT_FALSE(test, t_vbl_live(ebc));
+	msleep(3 * MSEC_PER_SEC / EBC_VBLANK_HZ);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&ebc->vblank_ticks), ticks);
+
+	rk3026_ebc_sleep_end(ebc);
+	KUNIT_EXPECT_FALSE(test, ebc->suspended);
+	KUNIT_EXPECT_TRUE(test, t_vbl_live(ebc));
+	KUNIT_EXPECT_TRUE(test, t_vbl_commit(test, ebc, ctx, &done) ||
+			  atomic64_read(&ebc->vblank_ticks) != ticks);
+	KUNIT_ASSERT_TRUE(test, wait_for_completion_timeout(&done,
+							    msecs_to_jiffies(1000)));
+	KUNIT_EXPECT_GT(test, atomic64_read(&ebc->vblank_ticks), ticks);
+
+	rk3026_ebc_vblank_disable(ebc);
+	KUNIT_EXPECT_FALSE(test, ebc->vblank_on);
+	KUNIT_EXPECT_FALSE(test, t_vbl_live(ebc));
+}
+
+/*
+ * System sleep with the CRTC off, or turned off while asleep: the resume
+ * leaves the vblank off. A suspend that fails ends the same way
+ * (rk3026_ebc_sleep_end() on its error path).
+ */
+static void ebc_test_vblank_sleep_off(struct kunit *test)
+{
+	struct rk3026_ebc *ebc = t_vbl_alloc(test, EBC_VBLANK_HZ);
+	struct drm_modeset_acquire_ctx *ctx = t_vbl_ctx(test);
+	struct completion done;
+
+	rk3026_ebc_sleep_begin(ebc);
+	rk3026_ebc_sleep_vblank_off(ebc);
+	KUNIT_EXPECT_FALSE(test, t_vbl_live(ebc));
+	rk3026_ebc_sleep_end(ebc);
+	KUNIT_EXPECT_FALSE(test, ebc->vblank_on);
+	KUNIT_EXPECT_FALSE(test, t_vbl_live(ebc));
+	KUNIT_EXPECT_FALSE(test, t_vbl_commit(test, ebc, ctx, &done));
+
+	rk3026_ebc_vblank_enable(ebc);
+	KUNIT_EXPECT_TRUE(test, t_vbl_live(ebc));
+	rk3026_ebc_sleep_begin(ebc);
+	rk3026_ebc_sleep_vblank_off(ebc);
+	rk3026_ebc_vblank_disable(ebc);
+	rk3026_ebc_sleep_end(ebc);
+	KUNIT_EXPECT_FALSE(test, ebc->vblank_on);
+	KUNIT_EXPECT_FALSE(test, t_vbl_live(ebc));
+	KUNIT_EXPECT_FALSE(test, t_vbl_commit(test, ebc, ctx, &done));
+	KUNIT_EXPECT_EQ(test, atomic64_read(&ebc->vblank_ticks), 0);
+}
+
 static struct kunit_case rk3026_ebc_vblank_test_cases[] = {
 	KUNIT_CASE(ebc_test_vblank_flush_off),
 	KUNIT_CASE(ebc_test_vblank_flush_armed),
@@ -9881,6 +10003,8 @@ static struct kunit_case rk3026_ebc_vblank_test_cases[] = {
 	KUNIT_CASE(ebc_test_vblank_off_event),
 	KUNIT_CASE(ebc_test_vblank_mode_valid),
 	KUNIT_CASE(ebc_test_vblank_tick_off),
+	KUNIT_CASE(ebc_test_vblank_sleep),
+	KUNIT_CASE(ebc_test_vblank_sleep_off),
 	{}
 };
 

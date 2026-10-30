@@ -5007,9 +5007,19 @@ struct t_drives {
 	bool		drive_off;
 	bool		drive_sleep;
 	struct drm_pending_vblank_event *drive_left;
+	/* t_clock_flip(): the last read of the clock with an event held. */
+	ktime_t		held_read;
+	/* t_clock_flip(): @image_lock was held at that read. */
+	bool		held_locked;
 	/* t_clock_window(): the flush made in the window, and its result. */
 	struct drm_pending_vblank_event *window_flush;
 	bool		window_held;
+	/* t_flip_trace(): the flip_event traces, the last one's fields. */
+	unsigned int	traces;
+	u32		trace_seq;
+	u32		trace_held_us;
+	enum rk3026_ebc_flip_why trace_why;
+	int		trace_err;
 };
 
 /*
@@ -8516,6 +8526,23 @@ static int t_drive_flip(struct rk3026_ebc *ebc, const u8 *lut, u32 frames,
 }
 
 /*
+ * t_clock() moved 1 us at each read, noting the last read made while a
+ * commit event was still held, and whether @image_lock was held at it. The
+ * test runs alone, so the lock is held by the code under test.
+ */
+static ktime_t t_clock_flip(struct rk3026_ebc *ebc)
+{
+	struct t_drives *d = kunit_get_current_test()->priv;
+
+	d->now = ktime_add_us(d->now, 1);
+	if (READ_ONCE(ebc->flip_event)) {
+		d->held_read = d->now;
+		d->held_locked = mutex_is_locked(&ebc->image_lock);
+	}
+	return d->now;
+}
+
+/*
  * The event is sent at the finish of its part, not at its take: the
  * waveform runs with it held. A part skipped, its target what the glass
  * shows, finishes too; so does a part the commit's update was merged into
@@ -8678,6 +8705,36 @@ static void t_flip_expect_fence(struct kunit *test, struct dma_fence *fence,
 	dma_fence_put(fence);
 }
 
+/*
+ * rk3026_ebc_flip_trace() noting the flip_event traces in struct
+ * t_drives: how many, and the fields of the last one.
+ */
+static void t_flip_trace(struct rk3026_ebc *ebc, u32 seq, u32 held_us,
+			 enum rk3026_ebc_flip_why why, int err)
+{
+	struct t_drives *d = kunit_get_current_test()->priv;
+
+	d->traces++;
+	d->trace_seq = seq;
+	d->trace_held_us = held_us;
+	d->trace_why = why;
+	d->trace_err = err;
+}
+
+/*
+ * One flip_event traced since the last call (t_flip_trace()): of @seq,
+ * sent as @why with @err. Starts the count again.
+ */
+static void t_flip_expect_trace(struct kunit *test, struct t_drives *d,
+				u32 seq, enum rk3026_ebc_flip_why why, int err)
+{
+	KUNIT_EXPECT_EQ(test, d->traces, 1);
+	KUNIT_EXPECT_EQ(test, d->trace_seq, seq);
+	KUNIT_EXPECT_EQ(test, d->trace_why, why);
+	KUNIT_EXPECT_EQ(test, d->trace_err, err);
+	d->traces = 0;
+}
+
 /* A commit of @fb with an event and an out-fence; ASSERTs it held. */
 static struct dma_fence *t_flip_fenced(struct kunit *test,
 				       struct rk3026_ebc *ebc, const u32 *fb,
@@ -8714,6 +8771,7 @@ static void ebc_test_glue_flip_failed(struct kunit *test)
 	struct dma_fence *fence;
 	struct t_flip *f;
 
+	kunit_activate_static_stub(test, rk3026_ebc_flip_trace, t_flip_trace);
 	ebc->du_cleanup_area = 4 * T_W * T_H;
 
 	fence = t_flip_fenced(test, ebc, black, &f, &e);
@@ -8721,12 +8779,14 @@ static void ebc_test_glue_flip_failed(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
 	t_flip_expect_sent(test, f, e);
 	t_flip_expect_fence(test, fence, 0);
+	t_flip_expect_trace(test, &d, ebc->commit_seq, EBC_FLIP_DONE, 0);
 
 	fence = t_flip_fenced(test, ebc, black, &f, &e);
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_SKIPPED);
 	t_flip_expect_sent(test, f, e);
 	t_flip_expect_fence(test, fence, 0);
+	t_flip_expect_trace(test, &d, ebc->commit_seq, EBC_FLIP_DONE, 0);
 
 	/* Cut short: finished, not carried, and not on the glass. */
 	kunit_activate_static_stub(test, rk3026_ebc_drive, t_drive_timeout);
@@ -8736,6 +8796,7 @@ static void ebc_test_glue_flip_failed(struct kunit *test)
 	KUNIT_EXPECT_NULL(test, ebc->flip_event);
 	t_flip_expect_sent(test, f, e);
 	t_flip_expect_fence(test, fence, -EIO);
+	t_flip_expect_trace(test, &d, ebc->commit_seq, EBC_FLIP_FAILED, -EIO);
 
 	/* The next part repairs the glass with a RESET, then is driven. */
 	kunit_activate_static_stub(test, rk3026_ebc_drive, t_drive_ok);
@@ -8746,6 +8807,7 @@ static void ebc_test_glue_flip_failed(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, last.repaired);
 	t_flip_expect_sent(test, f, e);
 	t_flip_expect_fence(test, fence, 0);
+	t_flip_expect_trace(test, &d, ebc->commit_seq, EBC_FLIP_DONE, 0);
 
 	/* Behind a RESET, absorbed by a second one: whitened. */
 	t_send(ebc, &r, EBC_MODE_RESET, 0, EBC_SOURCE_MXCFB);
@@ -8757,6 +8819,8 @@ static void ebc_test_glue_flip_failed(struct kunit *test)
 	KUNIT_EXPECT_NULL(test, ebc->flip_event);
 	t_flip_expect_sent(test, f, e);
 	t_flip_expect_fence(test, fence, -ECANCELED);
+	t_flip_expect_trace(test, &d, ebc->commit_seq, EBC_FLIP_FAILED,
+			    -ECANCELED);
 }
 
 /*
@@ -8826,6 +8890,7 @@ static void ebc_test_glue_flip_preempted(struct kunit *test)
 	struct dma_fence *fence;
 	struct t_flip *f;
 
+	kunit_activate_static_stub(test, rk3026_ebc_flip_trace, t_flip_trace);
 	ebc->du_cleanup_area = 4 * T_W * T_H;
 
 	/* Driven before the flush: no error. */
@@ -8833,6 +8898,7 @@ static void ebc_test_glue_flip_preempted(struct kunit *test)
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
 	t_flip_late_flush(test, ebc, f, e, fence, 0);
+	KUNIT_EXPECT_EQ(test, d.traces, 0);
 
 	/* Cut short, then a later part driven: -EIO all the same. */
 	kunit_activate_static_stub(test, rk3026_ebc_drive, t_drive_timeout);
@@ -8845,6 +8911,8 @@ static void ebc_test_glue_flip_preempted(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
 	KUNIT_EXPECT_EQ(test, ebc->commit_err, -EIO);
 	t_flip_late_flush(test, ebc, f, e, fence, -EIO);
+	t_flip_expect_trace(test, &d, ebc->commit_seq, EBC_FLIP_FAILED, -EIO);
+	KUNIT_EXPECT_EQ(test, d.trace_held_us, 0);
 
 	/* Driven, then a later part cut short: still no error. */
 	fence = t_flip_preempted(test, ebc, black, &f, &e);
@@ -8856,6 +8924,7 @@ static void ebc_test_glue_flip_preempted(struct kunit *test)
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_TIMEOUT);
 	t_flip_late_flush(test, ebc, f, e, fence, 0);
+	KUNIT_EXPECT_EQ(test, d.traces, 0);
 
 	/* Whitened by a RESET that absorbed it: -ECANCELED. */
 	kunit_activate_static_stub(test, rk3026_ebc_drive, t_drive_ok);
@@ -8865,12 +8934,16 @@ static void ebc_test_glue_flip_preempted(struct kunit *test)
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_EQ(test, last.asked_mode, EBC_MODE_RESET);
 	t_flip_late_flush(test, ebc, f, e, fence, -ECANCELED);
+	t_flip_expect_trace(test, &d, ebc->commit_seq, EBC_FLIP_FAILED,
+			    -ECANCELED);
+	KUNIT_EXPECT_EQ(test, d.trace_held_us, 0);
 
 	/* The next commit starts a new record: driven, no error. */
 	fence = t_flip_preempted(test, ebc, black, &f, &e);
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
 	t_flip_late_flush(test, ebc, f, e, fence, 0);
+	KUNIT_EXPECT_EQ(test, d.traces, 0);
 }
 
 /*
@@ -8923,6 +8996,7 @@ static void ebc_test_glue_flip_window(struct kunit *test)
 	unsigned int i;
 
 	kunit_activate_static_stub(test, rk3026_ebc_clock, t_clock_window);
+	kunit_activate_static_stub(test, rk3026_ebc_flip_trace, t_flip_trace);
 	ebc->du_cleanup_area = 4 * T_W * T_H;
 
 	for (i = 0; i < ARRAY_SIZE(c); i++) {
@@ -8943,6 +9017,9 @@ static void ebc_test_glue_flip_window(struct kunit *test)
 		KUNIT_EXPECT_NULL(test, ebc->flip_event);
 		t_flip_expect_sent(test, f, e);
 		t_flip_expect_fence(test, fence, c[i].error);
+		t_flip_expect_trace(test, &d, ebc->commit_seq,
+				    c[i].error ? EBC_FLIP_FAILED : EBC_FLIP_DONE,
+				    c[i].error);
 	}
 }
 
@@ -8964,6 +9041,7 @@ static void ebc_test_glue_flip_gave_up(struct kunit *test)
 
 	d.now = ms_to_ktime(1000);
 	kunit_activate_static_stub(test, rk3026_ebc_clock, t_clock);
+	kunit_activate_static_stub(test, rk3026_ebc_flip_trace, t_flip_trace);
 	ebc->du_cleanup_area = 4 * T_W * T_H;
 
 	d.rails_ret = -EIO;
@@ -8977,6 +9055,10 @@ static void ebc_test_glue_flip_gave_up(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
 	t_flip_expect_sent(test, f, e);
 	t_flip_expect_fence(test, fence, 0);
+	/* Held from the commit to the retry's finish, on the fake clock. */
+	KUNIT_EXPECT_EQ(test, d.trace_held_us,
+			ktime_us_delta(d.now, ms_to_ktime(1000)));
+	t_flip_expect_trace(test, &d, ebc->commit_seq, EBC_FLIP_DONE, 0);
 
 	d.rails_ret = -EIO;
 	fence = t_flip_fenced(test, ebc, white, &f, &e);
@@ -8992,6 +9074,7 @@ static void ebc_test_glue_flip_gave_up(struct kunit *test)
 	KUNIT_EXPECT_NULL(test, ebc->flip_event);
 	t_flip_expect_sent(test, f, e);
 	t_flip_expect_fence(test, fence, -EIO);
+	t_flip_expect_trace(test, &d, ebc->commit_seq, EBC_FLIP_FAILED, -EIO);
 }
 
 /*
@@ -9194,6 +9277,7 @@ static void ebc_test_glue_flip_file_closed(struct kunit *test)
 	KUNIT_EXPECT_NULL(test, ebc->flip_event);
 	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&ebc->flip_wd));
 	kfree(e);
+	KUNIT_EXPECT_EQ(test, ebc->flip_held, 1);
 }
 
 /*
@@ -9259,8 +9343,8 @@ static void ebc_test_glue_flip_wrap(struct kunit *test)
 /*
  * The CRTC disable sends a held event at once, whatever its part does; a
  * system sleep sends it once no part is in flight (rk3026_ebc_sleep_wait())
- * and holds none while it lasts. The watchdog stops, and the part
- * finishing later sends nothing more.
+ * and holds none while it lasts. The watchdog stops, nothing counts late,
+ * and the part finishing later sends nothing more.
  */
 static void ebc_test_glue_flip_off_sleep(struct kunit *test)
 {
@@ -9325,6 +9409,8 @@ static void ebc_test_glue_flip_off_sleep(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk3026_ebc_sleep_wait(ebc, 0), 0);
 	rk3026_ebc_sleep_end(ebc);
 	t_flip_expect_sent(test, f, e);
+	KUNIT_EXPECT_EQ(test, ebc->flip_held, 2);
+	KUNIT_EXPECT_EQ(test, ebc->flip_late, 0);
 }
 
 /*
@@ -9371,6 +9457,8 @@ static void ebc_test_glue_flip_driving(struct kunit *test)
 	KUNIT_EXPECT_NULL(test, d.drive_left);
 	KUNIT_EXPECT_NULL(test, ebc->flip_event);
 	t_flip_expect_sent(test, f, e);
+	KUNIT_EXPECT_EQ(test, ebc->flip_held, 2);
+	KUNIT_EXPECT_EQ(test, ebc->flip_late, 0);
 }
 
 /*
@@ -9378,11 +9466,12 @@ static void ebc_test_glue_flip_driving(struct kunit *test)
  * clamped to EBC_FLIP_TIMEOUT_MAX_MS, and stopped by the send at the
  * part's finish. Its run on its own time (rk3026_ebc_flip_watchdog_run(),
  * the real timer kept out): not due, the event stays held and the
- * watchdog is armed again; due, the event is sent once, its out-fence
- * with -ETIMEDOUT (not confirmed on the glass), and the part's finish
- * sends nothing more. A run left over from that hold, at its deadline,
- * leaves the next event, held for a later deadline, to its own time.
- * With 0 the event is due at the hold. Nothing held: a run sends nothing.
+ * watchdog is armed again; due, the event is sent once and counted late,
+ * its out-fence with -ETIMEDOUT (not confirmed on the glass), and the
+ * part's finish sends nothing more. A run left over from that hold, at
+ * its deadline, leaves the next event, held for a later deadline, to its
+ * own time. With 0 the event is due at the hold. Nothing held: a run
+ * sends nothing.
  */
 static void ebc_test_glue_flip_watchdog(struct kunit *test)
 {
@@ -9400,11 +9489,12 @@ static void ebc_test_glue_flip_watchdog(struct kunit *test)
 
 	KUNIT_EXPECT_EQ(test, ebc->flip_timeout_ms, EBC_FLIP_TIMEOUT_MS);
 
-	/* Sent by the finish: the watchdog stops. */
+	/* Sent by the finish: the watchdog stops, nothing late. */
 	f = t_flip_alloc(test);
 	e = t_flip_event(test, f, true, NULL);
 	before = jiffies;
 	KUNIT_ASSERT_TRUE(test, t_flip_commit(ebc, black, e));
+	KUNIT_EXPECT_EQ(test, ebc->flip_held, 1);
 	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&ebc->flip_wd));
 	KUNIT_EXPECT_TRUE(test, time_after_eq(ebc->flip_due, before + bound));
 	KUNIT_EXPECT_TRUE(test, time_before_eq(ebc->flip_due, jiffies + bound));
@@ -9412,6 +9502,7 @@ static void ebc_test_glue_flip_watchdog(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_NO_WAVEFORM);
 	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&ebc->flip_wd));
 	t_flip_expect_sent(test, f, e);
+	KUNIT_EXPECT_EQ(test, ebc->flip_late, 0);
 
 	/* Not due: left held, armed again; due: sent late, -ETIMEDOUT. */
 	f = t_flip_alloc(test);
@@ -9430,6 +9521,7 @@ static void ebc_test_glue_flip_watchdog(struct kunit *test)
 	rk3026_ebc_flip_watchdog_run(ebc, due);
 	KUNIT_EXPECT_NULL(test, ebc->flip_event);
 	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&ebc->flip_wd));
+	KUNIT_EXPECT_EQ(test, ebc->flip_late, 1);
 	t_flip_expect_sent(test, f, e);
 	KUNIT_EXPECT_EQ(test, dma_fence_get_status(fence), -ETIMEDOUT);
 	KUNIT_EXPECT_FALSE(test, rk3026_ebc_seq_finished(&ebc->pending, seq));
@@ -9438,6 +9530,7 @@ static void ebc_test_glue_flip_watchdog(struct kunit *test)
 	t_flip_expect_sent(test, f, e);
 	t_flip_expect_fence(test, fence, -ETIMEDOUT);
 	rk3026_ebc_flip_watchdog_run(ebc, due);
+	KUNIT_EXPECT_EQ(test, ebc->flip_late, 1);
 
 	/*
 	 * A bound past the core's wait is clamped. A run left over from the
@@ -9461,6 +9554,7 @@ static void ebc_test_glue_flip_watchdog(struct kunit *test)
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&ebc->flip_wd));
 	t_flip_expect_sent(test, f, e);
+	KUNIT_EXPECT_EQ(test, ebc->flip_late, 1);
 
 	/* 0: due at the hold, sent late at the first run. */
 	ebc->flip_timeout_ms = 0;
@@ -9475,12 +9569,14 @@ static void ebc_test_glue_flip_watchdog(struct kunit *test)
 		rk3026_ebc_flip_watchdog_run(ebc, ebc->flip_due);
 	KUNIT_EXPECT_NULL(test, ebc->flip_event);
 	t_flip_expect_sent(test, f, e);
+	KUNIT_EXPECT_EQ(test, ebc->flip_late, 2);
+	KUNIT_EXPECT_EQ(test, ebc->flip_held, 4);
 }
 
 /*
  * The real watchdog, on the system workqueue: with a bound of 0 it sends
- * the held event at its first run, its out-fence with -ETIMEDOUT, and
- * empties the slot; the part's finish sends nothing more.
+ * the held event at its first run, counted late, its out-fence with
+ * -ETIMEDOUT, and empties the slot; the part's finish sends nothing more.
  */
 static void ebc_test_glue_flip_watchdog_work(struct kunit *test)
 {
@@ -9498,19 +9594,46 @@ static void ebc_test_glue_flip_watchdog_work(struct kunit *test)
 	flush_delayed_work(&ebc->flip_wd);
 	KUNIT_EXPECT_NULL(test, ebc->flip_event);
 	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&ebc->flip_wd));
+	KUNIT_EXPECT_EQ(test, ebc->flip_late, 1);
 	t_flip_expect_sent(test, f, e);
 	rk3026_ebc_do_refresh(ebc, &last);
 	t_flip_expect_sent(test, f, e);
 	t_flip_expect_fence(test, fence, -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, ebc->flip_late, 1);
+}
+
+/*
+ * The CRTC off sends the held event under @image_lock, the lock of the
+ * take, so a refresh thread cannot take the part between the two. The send
+ * reads the clock for its trace before it empties the slot
+ * (t_clock_flip()).
+ */
+static void ebc_test_glue_flip_off_locked(struct kunit *test)
+{
+	struct t_drives d;
+	struct rk3026_ebc *ebc = t_driven_ebc(test, &d, true);
+	u32 *black = t_plane_fb(test, 0);
+	struct t_flip *f = t_flip_alloc(test);
+	struct drm_pending_vblank_event *e = t_flip_event(test, f, true, NULL);
+
+	KUNIT_ASSERT_TRUE(test, t_flip_commit(ebc, black, e));
+	kunit_activate_static_stub(test, rk3026_ebc_clock, t_clock_flip);
+	d.now = ms_to_ktime(1000);
+	rk3026_ebc_crtc_off(ebc);
+	t_flip_expect_sent(test, f, e);
+	KUNIT_ASSERT_TRUE(test, ktime_after(d.held_read, ms_to_ktime(1000)));
+	KUNIT_EXPECT_TRUE(test, d.held_locked);
+	KUNIT_EXPECT_FALSE(test, mutex_is_locked(&ebc->image_lock));
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&ebc->flip_wd));
 }
 
 /*
  * A second hold that finds the slot full, which the watchdog rules out
  * (it sends the old event before the core's 10 s wait for it ends): the
- * old event goes out at once, its out-fence with -ETIMEDOUT (its part
- * has not finished), and the new one is held, the watchdog armed again
- * for its later deadline; the part's finish then sends the new one
- * alone. A rate-limited warning, no splat.
+ * old event goes out at once, not late, its out-fence with -ETIMEDOUT
+ * (its part has not finished), and the new one is held, the watchdog
+ * armed again for its later deadline; the part's finish then sends the
+ * new one alone. A rate-limited warning, no splat.
  */
 static void ebc_test_glue_flip_replaced(struct kunit *test)
 {
@@ -9544,6 +9667,7 @@ static void ebc_test_glue_flip_replaced(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, completion_done(&f2->done));
 	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&ebc->flip_wd));
 	KUNIT_EXPECT_TRUE(test, time_after(ebc->flip_due, due));
+	KUNIT_EXPECT_EQ(test, ebc->flip_late, 0);
 
 	/* No waveform here: the part finishes off the glass. */
 	rk3026_ebc_do_refresh(ebc, &last);
@@ -9554,14 +9678,16 @@ static void ebc_test_glue_flip_replaced(struct kunit *test)
 	t_flip_expect_fence(test, fence2, -EIO);
 	t_flip_expect_sent(test, f, e);
 	t_flip_expect_fence(test, fence, -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, ebc->flip_held, 2);
+	KUNIT_EXPECT_EQ(test, ebc->flip_late, 0);
 }
 
 /*
  * The remove (rk3026_ebc_flip_fini()): a held event goes out at once, its
- * part not finished, and the watchdog stops. A commit tail the remove's
- * shutdown did not wait for then queues an update not finished and
- * offers its event: not held, left for the core, and the watchdog stays
- * stopped, so nothing runs on the device after the remove.
+ * part not finished, and the watchdog stops, nothing late. A commit tail
+ * the remove's shutdown did not wait for then queues an update not
+ * finished and offers its event: not held, left for the core, and the
+ * watchdog stays stopped, so nothing runs on the device after the remove.
  */
 static void ebc_test_glue_flip_fini(struct kunit *test)
 {
@@ -9594,6 +9720,8 @@ static void ebc_test_glue_flip_fini(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&ebc->flip_wd));
 	KUNIT_EXPECT_FALSE(test, completion_done(&f2->done));
 	t_flip_expect_sent(test, f, e);
+	KUNIT_EXPECT_EQ(test, ebc->flip_held, 1);
+	KUNIT_EXPECT_EQ(test, ebc->flip_late, 0);
 }
 
 /*
@@ -9629,6 +9757,8 @@ static void ebc_test_glue_flip_fini_twice(struct kunit *test)
 	KUNIT_EXPECT_NULL(test, ebc->flip_event);
 	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&ebc->flip_wd));
 	KUNIT_EXPECT_FALSE(test, completion_done(&f2->done));
+	KUNIT_EXPECT_EQ(test, ebc->flip_held, 1);
+	KUNIT_EXPECT_EQ(test, ebc->flip_late, 0);
 }
 
 /*
@@ -9662,12 +9792,14 @@ static void ebc_test_glue_flip_sleep_busy(struct kunit *test)
 	cancel_delayed_work_sync(&ebc->flip_wd);
 	rk3026_ebc_flip_watchdog_run(ebc, ebc->flip_due);
 	KUNIT_EXPECT_NULL(test, ebc->flip_event);
+	KUNIT_EXPECT_EQ(test, ebc->flip_late, 1);
 	t_flip_expect_sent(test, f, e);
 
 	WRITE_ONCE(ebc->in_flight, false);
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_TRUE(test, rk3026_ebc_seq_finished(&ebc->pending, seq));
 	t_flip_expect_sent(test, f, e);
+	KUNIT_EXPECT_EQ(test, ebc->flip_late, 1);
 }
 
 /*
@@ -9709,6 +9841,7 @@ static void ebc_test_glue_flip_resume_no_clocks(struct kunit *test)
 							ebc->commit_seq));
 	t_flip_expect_sent(test, f2, e2);
 	KUNIT_EXPECT_FALSE(test, completion_done(&f->done));
+	KUNIT_EXPECT_EQ(test, ebc->flip_held, 1);
 }
 
 static struct kunit_case rk3026_ebc_glue_test_cases[] = {
@@ -9810,6 +9943,7 @@ static struct kunit_case rk3026_ebc_glue_test_cases[] = {
 	KUNIT_CASE(ebc_test_glue_flip_driving),
 	KUNIT_CASE(ebc_test_glue_flip_watchdog),
 	KUNIT_CASE(ebc_test_glue_flip_watchdog_work),
+	KUNIT_CASE(ebc_test_glue_flip_off_locked),
 	KUNIT_CASE(ebc_test_glue_flip_replaced),
 	KUNIT_CASE(ebc_test_glue_flip_fini),
 	KUNIT_CASE(ebc_test_glue_flip_fini_twice),

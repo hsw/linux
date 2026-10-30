@@ -1380,6 +1380,53 @@ bool rk3026_ebc_flip_holds(const struct drm_pending_vblank_event *e,
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_flip_holds);
 
 /**
+ * rk3026_ebc_part_err - whether a finished part put its updates on the
+ *	glass, as the error of their out-fences
+ * @part: the part's record, as the refresh thread published it at its
+ *	finish (struct rk3026_ebc_last)
+ *
+ * The finish of a part moves @done_seq over its updates whether or not they
+ * reached the glass (rk3026_ebc_scan_finish()). On the glass (0): a part
+ * driven to its end (DRIVEN, after a repair that ran or none), or skipped
+ * because the glass shows its image already (SKIPPED). Dropped with the
+ * CRTC off (CRTC_OFF) is not a failure either (0): the CRTC went off with
+ * the part pending, and the events of such a frame go out without an error
+ * (rk3026_ebc_crtc_off()), as the core's do when a CRTC goes off.
+ *
+ * Off the glass:
+ *
+ * - -ECANCELED, a RESET part (@asked_mode), whatever its outcome: a plane
+ *   update never asks for a RESET, so the updates in it are those a RESET
+ *   absorbed or a carry it dropped (rk3026_ebc_pending_add()): whitened,
+ *   not drawn, also when the RESET itself ran to its end.
+ * - -EIO, a waveform cut short (TIMEOUT, ABANDONED): the glass shows part
+ *   of the frame, or of the repair RESET before it, and is not known.
+ * - -EIO, nothing driven (NO_RAILS, NO_LUT, NO_WAVEFORM): a part carried
+ *   for these does not finish until a try draws it or it is given up; one
+ *   that finishes with them was not carried (or was given up).
+ * - -EIO, a carry given up (@gave_up), whatever the last try's outcome.
+ * - -EIO, EBC_OUTCOME_NONE or any outcome added later: nothing says the
+ *   frame is on the glass.
+ *
+ * Return: 0 if the part's updates are on the glass, else the negative
+ * errno above.
+ */
+int rk3026_ebc_part_err(const struct rk3026_ebc_last *part)
+{
+	if (part->outcome == EBC_OUTCOME_CRTC_OFF)
+		return 0;
+	if (part->asked_mode == EBC_MODE_RESET)
+		return -ECANCELED;
+	if (part->gave_up)
+		return -EIO;
+	if (part->outcome == EBC_OUTCOME_DRIVEN ||
+	    part->outcome == EBC_OUTCOME_SKIPPED)
+		return 0;
+	return -EIO;
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_part_err);
+
+/**
  * rk3026_ebc_marker_seq_record - remember which seq a marker was queued with
  * @ring: marker ring
  * @marker: the client's marker; 0 is never recorded

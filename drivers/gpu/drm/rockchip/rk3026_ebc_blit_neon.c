@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Rockchip RK3026 EBC: XRGB8888 to packed 4bpp grey with NEON.
+ * Rockchip RK3026 EBC: XRGB8888 and 8-bit grey to packed 4bpp grey with
+ * NEON.
  *
  * Built with CC_FLAGS_FPU, so the compiler may use NEON anywhere in this
  * unit: nothing here may run outside a kernel-mode NEON section.
@@ -18,6 +19,13 @@
  * tested, so every page costs about the same; on the RK3026 (Cortex-A9 at
  * 600 MHz, with the L2 cache controller's prefetch and line-fill options
  * set as the vendor firmware sets them) that is the memory floor.
+ *
+ * The 8-bit rows give the levels of rk3026_ebc_grey_round[],
+ * (g * 15 + 127) / 255, computed instead of looked up: ARMv7 NEON has no
+ * 256-entry table lookup. Per 16 pixels: vld1.8, vmlal.u8 into
+ * g * 15 + 127 in u16 lanes, the exact division by 255 of a v < 2^16 as
+ * (v + (v >> 8) + 1) >> 8 (vsra #8, then vaddhn with 1), vuzp.8 and
+ * vsli.8 #4.
  */
 
 #include <arm_neon.h>
@@ -88,5 +96,68 @@ void rk3026_ebc_blit_rows_neon(unsigned char *dst, const void *src,
 		}
 		for (; n > 0; n -= 2, s += 8, d++)
 			*d = ebc_neon_nibble(s) | ebc_neon_nibble(s + 4) << 4;
+	}
+}
+
+/* The rounded level of the 8-bit grey @g, as rk3026_ebc_grey_round[@g]. */
+static __always_inline unsigned char ebc_neon_grey(unsigned char g)
+{
+	return (g * 15 + 127) / 255;
+}
+
+/* Sixteen 8-bit greys at @s into eight bytes, pixel 0 in the low nibble. */
+static __always_inline uint8x8_t ebc_neon_grey16(const unsigned char *s)
+{
+	const uint8x8_t k15 = vdup_n_u8(15);
+	const uint16x8_t k127 = vdupq_n_u16(127);
+	const uint16x8_t k1 = vdupq_n_u16(1);
+	uint8x16_t g = vld1q_u8(s);
+	uint16x8_t lo, hi;
+	uint8x8x2_t eo;
+
+	lo = vmlal_u8(k127, vget_low_u8(g), k15);
+	hi = vmlal_u8(k127, vget_high_u8(g), k15);
+	lo = vsraq_n_u16(lo, lo, 8);
+	hi = vsraq_n_u16(hi, hi, 8);
+	eo = vuzp_u8(vaddhn_u16(lo, k1), vaddhn_u16(hi, k1));	/* even, odd */
+	return vsli_n_u8(eo.val[0], eo.val[1], 4);
+}
+
+/**
+ * rk3026_ebc_blit_grey_rows_neon - rk3026_ebc_blit_grey_rows() with NEON
+ * @dst: target image, @width / 2 bytes per row, low nibble first
+ * @src: 8-bit source, one byte per pixel, top-left of the framebuffer
+ * @src_pitch: source stride in bytes
+ * @x1: first column, even
+ * @x2: end column, even, at most @width, above @x1
+ * @y1: first row
+ * @y2: end row, above @y1
+ * @width: image width in pixels
+ *
+ * Writes the bytes rk3026_ebc_blit_grey_rows() writes with the rounding
+ * table rk3026_ebc_grey_round, and only those. Sixteen pixels at a time,
+ * with the source read 256 bytes ahead; a row's last 2 to 14 pixels two
+ * at a time. No alignment is needed.
+ *
+ * Call only between kernel_neon_begin() and kernel_neon_end().
+ */
+void rk3026_ebc_blit_grey_rows_neon(unsigned char *dst, const void *src,
+				    unsigned int src_pitch, int x1, int x2,
+				    int y1, int y2, unsigned int width)
+{
+	int y;
+
+	for (y = y1; y < y2; y++) {
+		const unsigned char *s = (const unsigned char *)src +
+				   (size_t)y * src_pitch + x1;
+		unsigned char *d = dst + ((size_t)y * width + x1) / 2;
+		int n = x2 - x1;
+
+		for (; n >= 16; n -= 16, s += 16, d += 8) {
+			__builtin_prefetch(s + 256);
+			vst1_u8(d, ebc_neon_grey16(s));
+		}
+		for (; n > 0; n -= 2, s += 2, d++)
+			*d = ebc_neon_grey(s[0]) | ebc_neon_grey(s[1]) << 4;
 	}
 }

@@ -851,8 +851,10 @@ static u32 ebc_us_since(ktime_t start)
  *
  * The panel is 4bpp with two pixels per byte, low nibble first. The clip is
  * widened to an even pixel boundary so byte writes stay whole, and clamped
- * to the panel; rk3026_ebc_blit_convert() converts it. A format with no
- * conversion here is a driver bug: it warns once and writes nothing.
+ * to the panel. XRGB8888 goes through rk3026_ebc_blit_convert(), the top
+ * four bits of the luma; R8 through rk3026_ebc_blit_grey_convert() with the
+ * rounding table, the nearest of the 16 levels. A format with no conversion
+ * here is a driver bug: it warns once and writes nothing.
  *
  * Writes @next_shadow. Called under @image_lock, in the same section that
  * queues the update, so no snapshot sees the pixels without their update.
@@ -877,6 +879,11 @@ u32 rk3026_ebc_blit(struct rk3026_ebc *ebc, const void *src,
 	case DRM_FORMAT_XRGB8888:
 		rk3026_ebc_blit_convert(ebc->next_shadow, src, src_pitch,
 					r.x1, r.x2, r.y1, r.y2, ebc->width);
+		break;
+	case DRM_FORMAT_R8:
+		rk3026_ebc_blit_grey_convert(ebc->next_shadow, src, src_pitch,
+					     r.x1, r.x2, r.y1, r.y2, ebc->width,
+					     rk3026_ebc_grey_round);
 		break;
 	default:
 		WARN_ON_ONCE(1);
@@ -2602,8 +2609,15 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_wait_marker);
 
 /* --- DRM --- */
 
+/*
+ * XRGB8888 first, the format of the fbdev emulation and of most clients.
+ * R8 is grey for clients that render in grey already: one byte a pixel,
+ * rounded to the nearest panel level rather than cut to its top four bits,
+ * so the greys k * 17 of a client dithering to 16 levels stay exact.
+ */
 static const u32 ebc_plane_formats[] = {
 	DRM_FORMAT_XRGB8888,
+	DRM_FORMAT_R8,
 };
 
 static const u64 ebc_plane_modifiers[] = {

@@ -4,9 +4,10 @@
  *
  * The snapshot and the XRGB8888 blit worked out pixel by pixel, in the
  * byte loops rk3026_ebc_core.c and rk3026_ebc.c had before the word-wide
- * versions. The tests require the driver's functions to match these bit
- * for bit. They have their own copies of the helpers and share no code
- * with the driver, so a change to the driver cannot change them too.
+ * versions, and the 8-bit blit one pixel at a time as well. The tests
+ * require the driver's functions to match these bit for bit. They have
+ * their own copies of the helpers and share no code with the driver, so a
+ * change to the driver cannot change them too.
  */
 
 #include <linux/math.h>
@@ -106,6 +107,32 @@ void rk3026_ebc_ref_blit_rows(u8 *dst, const void *src,
 				  29 * (p1 & 0xff)) / 256;
 
 			*d = (g0 >> 4) | (g1 & 0xf0);
+		}
+	}
+}
+
+/*
+ * The 8-bit blit as a per-pixel loop, on a box the caller has widened and
+ * clamped as for rk3026_ebc_ref_blit_rows(): each byte through @levels,
+ * or with @levels NULL to the nearest of the 16 levels k * 17, which is
+ * (g + 8) / 17 since 17 is odd.
+ */
+void rk3026_ebc_ref_grey_rows(u8 *dst, const void *src,
+			      unsigned int src_pitch, int x1, int x2,
+			      int y1, int y2, unsigned int width,
+			      const u8 *levels)
+{
+	int x, y;
+
+	for (y = y1; y < y2; y++) {
+		const u8 *s = (const u8 *)src + (size_t)y * src_pitch + x1;
+		u8 *d = dst + ((size_t)y * width + x1) / 2;
+
+		for (x = x1; x < x2; x += 2, s += 2, d++) {
+			u8 l0 = levels ? levels[s[0]] : (s[0] + 8) / 17;
+			u8 l1 = levels ? levels[s[1]] : (s[1] + 8) / 17;
+
+			*d = l0 | l1 << 4;
 		}
 	}
 }

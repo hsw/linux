@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Rockchip RK3026 EBC: XRGB8888 to the panel's packed 4bpp grey.
+ * Rockchip RK3026 EBC: XRGB8888 and 8-bit grey to the panel's packed 4bpp
+ * grey.
  *
  * Every plane and mxcfb update converts its damage here, under @image_lock,
  * so this loop is most of the CPU time of a refresh. It is a pure function
@@ -15,6 +16,12 @@
  * With CONFIG_DRM_RK3026_EBC_NEON, rk3026_ebc_blit_convert() runs the NEON
  * rows of rk3026_ebc_blit_neon.c instead where it can, and these rows
  * everywhere else.
+ *
+ * 8-bit sources (one byte per pixel) take rk3026_ebc_blit_grey_convert():
+ * each byte goes through a 256-entry table of levels. The rounding table
+ * rk3026_ebc_grey_round[] maps a grey to the nearest of the panel's 16
+ * levels, so the greys k * 17 that a 16-level dither emits stay exactly
+ * level k; NEON computes that table's levels instead of looking them up.
  */
 
 #include <linux/compiler.h>
@@ -98,6 +105,76 @@ void rk3026_ebc_blit_rows(u8 *dst, const void *src, unsigned int src_pitch,
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_blit_rows);
 
+/*
+ * rk3026_ebc_grey_round[g] is the panel level of the 8-bit grey g rounded
+ * to the nearest of the 16, (g * 15 + 127) / 255: 17 k - 8 to 17 k + 8
+ * give level k, so the greys k * 17 that a 16-level dither emits are
+ * exactly level k, and the others round instead of losing their low four
+ * bits. rk3026_ebc_blit_grey_convert() takes the NEON rows for this table.
+ */
+const u8 rk3026_ebc_grey_round[EBC_PALETTE_SIZE] = {
+	[0 ... 8] = 0, [9 ... 25] = 1, [26 ... 42] = 2, [43 ... 59] = 3,
+	[60 ... 76] = 4, [77 ... 93] = 5, [94 ... 110] = 6,
+	[111 ... 127] = 7, [128 ... 144] = 8, [145 ... 161] = 9,
+	[162 ... 178] = 10, [179 ... 195] = 11, [196 ... 212] = 12,
+	[213 ... 229] = 13, [230 ... 246] = 14, [247 ... 255] = 15,
+};
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_grey_round);
+
+/* Two 8-bit pixels at @s into one byte through @levels, @s[0] low. */
+static __always_inline u32 ebc_grey_pack2(const u8 *levels, const u8 *s)
+{
+	return levels[s[0]] | levels[s[1]] << 4;
+}
+
+/**
+ * rk3026_ebc_blit_grey_rows - convert 8-bit rows to packed 4bpp grey
+ * @dst: target image, @width / 2 bytes per row, low nibble first
+ * @src: 8-bit source, one byte per pixel, top-left of the framebuffer
+ * @src_pitch: source stride in bytes
+ * @x1: first column, even
+ * @x2: end column, even, at most @width, above @x1
+ * @y1: first row
+ * @y2: end row, above @y1
+ * @width: image width in pixels
+ * @levels: EBC_PALETTE_SIZE levels of 0 to 15, one per byte value
+ *
+ * Writes bytes @x1 / 2 to @x2 / 2 of rows @y1 to @y2 of @dst, nothing else.
+ *
+ * Eight pixels per 32-bit store, with the source prefetched 128 bytes
+ * ahead; a row's last 2 to 6 pixels two at a time.
+ */
+void rk3026_ebc_blit_grey_rows(u8 *dst, const void *src,
+			       unsigned int src_pitch, int x1, int x2,
+			       int y1, int y2, unsigned int width,
+			       const u8 *levels)
+{
+	int y;
+
+	for (y = y1; y < y2; y++) {
+		const u8 *s = (const u8 *)src + (size_t)y * src_pitch + x1;
+		u8 *d = dst + ((size_t)y * width + x1) / 2;
+		int n = x2 - x1;
+
+		for (; n >= 8; n -= 8, s += 8, d += 4) {
+			prefetch(s + 128);
+			put_unaligned_le32(ebc_grey_pack2(levels, s) |
+					   ebc_grey_pack2(levels, s + 2) << 8 |
+					   ebc_grey_pack2(levels, s + 4) << 16 |
+					   ebc_grey_pack2(levels, s + 6) << 24,
+					   d);
+		}
+		for (; n > 0; n -= 2, s += 2, d++)
+			*d = ebc_grey_pack2(levels, s);
+	}
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_blit_grey_rows);
+
+/* A NEON row function of rk3026_ebc_blit_neon.c. */
+typedef void ebc_neon_rows_fn(unsigned char *dst, const void *src,
+			      unsigned int src_pitch, int x1, int x2,
+			      int y1, int y2, unsigned int width);
+
 #if IS_ENABLED(CONFIG_DRM_RK3026_EBC_NEON)
 /*
  * Rows per kernel-mode NEON section. A section disables preemption and
@@ -108,6 +185,8 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_blit_rows);
 
 /* Exported here: rk3026_ebc_blit_neon.c includes no kernel header. */
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_blit_rows_neon);
+/* And the 8-bit rows of that unit. */
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_blit_grey_rows_neon);
 
 /* The NEON rows are built in and this CPU can run them. */
 static bool ebc_neon_cpu(void)
@@ -116,12 +195,15 @@ static bool ebc_neon_cpu(void)
 }
 
 /*
- * The NEON rows on the clip, one band of rows per section, if NEON may run
- * here and the clip holds at least one 16-pixel block; else false and
- * nothing written.
+ * @rows on the clip, one band of rows per section, if NEON may run here
+ * and the clip holds at least one 16-pixel block; else false and nothing
+ * written.
  */
-static bool ebc_blit_neon(u8 *dst, const void *src, unsigned int src_pitch,
-			  int x1, int x2, int y1, int y2, unsigned int width)
+static __always_inline bool ebc_neon_bands(ebc_neon_rows_fn *rows, u8 *dst,
+					   const void *src,
+					   unsigned int src_pitch, int x1,
+					   int x2, int y1, int y2,
+					   unsigned int width)
 {
 	int y;
 
@@ -132,8 +214,7 @@ static bool ebc_blit_neon(u8 *dst, const void *src, unsigned int src_pitch,
 		int end = min(y + EBC_NEON_BAND_ROWS, y2);
 
 		scoped_ksimd()
-			rk3026_ebc_blit_rows_neon(dst, src, src_pitch, x1, x2,
-						  y, end, width);
+			rows(dst, src, src_pitch, x1, x2, y, end, width);
 	}
 	return true;
 }
@@ -143,8 +224,13 @@ static bool ebc_neon_cpu(void)
 	return false;
 }
 
-static bool ebc_blit_neon(u8 *dst, const void *src, unsigned int src_pitch,
-			  int x1, int x2, int y1, int y2, unsigned int width)
+/* The NEON rows are not built: their names are NULL, never called. */
+#define rk3026_ebc_blit_rows_neon	NULL
+#define rk3026_ebc_blit_grey_rows_neon	NULL
+
+static bool ebc_neon_bands(ebc_neon_rows_fn *rows, u8 *dst, const void *src,
+			   unsigned int src_pitch, int x1, int x2, int y1,
+			   int y2, unsigned int width)
 {
 	return false;
 }
@@ -170,14 +256,54 @@ void rk3026_ebc_blit_convert(u8 *dst, const void *src, unsigned int src_pitch,
 			     int x1, int x2, int y1, int y2,
 			     unsigned int width)
 {
-	if (!ebc_blit_neon(dst, src, src_pitch, x1, x2, y1, y2, width))
+	if (!ebc_neon_bands(rk3026_ebc_blit_rows_neon, dst, src, src_pitch, x1,
+			    x2, y1, y2, width))
 		rk3026_ebc_blit_rows(dst, src, src_pitch, x1, x2, y1, y2,
 				     width);
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_blit_convert);
 
 /**
- * rk3026_ebc_blit_impl - the conversion rk3026_ebc_blit() runs
+ * rk3026_ebc_blit_grey_convert - convert 8-bit rows, with NEON if it can
+ * @dst: target image, @width / 2 bytes per row, low nibble first
+ * @src: 8-bit source, one byte per pixel, top-left of the framebuffer
+ * @src_pitch: source stride in bytes
+ * @x1: first column, even
+ * @x2: end column, even, at most @width, above @x1
+ * @y1: first row
+ * @y2: end row, above @y1
+ * @width: image width in pixels
+ * @levels: EBC_PALETTE_SIZE levels of 0 to 15, one per byte value
+ *
+ * With @levels the rounding table rk3026_ebc_grey_round, the NEON rows
+ * rk3026_ebc_blit_grey_rows_neon() under the conditions of
+ * rk3026_ebc_blit_convert(); otherwise, and with any other table,
+ * rk3026_ebc_blit_grey_rows(). ARMv7 NEON has no 256-entry lookup, so the
+ * NEON rows compute the rounding table's levels and do not read @levels.
+ * Both write the same bytes, so the choice only changes the time.
+ *
+ * Returns true if the NEON rows ran: never for a table other than
+ * rk3026_ebc_grey_round itself, a copy of it included. For KUnit, which
+ * checks the choice; a caller needs no answer, as both rows write the
+ * same bytes.
+ */
+bool rk3026_ebc_blit_grey_convert(u8 *dst, const void *src,
+				  unsigned int src_pitch, int x1, int x2,
+				  int y1, int y2, unsigned int width,
+				  const u8 *levels)
+{
+	if (levels == rk3026_ebc_grey_round &&
+	    ebc_neon_bands(rk3026_ebc_blit_grey_rows_neon, dst, src, src_pitch,
+			   x1, x2, y1, y2, width))
+		return true;
+	rk3026_ebc_blit_grey_rows(dst, src, src_pitch, x1, x2, y1, y2, width,
+				  levels);
+	return false;
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_blit_grey_convert);
+
+/**
+ * rk3026_ebc_blit_impl - the XRGB8888 conversion rk3026_ebc_blit() runs
  *
  * For the probe line and debugfs "timing", so a measured blit time says
  * which loop it is from.

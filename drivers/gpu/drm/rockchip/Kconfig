@@ -195,10 +195,11 @@ config DRM_RK3026_EBC_NEON
 	depends on DRM_RK3026_EBC && ARM && KERNEL_MODE_NEON
 	default y
 	help
-	  Convert the XRGB8888 framebuffer to the panel's 4-bit grey with
-	  NEON where the CPU has it, in short kernel-mode NEON sections.
-	  The plain C conversion stays for every other case and gives the
-	  same bytes, so turning this off only makes the conversion slower.
+	  Convert XRGB8888 and 8-bit grey (R8) framebuffers to the panel's
+	  4-bit grey with NEON where the CPU has it, in short kernel-mode
+	  NEON sections. The plain C conversion stays for every other case
+	  and gives the same bytes, so turning this off only makes the
+	  conversion slower.
 
 	  If unsure, say Y.
 

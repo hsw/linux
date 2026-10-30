@@ -8239,6 +8239,101 @@ static void ebc_test_glue_plane_resync(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, ebc->plane_resync);
 }
 
+/* The level of the 8-bit grey @g: the nearest 17 k (no tie, 17 is odd). */
+static u8 t_grey_level(unsigned int g)
+{
+	return (g + 8) / 17;
+}
+
+/* An odd box of the 8-bit framebuffer tests, and the box widened to bytes. */
+static const struct drm_rect t_odd_box = DRM_RECT_INIT(3, 1, 9, 3);
+static const struct drm_rect t_odd_wide = DRM_RECT_INIT(2, 1, 10, 3);
+
+/*
+ * An 8-bit framebuffer of the panel at @pitch: the greys 17 k, every k on
+ * rows 0 and 3, and the rounding edges 17 k + 8 and + 9 on the rows
+ * between; padding 0x1f.
+ */
+static u8 *t_grey_fb(struct kunit *test, unsigned int pitch)
+{
+	static const u8 edge[3] = { 0, 8, 9 };
+	u8 *fb = kunit_kmalloc(test, pitch * T_H, GFP_KERNEL);
+	int x, y;
+
+	KUNIT_ASSERT_NOT_NULL(test, fb);
+	for (y = 0; y < T_H; y++)
+		for (x = 0; x < (int)pitch; x++)
+			fb[y * pitch + x] = x >= T_W ? 0x1f :
+					    min(17 * ((x + y) % 16) +
+						edge[y % 3], 255);
+	return fb;
+}
+
+/*
+ * Every pixel of @img inside @box is the rounded level of its grey in the
+ * 8-bit @fb, every other one white.
+ */
+static void t_expect_grey_box(struct kunit *test, const u8 *img,
+			      const u8 *fb, unsigned int pitch,
+			      const struct drm_rect *box)
+{
+	int x, y;
+
+	for (y = 0; y < T_H; y++) {
+		for (x = 0; x < T_W; x++) {
+			u8 g = fb[y * pitch + x];
+
+			KUNIT_EXPECT_EQ_MSG(test, t_px(img, x, y),
+					    t_in_rect(box, x, y) ?
+					    t_grey_level(g) : 15,
+					    "pixel %d,%d grey %u", x, y, g);
+		}
+	}
+	t_expect_guard(test, img);
+}
+
+/*
+ * An R8 plane: one byte a pixel at the framebuffer's pitch, wider than the
+ * panel here, each grey rounded to the nearest level, where XRGB8888 takes
+ * the top four bits of the luma. The blit widens an odd box to whole
+ * bytes and leaves the rest of the target alone; after another writer it
+ * redraws the whole panel.
+ */
+static void ebc_test_glue_plane_r8(struct kunit *test)
+{
+	static const struct drm_rect clip = DRM_RECT_INIT(8, 3, 4, 2);
+	const unsigned int pitch = T_W + 5;
+	struct rk3026_ebc *ebc = t_ebc_alloc(test);
+	u8 *fb = t_grey_fb(test, pitch);
+	u32 *xrgb = t_plane_fb(test, 0x1f1f1f);
+
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, fb, pitch,
+							DRM_FORMAT_R8,
+							&t_odd_box));
+	KUNIT_EXPECT_TRUE(test, drm_rect_equals(&ebc->pending.pre.box,
+						&t_odd_box));
+	t_expect_grey_box(test, ebc->next_shadow, fb, pitch, &t_odd_wide);
+
+	/* 0x1f: XRGB8888 cuts it to level 1, R8 rounds it to 2. */
+	memset(fb, 0x1f, pitch * T_H);
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, xrgb, &t_panel));
+	t_expect_box_img(test, ebc->next_shadow, &t_panel, 1, 1);
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, fb, pitch,
+							DRM_FORMAT_R8,
+							&t_panel));
+	t_expect_box_img(test, ebc->next_shadow, &t_panel, 2, 2);
+
+	/* After an mxcfb send, the box alone redraws the whole panel. */
+	t_send(ebc, &clip, EBC_MODE_PART, 0, EBC_SOURCE_MXCFB);
+	KUNIT_EXPECT_TRUE(test, ebc->plane_resync);
+	t_img_fill(ebc->next_shadow, 9);
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, fb, pitch,
+							DRM_FORMAT_R8,
+							&t_odd_box));
+	t_expect_box_img(test, ebc->next_shadow, &t_panel, 2, 2);
+	KUNIT_EXPECT_FALSE(test, ebc->plane_resync);
+}
+
 /*
  * The policy does not change with the box: a damaged plane part whose
  * changes are all black or white goes DU, one with a grey PART. The
@@ -10571,6 +10666,7 @@ static struct kunit_case rk3026_ebc_glue_test_cases[] = {
 	KUNIT_CASE(ebc_test_glue_plane_box_update),
 	KUNIT_CASE(ebc_test_glue_plane_box_merge),
 	KUNIT_CASE(ebc_test_glue_plane_resync),
+	KUNIT_CASE(ebc_test_glue_plane_r8),
 	KUNIT_CASE(ebc_test_glue_plane_box_du),
 	KUNIT_CASE(ebc_test_glue_plane_box_grey),
 	KUNIT_CASE(ebc_test_glue_flip_hold),
@@ -10840,10 +10936,10 @@ static u32 t_col_4096(u32 i)
 /*
  * Fill the @f->w x @f->h pixels of @src, @src_pitch bytes per row (at least
  * 4 * @f->w; the callers pass it dense and with 4 bytes of padding), with
- * @kind from @seed.
+ * @kind, an enum t_src_kind, from @seed.
  */
 static void t_src_fill(u8 *src, unsigned int src_pitch, const struct t_fix *f,
-		       enum t_src_kind kind, u32 seed)
+		       unsigned int kind, u32 seed)
 {
 	struct rnd_state rs;
 	int x, y, k = 0;
@@ -11389,45 +11485,135 @@ static void ebc_test_snapshot_two_level_positions(struct kunit *test)
 	}
 }
 
-/* A bare struct rk3026_ebc for rk3026_ebc_blit() on @f. */
-static struct rk3026_ebc *t_blit_ebc(struct kunit *test, const struct t_fix *f)
-{
-	struct rk3026_ebc *ebc = kunit_kzalloc(test, sizeof(*ebc), GFP_KERNEL);
-
-	KUNIT_ASSERT_NOT_NULL(test, ebc);
-	mutex_init(&ebc->image_lock);
-	ebc->width = f->w;
-	ebc->height = f->h;
-	ebc->next_shadow = t_fix_img(test, f);
-	return ebc;
-}
+/* A row conversion in the shape of rk3026_ebc_blit_rows(). */
+typedef void t_rows_fn(u8 *dst, const void *src, unsigned int src_pitch,
+		       int x1, int x2, int y1, int y2, unsigned int width);
 
 /*
- * Every clip on one source: the reference rows on the clip widened as the
- * driver widens it and rk3026_ebc_blit() write the same target over the
- * same junk, guards included. False after the first difference.
+ * Sources of one pixel format for t_src_sets(): @cpp bytes a pixel, a
+ * dense pitch and one @pad bytes wider, @kinds fills of @fill, the clips
+ * seeded from @clip_seed * seed + kind.
+ */
+struct t_src_set {
+	unsigned int cpp;
+	unsigned int pad;
+	unsigned int kinds;
+	u32 clip_seed;
+	void (*fill)(u8 *src, unsigned int src_pitch, const struct t_fix *f,
+		     unsigned int kind, u32 seed);
+};
+
+/*
+ * What t_src_sets() checks on one source @src of @f at @pitch: the @n
+ * clips of @clips, with two images of @f, @out and @ref, to write. False
+ * after a difference, which it reports.
+ */
+typedef bool t_src_check_fn(struct kunit *test, const struct t_fix *f,
+			    void *arg, u8 *out, u8 *ref, const u8 *src,
+			    unsigned int pitch, const struct drm_rect *clips,
+			    int n, struct rnd_state *rs);
+
+/*
+ * @check with @arg on every fixture, source kind and seed of @set, dense
+ * and padded source pitch, and clip; then the guards of each fixture's
+ * @out. Stops at the first difference.
+ */
+static void t_src_sets(struct kunit *test, const struct t_src_set *set,
+		       t_src_check_fn *check, void *arg)
+{
+	unsigned int fi, pad, kind;
+	u32 seed;
+
+	for (fi = 0; fi < ARRAY_SIZE(t_fixes); fi++) {
+		const struct t_fix *f = &t_fixes[fi];
+		u8 *out = t_fix_img(test, f);
+		u8 *ref = t_fix_img(test, f);
+		struct drm_rect clips[T_CLIPS_MAX];
+		struct rnd_state rs;
+		u8 *src;
+		int n;
+
+		src = kunit_kmalloc(test,
+				    (size_t)(f->w * set->cpp + set->pad) * f->h,
+				    GFP_KERNEL);
+		KUNIT_ASSERT_NOT_NULL(test, src);
+
+		for (pad = 0; pad <= set->pad; pad += set->pad) {
+			unsigned int pitch = f->w * set->cpp + pad;
+
+			for (kind = 0; kind < set->kinds; kind++) {
+				for (seed = 1; seed <= 2; seed++) {
+					set->fill(src, pitch, f, kind, seed);
+					prandom_seed_state(&rs, seed *
+							   set->clip_seed +
+							   kind);
+					n = t_fix_clips(f, &rs, clips);
+					if (check(test, f, arg, out, ref, src,
+						  pitch, clips, n, &rs))
+						continue;
+					kunit_info(test, "source %u seed %u\n",
+						   kind, seed);
+					return;
+				}
+			}
+		}
+		KUNIT_EXPECT_TRUE(test, t_fix_guard_ok(f, out));
+	}
+}
+
+/* XRGB8888 sources: every kind of t_src_fill(), 4 bytes of padding. */
+static const struct t_src_set t_xrgb_srcs = {
+	.cpp = 4, .pad = 4, .kinds = T_SRC_COUNT, .clip_seed = 11,
+	.fill = t_src_fill,
+};
+
+/* A plane format, the per-pixel reference of its conversion. */
+struct t_blit_fmt {
+	u32 format;
+	t_rows_fn *ref_rows;
+};
+
+static const struct t_blit_fmt t_blit_xrgb = {
+	DRM_FORMAT_XRGB8888, rk3026_ebc_ref_blit_rows,
+};
+
+/* rk3026_ebc_blit() of a format through a bare struct rk3026_ebc. */
+struct t_blit_run {
+	const struct t_blit_fmt *fmt;
+	struct rk3026_ebc *ebc;
+};
+
+/*
+ * A t_src_check_fn: on every clip, the reference rows on the clip widened
+ * as the driver widens it and rk3026_ebc_blit() into @out write the same
+ * target over the same junk.
  */
 static bool t_ref_blit_src(struct kunit *test, const struct t_fix *f,
-			   struct rk3026_ebc *ebc, u8 *ref, const u8 *src,
+			   void *arg, u8 *out, u8 *ref, const u8 *src,
 			   unsigned int pitch, const struct drm_rect *clips,
 			   int n, struct rnd_state *rs)
 {
+	const struct t_blit_run *run = arg;
+	struct rk3026_ebc *ebc = run->ebc;
 	int c;
 
+	ebc->width = f->w;
+	ebc->height = f->h;
+	ebc->next_shadow = out;
 	for (c = 0; c < n; c++) {
 		const struct drm_rect *r = &clips[c];
 		struct drm_rect w;
 		int diff;
 
 		prandom_bytes_state(rs, ref, t_fix_size(f));
-		memcpy(ebc->next_shadow, ref, t_fix_size(f));
+		memcpy(out, ref, t_fix_size(f));
 		if (t_widen(f, r, &w))
-			rk3026_ebc_ref_blit_rows(ref, src, pitch, w.x1, w.x2,
-						 w.y1, w.y2, f->w);
+			run->fmt->ref_rows(ref, src, pitch, w.x1, w.x2, w.y1,
+					   w.y2, f->w);
 		mutex_lock(&ebc->image_lock);
-		rk3026_ebc_blit(ebc, src, pitch, DRM_FORMAT_XRGB8888, r);
+		rk3026_ebc_blit(ebc, src, pitch, run->fmt->format, r);
 		mutex_unlock(&ebc->image_lock);
-		diff = t_fix_diff(f, ref, ebc->next_shadow);
+		diff = t_fix_diff(f, ref, out);
 		if (diff != INT_MAX) {
 			KUNIT_FAIL(test, "%s pitch %u clip " DRM_RECT_FMT
 				   ": byte %d", f->name, pitch,
@@ -11438,55 +11624,29 @@ static bool t_ref_blit_src(struct kunit *test, const struct t_fix *f,
 	return true;
 }
 
+/* rk3026_ebc_blit() of @fmt against its reference on the sources @set. */
+static void t_blit_sets(struct kunit *test, const struct t_src_set *set,
+			const struct t_blit_fmt *fmt)
+{
+	struct t_blit_run run = {
+		.fmt = fmt,
+		.ebc = kunit_kzalloc(test, sizeof(*run.ebc), GFP_KERNEL),
+	};
+
+	KUNIT_ASSERT_NOT_NULL(test, run.ebc);
+	mutex_init(&run.ebc->image_lock);
+	t_src_sets(test, set, t_ref_blit_src, &run);
+}
+
 /*
- * rk3026_ebc_blit() widens and clamps the clip to whole bytes and
- * writes the bytes of the per-pixel reference loop, on every fixture,
+ * rk3026_ebc_blit() of XRGB8888 widens and clamps the clip to whole bytes
+ * and writes the bytes of the per-pixel reference loop, on every fixture,
  * source set, dense and padded source pitch, and clip.
  */
 static void ebc_test_ref_blit(struct kunit *test)
 {
-	unsigned int fi, pad, kind;
-	u32 seed;
-
-	for (fi = 0; fi < ARRAY_SIZE(t_fixes); fi++) {
-		const struct t_fix *f = &t_fixes[fi];
-		struct rk3026_ebc *ebc = t_blit_ebc(test, f);
-		u8 *ref = t_fix_img(test, f);
-		struct drm_rect clips[T_CLIPS_MAX];
-		struct rnd_state rs;
-		u8 *src;
-		int n;
-
-		src = kunit_kmalloc(test, (size_t)(f->w * 4 + 4) * f->h,
-				    GFP_KERNEL);
-		KUNIT_ASSERT_NOT_NULL(test, src);
-
-		for (pad = 0; pad <= 4; pad += 4) {
-			unsigned int pitch = f->w * 4 + pad;
-
-			for (kind = 0; kind < T_SRC_COUNT; kind++) {
-				for (seed = 1; seed <= 2; seed++) {
-					t_src_fill(src, pitch, f, kind, seed);
-					prandom_seed_state(&rs, seed * 7 + kind);
-					n = t_fix_clips(f, &rs, clips);
-					if (!t_ref_blit_src(test, f, ebc, ref,
-							    src, pitch, clips,
-							    n, &rs)) {
-						kunit_info(test,
-							   "source %u seed %u\n",
-							   kind, seed);
-						return;
-					}
-				}
-			}
-		}
-		KUNIT_EXPECT_TRUE(test, t_fix_guard_ok(f, ebc->next_shadow));
-	}
+	t_blit_sets(test, &t_xrgb_srcs, &t_blit_xrgb);
 }
-
-/* A row conversion in the shape of rk3026_ebc_blit_rows(). */
-typedef void t_rows_fn(u8 *dst, const void *src, unsigned int src_pitch,
-		       int x1, int x2, int y1, int y2, unsigned int width);
 
 /*
  * @rows and the reference rows @ref_rows on @x1..@x2 (even), @y1..@y2 of
@@ -11512,16 +11672,23 @@ static bool t_rows_vs_ref(struct kunit *test, const struct t_fix *f,
 	return false;
 }
 
+/* A row conversion and the reference rows it is checked against. */
+struct t_rows_pair {
+	t_rows_fn *rows;
+	t_rows_fn *ref_rows;
+};
+
 /*
- * @rows against @ref_rows on one source and every non-empty clip of
- * @clips, widened and clamped as rk3026_ebc_blit() does.
+ * A t_src_check_fn: the rows against the reference rows of the
+ * struct t_rows_pair @arg on every non-empty clip, widened and clamped as
+ * rk3026_ebc_blit() does.
  */
 static bool t_rows_clips(struct kunit *test, const struct t_fix *f,
-			 t_rows_fn *rows, t_rows_fn *ref_rows, u8 *out,
-			 u8 *ref, const u8 *src, unsigned int pitch,
-			 const struct drm_rect *clips, int n,
-			 struct rnd_state *rs)
+			 void *arg, u8 *out, u8 *ref, const u8 *src,
+			 unsigned int pitch, const struct drm_rect *clips,
+			 int n, struct rnd_state *rs)
 {
+	const struct t_rows_pair *p = arg;
 	int c;
 
 	for (c = 0; c < n; c++) {
@@ -11529,55 +11696,20 @@ static bool t_rows_clips(struct kunit *test, const struct t_fix *f,
 
 		if (!t_widen(f, &clips[c], &w))
 			continue;
-		if (!t_rows_vs_ref(test, f, rows, ref_rows, out, ref, src,
-				   pitch, w.x1, w.x2, w.y1, w.y2, rs))
+		if (!t_rows_vs_ref(test, f, p->rows, p->ref_rows, out, ref,
+				   src, pitch, w.x1, w.x2, w.y1, w.y2, rs))
 			return false;
 	}
 	return true;
 }
 
-/*
- * @rows against @ref_rows on every fixture, source set, dense and padded
- * source pitch, and clip.
- */
+/* @rows against @ref_rows on the XRGB8888 sources. */
 static void t_rows_sets(struct kunit *test, t_rows_fn *rows,
 			t_rows_fn *ref_rows)
 {
-	unsigned int fi, pad, kind;
-	u32 seed;
+	struct t_rows_pair p = { rows, ref_rows };
 
-	for (fi = 0; fi < ARRAY_SIZE(t_fixes); fi++) {
-		const struct t_fix *f = &t_fixes[fi];
-		u8 *out = t_fix_img(test, f);
-		u8 *ref = t_fix_img(test, f);
-		struct drm_rect clips[T_CLIPS_MAX];
-		struct rnd_state rs;
-		u8 *src;
-		int n;
-
-		src = kunit_kmalloc(test, (size_t)(f->w * 4 + 4) * f->h,
-				    GFP_KERNEL);
-		KUNIT_ASSERT_NOT_NULL(test, src);
-
-		for (pad = 0; pad <= 4; pad += 4) {
-			unsigned int pitch = f->w * 4 + pad;
-
-			for (kind = 0; kind < T_SRC_COUNT; kind++) {
-				for (seed = 1; seed <= 2; seed++) {
-					t_src_fill(src, pitch, f, kind, seed);
-					prandom_seed_state(&rs, seed * 11 + kind);
-					n = t_fix_clips(f, &rs, clips);
-					if (t_rows_clips(test, f, rows, ref_rows,
-							 out, ref, src, pitch,
-							 clips, n, &rs))
-						continue;
-					kunit_info(test, "source %u seed %u\n",
-						   kind, seed);
-					return;
-				}
-			}
-		}
-	}
+	t_src_sets(test, &t_xrgb_srcs, t_rows_clips, &p);
 }
 
 /*
@@ -11729,6 +11861,344 @@ static void ebc_test_blit_convert(struct kunit *test)
 			return;
 }
 
+/*
+ * rk3026_ebc_grey_round[] on every grey: at most 15, the nearest level
+ * (|g - 17 * level| <= 8, no tie as 17 is odd), so the levels k * 17 of a
+ * 16-level dither map to exactly k, rising, and the edges where it steps.
+ */
+static void ebc_test_grey_round_table(struct kunit *test)
+{
+	static const u8 edges[][2] = {
+		{ 0, 0 }, { 8, 0 }, { 9, 1 }, { 127, 7 }, { 128, 8 },
+		{ 246, 14 }, { 247, 15 }, { 255, 15 },
+	};
+	unsigned int g, k, i;
+
+	for (g = 0; g < EBC_PALETTE_SIZE; g++) {
+		int l = rk3026_ebc_grey_round[g];
+
+		KUNIT_EXPECT_LE_MSG(test, l, 15, "grey %u", g);
+		KUNIT_EXPECT_LE_MSG(test, abs((int)g - 17 * l), 8, "grey %u",
+				    g);
+		if (g)
+			KUNIT_EXPECT_GE_MSG(test, l,
+					    (int)rk3026_ebc_grey_round[g - 1],
+					    "grey %u", g);
+	}
+	for (k = 0; k < 16; k++)
+		KUNIT_EXPECT_EQ_MSG(test, rk3026_ebc_grey_round[k * 17], k,
+				    "level %u", k);
+	for (i = 0; i < ARRAY_SIZE(edges); i++)
+		KUNIT_EXPECT_EQ_MSG(test, rk3026_ebc_grey_round[edges[i][0]],
+				    edges[i][1], "grey %u", edges[i][0]);
+}
+
+/* 8-bit sources */
+enum t_grey_kind {
+	T_GREY_ALL,	/* 0..255 in turn */
+	T_GREY_DITHER,	/* random levels k * 17, as a 16-level dither emits */
+	T_GREY_EDGES,	/* random 17 k + 8 and 17 k + 9, either side of a step */
+	T_GREY_RANDOM,	/* random bytes */
+	T_GREY_COUNT,
+};
+
+/*
+ * Fill the @f->w x @f->h pixels of @src, @src_pitch bytes per row (at least
+ * @f->w), with @kind, an enum t_grey_kind, from @seed; the padding bytes
+ * are random.
+ */
+static void t_grey_fill(u8 *src, unsigned int src_pitch,
+			const struct t_fix *f, unsigned int kind, u32 seed)
+{
+	struct rnd_state rs;
+	int x, y, k = 0;
+
+	prandom_seed_state(&rs, seed);
+	for (y = 0; y < f->h; y++) {
+		u8 *s = src + (size_t)y * src_pitch;
+
+		for (x = 0; x < (int)src_pitch; x++, k++) {
+			u32 r = prandom_u32_state(&rs);
+
+			if (x >= f->w) {
+				s[x] = r;
+				continue;
+			}
+			switch (kind) {
+			case T_GREY_ALL:
+				s[x] = k + seed;
+				break;
+			case T_GREY_DITHER:
+				s[x] = (r % 16) * 17;
+				break;
+			case T_GREY_EDGES:
+				s[x] = 17 * (r % 15) + 8 + (r >> 8 & 1);
+				break;
+			default:
+				s[x] = r;
+				break;
+			}
+		}
+	}
+}
+
+/* A random table of levels, as a palette could give. */
+static void t_grey_rand_levels(u8 *levels, u32 seed)
+{
+	struct rnd_state rs;
+	int i;
+
+	prandom_seed_state(&rs, seed);
+	for (i = 0; i < EBC_PALETTE_SIZE; i++)
+		levels[i] = prandom_u32_state(&rs) & 15;
+}
+
+/*
+ * The table of the *_tab wrappers below: set by each case that uses them,
+ * cleared by the suite's exit (t_conv_exit()).
+ */
+static const u8 *t_grey_levels;
+
+static void t_grey_rows_tab(u8 *dst, const void *src, unsigned int src_pitch,
+			    int x1, int x2, int y1, int y2, unsigned int width)
+{
+	rk3026_ebc_blit_grey_rows(dst, src, src_pitch, x1, x2, y1, y2, width,
+				  t_grey_levels);
+}
+
+static void t_grey_ref_round(u8 *dst, const void *src, unsigned int src_pitch,
+			     int x1, int x2, int y1, int y2,
+			     unsigned int width)
+{
+	rk3026_ebc_ref_grey_rows(dst, src, src_pitch, x1, x2, y1, y2, width,
+				 NULL);
+}
+
+static void t_grey_ref_tab(u8 *dst, const void *src, unsigned int src_pitch,
+			   int x1, int x2, int y1, int y2, unsigned int width)
+{
+	rk3026_ebc_ref_grey_rows(dst, src, src_pitch, x1, x2, y1, y2, width,
+				 t_grey_levels);
+}
+
+static void t_grey_convert_tab(u8 *dst, const void *src,
+			       unsigned int src_pitch, int x1, int x2, int y1,
+			       int y2, unsigned int width)
+{
+	rk3026_ebc_blit_grey_convert(dst, src, src_pitch, x1, x2, y1, y2,
+				     width, t_grey_levels);
+}
+
+/* 8-bit sources: every kind of t_grey_fill(), an odd 3 bytes of padding. */
+static const struct t_src_set t_grey_srcs = {
+	.cpp = 1, .pad = 3, .kinds = T_GREY_COUNT, .clip_seed = 13,
+	.fill = t_grey_fill,
+};
+
+/* @rows against @ref_rows on the 8-bit sources. */
+static void t_grey_sets(struct kunit *test, t_rows_fn *rows,
+			t_rows_fn *ref_rows)
+{
+	struct t_rows_pair p = { rows, ref_rows };
+
+	t_src_sets(test, &t_grey_srcs, t_rows_clips, &p);
+}
+
+/*
+ * Every alignment of an 8-bit row: every even start 0..30 and every even
+ * length 2..80, on random bytes, dither levels and rounding edges, from an
+ * even and from an odd source address; @rows against @ref_rows.
+ */
+static void t_grey_tails(struct kunit *test, t_rows_fn *rows,
+			 t_rows_fn *ref_rows)
+{
+	static const struct t_fix f = { "112x3", 112, 3 };
+	unsigned int pitch = f.w;
+	u8 *out = t_fix_img(test, &f);
+	u8 *ref = t_fix_img(test, &f);
+	u8 *buf = kunit_kmalloc(test, (size_t)pitch * f.h + 1, GFP_KERNEL);
+	struct rnd_state rs;
+	int x, x1, len, off;
+
+	KUNIT_ASSERT_NOT_NULL(test, buf);
+	prandom_seed_state(&rs, 1717);
+	for (off = 0; off <= 1; off++) {
+		u8 *src = buf + off;
+
+		for (x = 0; x < f.w; x++) {
+			u32 r = prandom_u32_state(&rs);
+
+			src[x] = r;
+			src[pitch + x] = (r >> 8) % 16 * 17;
+			src[2 * pitch + x] = 17 * ((r >> 16) % 15) + 8 +
+					     (r >> 24 & 1);
+		}
+		for (x1 = 0; x1 <= 30; x1 += 2) {
+			for (len = 2; len <= 80; len += 2) {
+				if (t_rows_vs_ref(test, &f, rows, ref_rows, out,
+						  ref, src, pitch, x1, x1 + len,
+						  0, f.h, &rs))
+					continue;
+				kunit_info(test, "offset %d start %d length %d\n",
+					   off, x1, len);
+				return;
+			}
+		}
+	}
+}
+
+/*
+ * rk3026_ebc_blit_grey_rows() writes the bytes of the per-pixel reference,
+ * with the rounding table and with two random tables.
+ */
+static void ebc_test_grey_rows(struct kunit *test)
+{
+	u8 *levels = kunit_kmalloc(test, EBC_PALETTE_SIZE, GFP_KERNEL);
+	u32 seed;
+
+	KUNIT_ASSERT_NOT_NULL(test, levels);
+	t_grey_levels = rk3026_ebc_grey_round;
+	t_grey_sets(test, t_grey_rows_tab, t_grey_ref_round);
+	t_grey_levels = levels;
+	for (seed = 1; seed <= 2; seed++) {
+		t_grey_rand_levels(levels, seed);
+		t_grey_sets(test, t_grey_rows_tab, t_grey_ref_tab);
+	}
+}
+
+/* The 8-px stores and the 2-px tail from every start. */
+static void ebc_test_grey_rows_tails(struct kunit *test)
+{
+	u8 *levels = kunit_kmalloc(test, EBC_PALETTE_SIZE, GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, levels);
+	t_grey_levels = rk3026_ebc_grey_round;
+	t_grey_tails(test, t_grey_rows_tab, t_grey_ref_round);
+	t_grey_rand_levels(levels, 3);
+	t_grey_levels = levels;
+	t_grey_tails(test, t_grey_rows_tab, t_grey_ref_tab);
+}
+
+#if IS_ENABLED(CONFIG_DRM_RK3026_EBC_NEON)
+/* rk3026_ebc_blit_grey_rows_neon() in the NEON section it needs. */
+static void t_grey_neon(u8 *dst, const void *src, unsigned int src_pitch,
+			int x1, int x2, int y1, int y2, unsigned int width)
+{
+	scoped_ksimd()
+		rk3026_ebc_blit_grey_rows_neon(dst, src, src_pitch, x1, x2, y1,
+					       y2, width);
+}
+
+/*
+ * rk3026_ebc_blit_grey_rows_neon() writes the bytes of
+ * rk3026_ebc_blit_grey_rows() with the rounding table: every fixture,
+ * 8-bit source set, pitch and clip.
+ */
+static void ebc_test_grey_neon_rows(struct kunit *test)
+{
+	if (!t_neon_ready(test))
+		return;
+	t_grey_levels = rk3026_ebc_grey_round;
+	t_grey_sets(test, t_grey_neon, t_grey_rows_tab);
+}
+
+/* The 16-px blocks and every tail of 0 to 14 px, odd addresses too. */
+static void ebc_test_grey_neon_tails(struct kunit *test)
+{
+	if (!t_neon_ready(test))
+		return;
+	t_grey_levels = rk3026_ebc_grey_round;
+	t_grey_tails(test, t_grey_neon, t_grey_rows_tab);
+}
+#else
+/* No NEON rows: a skip. */
+static void ebc_test_grey_neon_rows(struct kunit *test)
+{
+	t_neon_ready(test);
+}
+
+static void ebc_test_grey_neon_tails(struct kunit *test)
+{
+	t_neon_ready(test);
+}
+#endif
+
+/*
+ * rk3026_ebc_blit_grey_convert() writes the bytes of the reference on the
+ * band edges and below 16 px as ebc_test_blit_convert() checks it: with
+ * the rounding table (NEON where it is built in) and with a random table
+ * and a copy of the rounding table at another address (the scalar rows);
+ * and that it says which rows ran.
+ */
+static void ebc_test_grey_convert(struct kunit *test)
+{
+	static const struct t_fix f = { "48x200", 48, 200 };
+	static const struct {
+		int x1, x2, y1, y2;
+	} r[] = {
+		{ 0, 48, 0, 200 }, { 2, 46, 1, 130 }, { 0, 48, 63, 65 },
+		{ 4, 38, 5, 69 }, { 0, 48, 0, 64 }, { 0, 48, 0, 65 },
+		{ 0, 48, 64, 128 }, { 16, 32, 199, 200 }, { 0, 16, 0, 200 },
+		{ 2, 16, 0, 200 }, { 6, 8, 60, 70 },
+	};
+	unsigned int pitch = f.w + 1;
+	u8 *out = t_fix_img(test, &f);
+	u8 *ref = t_fix_img(test, &f);
+	u8 *src = kunit_kmalloc(test, (size_t)pitch * f.h, GFP_KERNEL);
+	u8 *levels = kunit_kmalloc(test, EBC_PALETTE_SIZE, GFP_KERNEL);
+	struct rnd_state rs;
+	unsigned int i, t;
+
+	KUNIT_ASSERT_NOT_NULL(test, src);
+	KUNIT_ASSERT_NOT_NULL(test, levels);
+	if (IS_ENABLED(CONFIG_DRM_RK3026_EBC_NEON) && !t_neon_ready(test))
+		return;
+	t_grey_fill(src, pitch, &f, T_GREY_RANDOM, 78);
+	prandom_seed_state(&rs, 7800);
+	for (t = 0; t < 3; t++) {
+		t_grey_levels = t ? levels : rk3026_ebc_grey_round;
+		if (t == 1)
+			t_grey_rand_levels(levels, 5);
+		else if (t == 2)
+			memcpy(levels, rk3026_ebc_grey_round, EBC_PALETTE_SIZE);
+		for (i = 0; i < ARRAY_SIZE(r); i++)
+			if (!t_rows_vs_ref(test, &f, t_grey_convert_tab,
+					   t ? t_grey_ref_tab :
+					       t_grey_ref_round,
+					   out, ref, src, pitch, r[i].x1,
+					   r[i].x2, r[i].y1, r[i].y2, &rs))
+				return;
+	}
+
+	/* NEON for the rounding table itself from 16 px, where built in. */
+	KUNIT_EXPECT_EQ(test,
+			rk3026_ebc_blit_grey_convert(out, src, pitch, 0, 16, 0,
+						     2, f.w,
+						     rk3026_ebc_grey_round),
+			IS_ENABLED(CONFIG_DRM_RK3026_EBC_NEON));
+	KUNIT_EXPECT_FALSE(test,
+			   rk3026_ebc_blit_grey_convert(out, src, pitch, 0, 14,
+							0, 2, f.w,
+							rk3026_ebc_grey_round));
+	KUNIT_EXPECT_FALSE(test,
+			   rk3026_ebc_blit_grey_convert(out, src, pitch, 0, 48,
+							0, 2, f.w, levels));
+}
+
+static const struct t_blit_fmt t_blit_r8 = {
+	DRM_FORMAT_R8, t_grey_ref_round,
+};
+
+/*
+ * rk3026_ebc_blit() of R8 widens and clamps the clip to whole bytes and
+ * writes the bytes of the per-pixel rounding reference, on every fixture,
+ * 8-bit source set, a dense and an odd padded source pitch, and clip.
+ */
+static void ebc_test_ref_blit_r8(struct kunit *test)
+{
+	t_blit_sets(test, &t_grey_srcs, &t_blit_r8);
+}
+
 static struct kunit_case rk3026_ebc_conv_test_cases[] = {
 	KUNIT_CASE(ebc_test_ref_snapshot),
 	KUNIT_CASE(ebc_test_snapshot_nibble_pairs),
@@ -11741,11 +12211,24 @@ static struct kunit_case rk3026_ebc_conv_test_cases[] = {
 	KUNIT_CASE(ebc_test_blit_neon_rows),
 	KUNIT_CASE(ebc_test_blit_neon_tails),
 	KUNIT_CASE(ebc_test_blit_convert),
+	KUNIT_CASE(ebc_test_grey_round_table),
+	KUNIT_CASE(ebc_test_grey_rows),
+	KUNIT_CASE(ebc_test_grey_rows_tails),
+	KUNIT_CASE(ebc_test_grey_neon_rows),
+	KUNIT_CASE(ebc_test_grey_neon_tails),
+	KUNIT_CASE(ebc_test_grey_convert),
+	KUNIT_CASE(ebc_test_ref_blit_r8),
 	{}
 };
 
+static void t_conv_exit(struct kunit *test)
+{
+	t_grey_levels = NULL;
+}
+
 static struct kunit_suite rk3026_ebc_conv_test_suite = {
 	.name = "rk3026_ebc_conv",
+	.exit = t_conv_exit,
 	.test_cases = rk3026_ebc_conv_test_cases,
 };
 

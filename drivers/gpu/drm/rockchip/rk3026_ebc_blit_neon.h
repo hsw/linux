@@ -9,5 +9,8 @@
 void rk3026_ebc_blit_rows_neon(unsigned char *dst, const void *src,
 			       unsigned int src_pitch, int x1, int x2,
 			       int y1, int y2, unsigned int width);
+void rk3026_ebc_blit_grey_rows_neon(unsigned char *dst, const void *src,
+				    unsigned int src_pitch, int x1, int x2,
+				    int y1, int y2, unsigned int width);
 
 #endif /* _RK3026_EBC_BLIT_NEON_H */

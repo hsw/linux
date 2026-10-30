@@ -711,6 +711,12 @@ struct rk3026_ebc_shadows {
 };
 
 /*
+ * Entries of a table of levels, rk3026_ebc_grey_round[]: one per value of
+ * an 8-bit pixel.
+ */
+#define EBC_PALETTE_SIZE	256
+
+/*
  * MXCFB_WAIT_FOR_UPDATE_COMPLETE markers of the newest updates, and the seq
  * each was queued with. Marker 0 is never recorded, so an empty slot never
  * matches.
@@ -1239,6 +1245,15 @@ void rk3026_ebc_blit_convert(u8 *dst, const void *src, unsigned int src_pitch,
 			     int x1, int x2, int y1, int y2,
 			     unsigned int width);
 const char *rk3026_ebc_blit_impl(void);
+extern const u8 rk3026_ebc_grey_round[EBC_PALETTE_SIZE];
+void rk3026_ebc_blit_grey_rows(u8 *dst, const void *src,
+			       unsigned int src_pitch, int x1, int x2,
+			       int y1, int y2, unsigned int width,
+			       const u8 *levels);
+bool rk3026_ebc_blit_grey_convert(u8 *dst, const void *src,
+				  unsigned int src_pitch, int x1, int x2,
+				  int y1, int y2, unsigned int width,
+				  const u8 *levels);
 
 /* rk3026_ebc_core.c */
 u32 rk3026_ebc_dsp_ctrl_mode(u32 mode);

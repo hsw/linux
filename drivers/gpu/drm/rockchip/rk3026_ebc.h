@@ -225,6 +225,19 @@ enum rk3026_ebc_source {
 	EBC_SOURCE_RESTORE,	/* the redraw after a hibernation restore */
 };
 
+/*
+ * Why a held commit event was sent (rk3026_ebc_flip_hold()): the flip_event
+ * tracepoint.
+ */
+enum rk3026_ebc_flip_why {
+	EBC_FLIP_DONE,		/* its part finished, on the glass */
+	EBC_FLIP_WATCHDOG,	/* the watchdog: late, -ETIMEDOUT */
+	EBC_FLIP_OFF,		/* the CRTC went off, or the driver goes away */
+	EBC_FLIP_SLEEP,		/* a system sleep, its part not taken */
+	EBC_FLIP_REPLACED,	/* slot full (watchdog late): as WATCHDOG */
+	EBC_FLIP_FAILED,	/* finished off the glass: -EIO, -ECANCELED */
+};
+
 /* What became of one part (the updates one scan takes). */
 enum rk3026_ebc_outcome {
 	EBC_OUTCOME_NONE,	/* nothing taken yet */
@@ -341,8 +354,8 @@ struct rk3026_ebc_idle {
 
 /*
  * How long a commit event is held at most (rk3026_ebc_flip_hold()) before
- * the watchdog sends it late. Above the longest wait for the part of a
- * plane commit on a known glass: its take may wait for a part ahead
+ * the watchdog sends it, counted late. Above the longest wait for the part
+ * of a plane commit on a known glass: its take may wait for a part ahead
  * (a cold RESET and FULL, about 3.4 s), the take's gap (EBC_TAKE_CAP_MAX_MS),
  * the temperature and the rails (about 0.6 s), then its own waveform (a
  * cold FULL, about 1.6 s): 6.6 s. Below the 10 s the core waits for a
@@ -350,9 +363,9 @@ struct rk3026_ebc_idle {
  * with 2 s left at the most for the timer's jiffies and the workqueue. A
  * part that first repairs a glass not known (@shadows.prev_unknown: after
  * a hibernation restore, or a waveform cut short) runs a RESET before its
- * waveform and may take longer: its event then goes late. Kept in
- * @flip_timeout_ms, used up to EBC_FLIP_TIMEOUT_MAX_MS; 0 sends at the
- * watchdog's first run.
+ * waveform and may take longer: its event then goes late. debugfs
+ * flip_timeout_ms changes it, used up to EBC_FLIP_TIMEOUT_MAX_MS; 0 sends
+ * at the watchdog's first run.
  */
 #define EBC_FLIP_TIMEOUT_MS	7000
 #define EBC_FLIP_TIMEOUT_MAX_MS	8000
@@ -1104,13 +1117,17 @@ struct rk3026_ebc {
 	 * thread sends it from step 4 of rk3026_ebc_do_refresh(), and the
 	 * CRTC off, the sleep and rk3026_ebc_flip_fini() send it
 	 * (ebc_flip_send_held()), with @image_lock held around it; the
-	 * watchdog @flip_wd sends it without, at @flip_due (jiffies).
+	 * watchdog @flip_wd sends it without. @flip_held_at is when it was
+	 * held (rk3026_ebc_clock()), @flip_due when the watchdog sends it
+	 * (jiffies).
 	 *
 	 * @flip_timeout_ms: the watchdog's bound, EBC_FLIP_TIMEOUT_MS at probe
-	 * (rk3026_ebc_flip_init()); the hold reads it with READ_ONCE().
-	 * @flip_closed: the remove or the shutdown began
-	 * (rk3026_ebc_flip_fini()), nothing is held any more; set under
-	 * @drm.event_lock.
+	 * (rk3026_ebc_flip_init()); debugfs may change it, the hold reads it
+	 * with READ_ONCE(). @flip_held counts the events held, @flip_late
+	 * those the watchdog sent: written with WRITE_ONCE() under
+	 * @drm.event_lock, debugfs reads them without. @flip_closed: the
+	 * remove or the shutdown began (rk3026_ebc_flip_fini()), nothing is
+	 * held any more; set under @drm.event_lock.
 	 *
 	 * @flip_done_seq: @pending.done_seq as the last ebc_flip_check_locked()
 	 * saw it, under @image_lock and @drm.event_lock. The hold tests
@@ -1123,9 +1140,12 @@ struct rk3026_ebc {
 	struct drm_pending_vblank_event *flip_event;
 	u32			flip_seq;
 	u32			flip_done_seq;
+	ktime_t			flip_held_at;
 	unsigned long		flip_due;
 	struct delayed_work	flip_wd;
 	u32			flip_timeout_ms;
+	u32			flip_held;
+	u32			flip_late;
 	bool			flip_closed;
 
 	/*
@@ -1167,6 +1187,8 @@ bool rk3026_ebc_plane_update(struct rk3026_ebc *ebc, const void *src,
 void rk3026_ebc_flip_init(struct rk3026_ebc *ebc);
 void rk3026_ebc_flip_fini(struct rk3026_ebc *ebc);
 void rk3026_ebc_flip_watchdog_run(struct rk3026_ebc *ebc, unsigned long now);
+void rk3026_ebc_flip_trace(struct rk3026_ebc *ebc, u32 seq, u32 held_us,
+			   enum rk3026_ebc_flip_why why, int err);
 bool rk3026_ebc_flip_hold(struct rk3026_ebc *ebc,
 			  struct drm_crtc_state *crtc_state);
 bool rk3026_ebc_idle_tick(struct rk3026_ebc *ebc, unsigned long now);

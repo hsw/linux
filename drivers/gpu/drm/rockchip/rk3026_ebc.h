@@ -338,6 +338,17 @@ struct rk3026_ebc_idle {
 #define EBC_TAKE_CAP_MAX_MS	1000
 
 /*
+ * The vblank is simulated: a tick at a fixed rate, not tied to the panel,
+ * whose scans take many frames each while the driver merges what arrives in
+ * between. EBC_VBLANK_HZ is the rate probe sets and the connector's mode
+ * reports (rk3026_ebc_vblank_mode_clock()); rates are clamped to
+ * EBC_VBLANK_HZ_MIN..EBC_VBLANK_HZ_MAX (rk3026_ebc_vblank_period_ns()).
+ */
+#define EBC_VBLANK_HZ		10
+#define EBC_VBLANK_HZ_MIN	1
+#define EBC_VBLANK_HZ_MAX	60
+
+/*
  * The next part as rk3026_ebc_take_wait() reads it, under @image_lock:
  *
  * @first, @last: when its first and newest update were queued;
@@ -1164,6 +1175,8 @@ void rk3026_ebc_marker_seq_record(struct rk3026_ebc_marker_ring *ring,
 				  u32 marker, u32 seq);
 bool rk3026_ebc_marker_seq_lookup(const struct rk3026_ebc_marker_ring *ring,
 				  u32 marker, u32 *seq);
+u64 rk3026_ebc_vblank_period_ns(u32 hz);
+int rk3026_ebc_vblank_mode_clock(u32 hz, u32 htotal, u32 vtotal);
 #if IS_ENABLED(CONFIG_KUNIT)
 unsigned int rk3026_ebc_mode_rank(u32 mode);
 #endif

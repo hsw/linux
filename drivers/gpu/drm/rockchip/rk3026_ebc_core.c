@@ -12,7 +12,9 @@
 #include <linux/export.h>
 #include <linux/jiffies.h>
 #include <linux/ktime.h>
+#include <linux/limits.h>
 #include <linux/math.h>
+#include <linux/math64.h>
 #include <linux/minmax.h>
 #include <linux/overflow.h>
 #include <linux/string.h>
@@ -1403,3 +1405,53 @@ bool rk3026_ebc_marker_seq_lookup(const struct rk3026_ebc_marker_ring *ring,
 	return false;
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_marker_seq_lookup);
+
+static u32 ebc_vblank_hz(u32 hz)
+{
+	return clamp(hz, EBC_VBLANK_HZ_MIN, EBC_VBLANK_HZ_MAX);
+}
+
+/**
+ * rk3026_ebc_vblank_period_ns - the period of the simulated vblank
+ * @hz: the tick rate, clamped to EBC_VBLANK_HZ_MIN..EBC_VBLANK_HZ_MAX
+ *
+ * The panel has no vertical blank: one scan drives a waveform of many
+ * frames, and updates that arrive meanwhile are merged into the next part.
+ * The tick paces the DRM events only, so any rate within the clamp works;
+ * a rate of 0 is taken as the lowest one rather than as no tick.
+ *
+ * Returns the period in nanoseconds, rounded down.
+ */
+u64 rk3026_ebc_vblank_period_ns(u32 hz)
+{
+	return div_u64(NSEC_PER_SEC, ebc_vblank_hz(hz));
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_vblank_period_ns);
+
+/**
+ * rk3026_ebc_vblank_mode_clock - the mode clock that reports a tick rate
+ * @hz: the tick rate, clamped as rk3026_ebc_vblank_period_ns() does
+ * @htotal: the mode's htotal
+ * @vtotal: the mode's vtotal
+ *
+ * The connector's one mode describes the tick, not the controller's timing:
+ * the dot clock comes from the DT's clock-frequency, and nothing reads the
+ * mode's clock for it, while drm_mode_vrefresh() and the vblank core's
+ * frame duration are derived from it. The clock is rounded to the nearest
+ * kHz, which is off from @hz * @htotal * @vtotal / 1000 by at most 0.5 kHz,
+ * so drm_mode_vrefresh() gives @hz back whenever @htotal * @vtotal is above
+ * 1000.
+ *
+ * Returns the clock in kHz, at least 1 (a mode with clock 0 is invalid) and
+ * at most INT_MAX.
+ */
+int rk3026_ebc_vblank_mode_clock(u32 hz, u32 htotal, u32 vtotal)
+{
+	u64 px;
+
+	if (check_mul_overflow(mul_u32_u32(htotal, vtotal),
+			       (u64)ebc_vblank_hz(hz), &px))
+		return INT_MAX;
+	return clamp_t(u64, DIV_ROUND_CLOSEST_ULL(px, 1000), 1, INT_MAX);
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_vblank_mode_clock);

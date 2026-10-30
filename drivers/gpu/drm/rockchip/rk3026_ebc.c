@@ -2722,7 +2722,6 @@ static int ebc_connector_get_modes(struct drm_connector *connector)
 		return 0;
 
 	mode->type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED;
-	mode->clock = ebc_pixel_rate(ebc) / 1000;
 	mode->hdisplay = ebc->width;
 	mode->hsync_start = ebc->width;
 	mode->hsync_end = ebc->width;
@@ -2731,6 +2730,13 @@ static int ebc_connector_get_modes(struct drm_connector *connector)
 	mode->vsync_start = ebc->height;
 	mode->vsync_end = ebc->height;
 	mode->vtotal = ebc->height;
+	/*
+	 * Not the dot clock (ebc_pixel_rate(), which nothing takes from the
+	 * mode): the clock that makes the mode's refresh the vblank tick's
+	 * rate, EBC_VBLANK_HZ.
+	 */
+	mode->clock = rk3026_ebc_vblank_mode_clock(EBC_VBLANK_HZ, mode->htotal,
+						   mode->vtotal);
 	drm_mode_set_name(mode);
 	drm_mode_probed_add(connector, mode);
 

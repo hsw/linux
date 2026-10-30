@@ -28,6 +28,7 @@
 
 #include <drm/drm_drv.h>
 #include <drm/drm_framebuffer.h>
+#include <drm/drm_modes.h>
 #include <drm/drm_plane.h>
 
 #if IS_ENABLED(CONFIG_DRM_RK3026_EBC_NEON)
@@ -3396,6 +3397,107 @@ static void ebc_test_du_account_reset(struct kunit *test)
 	}
 }
 
+/*
+ * The vblank tick's period: NSEC_PER_SEC / rate, rounded down, the rate
+ * clamped to 1-60 Hz; 0 is the slowest tick, not a division by zero.
+ */
+static void ebc_test_vblank_period(struct kunit *test)
+{
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_vblank_period_ns(1), 1000000000ULL);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_vblank_period_ns(10), 100000000ULL);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_vblank_period_ns(40), 25000000ULL);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_vblank_period_ns(60), 16666666ULL);
+
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_vblank_period_ns(0), 1000000000ULL);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_vblank_period_ns(61), 16666666ULL);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_vblank_period_ns(U32_MAX),
+			16666666ULL);
+
+	KUNIT_EXPECT_GE(test, EBC_VBLANK_HZ, EBC_VBLANK_HZ_MIN);
+	KUNIT_EXPECT_LE(test, EBC_VBLANK_HZ, EBC_VBLANK_HZ_MAX);
+}
+
+/* EPD panel sizes, both scan directions of the RC2's 6" 300 dpi one first. */
+static const struct {
+	u16 w, h;
+} t_vblank_panels[] = {
+	{ 1448, 1072 }, { 1072, 1448 }, { 800, 600 }, { 1024, 758 },
+	{ 1872, 1404 }, { 2200, 1650 },
+};
+
+/* The connector's mode as ebc_connector_get_modes() builds it. */
+static void t_vblank_mode(struct drm_display_mode *m, u32 hz, u16 w, u16 h)
+{
+	memset(m, 0, sizeof(*m));
+	m->hdisplay = w;
+	m->hsync_start = w;
+	m->hsync_end = w;
+	m->htotal = w;
+	m->vdisplay = h;
+	m->vsync_start = h;
+	m->vsync_end = h;
+	m->vtotal = h;
+	m->clock = rk3026_ebc_vblank_mode_clock(hz, m->htotal, m->vtotal);
+}
+
+/*
+ * The mode reports the tick: drm_mode_vrefresh() gives every rate back for
+ * every panel, and the frame duration the vblank core derives from the mode
+ * (drm_calc_timestamping_constants()) is the tick's period within 0.2 %.
+ */
+static void ebc_test_vblank_mode_clock(struct kunit *test)
+{
+	struct drm_display_mode m;
+	unsigned int i;
+	u32 hz;
+
+	for (i = 0; i < ARRAY_SIZE(t_vblank_panels); i++) {
+		u16 w = t_vblank_panels[i].w, h = t_vblank_panels[i].h;
+
+		for (hz = EBC_VBLANK_HZ_MIN; hz <= EBC_VBLANK_HZ_MAX; hz++) {
+			u64 period = rk3026_ebc_vblank_period_ns(hz);
+			u64 framedur;
+
+			t_vblank_mode(&m, hz, w, h);
+			KUNIT_ASSERT_GT(test, m.clock, 0);
+			KUNIT_EXPECT_EQ_MSG(test, drm_mode_vrefresh(&m), hz,
+					    "%ux%u", w, h);
+			framedur = div_u64(mul_u32_u32(w, h) * 1000000,
+					   m.clock);
+			KUNIT_EXPECT_LE_MSG(test, abs_diff(framedur, period),
+					    div_u64(period, 500),
+					    "%ux%u at %u Hz", w, h, hz);
+		}
+	}
+
+	/* The RC2 panel at the probe default. */
+	KUNIT_EXPECT_EQ(test,
+			rk3026_ebc_vblank_mode_clock(EBC_VBLANK_HZ, 1448, 1072),
+			15523);
+	t_vblank_mode(&m, EBC_VBLANK_HZ, 1448, 1072);
+	KUNIT_EXPECT_EQ(test, drm_mode_vrefresh(&m), EBC_VBLANK_HZ);
+
+	/* Rates out of range are clamped as the period's are. */
+	t_vblank_mode(&m, 0, 1448, 1072);
+	KUNIT_EXPECT_EQ(test, drm_mode_vrefresh(&m), 1);
+	t_vblank_mode(&m, 61, 1448, 1072);
+	KUNIT_EXPECT_EQ(test, drm_mode_vrefresh(&m), 60);
+	t_vblank_mode(&m, U32_MAX, 1448, 1072);
+	KUNIT_EXPECT_EQ(test, drm_mode_vrefresh(&m), 60);
+
+	/* Never 0 (an invalid mode), never past INT_MAX. */
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_vblank_mode_clock(1, 1, 1), 1);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_vblank_mode_clock(1, 0, 1072), 1);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_vblank_mode_clock(60, 65535, 65535),
+			257690174);
+	KUNIT_EXPECT_EQ(test,
+			rk3026_ebc_vblank_mode_clock(60, U32_MAX, U32_MAX),
+			INT_MAX);
+	KUNIT_EXPECT_EQ(test,
+			rk3026_ebc_vblank_mode_clock(1, U32_MAX, U32_MAX),
+			INT_MAX);
+}
+
 static struct kunit_case rk3026_ebc_core_test_cases[] = {
 	KUNIT_CASE(ebc_test_dsp_ctrl_mode),
 	KUNIT_CASE(ebc_test_us_between),
@@ -3461,6 +3563,8 @@ static struct kunit_case rk3026_ebc_core_test_cases[] = {
 	KUNIT_CASE(ebc_test_marker_zero),
 	KUNIT_CASE(ebc_test_marker_newest),
 	KUNIT_CASE(ebc_test_marker_eviction),
+	KUNIT_CASE(ebc_test_vblank_period),
+	KUNIT_CASE(ebc_test_vblank_mode_clock),
 	{}
 };
 

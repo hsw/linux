@@ -4558,6 +4558,59 @@ static void ebc_test_glue_plane_update(struct kunit *test)
 }
 
 /*
+ * A plane update records the update it queued for the commit being applied,
+ * for the commit's event: @commit_seq is the pending set's newest seq, one
+ * more for each update merged into it, and @commit_queued is set. Nothing
+ * is recorded while an mxcfb client owns the panel.
+ */
+static void ebc_test_glue_plane_update_seq(struct kunit *test)
+{
+	struct rk3026_ebc *ebc = t_ebc_alloc(test);
+	u32 *fb = kunit_kcalloc(test, T_W * T_H, sizeof(*fb), GFP_KERNEL);
+	struct drm_rect box = DRM_RECT_INIT(0, 0, 8, 2);
+	u32 first;
+
+	KUNIT_ASSERT_NOT_NULL(test, fb);
+
+	/* An mxcfb client owns the panel: nothing queued, nothing recorded. */
+	ebc->commit_seq = 0xdeadbeef;
+	ebc->mxcfb_active = true;
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_plane_update(ebc, fb, T_W * 4,
+							 &box));
+	KUNIT_EXPECT_FALSE(test, ebc->commit_queued);
+	KUNIT_EXPECT_EQ(test, ebc->commit_seq, 0xdeadbeef);
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_work_pending(&ebc->pending));
+
+	/* Queued: the seq of the update, the newest pending one. */
+	ebc->mxcfb_active = false;
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, fb, T_W * 4,
+							&box));
+	KUNIT_EXPECT_TRUE(test, ebc->commit_queued);
+	KUNIT_EXPECT_EQ(test, ebc->commit_seq, ebc->pending.queued_seq);
+	first = ebc->commit_seq;
+
+	/* A second update merges into the same part and gets the next seq. */
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, fb, T_W * 4,
+							&t_panel));
+	KUNIT_EXPECT_EQ(test, ebc->commit_seq, first + 1);
+	KUNIT_EXPECT_EQ(test, ebc->commit_seq, ebc->pending.queued_seq);
+	KUNIT_EXPECT_EQ(test, ebc->pending.pre.merged, 2);
+
+	/*
+	 * The next commit starts with nothing recorded, and the panel is
+	 * claimed again: the last seq stays.
+	 */
+	ebc->commit_queued = false;
+	ebc->mxcfb_active = true;
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_plane_update(ebc, fb, T_W * 4,
+							 &box));
+	KUNIT_EXPECT_FALSE(test, ebc->commit_queued);
+	KUNIT_EXPECT_EQ(test, ebc->commit_seq, first + 1);
+	KUNIT_EXPECT_EQ(test, ebc->pending.queued_seq, first + 1);
+	KUNIT_EXPECT_EQ(test, ebc->stats.updates, 2);
+}
+
+/*
  * The mode policy end to end, on a white glass: a plane update whose changes
  * are all black or white resolves DU, one with a grey PART, one that
  * changes nothing is skipped in its own mode. With the rails counted as up
@@ -8136,6 +8189,7 @@ static struct kunit_case rk3026_ebc_glue_test_cases[] = {
 	KUNIT_CASE(ebc_test_glue_wait_barrier),
 	KUNIT_CASE(ebc_test_glue_wait_timeout),
 	KUNIT_CASE(ebc_test_glue_plane_update),
+	KUNIT_CASE(ebc_test_glue_plane_update_seq),
 	KUNIT_CASE(ebc_test_glue_auto_du),
 	KUNIT_CASE(ebc_test_glue_auto_grey),
 	KUNIT_CASE(ebc_test_glue_auto_skipped),

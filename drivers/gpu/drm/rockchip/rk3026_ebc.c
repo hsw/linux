@@ -2406,6 +2406,10 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_plane_box);
  * makes the thread take the new deadline. The end of its scan stamps it
  * again (rk3026_ebc_do_refresh()).
  *
+ * A queued update is also recorded for the commit being applied, in the
+ * same section: @commit_seq gets the seq rk3026_ebc_add_update() gave it,
+ * and @commit_queued is set. Nothing is recorded when nothing was queued.
+ *
  * Returns true if the update was queued.
  */
 VISIBLE_IF_KUNIT bool rk3026_ebc_plane_update(struct rk3026_ebc *ebc,
@@ -2431,7 +2435,8 @@ VISIBLE_IF_KUNIT bool rk3026_ebc_plane_update(struct rk3026_ebc *ebc,
 						       &upd.clip);
 		WRITE_ONCE(ebc->idle_last_plane, jiffies);
 		WRITE_ONCE(ebc->idle_armed, true);
-		rk3026_ebc_add_update(ebc, &upd);
+		ebc->commit_seq = rk3026_ebc_add_update(ebc, &upd);
+		ebc->commit_queued = true;
 	}
 	mutex_unlock(&ebc->image_lock);
 	return queue;
@@ -2694,6 +2699,21 @@ static void ebc_crtc_atomic_disable(struct drm_crtc *crtc,
 	}
 }
 
+/*
+ * A commit starts with no update queued; rk3026_ebc_plane_update() records
+ * the one it queues (@commit_queued, @commit_seq). The core calls this in
+ * drm_atomic_helper_commit_planes() before the plane updates, for a commit
+ * that holds the CRTC while it is active. A plane in a commit always pulls
+ * its CRTC in, and only a commit that holds the CRTC carries its event.
+ */
+static void ebc_crtc_atomic_begin(struct drm_crtc *crtc,
+				  struct drm_atomic_state *state)
+{
+	struct rk3026_ebc *ebc = drm_to_ebc(crtc->dev);
+
+	ebc->commit_queued = false;
+}
+
 static const struct drm_crtc_funcs ebc_crtc_funcs = {
 	.set_config		= drm_atomic_helper_set_config,
 	.page_flip		= drm_atomic_helper_page_flip,
@@ -2704,6 +2724,7 @@ static const struct drm_crtc_funcs ebc_crtc_funcs = {
 };
 
 static const struct drm_crtc_helper_funcs ebc_crtc_helper_funcs = {
+	.atomic_begin		= ebc_crtc_atomic_begin,
 	.atomic_enable		= ebc_crtc_atomic_enable,
 	.atomic_disable		= ebc_crtc_atomic_disable,
 };

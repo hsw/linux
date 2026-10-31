@@ -189,11 +189,12 @@ config DRM_RK3026_EBC_MXCFB
 	  MXCFB_WAIT_FOR_UPDATE_SUBMISSION ioctls to the emulated fbdev, so
 	  e-reader userspace can pick a waveform mode, supply a panel
 	  temperature and wait for a refresh to finish, or only for it to
-	  be submitted. On an 8-bit (C8) fbdev a send takes each byte as
-	  grey, as i.MX does, not as an index into the palette; a redraw of
-	  the same bytes through the plane, with the first plane update
-	  after the client exits, takes them as indices again. The other
-	  mxcfb commands are refused with -ENOTTY.
+	  be submitted. EPDC_FLAG_ENABLE_INVERSION draws an update
+	  inverted. On an 8-bit (C8) fbdev a send takes each byte as grey,
+	  as i.MX does, not as an index into the palette; a redraw of the
+	  same bytes through the plane, with the first plane update after
+	  the client exits, takes them as indices again. The other mxcfb
+	  commands are refused with -ENOTTY.
 	  This is not an upstream interface; without it every update takes
 	  the plane path, whose waveform the driver picks from the content,
 	  so the display keeps working without client-chosen modes,

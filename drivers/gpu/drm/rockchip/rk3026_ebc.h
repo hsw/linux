@@ -142,14 +142,6 @@
 				 GRF_LVDS_OUT_SEL_BIT)
 
 /*
- * GRF pad-mux registers for the eight EBC pads, read back only for reporting.
- * Two bits per pin at 0xa8 + 4 * group; bank 2 groups B, C and D.
- */
-#define GRF_IOMUX_GPIO2B	0xcc
-#define GRF_IOMUX_GPIO2C	0xd0
-#define GRF_IOMUX_GPIO2D	0xd4
-
-/*
  * Source-driver clock: 306 x 769 x 85 Hz = 20 MHz, which is the figure the
  * panel table carries and what DRM's mode->clock describes.
  *

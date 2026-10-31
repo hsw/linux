@@ -1239,6 +1239,7 @@ const char *rk3026_ebc_blit_impl(void);
 
 /* rk3026_ebc_core.c */
 u32 rk3026_ebc_dsp_ctrl_mode(u32 mode);
+u32 rk3026_ebc_sdck(u32 width);
 u32 rk3026_ebc_us_between(ktime_t start, ktime_t end);
 bool rk3026_ebc_pending_add(struct rk3026_ebc_pending *p,
 			    const struct rk3026_ebc_update *upd, u32 *seq);

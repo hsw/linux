@@ -47,6 +47,24 @@ u32 rk3026_ebc_dsp_ctrl_mode(u32 mode)
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_dsp_ctrl_mode);
 
 /**
+ * rk3026_ebc_sdck - EPD_CTRL SDCK for a panel @width pixels wide
+ * @width: the panel's active width
+ *
+ * SDCK counts source-driver clocks per line, four pixels each. The field
+ * is 8 bits wide: a width of 1024 or more saturates it at 0xff, the value
+ * the vendor's kernel was read back programming on such a panel. Whether
+ * the field holds the count or the count - 1 is not established: only the
+ * saturated value has been compared with the vendor's.
+ *
+ * Return: @width / 4, at most 0xff.
+ */
+u32 rk3026_ebc_sdck(u32 width)
+{
+	return min(width / 4, 0xffU);
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_sdck);
+
+/**
  * rk3026_ebc_us_between - microseconds from @start to @end, for a record
  * @start: when it began
  * @end: when it ended

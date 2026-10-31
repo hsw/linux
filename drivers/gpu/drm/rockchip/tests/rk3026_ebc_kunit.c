@@ -175,6 +175,19 @@ static void ebc_test_dsp_ctrl_mode(struct kunit *test)
 }
 
 /*
+ * SDCK is width / 4 in an 8-bit field: a narrow panel gets its own count,
+ * one of 1024 pixels or more the saturated 0xff.
+ */
+static void ebc_test_sdck(struct kunit *test)
+{
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_sdck(800), 200);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_sdck(1020), 0xff);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_sdck(1024), 0xff);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_sdck(1448), 0xff);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_sdck(4096), 0xff);
+}
+
+/*
  * A record's time in us: rounded up, at least 1 once measured (0 means
  * none), 1 for a clock seen going backwards, saturated at U32_MAX.
  */
@@ -3476,6 +3489,7 @@ static void ebc_test_du_account_reset(struct kunit *test)
 
 static struct kunit_case rk3026_ebc_core_test_cases[] = {
 	KUNIT_CASE(ebc_test_dsp_ctrl_mode),
+	KUNIT_CASE(ebc_test_sdck),
 	KUNIT_CASE(ebc_test_us_between),
 	KUNIT_CASE(ebc_test_rank_order),
 	KUNIT_CASE(ebc_test_rank_unknown),

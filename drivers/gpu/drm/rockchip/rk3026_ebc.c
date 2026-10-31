@@ -3284,11 +3284,12 @@ static int ebc_probe(struct platform_device *pdev)
 	if (IS_ERR(ebc->rst))
 		return dev_err_probe(dev, PTR_ERR(ebc->rst), "bad resets\n");
 
-	ebc->grf = syscon_regmap_lookup_by_phandle(dev->of_node, "rockchip,grf");
-	if (IS_ERR(ebc->grf)) {
+	ebc->grf = syscon_regmap_lookup_by_phandle_optional(dev->of_node,
+							    "rockchip,grf");
+	if (IS_ERR(ebc->grf))
+		return dev_err_probe(dev, PTR_ERR(ebc->grf), "bad rockchip,grf\n");
+	if (!ebc->grf)
 		dev_warn(dev, "no rockchip,grf; skipping pad mux\n");
-		ebc->grf = NULL;
-	}
 
 	ret = of_get_display_timing(dev->of_node, "panel-timing", &ebc->timing);
 	if (ret)

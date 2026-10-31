@@ -1325,6 +1325,20 @@ static inline void rk3026_ebc_debugfs_fini(struct rk3026_ebc *ebc) { }
 
 /* rk3026_ebc_mxcfb.c */
 #if IS_ENABLED(CONFIG_DRM_RK3026_EBC_MXCFB)
+/**
+ * enum rk3026_ebc_mxcfb_cmd - what the shim does with an fb ioctl number
+ * @EBC_MXCFB_FBDEV: not an mxcfb number: the DRM fbdev helper answers
+ * @EBC_MXCFB_REFUSED: an mxcfb number this shim does not implement: -ENOTTY
+ * @EBC_MXCFB_SEND_UPDATE: MXCFB_SEND_UPDATE
+ * @EBC_MXCFB_WAIT_COMPLETE: MXCFB_WAIT_FOR_UPDATE_COMPLETE
+ */
+enum rk3026_ebc_mxcfb_cmd {
+	EBC_MXCFB_FBDEV,
+	EBC_MXCFB_REFUSED,
+	EBC_MXCFB_SEND_UPDATE,
+	EBC_MXCFB_WAIT_COMPLETE,
+};
+
 void rk3026_ebc_mxcfb_install(struct rk3026_ebc *ebc, struct fb_info *info);
 #if IS_ENABLED(CONFIG_KUNIT)
 struct mxcfb_update_data;
@@ -1333,6 +1347,10 @@ u32 rk3026_ebc_mxcfb_to_ebc_mode(u32 waveform_mode, u32 update_mode,
 int rk3026_ebc_mxcfb_send(struct rk3026_ebc *ebc, const void *src,
 			  unsigned int pitch,
 			  const struct mxcfb_update_data *req);
+int rk3026_ebc_mxcfb_wait_complete(struct rk3026_ebc *ebc, u32 marker);
+enum rk3026_ebc_mxcfb_cmd rk3026_ebc_mxcfb_classify(unsigned int cmd);
+int rk3026_ebc_mxcfb_ioctl(struct fb_info *info, unsigned int cmd,
+			   unsigned long arg);
 #endif
 #else
 static inline void rk3026_ebc_mxcfb_install(struct rk3026_ebc *ebc,

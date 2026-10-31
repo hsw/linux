@@ -117,14 +117,23 @@ VISIBLE_IF_KUNIT u32 rk3026_ebc_mxcfb_to_ebc_mode(u32 waveform_mode,
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_mxcfb_to_ebc_mode);
 
 /*
- * One MXCFB_SEND_UPDATE request, already copied in: the region clamped to
- * the panel, the waveform and the flags mapped
+ * One MXCFB_SEND_UPDATE request, already copied in: the arguments checked,
+ * the region clamped to the panel, the waveform and the flags mapped
  * (rk3026_ebc_mxcfb_to_ebc_mode()), and, in one @image_lock section, the
  * client's pixels converted from @src, its framebuffer with @pitch bytes
  * per row, and the update queued.
  *
- * Returns 0, -EINVAL if nothing of the region is on the panel, or -EBUSY
- * with the CRTC off.
+ * The checks are i.MX's: an update_mode other than PARTIAL or FULL and a
+ * waveform number above MXCFB_WAVEFORM_MODE_MAX other than AUTO are
+ * invalid. Two flags change which image is meant and cannot be honoured,
+ * so the update is refused rather than drawn without them:
+ * EPDC_FLAG_USE_ALT_BUFFER names a physical address, and the shmem fbdev
+ * has none a client could name; EPDC_FLAG_TEST_COLLISION asks for a dry
+ * run. Other flags this shim does not read are ignored, as on i.MX.
+ *
+ * Returns 0, -EINVAL for an argument above or if nothing of the region is
+ * on the panel, or -EBUSY with the CRTC off. A refused send queues
+ * nothing and leaves the panel to whoever had it.
  */
 VISIBLE_IF_KUNIT int rk3026_ebc_mxcfb_send(struct rk3026_ebc *ebc,
 					   const void *src, unsigned int pitch,
@@ -134,6 +143,14 @@ VISIBLE_IF_KUNIT int rk3026_ebc_mxcfb_send(struct rk3026_ebc *ebc,
 	struct drm_rect clip;
 	bool auto_mode;
 	u32 mode;
+
+	if (req->update_mode > MXCFB_UPDATE_MODE_FULL)
+		return -EINVAL;
+	if (req->waveform_mode > MXCFB_WAVEFORM_MODE_MAX &&
+	    req->waveform_mode != MXCFB_WAVEFORM_MODE_AUTO)
+		return -EINVAL;
+	if (req->flags & (EPDC_FLAG_USE_ALT_BUFFER | EPDC_FLAG_TEST_COLLISION))
+		return -EINVAL;
 
 	clip.x1 = min_t(u32, req->update_region.left, ebc->width);
 	clip.y1 = min_t(u32, req->update_region.top, ebc->height);
@@ -203,6 +220,22 @@ static int mxcfb_send_update(struct rk3026_ebc *ebc, struct fb_info *info,
 }
 
 /*
+ * MXCFB_WAIT_FOR_UPDATE_COMPLETE for @marker. Marker 0 is "no marker" on
+ * the send side, so a wait on it is an invalid argument, as on i.MX; an
+ * unknown marker or one already pushed out of the ring returns 0 at once
+ * (rk3026_ebc_wait_marker()).
+ */
+VISIBLE_IF_KUNIT int rk3026_ebc_mxcfb_wait_complete(struct rk3026_ebc *ebc,
+						    u32 marker)
+{
+	if (!marker)
+		return -EINVAL;
+
+	return rk3026_ebc_wait_marker(ebc, marker);
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_mxcfb_wait_complete);
+
+/*
  * The fbdev core calls fb_ioctl under lock_fb_info(), so a client blocked
  * here (up to rk3026_ebc_wait_timeout_ms() when the refresh thread is stuck)
  * holds the fb_info lock: a send, FBIOPAN_DISPLAY or FBIOBLANK from another
@@ -217,26 +250,63 @@ static int mxcfb_wait_for_update(struct rk3026_ebc *ebc, unsigned long arg)
 	if (copy_from_user(&marker, (void __user *)arg, sizeof(marker)))
 		return -EFAULT;
 
-	return rk3026_ebc_wait_marker(ebc, marker);
+	return rk3026_ebc_mxcfb_wait_complete(ebc, marker);
 }
 
-static int ebc_fb_ioctl(struct fb_info *info, unsigned int cmd,
-			unsigned long arg)
+/*
+ * What an fb ioctl number gets. The i.MX EPDC dialect and its Kobo,
+ * Kindle, PocketBook and reMarkable variants use 'F' 0x21..0x55 (with the
+ * i.MX IPU commands that shared the fb's number space): their sends
+ * (0x2e) and waits (0x2f, 0x35, 0x37) in every struct size, the
+ * temperature, power-down delay, auto-update, update scheme, waveform-set
+ * and pause setters and getters, the work-buffer and EPDC-access test
+ * hooks, and PocketBook's EPDC_GET_UPDATE_STATE (0x55). The two V1
+ * commands are implemented; every other number there is refused with
+ * -ENOTTY here, before the fbdev helper, so a client that probes for one
+ * (PocketBook's B288 test takes 0 as "present") gets a defined failure
+ * whatever a later helper does with the number. Every other number,
+ * FBIO_WAITFORVSYNC (= MXCFB_WAIT_FOR_VSYNC) among them, is the helper's.
+ */
+VISIBLE_IF_KUNIT enum rk3026_ebc_mxcfb_cmd
+rk3026_ebc_mxcfb_classify(unsigned int cmd)
+{
+	switch (cmd) {
+	case MXCFB_SEND_UPDATE:
+		return EBC_MXCFB_SEND_UPDATE;
+	case MXCFB_WAIT_FOR_UPDATE_COMPLETE:
+		return EBC_MXCFB_WAIT_COMPLETE;
+	}
+
+	if (_IOC_TYPE(cmd) == 'F' && _IOC_NR(cmd) >= MXCFB_IOC_NR_FIRST &&
+	    _IOC_NR(cmd) <= MXCFB_IOC_NR_LAST)
+		return EBC_MXCFB_REFUSED;
+	return EBC_MXCFB_FBDEV;
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_mxcfb_classify);
+
+VISIBLE_IF_KUNIT int rk3026_ebc_mxcfb_ioctl(struct fb_info *info,
+					    unsigned int cmd,
+					    unsigned long arg)
 {
 	struct drm_fb_helper *helper = info->par;
 	struct rk3026_ebc *ebc = drm_to_ebc(helper->dev);
 
-	switch (cmd) {
-	case MXCFB_SEND_UPDATE:
+	switch (rk3026_ebc_mxcfb_classify(cmd)) {
+	case EBC_MXCFB_SEND_UPDATE:
 		return mxcfb_send_update(ebc, info, arg);
-	case MXCFB_WAIT_FOR_UPDATE_COMPLETE:
+	case EBC_MXCFB_WAIT_COMPLETE:
 		return mxcfb_wait_for_update(ebc, arg);
+	case EBC_MXCFB_REFUSED:
+		return -ENOTTY;
+	case EBC_MXCFB_FBDEV:
+		break;
 	}
 
 	if (ebc->orig_fbops->fb_ioctl)
 		return ebc->orig_fbops->fb_ioctl(info, cmd, arg);
 	return -ENOTTY;
 }
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_mxcfb_ioctl);
 
 static int ebc_fb_open(struct fb_info *info, int user)
 {
@@ -295,7 +365,7 @@ void rk3026_ebc_mxcfb_install(struct rk3026_ebc *ebc, struct fb_info *info)
 	*ops = *info->fbops;
 
 	ebc->orig_fbops = info->fbops;
-	ops->fb_ioctl = ebc_fb_ioctl;
+	ops->fb_ioctl = rk3026_ebc_mxcfb_ioctl;
 	ops->fb_open = ebc_fb_open;
 	ops->fb_release = ebc_fb_release;
 	ebc->fbops = ops;

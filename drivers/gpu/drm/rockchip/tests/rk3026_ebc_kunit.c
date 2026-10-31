@@ -14,6 +14,7 @@
 #include <linux/completion.h>
 #include <linux/dma-fence.h>
 #include <linux/err.h>
+#include <linux/fb.h>
 #include <linux/hrtimer.h>
 #include <linux/jiffies.h>
 #include <linux/ktime.h>
@@ -30,6 +31,7 @@
 
 #include <drm/drm_crtc.h>
 #include <drm/drm_drv.h>
+#include <drm/drm_fb_helper.h>
 #include <drm/drm_file.h>
 #include <drm/drm_framebuffer.h>
 #include <drm/drm_plane.h>
@@ -3757,10 +3759,177 @@ static void ebc_test_mxcfb_auto_resolve(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, reason, EBC_REASON_EXPLICIT);
 }
 
+/* --- the mxcfb ioctl numbers --- */
+
+struct t_mxcfb_cmd {
+	const char			*desc;
+	unsigned int			cmd;
+	enum rk3026_ebc_mxcfb_cmd	answer;
+};
+
+/*
+ * Every number of the i.MX / Kobo / Kindle / PocketBook / reMarkable
+ * mxcfb dialect a client may send to fb0 (on 32-bit ARM), as their
+ * headers spell them, with the answer it gets: the two V1 commands are
+ * implemented, every other one is refused. MXCFB_WAIT_FOR_VSYNC is
+ * FBIO_WAITFORVSYNC and stays the fbdev helper's, as do the numbers
+ * outside the dialect's 'F' range.
+ */
+static const struct t_mxcfb_cmd t_mxcfb_cmd_cases[] = {
+	{ "WAIT_FOR_VSYNC", 0x40044620, EBC_MXCFB_FBDEV },
+	{ "SET_GBL_ALPHA", 0x40084621, EBC_MXCFB_REFUSED },
+	{ "SET_CLR_KEY", 0x40084622, EBC_MXCFB_REFUSED },
+	{ "SET_OVERLAY_POS", 0xc0044624, EBC_MXCFB_REFUSED },
+	{ "GET_FB_IPU_CHAN", 0x80044625, EBC_MXCFB_REFUSED },
+	{ "SET_LOC_ALPHA", 0xc0104626, EBC_MXCFB_REFUSED },
+	{ "SET_LOC_ALP_BUF", 0x40044627, EBC_MXCFB_REFUSED },
+	{ "SET_GAMMA", 0x40844628, EBC_MXCFB_REFUSED },
+	{ "GET_FB_IPU_DI", 0x80044629, EBC_MXCFB_REFUSED },
+	{ "GET_DIFMT", 0x8004462a, EBC_MXCFB_REFUSED },
+	{ "GET_FB_BLANK", 0x8004462b, EBC_MXCFB_REFUSED },
+	{ "SET_WAVEFORM_MODES", 0x4018462b, EBC_MXCFB_REFUSED },
+	{ "SET_WAVEFORM_MODES_NTX", 0x4028462b, EBC_MXCFB_REFUSED },
+	{ "SET_WAVEFORM_MODES Kindle", 0x403c462b, EBC_MXCFB_REFUSED },
+	{ "SET_TEMPERATURE", 0x4004462c, EBC_MXCFB_REFUSED },
+	{ "CSC_UPDATE", 0x403c462d, EBC_MXCFB_REFUSED },
+	{ "SET_AUTO_UPDATE_MODE", 0x4004462d, EBC_MXCFB_REFUSED },
+	{ "HWTCON_SEND_UPDATE", 0x4024462e, EBC_MXCFB_REFUSED },
+	{ "SEND_UPDATE_V1", 0x4040462e, EBC_MXCFB_SEND_UPDATE },
+	{ "SEND_UPDATE_V1_NTX", 0x4044462e, EBC_MXCFB_REFUSED },
+	{ "SEND_UPDATE_V2", 0x4048462e, EBC_MXCFB_REFUSED },
+	{ "SEND_UPDATE_REX", 0x4050462e, EBC_MXCFB_REFUSED },
+	{ "SEND_UPDATE_ZELDA", 0x4058462e, EBC_MXCFB_REFUSED },
+	{ "SEND_UPDATE_MTK", 0x4060462e, EBC_MXCFB_REFUSED },
+	{ "WAIT_FOR_UPDATE_COMPLETE_V1", 0x4004462f, EBC_MXCFB_WAIT_COMPLETE },
+	{ "WAIT_FOR_UPDATE_COMPLETE_V3", 0xc008462f, EBC_MXCFB_REFUSED },
+	{ "SET_GPU_SPLIT_FMT", 0x40a4462f, EBC_MXCFB_REFUSED },
+	{ "SET_PWRDOWN_DELAY", 0x40044630, EBC_MXCFB_REFUSED },
+	{ "GET_PWRDOWN_DELAY", 0x80044631, EBC_MXCFB_REFUSED },
+	{ "SET_UPDATE_SCHEME", 0x40044632, EBC_MXCFB_REFUSED },
+	{ "SET_PAUSE", 0x40044633, EBC_MXCFB_REFUSED },
+	{ "GET_PAUSE", 0x40044634, EBC_MXCFB_REFUSED },
+	{ "GET_WORK_BUFFER", 0xc0044634, EBC_MXCFB_REFUSED },
+	{ "SET_RESUME", 0x40044635, EBC_MXCFB_REFUSED },
+	{ "DISABLE_EPDC_ACCESS", 0x00004635, EBC_MXCFB_REFUSED },
+	{ "WAIT_FOR_UPDATE_COMPLETE_V2", 0xc0084635, EBC_MXCFB_REFUSED },
+	{ "ENABLE_EPDC_ACCESS", 0x00004636, EBC_MXCFB_REFUSED },
+	{ "GET_WORK_BUFFER Kindle", 0xc0044636, EBC_MXCFB_REFUSED },
+	{ "WAIT_FOR_UPDATE_SUBMISSION", 0x40044637, EBC_MXCFB_REFUSED },
+	{ "WAIT_FOR_ANY_UPDATE_COMPLETE_MTK", 0xc0044637, EBC_MXCFB_REFUSED },
+	{ "GET_TEMPERATURE", 0x80044638, EBC_MXCFB_REFUSED },
+	{ "GET_WAVEFORM_TYPE", 0x80044639, EBC_MXCFB_REFUSED },
+	{ "GET_MATERIAL_TYPE", 0x8004463a, EBC_MXCFB_REFUSED },
+	{ "SET_UPDATE_FLAGS_MTK", 0x4004463b, EBC_MXCFB_REFUSED },
+	{ "GET_UPDATE_FLAGS_MTK", 0xc004463c, EBC_MXCFB_REFUSED },
+	{ "SET_NIGHTMODE", 0x8004464a, EBC_MXCFB_REFUSED },
+	{ "SET_NIGHTMODE_MTK", 0x8010464a, EBC_MXCFB_REFUSED },
+	{ "SET_HALFTONE", 0x4024464b, EBC_MXCFB_REFUSED },
+	{ "EPDC_GET_UPDATE_STATE", 0x80044655, EBC_MXCFB_REFUSED },
+	/* Type 'G', not 'F': the helper refuses it. */
+	{ "GET_PANEL_INFO_MTK", 0x80704730, EBC_MXCFB_FBDEV },
+	/* The implemented numbers with another size or direction. */
+	{ "SEND_UPDATE _IOWR", 0xc040462e, EBC_MXCFB_REFUSED },
+	{ "WAIT_FOR_UPDATE_COMPLETE _IOWR", 0xc004462f, EBC_MXCFB_REFUSED },
+	/* The ends of the range, and numbers unknown to every header. */
+	{ "'F' 0x21 none", 0x00004621, EBC_MXCFB_REFUSED },
+	{ "'F' 0x3d unknown", 0x4004463d, EBC_MXCFB_REFUSED },
+	{ "'F' 0x55 _IOW", 0x40044655, EBC_MXCFB_REFUSED },
+	{ "'F' 0x56", 0x40044656, EBC_MXCFB_FBDEV },
+	{ "'F' 0x20 none", 0x00004620, EBC_MXCFB_FBDEV },
+	/* The fbdev core's own (handled before fb_ioctl) and another type. */
+	{ "FBIOGET_VSCREENINFO", FBIOGET_VSCREENINFO, EBC_MXCFB_FBDEV },
+	{ "FBIOBLANK", FBIOBLANK, EBC_MXCFB_FBDEV },
+	{ "'E' 0x2e", 0x4040452e, EBC_MXCFB_FBDEV },
+};
+
+KUNIT_ARRAY_PARAM_DESC(t_mxcfb_cmd, t_mxcfb_cmd_cases, desc);
+
+static void ebc_test_mxcfb_classify(struct kunit *test)
+{
+	const struct t_mxcfb_cmd *c = test->param_value;
+
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_classify(c->cmd), c->answer);
+}
+
+/* The headers' numbers are the shim's. */
+static void ebc_test_mxcfb_numbers(struct kunit *test)
+{
+	KUNIT_EXPECT_EQ(test, MXCFB_SEND_UPDATE, 0x4040462e);
+	KUNIT_EXPECT_EQ(test, MXCFB_WAIT_FOR_UPDATE_COMPLETE, 0x4004462f);
+	KUNIT_EXPECT_EQ(test, FBIO_WAITFORVSYNC, 0x40044620);
+}
+
+/* The fbdev helper's answer, told apart from every errno. */
+#define T_FBDEV_ANSWER	4321
+
+static int t_fbdev_ioctl(struct fb_info *info, unsigned int cmd,
+			 unsigned long arg)
+{
+	unsigned int *calls = kunit_get_current_test()->priv;
+
+	(*calls)++;
+	return T_FBDEV_ANSWER;
+}
+
+/*
+ * Through the fb_ioctl the shim installs: a refused number answers
+ * -ENOTTY and never reaches the fbdev helper, a number that is not the
+ * shim's reaches it and gets its answer. The implemented numbers copy
+ * from userspace, so they are left to the classify cases.
+ */
+static void ebc_test_mxcfb_ioctl(struct kunit *test)
+{
+	static const struct fb_ops helper_ops = { .fb_ioctl = t_fbdev_ioctl };
+	static const struct fb_ops no_ioctl_ops = {};
+	struct rk3026_ebc *ebc = kunit_kzalloc(test, sizeof(*ebc), GFP_KERNEL);
+	struct drm_fb_helper *helper = kunit_kzalloc(test, sizeof(*helper),
+						     GFP_KERNEL);
+	struct fb_info *info = kunit_kzalloc(test, sizeof(*info), GFP_KERNEL);
+	unsigned int calls = 0, i;
+	int ret;
+
+	KUNIT_ASSERT_NOT_NULL(test, ebc);
+	KUNIT_ASSERT_NOT_NULL(test, helper);
+	KUNIT_ASSERT_NOT_NULL(test, info);
+	helper->dev = &ebc->drm;
+	info->par = helper;
+	ebc->orig_fbops = &helper_ops;
+	test->priv = &calls;
+
+	for (i = 0; i < ARRAY_SIZE(t_mxcfb_cmd_cases); i++) {
+		const struct t_mxcfb_cmd *c = &t_mxcfb_cmd_cases[i];
+		unsigned int before = calls;
+
+		if (c->answer == EBC_MXCFB_SEND_UPDATE ||
+		    c->answer == EBC_MXCFB_WAIT_COMPLETE)
+			continue;
+		/* A bad pointer: nothing may dereference it. */
+		ret = rk3026_ebc_mxcfb_ioctl(info, c->cmd, 1);
+		if (c->answer == EBC_MXCFB_REFUSED) {
+			KUNIT_EXPECT_EQ_MSG(test, ret, -ENOTTY, "%s", c->desc);
+			KUNIT_EXPECT_EQ_MSG(test, calls, before, "%s", c->desc);
+		} else {
+			KUNIT_EXPECT_EQ_MSG(test, ret, T_FBDEV_ANSWER, "%s",
+					    c->desc);
+			KUNIT_EXPECT_EQ_MSG(test, calls, before + 1, "%s",
+					    c->desc);
+		}
+	}
+
+	/* Without a helper fb_ioctl, a number not the shim's is -ENOTTY. */
+	ebc->orig_fbops = &no_ioctl_ops;
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_ioctl(info, FBIO_WAITFORVSYNC,
+						     1), -ENOTTY);
+	test->priv = NULL;
+}
+
 static struct kunit_case rk3026_ebc_mxcfb_test_cases[] = {
 	KUNIT_CASE_PARAM(ebc_test_mxcfb_map, t_mxcfb_gen_params),
 	KUNIT_CASE(ebc_test_mxcfb_full_class),
 	KUNIT_CASE(ebc_test_mxcfb_auto_resolve),
+	KUNIT_CASE_PARAM(ebc_test_mxcfb_classify, t_mxcfb_cmd_gen_params),
+	KUNIT_CASE(ebc_test_mxcfb_numbers),
+	KUNIT_CASE(ebc_test_mxcfb_ioctl),
 	{}
 };
 
@@ -7926,6 +8095,104 @@ static void ebc_test_glue_mxcfb_send(struct kunit *test)
 	t_expect_white(test, ebc->next_shadow);
 	KUNIT_EXPECT_EQ(test, ebc->stats.updates, 4);
 }
+
+/* A send the shim refuses for its arguments, and one it takes. */
+struct t_mxcfb_arg {
+	const char	*desc;
+	u32		waveform;
+	u32		update_mode;
+	u32		flags;
+	int		ret;
+};
+
+static const struct t_mxcfb_arg t_mxcfb_arg_cases[] = {
+	{ "update_mode 2", MXCFB_WAVEFORM_MODE_GC16, 2, 0, -EINVAL },
+	{ "update_mode ~0", MXCFB_WAVEFORM_MODE_GC16, ~0u, 0, -EINVAL },
+	{ "waveform 256", 256, T_PARTIAL, 0, -EINVAL },
+	{ "waveform 258", 258, T_FULL, 0, -EINVAL },
+	{ "waveform ~0", ~0u, T_PARTIAL, 0, -EINVAL },
+	{ "ALT_BUFFER", MXCFB_WAVEFORM_MODE_GC16, T_PARTIAL,
+	  EPDC_FLAG_USE_ALT_BUFFER, -EINVAL },
+	{ "TEST_COLLISION", MXCFB_WAVEFORM_MODE_AUTO, T_FULL,
+	  EPDC_FLAG_TEST_COLLISION, -EINVAL },
+	{ "ALT_BUFFER mono", MXCFB_WAVEFORM_MODE_DU, T_PARTIAL,
+	  EPDC_FLAG_USE_ALT_BUFFER | EPDC_FLAG_FORCE_MONOCHROME, -EINVAL },
+	{ "all flags", MXCFB_WAVEFORM_MODE_GC16, T_PARTIAL, ~0u, -EINVAL },
+	/* The edges that stay valid; flags this shim does not read. */
+	{ "waveform 255", 255, T_FULL, 0, 0 },
+	{ "AUTO", MXCFB_WAVEFORM_MODE_AUTO, T_PARTIAL, 0, 0 },
+	{ "update_mode FULL", MXCFB_WAVEFORM_MODE_GL16, T_FULL, 0, 0 },
+	{ "other flags", MXCFB_WAVEFORM_MODE_GC16, T_PARTIAL,
+	  ~(EPDC_FLAG_USE_ALT_BUFFER | EPDC_FLAG_TEST_COLLISION), 0 },
+};
+
+KUNIT_ARRAY_PARAM_DESC(t_mxcfb_arg, t_mxcfb_arg_cases, desc);
+
+/*
+ * A send with an invalid update_mode or waveform, or with a flag that
+ * changes which image is meant and cannot be honoured, is refused with
+ * -EINVAL: nothing converted, nothing queued, the panel not claimed from
+ * the plane. The arguments are checked first, so the answer is the same
+ * with the CRTC off. A valid send next to each edge is taken.
+ */
+static void ebc_test_glue_mxcfb_args(struct kunit *test)
+{
+	const struct t_mxcfb_arg *c = test->param_value;
+	struct rk3026_ebc *ebc = t_policy_ebc(test);
+	u32 *black = t_plane_fb(test, 0);
+	struct mxcfb_update_data req = {
+		.update_region = { .width = T_W, .height = T_H },
+		.waveform_mode = c->waveform,
+		.update_mode = c->update_mode,
+		.update_marker = 9,
+		.temp = MXCFB_TEMP_USE_AMBIENT,
+		.flags = c->flags,
+	};
+	struct rk3026_ebc_set part;
+
+	KUNIT_EXPECT_EQ(test, t_mxcfb_part(ebc, black, &req, &part), c->ret);
+	if (c->ret) {
+		KUNIT_EXPECT_EQ(test, part.merged, 0);
+		KUNIT_EXPECT_FALSE(test, ebc->mxcfb_active);
+		KUNIT_EXPECT_EQ(test, ebc->stats.updates, 0);
+		t_expect_white(test, ebc->next_shadow);
+		ebc->crtc_on = false;
+		KUNIT_EXPECT_EQ(test, t_mxcfb_part(ebc, black, &req, &part),
+				c->ret);
+	} else {
+		KUNIT_EXPECT_EQ(test, part.merged, 1);
+		KUNIT_EXPECT_EQ(test, part.marker, 9);
+		KUNIT_EXPECT_TRUE(test, ebc->mxcfb_active);
+		KUNIT_EXPECT_EQ(test, t_px(ebc->next_shadow, 0, 0), 0);
+	}
+}
+
+/*
+ * MXCFB_WAIT_FOR_UPDATE_COMPLETE: marker 0 is invalid, also with an
+ * unmarked update pending; a marker never sent and a finished one return
+ * at once. The driver's own wait keeps "marker 0: nothing to wait for".
+ */
+static void ebc_test_glue_mxcfb_wait(struct kunit *test)
+{
+	struct rk3026_ebc *ebc = t_ebc_alloc(test);
+	struct rk3026_ebc_last last;
+	u32 s0, s7;
+
+	ebc->crtc_on = false;
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_wait_complete(ebc, 0), -EINVAL);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_wait_complete(ebc, 42), 0);
+
+	s0 = t_send(ebc, &t_panel, EBC_MODE_PART, 0, EBC_SOURCE_MXCFB);
+	s7 = t_send(ebc, &t_panel, EBC_MODE_PART, 7, EBC_SOURCE_MXCFB);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_wait_complete(ebc, 0), -EINVAL);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_marker(ebc, 0), 0);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_CRTC_OFF);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_seq_finished(&ebc->pending, s0));
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_seq_finished(&ebc->pending, s7));
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_wait_complete(ebc, 7), 0);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_wait_complete(ebc, 0), -EINVAL);
+}
 #endif
 /*
  * The CPU time of a part in its record: the blit of its newest update, as
@@ -10558,6 +10825,8 @@ static struct kunit_case rk3026_ebc_glue_test_cases[] = {
 	KUNIT_CASE(ebc_test_glue_sleep_crtc_wait),
 #if IS_ENABLED(CONFIG_DRM_RK3026_EBC_MXCFB)
 	KUNIT_CASE(ebc_test_glue_mxcfb_send),
+	KUNIT_CASE_PARAM(ebc_test_glue_mxcfb_args, t_mxcfb_arg_gen_params),
+	KUNIT_CASE(ebc_test_glue_mxcfb_wait),
 #endif
 	KUNIT_CASE(ebc_test_glue_timing),
 	KUNIT_CASE(ebc_test_glue_timing_skipped),

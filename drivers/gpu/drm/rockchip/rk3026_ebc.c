@@ -267,25 +267,6 @@ VISIBLE_IF_KUNIT unsigned int rk3026_ebc_wait_timeout_ms(struct rk3026_ebc *ebc)
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_wait_timeout_ms);
 
 /*
- * DIAGNOSTIC, REVERT ME. The scan completes -- frame-end interrupts arrive and
- * no chunk times out -- while the glass does not move, so every stage between
- * the source image and the panel is reported as a positive marker rather than
- * inferred from the absence of an error. Reports the next N scans; off by
- * default, armed at runtime with
- *
- *	echo 4 > /sys/module/rk3026_ebc/parameters/debug_scan
- *
- * or for the fbcon updates at boot with rk3026_ebc.debug_scan=6 on the kernel
- * command line. The debugfs panel, target and state files do not depend on it.
- */
-static unsigned int debug_scan;
-module_param(debug_scan, uint, 0644);
-MODULE_PARM_DESC(debug_scan, "report every stage of the next N waveform scans (0 = off)");
-
-static atomic_t dbg_irqs = ATOMIC_INIT(0);
-static u32 dbg_last_status;
-
-/*
  * DIAGNOSTIC, REVERT ME. Runtime knobs so one card can answer several questions
  * without a rebuild, because judging a weak panel response by eye is expensive
  * and ambiguous.
@@ -332,135 +313,6 @@ MODULE_PARM_DESC(force_mode, "override the refresh mode (0-12; -1 = use the upda
 static unsigned int debug_timeout;
 module_param(debug_timeout, uint, 0644);
 MODULE_PARM_DESC(debug_timeout, "force the next N chunks to time out (0 = off); provokes P62's abort");
-
-/*
- * DIAGNOSTIC: the snapshot a scan drives against the image the panel is
- * believed to show, from the cached shadows (debug_scan only). The skip
- * decision does not depend on it: rk3026_ebc_do_refresh() makes that one on
- * every refresh, from what rk3026_ebc_build_snapshot() returns.
- */
-static void ebc_report_image(struct rk3026_ebc *ebc)
-{
-	const u8 *p = ebc->shadows.prev, *n = ebc->shadows.scan;
-	size_t i, diff = 0, black = 0, white = 0;
-	u32 hn = 2166136261u, hp = 2166136261u;
-
-	for (i = 0; i < ebc->img_size; i++) {
-		if (p[i] != n[i])
-			diff++;
-		if (n[i] == 0x00)
-			black++;
-		else if (n[i] == 0xff)
-			white++;
-		/*
-		 * Position-sensitive fingerprints, because the counts are NOT.
-		 * A half-black image has the same totals whether the split is
-		 * horizontal or vertical, so "194048 x00 194048 xff" matched both
-		 * fbpoke hsplit and vsplit -- and a dropped update therefore read
-		 * as a plausible new one on 2026-08-03. FNV-1a; the value means
-		 * nothing on its own, only whether it CHANGED.
-		 */
-		hn = (hn ^ n[i]) * 16777619u;
-		hp = (hp ^ p[i]) * 16777619u;
-	}
-
-	dev_info(ebc->dev,
-		 "scan: image %zu bytes, %zu differ from prev, scan %zu x00 %zu xff, fp scan %08x prev %08x\n",
-		 ebc->img_size, diff, black, white, hn, hp);
-}
-
-/*
- * What the clocks and the EPD rail actually are at the moment of the scan.
- *
- * The GRF and CRU reads are here because a good boot and a bad boot have so
- * far produced dmesg that is identical line for line -- same registers, same
- * LUT, same frame counts, same 4260 ms -- while the panel images on one and
- * not the other. Whatever differs is therefore something the driver sets up
- * but never reads back, and pad mux, the EBC/LCDC pad select and the dclk mux
- * are exactly that: written once at probe, believed forever after.
- */
-static void ebc_report_env(struct rk3026_ebc *ebc)
-{
-	u32 iomux2b = 0, iomux2c = 0, iomux2d = 0, ebc_sel = 0;
-
-	dev_info(ebc->dev, "scan: aclk %lu dclk %lu hclk %lu epd_supply %d\n",
-		 clk_get_rate(ebc->aclk), clk_get_rate(ebc->dclk),
-		 clk_get_rate(ebc->hclk),
-		 ebc->epd_supply ? regulator_is_enabled(ebc->epd_supply) : -1);
-
-	if (ebc->grf) {
-		regmap_read(ebc->grf, GRF_IOMUX_GPIO2B, &iomux2b);
-		regmap_read(ebc->grf, GRF_IOMUX_GPIO2C, &iomux2c);
-		regmap_read(ebc->grf, GRF_IOMUX_GPIO2D, &iomux2d);
-		regmap_read(ebc->grf, GRF_EBC_SEL_REG, &ebc_sel);
-	}
-	dev_info(ebc->dev,
-		 "scan: grf iomux2b %08x 2c %08x 2d %08x ebc_sel %08x (want aa/ff28/0a/0x301)\n",
-		 iomux2b, iomux2c, iomux2d, ebc_sel);
-}
-
-/*
- * Registers the controller reads back, after the group has been latched by
- * CONFIG_DONE. DSP_START, DSP_CTRL and EBC_INT are write-only, so the values
- * printed for those are the driver's own shadow state, not the hardware's.
- */
-static void ebc_report_regs(struct rk3026_ebc *ebc, const char *when)
-{
-	dev_info(ebc->dev,
-		 "scan: %s win_ctrl %08x mst0 %08x mst1 %08x vir %08x act %08x dsp %08x dsp_st %08x\n",
-		 when, ebc_read(ebc, EBC_WIN_CTRL), ebc_read(ebc, EBC_WIN_MST0),
-		 ebc_read(ebc, EBC_WIN_MST1), ebc_read(ebc, EBC_WIN_VIR),
-		 ebc_read(ebc, EBC_WIN_ACT), ebc_read(ebc, EBC_WIN_DSP),
-		 ebc_read(ebc, EBC_WIN_DSP_ST));
-	dev_info(ebc->dev,
-		 "scan: %s epd_ctrl %08x act_info %08x ht %08x %08x vt %08x %08x\n",
-		 when, ebc_read(ebc, EBC_EPD_CTRL),
-		 ebc_read(ebc, EBC_DSP_ACT_INFO),
-		 ebc_read(ebc, EBC_DSP_HTIMING0), ebc_read(ebc, EBC_DSP_HTIMING1),
-		 ebc_read(ebc, EBC_DSP_VTIMING0), ebc_read(ebc, EBC_DSP_VTIMING1));
-	dev_info(ebc->dev,
-		 "scan: %s int(hw) %08x; shadow dsp_start %08x dsp_ctrl %08x int %08x\n",
-		 when, ebc_read(ebc, EBC_INT), ebc->dsp_start, ebc->dsp_ctrl,
-		 ebc->int_reg);
-}
-
-/*
- * Read the LUT SRAM window back. A scan against a zero LUT drives no pigment
- * and still ends normally, which is indistinguishable from success by every
- * signal we have today.
- *
- * A readback that is uniformly zero is ambiguous: either the writes did not
- * land, or the window is write-only. Compare against @nonzero_src -- if the
- * source LUT itself is mostly zeros, the waveform selection is the suspect,
- * not the SRAM.
- */
-static void ebc_report_lut(struct rk3026_ebc *ebc, const u8 *src, u32 words,
-			   u32 chunk)
-{
-	u32 i, want, got, bad = 0, nonzero_hw = 0, nonzero_src = 0;
-	u32 first = 0, first_want = 0, first_got = 0;
-
-	for (i = 0; i < words; i++) {
-		want = get_unaligned_le32(src + i * 4);
-		got = ebc_read(ebc, EBC_LUT_BASE + i * 4);
-		if (want)
-			nonzero_src++;
-		if (got)
-			nonzero_hw++;
-		if (got != want && !bad++) {
-			first = i;
-			first_want = want;
-			first_got = got;
-		}
-	}
-
-	dev_info(ebc->dev,
-		 "scan: chunk %u lut %u words, nonzero src %u hw %u, %u mismatched\n",
-		 chunk, words, nonzero_src, nonzero_hw, bad);
-	if (bad)
-		dev_info(ebc->dev, "scan: chunk %u first mismatch word %u: wrote %08x read %08x\n",
-			 chunk, first, first_want, first_got);
-}
 
 /*
  * H/V timing and active window. The H registers count source-driver clocks,
@@ -583,8 +435,7 @@ static void ebc_set_dsp_ctrl(struct rk3026_ebc *ebc, u32 mode)
  * ⚠️ WIN_MST0/1 are SHADOWED: a write does not affect the scan that follows it,
  * only the one after, because the shadow goes active on a latch the scan itself
  * performs. So flipping this and running ONE scan tests nothing --
- * the first scan still uses the previous pair. Verify against the `armed`
- * readback, not against what was just written.
+ * the first scan still uses the previous pair.
  *
  * Both hold absolute physical addresses, biased by the window origin at two
  * pixels per byte. The row stride is the panel width: the images are packed
@@ -645,17 +496,8 @@ static void ebc_frame_kick(struct rk3026_ebc *ebc, const u8 *lut,
 	 * The vendor does the equivalent explicitly: flush_cache_all() + outer_sync()
 	 * after every generated frame, on a pool that is additionally mapped uncached
 	 * (docs/re/EBC-DATAPATH.md).
-	 *
-	 * ⚠️ ebc_report_lut() below is a READ of the LUT window, and a read drains
-	 * posted writes. So while debug_scan was armed this ordering happened by
-	 * accident, and it stopped happening when the budget ran out -- which makes
-	 * every "608/608 LUT words match" measurement one taken under a barrier that
-	 * normal operation did not have. The barrier must not depend on logging.
 	 */
 	wmb();
-
-	if (debug_scan)
-		ebc_report_lut(ebc, src, words, chunk);
 
 	ebc_write(ebc, EBC_WIN_DSP_ST,
 		  (t->hsync_len.typ + t->hback_porch.typ + 1) |
@@ -694,9 +536,6 @@ static irqreturn_t ebc_irq(int irq, void *data)
 {
 	struct rk3026_ebc *ebc = data;
 	u32 status = ebc_read(ebc, EBC_INT);
-
-	dbg_last_status = status;
-	atomic_inc(&dbg_irqs);
 
 	if (!(status & EBC_INT_FRAME_END))
 		return IRQ_NONE;
@@ -920,16 +759,10 @@ VISIBLE_IF_KUNIT int rk3026_ebc_drive(struct rk3026_ebc *ebc, const u8 *lut,
 	ebc_set_dsp_ctrl(ebc, mode);
 	ebc_set_image_addr(ebc, 0, 0);
 
-	if (debug_scan)
-		ebc_report_regs(ebc, "armed");
-
 	while (done < frames) {
 		u32 n = min_t(u32, frames - done, EBC_LUT_MAX_FRAMES);
-		int irqs = atomic_read(&dbg_irqs);
-		ktime_t t0 = ktime_get();
-		bool ok;
-
 		unsigned int budget = ebc_chunk_timeout_ms(ebc, n);
+		bool ok;
 
 		if (!ebc_rails_up(ebc)) {
 			dev_warn_ratelimited(ebc->dev,
@@ -950,12 +783,6 @@ VISIBLE_IF_KUNIT int rk3026_ebc_drive(struct rk3026_ebc *ebc, const u8 *lut,
 		ebc_frame_kick(ebc, lut, chunk, n, done + n >= frames);
 		ok = wait_for_completion_timeout(&ebc->frame_done,
 						msecs_to_jiffies(budget));
-		if (debug_scan)
-			dev_info(ebc->dev,
-				 "scan: chunk %u %u frames %s in %lld ms (budget %u), %d irqs, status %08x\n",
-				 chunk, n, ok ? "ended" : "TIMED OUT",
-				 ktime_ms_delta(ktime_get(), t0), budget,
-				 atomic_read(&dbg_irqs) - irqs, dbg_last_status);
 		if (!ok) {
 			dev_warn_ratelimited(ebc->dev, "frame timeout\n");
 			ebc_stop_scan(ebc);
@@ -969,11 +796,6 @@ VISIBLE_IF_KUNIT int rk3026_ebc_drive(struct rk3026_ebc *ebc, const u8 *lut,
 		}
 		done += n;
 		chunk++;
-	}
-
-	if (debug_scan) {
-		ebc_report_regs(ebc, "done");
-		dev_info(ebc->dev, "scan: %u of %u frames driven\n", done, frames);
 	}
 
 	/* The idle deadline runs from the end of the last waveform. */
@@ -1745,8 +1567,6 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 					       &a2.over_grey, &changed_px);
 	last->snap_us = ebc_us_since(snap_start);
 	last->changed_px = changed_px;
-	if (debug_scan)
-		ebc_report_image(ebc);
 
 	/*
 	 * Nothing changed? Then do not drive the panel.
@@ -1800,8 +1620,6 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 	 * flash is what it was queued for (rk3026_ebc_idle_tick()).
 	 */
 	if (rk3026_ebc_should_skip(&part, sh->prev_unknown, identical)) {
-		if (debug_scan)
-			dev_info(ebc->dev, "scan: skipped, image identical to prev\n");
 		last->outcome = EBC_OUTCOME_SKIPPED;
 		goto finish;
 	}
@@ -1899,25 +1717,11 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 					      &frames);
 	}
 	if (!lut) {
-		if (debug_scan)
-			dev_info(ebc->dev, "scan: no LUT for mode %u at %d C\n",
-				 mode, temp);
 		last->outcome = EBC_OUTCOME_NO_LUT;
 		goto relock;
 	}
 
-	if (debug_scan) {
-		dev_info(ebc->dev,
-			 "scan: mode %u (part asked %u) temp %d C, %u frames, clip %d,%d-%d,%d\n",
-			 mode, part.mode, temp, frames, part.box.x1, part.box.y1,
-			 part.box.x2, part.box.y2);
-		ebc_report_env(ebc);
-	}
-
 	rk3026_ebc_drive(ebc, lut, frames, mode, lut_mode, last);
-
-	if (debug_scan)
-		debug_scan--;
 
 relock:
 	mutex_lock(&ebc->image_lock);
@@ -3400,8 +3204,8 @@ static int ebc_hw_init(struct rk3026_ebc *ebc)
 	 * 0xff000100 and cleared the mux bit. Those flags are gone from
 	 * clk-rk3026.c, so the workaround outlived the bug it was working around.
 	 *
-	 * ⚠️ Verify against the FRAME TIME in the scan log, never clk_get_rate():
-	 * 38 frames take ~3000 ms at 12 MHz and ~560 ms at 66.
+	 * ⚠️ Verify against the frame time (the scan_end tracepoint's ms), never
+	 * clk_get_rate(): 38 frames take ~3000 ms at 12 MHz and ~560 ms at 66.
 	 */
 	if (ebc->dclk_parent) {
 		ret = clk_set_parent(ebc->dclk, ebc->dclk_parent);

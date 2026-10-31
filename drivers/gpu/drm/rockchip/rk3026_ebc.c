@@ -2207,14 +2207,20 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_add_update);
  * because the rails or a LUT were missing, drawn by a retry or given up
  * (rk3026_ebc_wait_seq()). A give-up returns 0 like a drive: the client's
  * wait means "done with it", and the content stays carried for the next
- * part. The marker is resolved to its seq once, here. Marker 0, a marker never
- * sent, and one overwritten by EBC_MARKER_RING_LEN newer markers return at
- * once.
+ * part. The marker is resolved to its seq once, here. A marker never sent,
+ * and one overwritten by EBC_MARKER_RING_LEN newer markers, return at once.
+ * Marker 0 is "no marker" on the send side, so no update is ever waited
+ * for with it: a wait on it is an invalid argument, as on i.MX.
+ *
+ * Returns 0, -EINVAL for marker 0, or the error of rk3026_ebc_wait_seq().
  */
 int rk3026_ebc_wait_marker(struct rk3026_ebc *ebc, u32 marker)
 {
 	bool known;
 	u32 seq;
+
+	if (!marker)
+		return -EINVAL;
 
 	mutex_lock(&ebc->image_lock);
 	known = rk3026_ebc_marker_seq_lookup(&ebc->markers, marker, &seq);

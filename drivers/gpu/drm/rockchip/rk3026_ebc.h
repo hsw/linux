@@ -1426,6 +1426,8 @@ u32 rk3026_ebc_mxcfb_to_ebc_mode(u32 waveform_mode, u32 update_mode,
 int rk3026_ebc_mxcfb_send(struct rk3026_ebc *ebc, const void *src,
 			  unsigned int pitch, u32 format,
 			  const struct mxcfb_update_data *req);
+void rk3026_ebc_mxcfb_invert(u8 *img, const struct drm_rect *clip,
+			     unsigned int width, unsigned int height);
 int rk3026_ebc_mxcfb_ioctl(struct fb_info *info, unsigned int cmd,
 			   unsigned long arg);
 #endif

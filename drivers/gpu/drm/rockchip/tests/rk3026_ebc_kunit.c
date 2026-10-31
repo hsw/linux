@@ -8448,11 +8448,18 @@ static const struct t_mxcfb_arg t_mxcfb_arg_cases[] = {
 	{ "ALT_BUFFER mono", MXCFB_WAVEFORM_MODE_DU, T_PARTIAL,
 	  EPDC_FLAG_USE_ALT_BUFFER | EPDC_FLAG_FORCE_MONOCHROME, -EINVAL },
 	{ "all flags", MXCFB_WAVEFORM_MODE_GC16, T_PARTIAL, ~0u, -EINVAL },
+	{ "ALT_BUFFER inverted", MXCFB_WAVEFORM_MODE_GC16, T_PARTIAL,
+	  EPDC_FLAG_USE_ALT_BUFFER | EPDC_FLAG_ENABLE_INVERSION, -EINVAL },
 	/* The edges that stay valid; flags this shim does not read. */
 	{ "waveform 255", 255, T_FULL, 0, 0 },
 	{ "AUTO", MXCFB_WAVEFORM_MODE_AUTO, T_PARTIAL, 0, 0 },
 	{ "update_mode FULL", MXCFB_WAVEFORM_MODE_GL16, T_FULL, 0, 0 },
+	{ "ENABLE_INVERSION", MXCFB_WAVEFORM_MODE_GC16, T_PARTIAL,
+	  EPDC_FLAG_ENABLE_INVERSION, 0 },
 	{ "other flags", MXCFB_WAVEFORM_MODE_GC16, T_PARTIAL,
+	  ~(EPDC_FLAG_USE_ALT_BUFFER | EPDC_FLAG_TEST_COLLISION |
+	    EPDC_FLAG_ENABLE_INVERSION), 0 },
+	{ "other flags inverted", MXCFB_WAVEFORM_MODE_GC16, T_PARTIAL,
 	  ~(EPDC_FLAG_USE_ALT_BUFFER | EPDC_FLAG_TEST_COLLISION), 0 },
 };
 
@@ -8463,7 +8470,8 @@ KUNIT_ARRAY_PARAM_DESC(t_mxcfb_arg, t_mxcfb_arg_cases, desc);
  * changes which image is meant and cannot be honoured, is refused with
  * -EINVAL: nothing converted, nothing queued, the panel not claimed from
  * the plane. The arguments are checked first, so the answer is the same
- * with the CRTC off. A valid send next to each edge is taken.
+ * with the CRTC off. A valid send next to each edge is taken, drawn black,
+ * or white when inverted.
  */
 static void ebc_test_glue_mxcfb_args(struct kunit *test)
 {
@@ -8493,7 +8501,8 @@ static void ebc_test_glue_mxcfb_args(struct kunit *test)
 		KUNIT_EXPECT_EQ(test, part.merged, 1);
 		KUNIT_EXPECT_EQ(test, part.marker, 9);
 		KUNIT_EXPECT_TRUE(test, ebc->mxcfb_active);
-		KUNIT_EXPECT_EQ(test, t_px(ebc->next_shadow, 0, 0), 0);
+		KUNIT_EXPECT_EQ(test, t_px(ebc->next_shadow, 0, 0),
+				c->flags & EPDC_FLAG_ENABLE_INVERSION ? 15 : 0);
 	}
 }
 
@@ -8690,6 +8699,187 @@ static void ebc_test_glue_mxcfb_submission(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, w->last.outcome, EBC_OUTCOME_CRTC_OFF);
 	KUNIT_EXPECT_EQ(test, calls.n, 0);
 	test->priv = NULL;
+}
+
+/* A panel framebuffer whose column x holds level x: grey 17 x. */
+static u32 *t_levels_fb(struct kunit *test)
+{
+	u32 *fb = t_plane_fb(test, 0);
+	int x, y;
+
+	for (y = 0; y < T_H; y++)
+		for (x = 0; x < T_W; x++)
+			fb[y * T_W + x] = x * 0x111111;
+	return fb;
+}
+
+/*
+ * EPDC_FLAG_ENABLE_INVERSION: the region converted and inverted, every
+ * level l drawn as 15 - l, and the target holds the inverted levels; the
+ * mapping of the waveform does not see the flag. A later send without it
+ * draws the framebuffer's levels again. An unaligned region is inverted as
+ * the blit widens it, in whole bytes, and nothing outside them. INIT
+ * whitens, the flag set or not.
+ */
+static void ebc_test_glue_mxcfb_inversion(struct kunit *test)
+{
+	struct rk3026_ebc *ebc = t_policy_ebc(test);
+	u32 *levels = t_levels_fb(test);
+	struct mxcfb_update_data req = {
+		.update_region = { .width = T_W, .height = T_H },
+		.waveform_mode = MXCFB_WAVEFORM_MODE_GC16,
+		.update_mode = MXCFB_UPDATE_MODE_PARTIAL,
+		.update_marker = 3,
+		.temp = MXCFB_TEMP_USE_AMBIENT,
+		.flags = EPDC_FLAG_ENABLE_INVERSION,
+	};
+	struct rk3026_ebc_set part;
+	int x, y;
+
+	KUNIT_EXPECT_EQ(test, t_mxcfb_part(ebc, levels, &req, &part), 0);
+	KUNIT_EXPECT_EQ(test, part.mode, EBC_MODE_PART);
+	KUNIT_EXPECT_EQ(test, part.marker, 3);
+	for (y = 0; y < T_H; y++)
+		for (x = 0; x < T_W; x++)
+			KUNIT_EXPECT_EQ_MSG(test, t_px(ebc->next_shadow, x, y),
+					    15 - x, "x %d y %d", x, y);
+	t_expect_guard(test, ebc->next_shadow);
+
+	req.flags = 0;
+	KUNIT_EXPECT_EQ(test, t_mxcfb_part(ebc, levels, &req, &part), 0);
+	for (y = 0; y < T_H; y++)
+		for (x = 0; x < T_W; x++)
+			KUNIT_EXPECT_EQ_MSG(test, t_px(ebc->next_shadow, x, y),
+					    x, "x %d y %d", x, y);
+
+	/* x 3..8 of rows 1 and 2: the bytes of x 2..9 inverted. */
+	req.flags = EPDC_FLAG_ENABLE_INVERSION;
+	req.update_region = (struct mxcfb_rect){ .left = 3, .top = 1,
+						 .width = 6, .height = 2 };
+	KUNIT_EXPECT_EQ(test, t_mxcfb_part(ebc, levels, &req, &part), 0);
+	for (y = 0; y < T_H; y++) {
+		for (x = 0; x < T_W; x++) {
+			bool in = x >= 2 && x < 10 && y >= 1 && y < 3;
+
+			KUNIT_EXPECT_EQ_MSG(test, t_px(ebc->next_shadow, x, y),
+					    in ? 15 - x : x, "x %d y %d", x, y);
+		}
+	}
+	t_expect_guard(test, ebc->next_shadow);
+
+	req.waveform_mode = MXCFB_WAVEFORM_MODE_INIT;
+	KUNIT_EXPECT_EQ(test, t_mxcfb_part(ebc, levels, &req, &part), 0);
+	KUNIT_EXPECT_EQ(test, part.mode, EBC_MODE_RESET);
+	KUNIT_EXPECT_EQ(test, part.blit_us, 0);
+	t_expect_white(test, ebc->next_shadow);
+}
+
+/* An inverted send over the white glass, and what its refresh makes of it. */
+struct t_inv_mode {
+	const char	*desc;
+	int		level;		/* of the page, or -1: level x in column x */
+	u32		waveform;
+	u32		flags;
+	bool		skipped;
+	enum rk3026_ebc_reason reason;
+};
+
+static const struct t_inv_mode t_inv_mode_cases[] = {
+	{ "AUTO white page", 15, MXCFB_WAVEFORM_MODE_AUTO, 0, false,
+	  EBC_REASON_AUTO_DU },
+	{ "AUTO black page", 0, MXCFB_WAVEFORM_MODE_AUTO, 0, true },
+	{ "AUTO FORCE_MONOCHROME levels", -1, MXCFB_WAVEFORM_MODE_AUTO,
+	  EPDC_FLAG_FORCE_MONOCHROME, false, EBC_REASON_EXPLICIT },
+	{ "DU levels", -1, MXCFB_WAVEFORM_MODE_DU, 0, false,
+	  EBC_REASON_EXPLICIT },
+};
+
+KUNIT_ARRAY_PARAM_DESC(t_inv_mode, t_inv_mode_cases, desc);
+
+/*
+ * The refresh sees the image as drawn. On the white glass a white page
+ * sent AUTO inverted is all black, two-level, and resolves DU; a black
+ * page inverted is white and is skipped. FORCE_MONOCHROME with AUTO, and
+ * an explicit DU, threshold the inverted levels: level l becomes white
+ * where 15 - l >= 8, which is where the threshold of l is black.
+ */
+static void ebc_test_glue_mxcfb_inversion_modes(struct kunit *test)
+{
+	const struct t_inv_mode *c = test->param_value;
+	struct rk3026_ebc *ebc = t_policy_ebc(test);
+	u32 *fb = c->level < 0 ? t_levels_fb(test) :
+		  t_plane_fb(test, c->level * 0x111111);
+	struct mxcfb_update_data req = {
+		.update_region = { .width = T_W, .height = T_H },
+		.waveform_mode = c->waveform,
+		.update_mode = MXCFB_UPDATE_MODE_PARTIAL,
+		.update_marker = 4,
+		.temp = MXCFB_TEMP_USE_AMBIENT,
+		.flags = EPDC_FLAG_ENABLE_INVERSION | c->flags,
+	};
+	struct rk3026_ebc_last last;
+	int x, y;
+
+	/* Two panels of DU budget: no cleanup after a whole-panel DU. */
+	ebc->du_cleanup_area = 2 * T_W * T_H;
+	KUNIT_ASSERT_EQ(test, rk3026_ebc_mxcfb_send(ebc, fb, T_W * 4,
+						    DRM_FORMAT_XRGB8888, &req),
+			0);
+	rk3026_ebc_do_refresh(ebc, &last);
+	if (c->skipped) {
+		KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_SKIPPED);
+		return;
+	}
+	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_BLACK_WHITE);
+	KUNIT_EXPECT_EQ(test, last.reason, c->reason);
+	for (y = 0; y < T_H; y++) {
+		for (x = 0; x < T_W; x++) {
+			int l = c->level < 0 ? x : c->level;
+
+			KUNIT_EXPECT_EQ_MSG(test, t_px(ebc->shadows.scan, x, y),
+					    l >= 8 ? 0 : 15, "x %d y %d", x, y);
+		}
+	}
+	t_expect_guard(test, ebc->shadows.scan);
+}
+
+/*
+ * The plane path never inverts. While the mxcfb client holds the panel the
+ * plane queues nothing; once it is gone, a plane update of one pixel
+ * redraws the whole panel from the framebuffer, as the framebuffer has it.
+ */
+static void ebc_test_glue_mxcfb_inversion_plane(struct kunit *test)
+{
+	static const struct drm_rect dot = DRM_RECT_INIT(5, 2, 1, 1);
+	struct rk3026_ebc *ebc = t_policy_ebc(test);
+	u32 *levels = t_levels_fb(test);
+	struct mxcfb_update_data req = {
+		.update_region = { .width = T_W, .height = T_H },
+		.waveform_mode = MXCFB_WAVEFORM_MODE_GC16,
+		.update_mode = MXCFB_UPDATE_MODE_FULL,
+		.temp = MXCFB_TEMP_USE_AMBIENT,
+		.flags = EPDC_FLAG_ENABLE_INVERSION,
+	};
+	int x, y;
+
+	KUNIT_ASSERT_EQ(test, rk3026_ebc_mxcfb_send(ebc, levels, T_W * 4,
+						    DRM_FORMAT_XRGB8888, &req),
+			0);
+	KUNIT_EXPECT_EQ(test, t_px(ebc->next_shadow, 0, 0), 15);
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_plane_update(ebc, levels, T_W * 4,
+							 DRM_FORMAT_XRGB8888,
+							 &dot));
+	KUNIT_EXPECT_EQ(test, t_px(ebc->next_shadow, 0, 0), 15);
+
+	/* What the last release of the fb does (ebc_fb_release()). */
+	ebc->mxcfb_active = false;
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_plane_update(ebc, levels, T_W * 4,
+							DRM_FORMAT_XRGB8888,
+							&dot));
+	for (y = 0; y < T_H; y++)
+		for (x = 0; x < T_W; x++)
+			KUNIT_EXPECT_EQ_MSG(test, t_px(ebc->next_shadow, x, y),
+					    x, "x %d y %d", x, y);
 }
 #endif
 /*
@@ -9599,6 +9789,85 @@ static void ebc_test_glue_mxcfb_c8(struct kunit *test)
 			-EINVAL);
 	KUNIT_EXPECT_EQ(test, part.merged, 0);
 	KUNIT_EXPECT_FALSE(test, ebc->mxcfb_active);
+	t_expect_white(test, ebc->next_shadow);
+}
+
+/*
+ * EPDC_FLAG_ENABLE_INVERSION on a C8 fbdev: each byte taken as a grey, as
+ * without the flag, and its level l drawn as 15 - l, with the console's
+ * palette set; the target holds the inverted levels, what the glass is to
+ * show. The odd box is inverted as the blit widens it, in whole bytes, and
+ * nothing outside them. A later send without the flag draws the greys
+ * again; INIT whitens, the flag set or not.
+ */
+static void ebc_test_glue_mxcfb_inversion_c8(struct kunit *test)
+{
+	const unsigned int pitch = T_W + 5;
+	struct rk3026_ebc *ebc = t_policy_ebc(test);
+	struct drm_color_lut *lut = kunit_kcalloc(test, EBC_PALETTE_SIZE,
+						  sizeof(*lut), GFP_KERNEL);
+	u8 *fb = t_grey_fb(test, pitch);
+	struct mxcfb_update_data req = {
+		.update_region = { .left = 3, .top = 1, .width = 9,
+				   .height = 3 },
+		.waveform_mode = MXCFB_WAVEFORM_MODE_GC16,
+		.update_mode = MXCFB_UPDATE_MODE_PARTIAL,
+		.update_marker = 5,
+		.temp = MXCFB_TEMP_USE_AMBIENT,
+		.flags = EPDC_FLAG_ENABLE_INVERSION,
+	};
+	struct rk3026_ebc_set part;
+	int x, y;
+
+	KUNIT_ASSERT_NOT_NULL(test, lut);
+	t_lut_con16(lut);
+	rk3026_ebc_load_palette(ebc, lut);
+
+	KUNIT_EXPECT_EQ(test, t_mxcfb_part_fmt(ebc, fb, pitch, DRM_FORMAT_C8,
+					       &req, &part), 0);
+	KUNIT_EXPECT_EQ(test, part.merged, 1);
+	KUNIT_EXPECT_TRUE(test, drm_rect_equals(&part.box, &t_odd_box));
+	KUNIT_EXPECT_EQ(test, part.mode, EBC_MODE_PART);
+	KUNIT_EXPECT_EQ(test, part.marker, 5);
+	for (y = 0; y < T_H; y++) {
+		for (x = 0; x < T_W; x++) {
+			u8 g = fb[y * pitch + x];
+
+			KUNIT_EXPECT_EQ_MSG(test, t_px(ebc->next_shadow, x, y),
+					    t_in_rect(&t_odd_wide, x, y) ?
+					    15 - t_grey_level(g) : 15,
+					    "pixel %d,%d grey %u", x, y, g);
+		}
+	}
+	t_expect_guard(test, ebc->next_shadow);
+
+	/* The whole panel: grey 17 k is level 15 - k. */
+	req.update_region = (struct mxcfb_rect) { .width = T_W,
+						  .height = T_H };
+	KUNIT_EXPECT_EQ(test, t_mxcfb_part_fmt(ebc, fb, pitch, DRM_FORMAT_C8,
+					       &req, &part), 0);
+	for (y = 0; y < T_H; y++)
+		for (x = 0; x < T_W; x++)
+			KUNIT_EXPECT_EQ_MSG(test, t_px(ebc->next_shadow, x, y),
+					    15 - t_grey_level(fb[y * pitch + x]),
+					    "pixel %d,%d", x, y);
+	for (x = 0; x < T_W; x++)
+		KUNIT_EXPECT_EQ_MSG(test, t_px(ebc->next_shadow, x, 0), 15 - x,
+				    "grey %d", 17 * x);
+	t_expect_guard(test, ebc->next_shadow);
+
+	/* Without the flag: the greys as the framebuffer has them. */
+	req.flags = 0;
+	KUNIT_EXPECT_EQ(test, t_mxcfb_part_fmt(ebc, fb, pitch, DRM_FORMAT_C8,
+					       &req, &part), 0);
+	t_expect_grey_box(test, ebc->next_shadow, fb, pitch, &t_panel);
+
+	req.flags = EPDC_FLAG_ENABLE_INVERSION;
+	req.waveform_mode = MXCFB_WAVEFORM_MODE_INIT;
+	KUNIT_EXPECT_EQ(test, t_mxcfb_part_fmt(ebc, fb, pitch, DRM_FORMAT_C8,
+					       &req, &part), 0);
+	KUNIT_EXPECT_EQ(test, part.mode, EBC_MODE_RESET);
+	KUNIT_EXPECT_EQ(test, part.blit_us, 0);
 	t_expect_white(test, ebc->next_shadow);
 }
 #endif
@@ -12351,6 +12620,10 @@ static struct kunit_case rk3026_ebc_glue_test_cases[] = {
 	KUNIT_CASE_PARAM(ebc_test_glue_mxcfb_args, t_mxcfb_arg_gen_params),
 	KUNIT_CASE(ebc_test_glue_mxcfb_ioctl),
 	KUNIT_CASE(ebc_test_glue_mxcfb_submission),
+	KUNIT_CASE(ebc_test_glue_mxcfb_inversion),
+	KUNIT_CASE_PARAM(ebc_test_glue_mxcfb_inversion_modes,
+			 t_inv_mode_gen_params),
+	KUNIT_CASE(ebc_test_glue_mxcfb_inversion_plane),
 #endif
 	KUNIT_CASE(ebc_test_glue_timing),
 	KUNIT_CASE(ebc_test_glue_timing_skipped),
@@ -12366,6 +12639,7 @@ static struct kunit_case rk3026_ebc_glue_test_cases[] = {
 	KUNIT_CASE(ebc_test_glue_palette_swap),
 #if IS_ENABLED(CONFIG_DRM_RK3026_EBC_MXCFB)
 	KUNIT_CASE(ebc_test_glue_mxcfb_c8),
+	KUNIT_CASE(ebc_test_glue_mxcfb_inversion_c8),
 #endif
 	KUNIT_CASE(ebc_test_glue_plane_box_du),
 	KUNIT_CASE(ebc_test_glue_plane_box_grey),
@@ -13971,6 +14245,101 @@ static void ebc_test_palette_levels(struct kunit *test)
 	}
 }
 
+#if IS_ENABLED(CONFIG_DRM_RK3026_EBC_MXCFB)
+/*
+ * An inverted mxcfb send's target on one source and every clip of @clips:
+ * rk3026_ebc_blit_convert(), the XRGB8888 conversion of rk3026_ebc_blit(),
+ * and then rk3026_ebc_mxcfb_invert() on the clip as it came, against the
+ * per-pixel reference with every level of the widened clip turned into
+ * 15 - level, over the same junk, guards included. False after the first
+ * difference.
+ */
+static bool t_invert_clips(struct kunit *test, const struct t_fix *f,
+			   u8 *out, u8 *ref, const u8 *src, unsigned int pitch,
+			   const struct drm_rect *clips, int n,
+			   struct rnd_state *rs)
+{
+	int c, x, y, diff;
+
+	for (c = 0; c < n; c++) {
+		const struct drm_rect *r = &clips[c];
+		struct drm_rect w;
+
+		prandom_bytes_state(rs, ref, t_fix_size(f));
+		memcpy(out, ref, t_fix_size(f));
+		if (t_widen(f, r, &w)) {
+			rk3026_ebc_ref_blit_rows(ref, src, pitch, w.x1, w.x2,
+						 w.y1, w.y2, f->w);
+			for (y = w.y1; y < w.y2; y++)
+				for (x = w.x1; x < w.x2; x++)
+					t_px_set_w(ref, f, x, y,
+						   15 - t_px_w(ref, f, x, y));
+			rk3026_ebc_blit_convert(out, src, pitch, w.x1, w.x2,
+						w.y1, w.y2, f->w);
+		}
+		rk3026_ebc_mxcfb_invert(out, r, f->w, f->h);
+		diff = t_fix_diff(f, ref, out);
+		if (diff != INT_MAX) {
+			KUNIT_FAIL(test, "%s pitch %u clip " DRM_RECT_FMT
+				   ": byte %d (%02x, ref %02x)", f->name,
+				   pitch, DRM_RECT_ARG(r), diff, out[diff],
+				   ref[diff]);
+			return false;
+		}
+	}
+	return true;
+}
+
+/*
+ * EPDC_FLAG_ENABLE_INVERSION on every fixture, source set, dense and
+ * padded pitch, and clip, unaligned and clamped ones among them: every
+ * level of the widened clip mirrored, nothing else written. The
+ * conversion is the one the driver runs, so with the NEON rows built in
+ * the NEON path must run here, as for the NEON cases, and the bytes are
+ * those of the scalar reference.
+ */
+static void ebc_test_mxcfb_invert(struct kunit *test)
+{
+	unsigned int fi, pad, kind;
+	u32 seed;
+
+	if (IS_ENABLED(CONFIG_DRM_RK3026_EBC_NEON) && !t_neon_ready(test))
+		return;
+	for (fi = 0; fi < ARRAY_SIZE(t_fixes); fi++) {
+		const struct t_fix *f = &t_fixes[fi];
+		u8 *out = t_fix_img(test, f);
+		u8 *ref = t_fix_img(test, f);
+		struct drm_rect clips[T_CLIPS_MAX];
+		struct rnd_state rs;
+		u8 *src;
+		int n;
+
+		src = kunit_kmalloc(test, (size_t)(f->w * 4 + 4) * f->h,
+				    GFP_KERNEL);
+		KUNIT_ASSERT_NOT_NULL(test, src);
+
+		for (pad = 0; pad <= 4; pad += 4) {
+			unsigned int pitch = f->w * 4 + pad;
+
+			for (kind = 0; kind < T_SRC_COUNT; kind++) {
+				for (seed = 1; seed <= 2; seed++) {
+					t_src_fill(src, pitch, f, kind, seed);
+					prandom_seed_state(&rs, seed * 13 + kind);
+					n = t_fix_clips(f, &rs, clips);
+					if (t_invert_clips(test, f, out, ref,
+							   src, pitch, clips,
+							   n, &rs))
+						continue;
+					kunit_info(test, "source %u seed %u\n",
+						   kind, seed);
+					return;
+				}
+			}
+		}
+	}
+}
+#endif
+
 static struct kunit_case rk3026_ebc_conv_test_cases[] = {
 	KUNIT_CASE(ebc_test_ref_snapshot),
 	KUNIT_CASE(ebc_test_snapshot_nibble_pairs),
@@ -13993,6 +14362,9 @@ static struct kunit_case rk3026_ebc_conv_test_cases[] = {
 	KUNIT_CASE(ebc_test_c8_rows),
 	KUNIT_CASE(ebc_test_c8_rows_tails),
 	KUNIT_CASE(ebc_test_palette_levels),
+#if IS_ENABLED(CONFIG_DRM_RK3026_EBC_MXCFB)
+	KUNIT_CASE(ebc_test_mxcfb_invert),
+#endif
 	{}
 };
 

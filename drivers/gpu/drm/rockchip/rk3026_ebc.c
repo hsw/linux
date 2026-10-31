@@ -40,6 +40,7 @@
 #include <drm/clients/drm_client_setup.h>
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
+#include <drm/drm_crtc_helper.h>
 #include <drm/drm_damage_helper.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_fb_helper.h>
@@ -2811,6 +2812,7 @@ static const struct drm_crtc_funcs ebc_crtc_funcs = {
 };
 
 static const struct drm_crtc_helper_funcs ebc_crtc_helper_funcs = {
+	.atomic_check		= drm_crtc_helper_atomic_check,
 	.atomic_begin		= ebc_crtc_atomic_begin,
 	.atomic_flush		= ebc_crtc_atomic_flush,
 	.atomic_enable		= ebc_crtc_atomic_enable,

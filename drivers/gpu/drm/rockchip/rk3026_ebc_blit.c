@@ -22,6 +22,10 @@
  * (rk3026_ebc_grey_level()), so the greys k * 17 that a 16-level dither
  * emits stay exactly level k. The rows compute the level, four pixels per
  * 32-bit word or 32 per NEON step, with no table and no division.
+ *
+ * C8 sources (one palette index per pixel) take rk3026_ebc_blit_c8_rows():
+ * each index goes through a 256-entry table of levels, one
+ * rk3026_ebc_palette_level() an entry of the palette.
  */
 
 #include <linux/compiler.h>
@@ -286,11 +290,85 @@ bool rk3026_ebc_blit_r8_convert(u8 *dst, const void *src,
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_blit_r8_convert);
 
+/* Two C8 pixels at @s into one byte through @levels, @s[0] low. */
+static __always_inline u32 ebc_c8_pack2(const u8 *levels, const u8 *s)
+{
+	return levels[s[0]] | levels[s[1]] << 4;
+}
+
+/**
+ * rk3026_ebc_blit_c8_rows - convert C8 rows to packed 4bpp grey
+ * @dst: target image, @width / 2 bytes per row, low nibble first
+ * @src: C8 source, one palette index per pixel, top-left of the framebuffer
+ * @src_pitch: source stride in bytes
+ * @x1: first column, even
+ * @x2: end column, even, at most @width, above @x1
+ * @y1: first row
+ * @y2: end row, above @y1
+ * @width: image width in pixels
+ * @levels: EBC_PALETTE_SIZE levels of 0 to 15, one per index
+ *
+ * Writes bytes @x1 / 2 to @x2 / 2 of rows @y1 to @y2 of @dst, nothing else.
+ *
+ * Eight pixels per 32-bit store, with the source prefetched 128 bytes
+ * ahead; a row's last 2 to 6 pixels two at a time.
+ */
+void rk3026_ebc_blit_c8_rows(u8 *dst, const void *src, unsigned int src_pitch,
+			     int x1, int x2, int y1, int y2,
+			     unsigned int width, const u8 *levels)
+{
+	int y;
+
+	for (y = y1; y < y2; y++) {
+		const u8 *s = (const u8 *)src + (size_t)y * src_pitch + x1;
+		u8 *d = dst + ((size_t)y * width + x1) / 2;
+		int n = x2 - x1;
+
+		for (; n >= 8; n -= 8, s += 8, d += 4) {
+			prefetch(s + 128);
+			put_unaligned_le32(ebc_c8_pack2(levels, s) |
+					   ebc_c8_pack2(levels, s + 2) << 8 |
+					   ebc_c8_pack2(levels, s + 4) << 16 |
+					   ebc_c8_pack2(levels, s + 6) << 24,
+					   d);
+		}
+		for (; n > 0; n -= 2, s += 2, d++)
+			*d = ebc_c8_pack2(levels, s);
+	}
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_blit_c8_rows);
+
+/**
+ * rk3026_ebc_palette_level - the level of a C8 palette entry
+ * @red: red of the entry, 16 bits
+ * @green: green of the entry, 16 bits
+ * @blue: blue of the entry, 16 bits
+ *
+ * The entry is taken at 8 bits a component, the top byte of each 16-bit
+ * value, its grey is the luma of the XRGB8888 conversion, and
+ * rk3026_ebc_grey_level() rounds that grey to the nearest level. An index
+ * thus shows as its colour would in XRGB8888, but rounded rather than cut
+ * to the top four bits, and a grey ramp, entry i = i * 0x101 as
+ * drm_crtc_fill_palette_8() fills it or i << 8 as the legacy gamma table
+ * starts, gives the levels of R8.
+ *
+ * Returns the level, 0 to 15.
+ */
+u8 rk3026_ebc_palette_level(u16 red, u16 green, u16 blue)
+{
+	u32 p = (red >> 8) << 16 | (green >> 8) << 8 | blue >> 8;
+
+	return rk3026_ebc_grey_level(ebc_luma(p) >> 24);
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_palette_level);
+
 /**
  * rk3026_ebc_blit_impl - the XRGB8888 conversion rk3026_ebc_blit() runs
  *
  * For the probe line and debugfs "timing", so a measured blit time says
- * which loop it is from.
+ * which loop it is from. R8 takes NEON under the same conditions; C8
+ * always takes the scalar table rows (rk3026_ebc_blit_c8_rows()),
+ * whatever this says.
  *
  * Returns "neon" if rk3026_ebc_blit_convert() takes the NEON rows for a
  * clip of 16 pixels or more in process context, else "scalar".

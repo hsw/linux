@@ -45,6 +45,13 @@
  *   flip_held        the commit events held (rk3026_ebc_flip_hold()),
  *                    whoever sent them, read-only
  *   flip_late        of those, the ones the watchdog sent, read-only
+ *   force_mode       the mode every part is driven in instead of its own,
+ *                    read-write, -1 (as probe sets it) for none, else
+ *                    0..EBC_MODE_MAX (@force_mode in struct rk3026_ebc).
+ *                    A test knob.
+ *   debug_timeout    the next chunks whose wait is cut to 1 ms so that
+ *                    it times out and the abort path runs, read-write;
+ *                    counts down to 0, as probe sets it. A test knob.
  *   flip_release     where a held commit event is sent, read-write text:
  *                    "done" at the finish of its part (the frame is on the
  *                    glass, or its out-fence has an error), "take" at the
@@ -376,6 +383,29 @@ static ssize_t rk3026_ebc_flip_release_write(struct file *file,
 }
 DEFINE_SHOW_STORE_ATTRIBUTE(rk3026_ebc_flip_release);
 
+static int rk3026_ebc_force_mode_get(void *data, u64 *val)
+{
+	struct rk3026_ebc *ebc = data;
+
+	*val = (s64)READ_ONCE(ebc->force_mode);
+	return 0;
+}
+
+/* -1 for none, else a mode the driver has. */
+static int rk3026_ebc_force_mode_set(void *data, u64 val)
+{
+	struct rk3026_ebc *ebc = data;
+	s64 mode = (s64)val;
+
+	if (mode < -1 || mode > EBC_MODE_MAX)
+		return -EINVAL;
+	WRITE_ONCE(ebc->force_mode, mode);
+	return 0;
+}
+DEFINE_DEBUGFS_ATTRIBUTE_SIGNED(rk3026_ebc_force_mode_fops,
+				rk3026_ebc_force_mode_get,
+				rk3026_ebc_force_mode_set, "%lld\n");
+
 void rk3026_ebc_debugfs_init(struct rk3026_ebc *ebc)
 {
 	struct dentry *dir = debugfs_create_dir("rk3026-ebc", NULL);
@@ -404,6 +434,9 @@ void rk3026_ebc_debugfs_init(struct rk3026_ebc *ebc)
 	debugfs_create_u32("flip_late", 0444, dir, &ebc->flip_late);
 	debugfs_create_file("flip_release", 0644, dir, ebc,
 			    &rk3026_ebc_flip_release_fops);
+	debugfs_create_file_unsafe("force_mode", 0644, dir, ebc,
+				   &rk3026_ebc_force_mode_fops);
+	debugfs_create_atomic_t("debug_timeout", 0644, dir, &ebc->debug_timeout);
 }
 
 void rk3026_ebc_debugfs_fini(struct rk3026_ebc *ebc)

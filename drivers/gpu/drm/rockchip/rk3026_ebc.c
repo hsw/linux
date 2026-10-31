@@ -267,54 +267,6 @@ VISIBLE_IF_KUNIT unsigned int rk3026_ebc_wait_timeout_ms(struct rk3026_ebc *ebc)
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_wait_timeout_ms);
 
 /*
- * DIAGNOSTIC, REVERT ME. Runtime knobs so one card can answer several questions
- * without a rebuild, because judging a weak panel response by eye is expensive
- * and ambiguous.
- *
- * force_mode: drive every update in this EBC_MODE_* instead of the one the
- * update carries. Modes 11 and 12 are the DIRECT modes -- they assert neither
- * DISPLAY_MODE nor UPDATE_MODE, so the controller drives from the image without
- * the waveform LUT at all. A hard black/white there proves the pad, clock, rail
- * and image-fetch chain and isolates the fault to the LUT; mush there exonerates
- * the LUT and points at the data path. A mode outside the full class
- * (rk3026_ebc_drive_knows_glass()) never makes a glass that is not known
- * known: with no RESET at the temperature the repair is the part's own
- * drive, which then never clears @prev_unknown, and every part stays
- * exempt from the skip until force_mode is cleared.
- */
-static int force_mode = -1;
-module_param(force_mode, int, 0644);
-MODULE_PARM_DESC(force_mode, "override the refresh mode (0-12; -1 = use the update's own)");
-
-/*
- * DIAGNOSTIC, REVERT ME. Provoke the abort that docs/PENDING.md P62 repairs.
- *
- * P62's recovery is unreachable by every other means: the frame budget is
- * DERIVED from the panel timings so there is no way to make it too small, and
- * the interruptible wait in rk3026_ebc_wait_marker() aborts a caller's wait
- * rather than the drive. Without this the repair path can only be reasoned
- * about, and a repair nobody has seen run is a repair nobody has tested.
- *
- * Cuts the budget of the next N chunks to 1 ms, so wait_for_completion_timeout()
- * genuinely expires: same code path, same controller stop and rails-off, same
- * prev_unknown. Nothing is faked.
- *
- * 🔴 An abort leaves the panel MID-WAVEFORM, which is the cumulative ghosting
- * this driver otherwise works hard to avoid. Set it once, to a small number, to
- * take a verdict -- never leave it armed.
- *
- * ⚠️ Reading the result: without a reset in the device tree the controller is
- * only un-armed (ebc_stop_scan()), and the aborted scan's frame-end interrupt
- * may still arrive while the NEXT waveform is being set up, completing that
- * waveform's first chunk early. A chunk that reports "ended in 0 ms" is that
- * stale interrupt, not a scan. Judge the recovery by its chunk durations, not
- * by the word "ended".
- */
-static unsigned int debug_timeout;
-module_param(debug_timeout, uint, 0644);
-MODULE_PARM_DESC(debug_timeout, "force the next N chunks to time out (0 = off); provokes P62's abort");
-
-/*
  * H/V timing and active window. The H registers count source-driver clocks,
  * four pixels each; the V registers count lines. E Ink spec names in comments.
  */
@@ -773,11 +725,9 @@ VISIBLE_IF_KUNIT int rk3026_ebc_drive(struct rk3026_ebc *ebc, const u8 *lut,
 			goto out;
 		}
 
-		/* DIAGNOSTIC: make the wait expire for real. See debug_timeout. */
-		if (debug_timeout) {
-			debug_timeout--;
+		/* debugfs debug_timeout: this chunk's wait expires for real. */
+		if (atomic_dec_if_positive(&ebc->debug_timeout) >= 0)
 			budget = 1;
-		}
 
 		reinit_completion(&ebc->frame_done);
 		ebc_frame_kick(ebc, lut, chunk, n, done + n >= frames);
@@ -1437,7 +1387,7 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 	u32 changed_px = 0;
 	const u8 *lut, *target;
 	int temp = EBC_TEMP_FALLBACK;
-	int rails = 0, rails_err;
+	int rails = 0, rails_err, forced;
 
 	mutex_lock(&ebc->image_lock);
 	if (ebc->suspended || !rk3026_ebc_pending_peek(&ebc->pending, &part)) {
@@ -1640,10 +1590,9 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 					   &reason);
 	last->reason = reason;
 
-	/* DIAGNOSTIC: drive a different mode class with the same data and scan. */
-	mode = resolved;
-	if (force_mode >= 0 && force_mode <= EBC_MODE_MAX)
-		mode = force_mode;
+	/* debugfs force_mode: another mode class, same data and scan. */
+	forced = READ_ONCE(ebc->force_mode);
+	mode = forced >= 0 && forced <= EBC_MODE_MAX ? forced : resolved;
 	last->mode = mode;
 	mutex_unlock(&ebc->image_lock);
 
@@ -1906,7 +1855,7 @@ static void ebc_take_state(struct rk3026_ebc *ebc,
 		.big_area	= budget.big_area,
 		.quiet_us	= READ_ONCE(ebc->take_quiet_us),
 		.cap_ms		= READ_ONCE(ebc->take_cap_ms),
-		.full		= force_mode == EBC_MODE_FULL ||
+		.full		= READ_ONCE(ebc->force_mode) == EBC_MODE_FULL ||
 				  (part->auto_ok && part->has_plane &&
 				   rk3026_ebc_du_at_ceiling(&budget)),
 		.exempt		= part->has_mxcfb || part->cleanup_idle ||
@@ -3447,6 +3396,8 @@ static int ebc_probe(struct platform_device *pdev)
 	/* A burst of updates is taken once it has been quiet this long. */
 	ebc->take_quiet_us = EBC_TAKE_QUIET_US;
 	ebc->take_cap_ms = EBC_TAKE_CAP_MS;
+	/* Every part in its own mode. */
+	ebc->force_mode = -1;
 
 	/* E Ink GDCK_STA / LGONL; no display-timing binding covers them. */
 	if (of_property_read_u32(dev->of_node, "rockchip,gdck-sta",

@@ -1010,6 +1010,38 @@ struct rk3026_ebc {
 	u32			take_quiet_us;
 	u32			take_cap_ms;
 
+	/*
+	 * Test knobs, set from debugfs alone; the refresh thread reads
+	 * @force_mode with READ_ONCE() and counts @debug_timeout down
+	 * atomically, so a write from debugfs (0 to cancel) is never lost.
+	 *
+	 * @force_mode: an EBC_MODE_* every part is driven in instead of its
+	 * resolved one, -1 (as probe sets it) for none. The skip stays on the
+	 * part's own mode, so it cannot disable the boot RESET. The direct
+	 * modes (EBC_MODE_DIRECT_*) assert neither DISPLAY_MODE nor
+	 * UPDATE_MODE: the controller drives from the image without the LUT,
+	 * so a clean black and white there clears the pads, clocks, rails and
+	 * image fetch and points at the LUT, and a smeared one points at the
+	 * data path. A mode outside the full class
+	 * (rk3026_ebc_drive_knows_glass()) does not make an unknown glass
+	 * known: with no RESET at the temperature to repair it, every part
+	 * stays exempt from the skip while such a mode is forced.
+	 *
+	 * @debug_timeout: the next chunks of a waveform whose wait gets a
+	 * budget of 1 ms, so it expires for real and rk3026_ebc_drive() takes
+	 * its abort path (controller stopped, rails off, @prev_unknown set):
+	 * the budget is derived from the panel timings and nothing else can
+	 * make it too short. An abort leaves the panel mid-waveform, which
+	 * ghosts; set it to a small count for one test and let it run out.
+	 * Without a reset in the device tree the controller is only stopped,
+	 * and the aborted scan's frame-end interrupt can still arrive while
+	 * the next waveform is set up, ending that waveform's first chunk
+	 * early: judge the recovery by the scan times (scan_end), not by the
+	 * absence of a timeout.
+	 */
+	int			force_mode;
+	atomic_t		debug_timeout;
+
 	/* Write-only registers the controller does not read back. */
 	u32			dsp_start;
 	u32			dsp_ctrl;

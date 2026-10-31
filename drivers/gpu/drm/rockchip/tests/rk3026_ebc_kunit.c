@@ -4344,6 +4344,8 @@ static struct rk3026_ebc *t_ebc_alloc(struct kunit *test)
 	ebc->du_cleanup_idle_ms = EBC_DU_CLEANUP_IDLE_MS;
 	/* A2 off for plane parts. */
 	ebc->a2_max_area = 0;
+	/* No mode forced. */
+	ebc->force_mode = -1;
 	/*
 	 * plane_resync stays false: after probe it is true (the probe RESET
 	 * is a non-plane update), but here the target and the framebuffers
@@ -5156,6 +5158,46 @@ static struct rk3026_ebc *t_driven_ebc(struct kunit *test, struct t_drives *d,
 	test->priv = d;
 	kunit_activate_static_stub(test, rk3026_ebc_drive, t_drive_ok);
 	return ebc;
+}
+
+/*
+ * debugfs force_mode: a part is driven in the forced mode, with the
+ * reason of the mode it resolved to; -1 drives the resolved mode again.
+ */
+static void ebc_test_glue_force_mode(struct kunit *test)
+{
+	struct t_drives d;
+	struct rk3026_ebc *ebc = t_driven_ebc(test, &d, true);
+	u32 *black = t_plane_fb(test, 0);
+	u32 *white = t_plane_fb(test, 0xffffff);
+	struct rk3026_ebc_last last;
+
+	/* No cleanup FULL: the resolved mode of a two-level part is DU. */
+	ebc->du_cleanup_area = 0;
+	ebc->du_cleanup_ceiling = 0;
+
+	WRITE_ONCE(ebc->force_mode, EBC_MODE_FULL);
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
+							&t_panel));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_FULL);
+	KUNIT_EXPECT_EQ(test, last.lut_mode, EBC_MODE_FULL);
+	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_AUTO_DU);
+	KUNIT_ASSERT_EQ(test, d.n, 1);
+	KUNIT_EXPECT_EQ(test, d.mode[0], EBC_MODE_FULL);
+	KUNIT_EXPECT_EQ(test, ebc->shadows.prev[0], 0);
+
+	WRITE_ONCE(ebc->force_mode, -1);
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, white, T_W * 4,
+							&t_panel));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_BLACK_WHITE);
+	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_AUTO_DU);
+	KUNIT_ASSERT_EQ(test, d.n, 2);
+	KUNIT_EXPECT_EQ(test, d.mode[1], EBC_MODE_BLACK_WHITE);
+	KUNIT_EXPECT_EQ(test, ebc->shadows.prev[0], 0xff);
 }
 
 /*
@@ -10523,6 +10565,7 @@ static struct kunit_case rk3026_ebc_glue_test_cases[] = {
 	KUNIT_CASE(ebc_test_glue_du_skipped),
 	KUNIT_CASE(ebc_test_glue_du_reset),
 	KUNIT_CASE(ebc_test_glue_du_driven),
+	KUNIT_CASE(ebc_test_glue_force_mode),
 	KUNIT_CASE(ebc_test_glue_part_driven),
 	KUNIT_CASE(ebc_test_glue_du_big),
 	KUNIT_CASE(ebc_test_glue_du_ceiling),

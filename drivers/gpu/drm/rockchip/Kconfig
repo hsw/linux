@@ -188,7 +188,8 @@ config DRM_RK3026_EBC_MXCFB
 	  MXCFB_WAIT_FOR_UPDATE_SUBMISSION ioctls to the emulated fbdev, so
 	  e-reader userspace can pick a waveform mode, supply a panel
 	  temperature and wait for a refresh to finish, or only for it to
-	  be submitted. The other mxcfb commands are refused with -ENOTTY.
+	  be submitted. EPDC_FLAG_ENABLE_INVERSION draws an update
+	  inverted. The other mxcfb commands are refused with -ENOTTY.
 	  This is not an upstream interface; without it the display
 	  degrades to single-mode partial refresh rather than breaking.
 

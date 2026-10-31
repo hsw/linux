@@ -3167,6 +3167,11 @@ static void ebc_debugfs_fini(void *data)
 	rk3026_ebc_debugfs_fini(data);
 }
 
+static void ebc_release_reserved_mem(void *data)
+{
+	of_reserved_mem_device_release(data);
+}
+
 static void ebc_release_fw(void *data)
 {
 	release_firmware(data);
@@ -3377,8 +3382,15 @@ static int ebc_probe(struct platform_device *pdev)
 				     PTR_ERR(ebc->tzd));
 
 	ret = of_reserved_mem_device_init(dev);
-	if (ret)
+	if (ret) {
 		dev_warn(dev, "no reserved memory region (%d)\n", ret);
+	} else {
+		/* Registered before the images: devres frees them first. */
+		ret = devm_add_action_or_reset(dev, ebc_release_reserved_mem,
+					       dev);
+		if (ret)
+			return ret;
+	}
 
 	ret = ebc_setup_buffers(ebc);
 	if (ret)

@@ -696,6 +696,12 @@ struct rk3026_ebc_shadows {
 };
 
 /*
+ * Entries of a C8 palette, one per value of an 8-bit pixel: the CRTC's
+ * GAMMA_LUT, the palette of a C8 plane, has as many.
+ */
+#define EBC_PALETTE_SIZE	256
+
+/*
  * MXCFB_WAIT_FOR_UPDATE_COMPLETE markers of the newest updates, and the seq
  * each was queued with. Marker 0 is never recorded, so an empty slot never
  * matches.
@@ -933,6 +939,11 @@ struct rk3026_ebc {
 	 * scans, are written by the thread alone, outside @image_lock, and
 	 * never read by the CPU.
 	 *
+	 * @c8_levels: the level of each C8 index, the levels of the CRTC's
+	 * GAMMA_LUT or of the default grey ramp without one
+	 * (rk3026_ebc_load_palette()). Filled in one @image_lock section, so
+	 * a blit sees one whole table.
+	 *
 	 * @image_lock is never held across a waveform, the sensor read or a
 	 * write into @prev_virt or @next_virt, so a sender waits at most for
 	 * one snapshot to be built; @rails_lock is never taken under it.
@@ -942,6 +953,7 @@ struct rk3026_ebc {
 	u8			*pre_shadow;
 	bool			pre_split;
 	bool			plane_resync;
+	u8			c8_levels[EBC_PALETTE_SIZE];
 	struct rk3026_ebc_shadows shadows;
 	struct rk3026_ebc_pending pending;
 	struct rk3026_ebc_marker_ring markers;
@@ -1238,6 +1250,8 @@ void rk3026_ebc_flip_trace(struct rk3026_ebc *ebc, u32 seq, u32 held_us,
 bool rk3026_ebc_flip_hold(struct rk3026_ebc *ebc,
 			  struct drm_crtc_state *crtc_state);
 int rk3026_ebc_kms_init(struct rk3026_ebc *ebc);
+void rk3026_ebc_load_palette(struct rk3026_ebc *ebc,
+			     const struct drm_color_lut *lut);
 bool rk3026_ebc_idle_tick(struct rk3026_ebc *ebc, unsigned long now);
 int rk3026_ebc_raise_rails(struct rk3026_ebc *ebc);
 ktime_t rk3026_ebc_clock(struct rk3026_ebc *ebc);
@@ -1269,6 +1283,10 @@ void rk3026_ebc_blit_r8_rows(u8 *dst, const void *src, unsigned int src_pitch,
 bool rk3026_ebc_blit_r8_convert(u8 *dst, const void *src,
 				unsigned int src_pitch, int x1, int x2, int y1,
 				int y2, unsigned int width);
+void rk3026_ebc_blit_c8_rows(u8 *dst, const void *src, unsigned int src_pitch,
+			     int x1, int x2, int y1, int y2,
+			     unsigned int width, const u8 *levels);
+u8 rk3026_ebc_palette_level(u16 red, u16 green, u16 blue);
 
 /**
  * rk3026_ebc_grey_level - the panel level of an 8-bit grey

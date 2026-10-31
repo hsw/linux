@@ -11,6 +11,11 @@
  *   MXCFB_SEND_UPDATE                _IOW('F', 0x2e, struct mxcfb_update_data)
  *   MXCFB_WAIT_FOR_UPDATE_COMPLETE   _IOW('F', 0x2f, __u32)
  *
+ * and the i.MX wait for an update's submission, which takes the same
+ * marker in every variant:
+ *
+ *   MXCFB_WAIT_FOR_UPDATE_SUBMISSION _IOW('F', 0x37, __u32)
+ *
  * V1 is chosen because it is the smallest variant that still carries
  * everything the EBC needs (region, waveform mode, update mode, marker,
  * temperature), it has no 64-bit-unsafe userspace pointer in it (V1_NTX
@@ -61,6 +66,7 @@ static_assert(sizeof(struct mxcfb_update_data) == 64);
 
 #define MXCFB_SEND_UPDATE		_IOW('F', 0x2e, struct mxcfb_update_data)
 #define MXCFB_WAIT_FOR_UPDATE_COMPLETE	_IOW('F', 0x2f, __u32)
+#define MXCFB_WAIT_FOR_UPDATE_SUBMISSION	_IOW('F', 0x37, __u32)
 
 /*
  * The command numbers of the mxcfb dialect across its variants, from

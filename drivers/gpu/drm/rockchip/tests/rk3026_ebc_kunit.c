@@ -12,6 +12,7 @@
 #include <kunit/test.h>
 
 #include <linux/completion.h>
+#include <linux/delay.h>
 #include <linux/dma-fence.h>
 #include <linux/err.h>
 #include <linux/fb.h>
@@ -3770,10 +3771,10 @@ struct t_mxcfb_cmd {
 /*
  * Every number of the i.MX / Kobo / Kindle / PocketBook / reMarkable
  * mxcfb dialect a client may send to fb0 (on 32-bit ARM), as their
- * headers spell them, with the answer it gets: the two V1 commands are
- * implemented, every other one is refused. MXCFB_WAIT_FOR_VSYNC is
- * FBIO_WAITFORVSYNC and stays the fbdev helper's, as do the numbers
- * outside the dialect's 'F' range.
+ * headers spell them, with the answer it gets: the two V1 commands and
+ * the submission wait are implemented, every other one is refused.
+ * MXCFB_WAIT_FOR_VSYNC is FBIO_WAITFORVSYNC and stays the fbdev helper's,
+ * as do the numbers outside the dialect's 'F' range.
  */
 static const struct t_mxcfb_cmd t_mxcfb_cmd_cases[] = {
 	{ "WAIT_FOR_VSYNC", 0x40044620, EBC_MXCFB_FBDEV },
@@ -3814,7 +3815,7 @@ static const struct t_mxcfb_cmd t_mxcfb_cmd_cases[] = {
 	{ "WAIT_FOR_UPDATE_COMPLETE_V2", 0xc0084635, EBC_MXCFB_REFUSED },
 	{ "ENABLE_EPDC_ACCESS", 0x00004636, EBC_MXCFB_REFUSED },
 	{ "GET_WORK_BUFFER Kindle", 0xc0044636, EBC_MXCFB_REFUSED },
-	{ "WAIT_FOR_UPDATE_SUBMISSION", 0x40044637, EBC_MXCFB_REFUSED },
+	{ "WAIT_FOR_UPDATE_SUBMISSION", 0x40044637, EBC_MXCFB_WAIT_SUBMISSION },
 	{ "WAIT_FOR_ANY_UPDATE_COMPLETE_MTK", 0xc0044637, EBC_MXCFB_REFUSED },
 	{ "GET_TEMPERATURE", 0x80044638, EBC_MXCFB_REFUSED },
 	{ "GET_WAVEFORM_TYPE", 0x80044639, EBC_MXCFB_REFUSED },
@@ -3856,6 +3857,7 @@ static void ebc_test_mxcfb_numbers(struct kunit *test)
 {
 	KUNIT_EXPECT_EQ(test, MXCFB_SEND_UPDATE, 0x4040462e);
 	KUNIT_EXPECT_EQ(test, MXCFB_WAIT_FOR_UPDATE_COMPLETE, 0x4004462f);
+	KUNIT_EXPECT_EQ(test, MXCFB_WAIT_FOR_UPDATE_SUBMISSION, 0x40044637);
 	KUNIT_EXPECT_EQ(test, FBIO_WAITFORVSYNC, 0x40044620);
 }
 
@@ -3901,7 +3903,8 @@ static void ebc_test_mxcfb_ioctl(struct kunit *test)
 		unsigned int before = calls;
 
 		if (c->answer == EBC_MXCFB_SEND_UPDATE ||
-		    c->answer == EBC_MXCFB_WAIT_COMPLETE)
+		    c->answer == EBC_MXCFB_WAIT_COMPLETE ||
+		    c->answer == EBC_MXCFB_WAIT_SUBMISSION)
 			continue;
 		/* A bad pointer: nothing may dereference it. */
 		ret = rk3026_ebc_mxcfb_ioctl(info, c->cmd, 1);
@@ -4576,7 +4579,8 @@ static void ebc_test_glue_crtc_off(struct kunit *test)
 	KUNIT_EXPECT_PTR_EQ(test, ebc->shadows.prev, prev);
 	KUNIT_EXPECT_EQ(test, ebc->stats.done, 1);
 	KUNIT_EXPECT_EQ(test, ebc->stats.dropped, 1);
-	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_marker(ebc, 1), 0);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_marker(ebc, 1, EBC_WAIT_FINISH),
+			0);
 
 	/* Nothing pending: nothing taken, the record stays. */
 	last.outcome = EBC_OUTCOME_NONE;
@@ -4728,14 +4732,18 @@ static void ebc_test_glue_wait_marker(struct kunit *test)
 	ebc->crtc_on = false;
 
 	/* Marker 0 and a marker never sent: nothing to wait for. */
-	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_marker(ebc, 0), 0);
-	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_marker(ebc, 42), 0);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_marker(ebc, 0, EBC_WAIT_FINISH),
+			0);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_marker(ebc, 42, EBC_WAIT_FINISH),
+			0);
 
 	/* The thread does not come: the wait times out. */
 	seq = t_send(ebc, &t_panel, EBC_MODE_PART, 7, EBC_SOURCE_MXCFB);
-	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_seq(ebc, seq, 20, true),
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_seq(ebc, seq, EBC_WAIT_FINISH,
+						  20, true),
 			-ETIMEDOUT);
-	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_seq(ebc, seq, 20, false),
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_seq(ebc, seq, EBC_WAIT_FINISH,
+						  20, false),
 			-ETIMEDOUT);
 
 	/* It comes later: the finish wakes the wait. */
@@ -4743,12 +4751,15 @@ static void ebc_test_glue_wait_marker(struct kunit *test)
 	w->parts = 1;
 	INIT_DELAYED_WORK(&w->work, t_glue_refresh);
 	schedule_delayed_work(&w->work, msecs_to_jiffies(50));
-	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_marker(ebc, 7), 0);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_marker(ebc, 7, EBC_WAIT_FINISH),
+			0);
 	flush_delayed_work(&w->work);
 	KUNIT_EXPECT_EQ(test, w->last.outcome, EBC_OUTCOME_CRTC_OFF);
 	KUNIT_EXPECT_TRUE(test, rk3026_ebc_seq_finished(&ebc->pending, seq));
 	/* Finished: a wait returns at once. */
-	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_seq(ebc, seq, 0, false), 0);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_seq(ebc, seq, EBC_WAIT_FINISH,
+						  0, false),
+			0);
 }
 
 /* A wait on the RESET ends at the RESET, not at what was sent after it. */
@@ -4769,19 +4780,80 @@ static void ebc_test_glue_wait_barrier(struct kunit *test)
 	w->parts = 2;
 	INIT_DELAYED_WORK(&w->work, t_glue_refresh);
 	schedule_delayed_work(&w->work, msecs_to_jiffies(20));
-	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_seq(ebc, s2, 10000, false), 0);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_seq(ebc, s2, EBC_WAIT_FINISH,
+						  10000, false),
+			0);
 	flush_delayed_work(&w->work);
 	KUNIT_EXPECT_TRUE(test, rk3026_ebc_seq_finished(&ebc->pending, s1));
 	KUNIT_EXPECT_FALSE(test, rk3026_ebc_seq_finished(&ebc->pending, s3));
 	KUNIT_EXPECT_TRUE(test, rk3026_ebc_work_pending(&ebc->pending));
-	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_seq(ebc, s3, 20, false),
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_seq(ebc, s3, EBC_WAIT_FINISH,
+						  20, false),
 			-ETIMEDOUT);
 
 	w->parts = 1;
 	schedule_delayed_work(&w->work, 0);
-	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_marker(ebc, 3), 0);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_marker(ebc, 3, EBC_WAIT_FINISH),
+			0);
 	flush_delayed_work(&w->work);
 	KUNIT_EXPECT_FALSE(test, rk3026_ebc_work_pending(&ebc->pending));
+}
+
+/*
+ * A wait for the take: marker 0 and a marker never sent return at once;
+ * an update not taken times out, with or without signals; the take wakes
+ * the wait, also for a part dropped with the CRTC off. Parts are taken in
+ * seq order: the take of the part in front of a RESET does not take the
+ * RESET, nor the RESET what was sent after it.
+ */
+static void ebc_test_glue_wait_take(struct kunit *test)
+{
+	struct rk3026_ebc *ebc = t_ebc_alloc(test);
+	struct t_glue_work *w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
+	struct drm_rect r = DRM_RECT_INIT(2, 2, 4, 2);
+	struct rk3026_ebc_last last;
+	u32 s1, s2, s3;
+
+	KUNIT_ASSERT_NOT_NULL(test, w);
+	ebc->crtc_on = false;
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_marker(ebc, 0, EBC_WAIT_TAKE), 0);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_marker(ebc, 42, EBC_WAIT_TAKE),
+			0);
+
+	s1 = t_send(ebc, &r, EBC_MODE_PART, 1, EBC_SOURCE_MXCFB);
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_seq_taken(&ebc->pending, s1));
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_seq(ebc, s1, EBC_WAIT_TAKE,
+						  20, true),
+			-ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_seq(ebc, s1, EBC_WAIT_TAKE,
+						  20, false),
+			-ETIMEDOUT);
+
+	s2 = t_send(ebc, &t_panel, EBC_MODE_RESET, 2, EBC_SOURCE_MXCFB);
+	s3 = t_send(ebc, &r, EBC_MODE_PART, 3, EBC_SOURCE_MXCFB);
+	w->ebc = ebc;
+	w->parts = 1;
+	INIT_DELAYED_WORK(&w->work, t_glue_refresh);
+	schedule_delayed_work(&w->work, msecs_to_jiffies(50));
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_marker(ebc, 1, EBC_WAIT_TAKE), 0);
+	flush_delayed_work(&w->work);
+	KUNIT_EXPECT_EQ(test, w->last.outcome, EBC_OUTCOME_CRTC_OFF);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_seq_taken(&ebc->pending, s1));
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_seq_taken(&ebc->pending, s2));
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_seq(ebc, s2, EBC_WAIT_TAKE,
+						  0, false),
+			-ETIMEDOUT);
+
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_RESET);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_marker(ebc, 2, EBC_WAIT_TAKE), 0);
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_seq_taken(&ebc->pending, s3));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_marker(ebc, 3, EBC_WAIT_TAKE), 0);
+	/* Taken: a wait returns at once. */
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_seq(ebc, s3, EBC_WAIT_TAKE,
+						  0, false),
+			0);
 }
 
 /*
@@ -5476,6 +5548,132 @@ static void ebc_test_glue_du_big(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, d.mode[1], EBC_MODE_PART);
 	KUNIT_EXPECT_EQ(test, d.mode[2], EBC_MODE_FULL);
 	KUNIT_EXPECT_EQ(test, d.mode[3], EBC_MODE_BLACK_WHITE);
+}
+
+/* How long the stubbed drive waits for the wait for the take to return. */
+#define T_TAKE_WAIT_MS	2000
+
+/* A wait for the take on its own thread, and the drive it races. */
+struct t_take_wait {
+	struct t_drives		d;	/* first: t_drive_ok()'s priv */
+	struct work_struct	work;
+	struct completion	returned;
+	struct rk3026_ebc	*ebc;
+	u32			seq;
+	int			ret;
+	bool			finished;
+	bool			in_drive;
+};
+
+static void t_take_waiter(struct work_struct *work)
+{
+	struct t_take_wait *w = container_of(work, struct t_take_wait, work);
+
+	w->ret = rk3026_ebc_wait_marker(w->ebc, 5, EBC_WAIT_TAKE);
+	w->finished = rk3026_ebc_seq_finished(&w->ebc->pending, w->seq);
+	complete(&w->returned);
+}
+
+/*
+ * rk3026_ebc_drive() that first gives the wait for the take up to
+ * T_TAKE_WAIT_MS to return, then drives as t_drive_ok().
+ */
+static int t_drive_held(struct rk3026_ebc *ebc, const u8 *lut, u32 frames,
+			u32 mode, u32 lut_mode, struct rk3026_ebc_last *last)
+{
+	struct t_drives *d = kunit_get_current_test()->priv;
+	struct t_take_wait *w = container_of(d, struct t_take_wait, d);
+	unsigned long left;
+
+	left = wait_for_completion_timeout(&w->returned,
+					   msecs_to_jiffies(T_TAKE_WAIT_MS));
+	w->in_drive = left != 0;
+	return t_drive_ok(ebc, lut, frames, mode, lut_mode, last);
+}
+
+/*
+ * The take wakes a wait for it: a waiter asleep before the take returns
+ * while the part's waveform runs, before the part finishes, not at its
+ * end.
+ */
+static void ebc_test_glue_wait_take_wakes(struct kunit *test)
+{
+	struct t_take_wait *w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
+	struct drm_rect r = DRM_RECT_INIT(2, 1, 4, 2);
+	struct rk3026_ebc_last last;
+	struct rk3026_ebc *ebc;
+	int i, x, y;
+
+	KUNIT_ASSERT_NOT_NULL(test, w);
+	ebc = t_driven_ebc(test, &w->d, true);
+	kunit_activate_static_stub(test, rk3026_ebc_drive, t_drive_held);
+	init_completion(&w->returned);
+	INIT_WORK(&w->work, t_take_waiter);
+	w->ebc = ebc;
+
+	for (y = r.y1; y < r.y2; y++)
+		for (x = r.x1; x < r.x2; x++)
+			t_px_set(ebc->next_shadow, x, y, 0);
+	w->seq = t_send(ebc, &r, EBC_MODE_PART, 5, EBC_SOURCE_MXCFB);
+	schedule_work(&w->work);
+	/* Asleep on the queue before the take: it did not return before. */
+	for (i = 0; i < 100; i++) {
+		/* Polled: a look that misses the waiter costs one round. */
+		if (waitqueue_active(&ebc->marker_wq))
+			break;
+		msleep(20);
+	}
+	KUNIT_ASSERT_LT(test, i, 100);
+	KUNIT_EXPECT_FALSE(test, completion_done(&w->returned));
+
+	rk3026_ebc_do_refresh(ebc, &last);
+	flush_work(&w->work);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_EXPECT_EQ(test, w->d.n, 1);
+	KUNIT_EXPECT_TRUE(test, w->in_drive);
+	KUNIT_EXPECT_EQ(test, w->ret, 0);
+	KUNIT_EXPECT_FALSE(test, w->finished);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_seq_finished(&ebc->pending, w->seq));
+}
+
+/*
+ * A part taken and not finished: skipped, its update is taken and done;
+ * carried for a retry (no LUT for it), its update is taken, so the wait
+ * for the take returns, and not done, so the wait for the finish times
+ * out.
+ */
+static void ebc_test_glue_wait_take_outcomes(struct kunit *test)
+{
+	static const struct t_rkf_seg seg = { T_RKF_GRAY16, 1 };
+	struct rk3026_ebc *ebc = t_policy_ebc(test);
+	struct drm_rect r = DRM_RECT_INIT(2, 1, 4, 2);
+	struct ebc_waveform *reset_only = ebc->waveform;
+	struct rk3026_ebc_last last;
+	u32 seq;
+	int x, y;
+
+	ebc->waveform = t_rkf_wf(test, ebc->dev, &seg, 1, 0);
+	seq = t_send(ebc, &t_panel, EBC_MODE_PART, 4, EBC_SOURCE_MXCFB);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_SKIPPED);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_seq_taken(&ebc->pending, seq));
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_seq_finished(&ebc->pending, seq));
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_marker(ebc, 4, EBC_WAIT_TAKE), 0);
+
+	ebc->waveform = reset_only;
+	for (y = r.y1; y < r.y2; y++)
+		for (x = r.x1; x < r.x2; x++)
+			t_px_set(ebc->next_shadow, x, y, 0);
+	seq = t_send(ebc, &r, EBC_MODE_PART, 5, EBC_SOURCE_MXCFB);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_NO_LUT);
+	KUNIT_ASSERT_TRUE(test, ebc->pending.retry.armed);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_seq_taken(&ebc->pending, seq));
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_seq_finished(&ebc->pending, seq));
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_marker(ebc, 5, EBC_WAIT_TAKE), 0);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_seq(ebc, seq, EBC_WAIT_FINISH,
+						  20, false),
+			-ETIMEDOUT);
 }
 
 /*
@@ -7478,8 +7676,10 @@ static void ebc_test_glue_retry_give_up(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, last.seq, s2);
 	KUNIT_EXPECT_TRUE(test, rk3026_ebc_seq_finished(&ebc->pending, s1));
 	KUNIT_EXPECT_TRUE(test, rk3026_ebc_seq_finished(&ebc->pending, s2));
-	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_marker(ebc, 5), 0);
-	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_marker(ebc, 6), 0);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_marker(ebc, 5, EBC_WAIT_FINISH),
+			0);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_marker(ebc, 6, EBC_WAIT_FINISH),
+			0);
 	KUNIT_EXPECT_EQ(test, ebc->stats.carry_failed, 1);
 	KUNIT_EXPECT_EQ(test, d.rails, 5);
 	KUNIT_EXPECT_EQ(test, d.n, 0);
@@ -7532,7 +7732,8 @@ static void ebc_test_glue_retry_crtc_off(struct kunit *test)
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_NO_RAILS);
 	KUNIT_EXPECT_FALSE(test, t_woken(ebc, &d));
-	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_seq(ebc, seq, 0, false),
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_seq(ebc, seq, EBC_WAIT_FINISH,
+						  0, false),
 			-ETIMEDOUT);
 
 	t_crtc_off(test, ebc);
@@ -7542,7 +7743,9 @@ static void ebc_test_glue_retry_crtc_off(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_CRTC_OFF);
 	KUNIT_EXPECT_EQ(test, last.seq, seq);
 	KUNIT_EXPECT_FALSE(test, last.gave_up);
-	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_seq(ebc, seq, 0, false), 0);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_seq(ebc, seq, EBC_WAIT_FINISH,
+						  0, false),
+			0);
 	KUNIT_EXPECT_FALSE(test, ebc->pending.retry.armed);
 	KUNIT_EXPECT_FALSE(test, ebc->pending.carry.merged);
 	KUNIT_EXPECT_FALSE(test, t_woken(ebc, &d));
@@ -8179,19 +8382,63 @@ static void ebc_test_glue_mxcfb_wait(struct kunit *test)
 	u32 s0, s7;
 
 	ebc->crtc_on = false;
-	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_wait_complete(ebc, 0), -EINVAL);
-	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_wait_complete(ebc, 42), 0);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_wait(ebc, 0, EBC_WAIT_FINISH),
+			-EINVAL);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_wait(ebc, 42, EBC_WAIT_FINISH),
+			0);
 
 	s0 = t_send(ebc, &t_panel, EBC_MODE_PART, 0, EBC_SOURCE_MXCFB);
 	s7 = t_send(ebc, &t_panel, EBC_MODE_PART, 7, EBC_SOURCE_MXCFB);
-	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_wait_complete(ebc, 0), -EINVAL);
-	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_marker(ebc, 0), 0);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_wait(ebc, 0, EBC_WAIT_FINISH),
+			-EINVAL);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_marker(ebc, 0, EBC_WAIT_FINISH),
+			0);
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_CRTC_OFF);
 	KUNIT_EXPECT_TRUE(test, rk3026_ebc_seq_finished(&ebc->pending, s0));
 	KUNIT_EXPECT_TRUE(test, rk3026_ebc_seq_finished(&ebc->pending, s7));
-	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_wait_complete(ebc, 7), 0);
-	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_wait_complete(ebc, 0), -EINVAL);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_wait(ebc, 7, EBC_WAIT_FINISH),
+			0);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_wait(ebc, 0, EBC_WAIT_FINISH),
+			-EINVAL);
+}
+
+/*
+ * MXCFB_WAIT_FOR_UPDATE_SUBMISSION: marker 0 is invalid, a marker never
+ * sent returns at once; a sent update carried for a retry has been taken,
+ * so the wait returns while its part has not finished.
+ */
+static void ebc_test_glue_mxcfb_submission(struct kunit *test)
+{
+	struct rk3026_ebc *ebc = t_policy_ebc(test);
+	u32 *black = t_plane_fb(test, 0);
+	struct mxcfb_update_data req = {
+		.update_region = { .left = 2, .top = 1, .width = 4,
+				   .height = 2 },
+		.waveform_mode = MXCFB_WAVEFORM_MODE_GC16,
+		.update_mode = MXCFB_UPDATE_MODE_PARTIAL,
+		.update_marker = 5,
+		.temp = MXCFB_TEMP_USE_AMBIENT,
+	};
+	struct rk3026_ebc_last last;
+	u32 seq;
+
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_wait(ebc, 0, EBC_WAIT_TAKE),
+			-EINVAL);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_wait(ebc, 42, EBC_WAIT_TAKE),
+			0);
+
+	KUNIT_ASSERT_EQ(test, rk3026_ebc_mxcfb_send(ebc, black, T_W * 4, &req),
+			0);
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_marker_seq_lookup(&ebc->markers, 5,
+							     &seq));
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_wait(ebc, 0, EBC_WAIT_TAKE),
+			-EINVAL);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_NO_LUT);
+	KUNIT_ASSERT_TRUE(test, ebc->pending.retry.armed);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_wait(ebc, 5, EBC_WAIT_TAKE), 0);
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_seq_finished(&ebc->pending, seq));
 }
 #endif
 /*
@@ -10762,6 +11009,7 @@ static struct kunit_case rk3026_ebc_glue_test_cases[] = {
 	KUNIT_CASE(ebc_test_glue_reset_keeps_pre),
 	KUNIT_CASE(ebc_test_glue_wait_marker),
 	KUNIT_CASE(ebc_test_glue_wait_barrier),
+	KUNIT_CASE(ebc_test_glue_wait_take),
 	KUNIT_CASE(ebc_test_glue_wait_timeout),
 	KUNIT_CASE(ebc_test_glue_plane_update),
 	KUNIT_CASE(ebc_test_glue_plane_update_seq),
@@ -10777,6 +11025,8 @@ static struct kunit_case rk3026_ebc_glue_test_cases[] = {
 	KUNIT_CASE(ebc_test_glue_du_reset),
 	KUNIT_CASE(ebc_test_glue_du_driven),
 	KUNIT_CASE(ebc_test_glue_part_driven),
+	KUNIT_CASE(ebc_test_glue_wait_take_wakes),
+	KUNIT_CASE(ebc_test_glue_wait_take_outcomes),
 	KUNIT_CASE(ebc_test_glue_du_big),
 	KUNIT_CASE(ebc_test_glue_du_ceiling),
 	KUNIT_CASE(ebc_test_glue_a2_off),
@@ -10827,6 +11077,7 @@ static struct kunit_case rk3026_ebc_glue_test_cases[] = {
 	KUNIT_CASE(ebc_test_glue_mxcfb_send),
 	KUNIT_CASE_PARAM(ebc_test_glue_mxcfb_args, t_mxcfb_arg_gen_params),
 	KUNIT_CASE(ebc_test_glue_mxcfb_wait),
+	KUNIT_CASE(ebc_test_glue_mxcfb_submission),
 #endif
 	KUNIT_CASE(ebc_test_glue_timing),
 	KUNIT_CASE(ebc_test_glue_timing_skipped),

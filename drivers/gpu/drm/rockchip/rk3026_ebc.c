@@ -246,8 +246,8 @@ VISIBLE_IF_KUNIT unsigned int rk3026_ebc_part_max_ms(struct rk3026_ebc *ebc)
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_part_max_ms);
 
 /*
- * Longest a wait on one update blocks (rk3026_ebc_wait_seq():
- * MXCFB_WAIT_FOR_UPDATE_COMPLETE, CRTC enable and disable): EBC_WAIT_PARTS
+ * Longest a wait on one update blocks (rk3026_ebc_wait_seq(): the mxcfb
+ * waits, CRTC enable and disable): EBC_WAIT_PARTS
  * parts at their longest, and the retries of its own part if that is
  * carried: tries until EBC_RETRY_SPAN_MS after its first carry, and the
  * one that gives it up may start just before then, so one part more and
@@ -256,7 +256,8 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_part_max_ms);
  * it are in flight already or exempt (in front of a RESET, or the RESET),
  * and a retry is exempt. 208 s with every chunk budget at its 5 s floor.
  * Past this the thread is stuck outside the EBC (an I2C transfer, say), and
- * the waiter goes on without it.
+ * the waiter goes on without it. A wait for the take of the update ends
+ * before its finish, so the same bound holds for it.
  */
 VISIBLE_IF_KUNIT unsigned int rk3026_ebc_wait_timeout_ms(struct rk3026_ebc *ebc)
 {
@@ -1650,7 +1651,8 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_flip_fini);
  *  2. under @image_lock: the part is taken (rk3026_ebc_pending_take(): what
  *     was sent before a RESET, then the RESET alone, then what was sent
  *     after it), a commit event held to the take for an update in it is
- *     sent (ebc_flip_check()), and its snapshot is built into
+ *     sent (ebc_flip_check()), the waiters for the take of its updates
+ *     are woken, and its snapshot is built into
  *     @shadows.scan from @shadows.prev and the target (@next_shadow, or
  *     @pre_shadow for what was sent before a pending RESET). Senders may
  *     blit into @next_shadow and add to @pending as soon as the lock is
@@ -1745,6 +1747,12 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 	 */
 	taken = rk3026_ebc_clock(ebc);
 	ebc_flip_check(ebc);
+	/*
+	 * @pending.taken_seq moved over the part's updates: the waits for
+	 * their take end here, whatever becomes of the part; the waits for
+	 * their finish find their condition false and sleep again.
+	 */
+	wake_up_all(&ebc->marker_wq);
 
 	/*
 	 * Taken while @pre_split, the part is the @pending.pre a RESET was sent
@@ -2400,12 +2408,28 @@ static int ebc_refresh_thread(void *data)
 	return 0;
 }
 
+/* The update of @seq has reached @until. Read without the lock. */
+static bool ebc_seq_reached(const struct rk3026_ebc_pending *p, u32 seq,
+			    enum rk3026_ebc_wait_for until)
+{
+	if (until == EBC_WAIT_TAKE)
+		return rk3026_ebc_seq_taken(p, seq);
+	return rk3026_ebc_seq_finished(p, seq);
+}
+
 /**
- * rk3026_ebc_wait_seq - block until a sent update has finished
+ * rk3026_ebc_wait_seq - block until a sent update is taken or finished
  * @ebc: controller
  * @seq: the seq rk3026_ebc_add_update() gave the update
+ * @until: wait for the take of its part, or for the finish
  * @timeout_ms: the longest wait
  * @interruptible: a signal ends the wait
+ *
+ * The update has been taken once @pending.taken_seq reached @seq: the
+ * refresh thread took the part with it (rk3026_ebc_pending_take()), what
+ * the part then does with it -- driven, skipped, dropped with the CRTC
+ * off, carried -- notwithstanding. Parts are taken in seq order, so every
+ * update sent before it has been taken too.
  *
  * The update has finished once @pending.done_seq reached @seq: its part was
  * driven, skipped, dropped with the CRTC off, or given up (a RESET not
@@ -2427,6 +2451,7 @@ static int ebc_refresh_thread(void *data)
  * and a signal arrived.
  */
 VISIBLE_IF_KUNIT int rk3026_ebc_wait_seq(struct rk3026_ebc *ebc, u32 seq,
+					 enum rk3026_ebc_wait_for until,
 					 unsigned int timeout_ms,
 					 bool interruptible)
 {
@@ -2436,11 +2461,11 @@ VISIBLE_IF_KUNIT int rk3026_ebc_wait_seq(struct rk3026_ebc *ebc, u32 seq,
 
 	if (interruptible)
 		ret = wait_event_interruptible_timeout(ebc->marker_wq,
-						       rk3026_ebc_seq_finished(p, seq),
+						       ebc_seq_reached(p, seq, until),
 						       timeout);
 	else
 		ret = wait_event_timeout(ebc->marker_wq,
-					 rk3026_ebc_seq_finished(p, seq),
+					 ebc_seq_reached(p, seq, until),
 					 timeout);
 	if (ret < 0)
 		return ret;
@@ -2561,20 +2586,23 @@ u32 rk3026_ebc_add_update(struct rk3026_ebc *ebc,
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_add_update);
 
 /**
- * rk3026_ebc_wait_marker - block until a sent update has been driven out
+ * rk3026_ebc_wait_marker - block until a sent update is taken or driven out
  * @ebc: controller
  * @marker: the marker the update was sent with
+ * @until: wait for the take of its part, or for the finish
  *
  * Waits for the newest update sent with @marker, until the part that took
- * it has finished: driven, skipped, dropped with the CRTC off, or, carried
- * because the rails or a LUT were missing, drawn by a retry or given up
- * (rk3026_ebc_wait_seq()). A give-up returns 0 like a drive: the client's
- * wait means "done with it", and the content stays carried for the next
- * part. The marker is resolved to its seq once, here. Marker 0, a marker never
- * sent, and one overwritten by EBC_MARKER_RING_LEN newer markers return at
- * once.
+ * it has finished (EBC_WAIT_FINISH): driven, skipped, dropped with the
+ * CRTC off, or, carried because the rails or a LUT were missing, drawn by
+ * a retry or given up (rk3026_ebc_wait_seq()). A give-up returns 0 like a
+ * drive: the client's wait means "done with it", and the content stays
+ * carried for the next part. Or only until that part has been taken
+ * (EBC_WAIT_TAKE), which is before its waveform starts. The marker is
+ * resolved to its seq once, here. Marker 0, a marker never sent, and one
+ * overwritten by EBC_MARKER_RING_LEN newer markers return at once.
  */
-int rk3026_ebc_wait_marker(struct rk3026_ebc *ebc, u32 marker)
+int rk3026_ebc_wait_marker(struct rk3026_ebc *ebc, u32 marker,
+			   enum rk3026_ebc_wait_for until)
 {
 	bool known;
 	u32 seq;
@@ -2585,8 +2613,8 @@ int rk3026_ebc_wait_marker(struct rk3026_ebc *ebc, u32 marker)
 	if (!known)
 		return 0;
 
-	return rk3026_ebc_wait_seq(ebc, seq, rk3026_ebc_wait_timeout_ms(ebc),
-				   true);
+	return rk3026_ebc_wait_seq(ebc, seq, until,
+				   rk3026_ebc_wait_timeout_ms(ebc), true);
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_wait_marker);
 

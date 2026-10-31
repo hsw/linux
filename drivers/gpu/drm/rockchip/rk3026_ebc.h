@@ -520,7 +520,7 @@ enum rk3026_ebc_gave_up {
 
 /*
  * One update as a sender hands it over (rk3026_ebc_add_update()): its region,
- * EBC work mode, MXCFB_WAIT_FOR_UPDATE_COMPLETE marker (0: none), the panel
+ * EBC work mode, mxcfb wait marker (0: none), the panel
  * temperature it brings (@temp, if @temp_valid) and who sent it.
  *
  * @auto_mode: the sender asked for no particular waveform, so @mode is only
@@ -711,8 +711,8 @@ struct rk3026_ebc_shadows {
 };
 
 /*
- * MXCFB_WAIT_FOR_UPDATE_COMPLETE markers of the newest updates, and the seq
- * each was queued with. Marker 0 is never recorded, so an empty slot never
+ * The mxcfb wait markers of the newest updates, and the seq each was
+ * queued with. Marker 0 is never recorded, so an empty slot never
  * matches.
  */
 #define EBC_MARKER_RING_LEN	32
@@ -845,6 +845,28 @@ static inline bool rk3026_ebc_seq_finished(const struct rk3026_ebc_pending *p,
 	return rk3026_ebc_seq_done(READ_ONCE(p->done_seq), seq);
 }
 
+/*
+ * The update queued with @seq has been taken into a part, which may still
+ * be in flight. Read without the lock.
+ */
+static inline bool rk3026_ebc_seq_taken(const struct rk3026_ebc_pending *p,
+					u32 seq)
+{
+	return rk3026_ebc_seq_done(READ_ONCE(p->taken_seq), seq);
+}
+
+/**
+ * enum rk3026_ebc_wait_for - where a wait on one update ends
+ * @EBC_WAIT_FINISH: its part has finished (rk3026_ebc_seq_finished()):
+ *	MXCFB_WAIT_FOR_UPDATE_COMPLETE
+ * @EBC_WAIT_TAKE: its part has been taken (rk3026_ebc_seq_taken()):
+ *	MXCFB_WAIT_FOR_UPDATE_SUBMISSION
+ */
+enum rk3026_ebc_wait_for {
+	EBC_WAIT_FINISH,
+	EBC_WAIT_TAKE,
+};
+
 /* The parts still to take: @pre, the RESET, @post. */
 static inline unsigned int
 rk3026_ebc_pending_parts(const struct rk3026_ebc_pending *p)
@@ -938,9 +960,9 @@ struct rk3026_ebc {
 	 * and adds its update in one section, so no snapshot sees pixels
 	 * without their update), and the carry of a scan that could not
 	 * drive its part. @markers maps the senders' markers to the seq of
-	 * their updates for MXCFB_WAIT_FOR_UPDATE_COMPLETE. @pending.queued_seq
-	 * and @pending.done_seq are also read without the lock, by the waits
-	 * on them.
+	 * their updates for the mxcfb waits. @pending.queued_seq,
+	 * @pending.taken_seq and @pending.done_seq are also read without the
+	 * lock, by the waits on them.
 	 *
 	 * @prev_virt and @next_virt, the write-combined images the controller
 	 * scans, are written by the thread alone, outside @image_lock, and
@@ -1027,8 +1049,9 @@ struct rk3026_ebc {
 
 	/*
 	 * Refresh thread. A send and a CRTC disable wake @update_wq; every
-	 * finished part wakes @marker_wq, where the waits on
-	 * @pending.done_seq look whether it moved over their update.
+	 * take and every finished part wake @marker_wq, where the waits on
+	 * @pending.taken_seq and @pending.done_seq look whether it moved over
+	 * their update.
 	 */
 	struct task_struct	*refresh_thread;
 	wait_queue_head_t	update_wq;
@@ -1188,12 +1211,14 @@ u32 rk3026_ebc_blit_xrgb8888(struct rk3026_ebc *ebc, const void *src,
 			     unsigned int src_pitch, const struct drm_rect *clip);
 u32 rk3026_ebc_add_update(struct rk3026_ebc *ebc,
 			  const struct rk3026_ebc_update *upd);
-int rk3026_ebc_wait_marker(struct rk3026_ebc *ebc, u32 marker);
+int rk3026_ebc_wait_marker(struct rk3026_ebc *ebc, u32 marker,
+			   enum rk3026_ebc_wait_for until);
 #if IS_ENABLED(CONFIG_KUNIT)
 void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc, struct rk3026_ebc_last *last);
 int rk3026_ebc_drive(struct rk3026_ebc *ebc, const u8 *lut, u32 frames,
 		     u32 mode, u32 lut_mode, struct rk3026_ebc_last *last);
 int rk3026_ebc_wait_seq(struct rk3026_ebc *ebc, u32 seq,
+			enum rk3026_ebc_wait_for until,
 			unsigned int timeout_ms, bool interruptible);
 unsigned int rk3026_ebc_part_max_ms(struct rk3026_ebc *ebc);
 unsigned int rk3026_ebc_wait_timeout_ms(struct rk3026_ebc *ebc);
@@ -1331,12 +1356,14 @@ static inline void rk3026_ebc_debugfs_fini(struct rk3026_ebc *ebc) { }
  * @EBC_MXCFB_REFUSED: an mxcfb number this shim does not implement: -ENOTTY
  * @EBC_MXCFB_SEND_UPDATE: MXCFB_SEND_UPDATE
  * @EBC_MXCFB_WAIT_COMPLETE: MXCFB_WAIT_FOR_UPDATE_COMPLETE
+ * @EBC_MXCFB_WAIT_SUBMISSION: MXCFB_WAIT_FOR_UPDATE_SUBMISSION
  */
 enum rk3026_ebc_mxcfb_cmd {
 	EBC_MXCFB_FBDEV,
 	EBC_MXCFB_REFUSED,
 	EBC_MXCFB_SEND_UPDATE,
 	EBC_MXCFB_WAIT_COMPLETE,
+	EBC_MXCFB_WAIT_SUBMISSION,
 };
 
 void rk3026_ebc_mxcfb_install(struct rk3026_ebc *ebc, struct fb_info *info);
@@ -1347,7 +1374,8 @@ u32 rk3026_ebc_mxcfb_to_ebc_mode(u32 waveform_mode, u32 update_mode,
 int rk3026_ebc_mxcfb_send(struct rk3026_ebc *ebc, const void *src,
 			  unsigned int pitch,
 			  const struct mxcfb_update_data *req);
-int rk3026_ebc_mxcfb_wait_complete(struct rk3026_ebc *ebc, u32 marker);
+int rk3026_ebc_mxcfb_wait(struct rk3026_ebc *ebc, u32 marker,
+			  enum rk3026_ebc_wait_for until);
 enum rk3026_ebc_mxcfb_cmd rk3026_ebc_mxcfb_classify(unsigned int cmd);
 int rk3026_ebc_mxcfb_ioctl(struct fb_info *info, unsigned int cmd,
 			   unsigned long arg);

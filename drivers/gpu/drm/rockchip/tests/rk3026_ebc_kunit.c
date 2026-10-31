@@ -8196,6 +8196,77 @@ static void ebc_test_glue_mxcfb_send(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ebc->stats.updates, 5);
 }
 
+/* A send the shim refuses for its arguments, and one it takes. */
+struct t_mxcfb_arg {
+	const char	*desc;
+	u32		waveform;
+	u32		update_mode;
+	u32		flags;
+	int		ret;
+};
+
+static const struct t_mxcfb_arg t_mxcfb_arg_cases[] = {
+	{ "update_mode 2", MXCFB_WAVEFORM_MODE_GC16, 2, 0, -EINVAL },
+	{ "update_mode ~0", MXCFB_WAVEFORM_MODE_GC16, ~0u, 0, -EINVAL },
+	{ "waveform 256", 256, T_PARTIAL, 0, -EINVAL },
+	{ "waveform 258", 258, T_FULL, 0, -EINVAL },
+	{ "waveform ~0", ~0u, T_PARTIAL, 0, -EINVAL },
+	{ "ALT_BUFFER", MXCFB_WAVEFORM_MODE_GC16, T_PARTIAL,
+	  EPDC_FLAG_USE_ALT_BUFFER, -EINVAL },
+	{ "TEST_COLLISION", MXCFB_WAVEFORM_MODE_AUTO, T_FULL,
+	  EPDC_FLAG_TEST_COLLISION, -EINVAL },
+	{ "ALT_BUFFER mono", MXCFB_WAVEFORM_MODE_DU, T_PARTIAL,
+	  EPDC_FLAG_USE_ALT_BUFFER | EPDC_FLAG_FORCE_MONOCHROME, -EINVAL },
+	{ "all flags", MXCFB_WAVEFORM_MODE_GC16, T_PARTIAL, ~0u, -EINVAL },
+	/* The edges that stay valid; flags this shim does not read. */
+	{ "waveform 255", 255, T_FULL, 0, 0 },
+	{ "AUTO", MXCFB_WAVEFORM_MODE_AUTO, T_PARTIAL, 0, 0 },
+	{ "update_mode FULL", MXCFB_WAVEFORM_MODE_GL16, T_FULL, 0, 0 },
+	{ "other flags", MXCFB_WAVEFORM_MODE_GC16, T_PARTIAL,
+	  ~(EPDC_FLAG_USE_ALT_BUFFER | EPDC_FLAG_TEST_COLLISION), 0 },
+};
+
+KUNIT_ARRAY_PARAM_DESC(t_mxcfb_arg, t_mxcfb_arg_cases, desc);
+
+/*
+ * A send with an invalid update_mode or waveform, or with a flag that
+ * changes which image is meant and cannot be honoured, is refused with
+ * -EINVAL: nothing converted, nothing queued, the panel not claimed from
+ * the plane. The arguments are checked first, so the answer is the same
+ * with the CRTC off. A valid send next to each edge is taken.
+ */
+static void ebc_test_glue_mxcfb_args(struct kunit *test)
+{
+	const struct t_mxcfb_arg *c = test->param_value;
+	struct rk3026_ebc *ebc = t_policy_ebc(test);
+	u32 *black = t_plane_fb(test, 0);
+	struct mxcfb_update_data req = {
+		.update_region = { .width = T_W, .height = T_H },
+		.waveform_mode = c->waveform,
+		.update_mode = c->update_mode,
+		.update_marker = 9,
+		.temp = MXCFB_TEMP_USE_AMBIENT,
+		.flags = c->flags,
+	};
+	struct rk3026_ebc_set part;
+
+	KUNIT_EXPECT_EQ(test, t_mxcfb_part(ebc, black, &req, &part), c->ret);
+	if (c->ret) {
+		KUNIT_EXPECT_EQ(test, part.merged, 0);
+		KUNIT_EXPECT_FALSE(test, ebc->mxcfb_active);
+		KUNIT_EXPECT_EQ(test, ebc->stats.updates, 0);
+		t_expect_white(test, ebc->next_shadow);
+		ebc->crtc_on = false;
+		KUNIT_EXPECT_EQ(test, t_mxcfb_part(ebc, black, &req, &part),
+				c->ret);
+	} else {
+		KUNIT_EXPECT_EQ(test, part.merged, 1);
+		KUNIT_EXPECT_EQ(test, part.marker, 9);
+		KUNIT_EXPECT_TRUE(test, ebc->mxcfb_active);
+		KUNIT_EXPECT_EQ(test, t_px(ebc->next_shadow, 0, 0), 0);
+	}
+}
+
 /* A page of user memory in the test's own mm, for the ioctls to read. */
 static unsigned long t_user_page(struct kunit *test)
 {
@@ -11954,6 +12025,7 @@ static struct kunit_case rk3026_ebc_glue_test_cases[] = {
 	KUNIT_CASE(ebc_test_glue_sleep_crtc_wait),
 #if IS_ENABLED(CONFIG_DRM_RK3026_EBC_MXCFB)
 	KUNIT_CASE(ebc_test_glue_mxcfb_send),
+	KUNIT_CASE_PARAM(ebc_test_glue_mxcfb_args, t_mxcfb_arg_gen_params),
 	KUNIT_CASE(ebc_test_glue_mxcfb_ioctl),
 #endif
 	KUNIT_CASE(ebc_test_glue_timing),

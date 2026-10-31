@@ -4344,8 +4344,9 @@ static struct rk3026_ebc *t_ebc_alloc(struct kunit *test)
 	ebc->du_cleanup_idle_ms = EBC_DU_CLEANUP_IDLE_MS;
 	/* A2 off for plane parts. */
 	ebc->a2_max_area = 0;
-	/* No mode forced. */
+	/* No mode forced; the rails' delay as probe sets it. */
 	ebc->force_mode = -1;
+	ebc->rails_off_ms = EBC_RAILS_OFF_MS;
 	/*
 	 * plane_resync stays false: after probe it is true (the probe RESET
 	 * is a non-plane update), but here the target and the framebuffers

@@ -2352,7 +2352,7 @@ static void ebc_plane_atomic_update(struct drm_plane *plane,
 		to_drm_shadow_plane_state(new_state);
 	struct rk3026_ebc *ebc = drm_to_ebc(plane->dev);
 	struct drm_rect box;
-	int idx;
+	int idx, ret;
 
 	if (!new_state->fb || !new_state->visible)
 		return;
@@ -2374,9 +2374,28 @@ static void ebc_plane_atomic_update(struct drm_plane *plane,
 	if (!drm_dev_enter(plane->dev, &idx))
 		return;
 
+	/*
+	 * The blit reads the buffer with the CPU. For an imported buffer
+	 * (PRIME, a GPU's render target) the exporter's caches have to be
+	 * synced first; a native shmem buffer needs nothing and the bracket
+	 * does nothing for it. If the exporter refuses, this damage is not
+	 * drawn: the next update blits the whole panel instead of its own.
+	 */
+	ret = drm_gem_fb_begin_cpu_access(new_state->fb, DMA_FROM_DEVICE);
+	if (ret) {
+		dev_err_ratelimited(ebc->dev, "framebuffer CPU access: %d\n",
+				    ret);
+		mutex_lock(&ebc->image_lock);
+		ebc->plane_resync = true;
+		mutex_unlock(&ebc->image_lock);
+		goto out_exit;
+	}
+
 	rk3026_ebc_plane_update(ebc, shadow->data[0].vaddr,
 				new_state->fb->pitches[0], &box);
 
+	drm_gem_fb_end_cpu_access(new_state->fb, DMA_FROM_DEVICE);
+out_exit:
 	drm_dev_exit(idx);
 }
 

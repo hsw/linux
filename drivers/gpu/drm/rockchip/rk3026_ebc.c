@@ -35,7 +35,6 @@
 #include <linux/regulator/consumer.h>
 #include <linux/reset.h>
 #include <linux/thermal.h>
-#include <linux/unaligned.h>
 #include <linux/workqueue.h>
 
 #include <drm/clients/drm_client_setup.h>
@@ -381,11 +380,13 @@ static void ebc_frame_kick(struct rk3026_ebc *ebc, const u8 *lut,
 	const u8 *src = lut + chunk * EBC_LUT_MAX_FRAMES * EBC_LUT_FRAME_BYTES;
 	u32 size = ebc->width | (ebc->height << 16);
 	const struct display_timing *t = &ebc->timing;
-	u32 words = frames * (EBC_LUT_FRAME_BYTES / 4);
-	u32 i;
 
-	for (i = 0; i < words; i++)
-		ebc_write(ebc, EBC_LUT_BASE + i * 4, get_unaligned_le32(src + i * 4));
+	/*
+	 * Word copies need a word-aligned source: @lut is the waveform's
+	 * kmalloc'd table and every chunk starts at a multiple of 4 KiB.
+	 */
+	__iowrite32_copy(ebc->regs + EBC_LUT_BASE, src,
+			 frames * EBC_LUT_FRAME_BYTES / 4);
 
 	ebc_write(ebc, EBC_WIN_DSP_ST,
 		  (t->hsync_len.typ + t->hback_porch.typ + 1) |

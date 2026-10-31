@@ -15,6 +15,7 @@
 #include <linux/delay.h>
 #include <linux/dma-fence.h>
 #include <linux/err.h>
+#include <linux/fb.h>
 #include <linux/hex.h>
 #include <linux/hrtimer.h>
 #include <linux/jiffies.h>
@@ -22,10 +23,12 @@
 #include <linux/limits.h>
 #include <linux/math.h>
 #include <linux/minmax.h>
+#include <linux/mman.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/prandom.h>
 #include <linux/string.h>
+#include <linux/uaccess.h>
 #include <linux/unaligned.h>
 #include <linux/wait.h>
 #include <linux/workqueue.h>
@@ -35,6 +38,7 @@
 #include <drm/drm_atomic_uapi.h>
 #include <drm/drm_crtc.h>
 #include <drm/drm_drv.h>
+#include <drm/drm_fb_helper.h>
 #include <drm/drm_file.h>
 #include <drm/drm_fourcc.h>
 #include <drm/drm_framebuffer.h>
@@ -3781,10 +3785,229 @@ static void ebc_test_mxcfb_auto_resolve(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, reason, EBC_REASON_EXPLICIT);
 }
 
+/* --- the mxcfb ioctl numbers --- */
+
+/* What the shim's fb_ioctl does with a number. */
+enum t_mxcfb_answer {
+	T_MXCFB_FBDEV,		/* passed to the fbdev helper */
+	T_MXCFB_REFUSED,	/* -ENOTTY in the shim */
+	T_MXCFB_SEND,		/* MXCFB_SEND_UPDATE */
+	T_MXCFB_WAIT_COMPLETE,	/* MXCFB_WAIT_FOR_UPDATE_COMPLETE */
+};
+
+struct t_mxcfb_cmd {
+	const char		*desc;
+	unsigned int		cmd;
+	enum t_mxcfb_answer	answer;
+};
+
+/*
+ * Every number of the i.MX / Kobo / Kindle / PocketBook / reMarkable
+ * mxcfb dialect a client may send to fb0 (on 32-bit ARM), as their
+ * headers spell them, with the answer it gets: the two V1 commands are
+ * implemented, every other one is refused. MXCFB_WAIT_FOR_VSYNC is
+ * FBIO_WAITFORVSYNC and stays the fbdev helper's, as do the numbers
+ * outside the dialect's 'F' range.
+ */
+static const struct t_mxcfb_cmd t_mxcfb_cmd_cases[] = {
+	{ "WAIT_FOR_VSYNC", 0x40044620, T_MXCFB_FBDEV },
+	{ "SET_GBL_ALPHA", 0x40084621, T_MXCFB_REFUSED },
+	{ "SET_CLR_KEY", 0x40084622, T_MXCFB_REFUSED },
+	{ "SET_OVERLAY_POS", 0xc0044624, T_MXCFB_REFUSED },
+	{ "GET_FB_IPU_CHAN", 0x80044625, T_MXCFB_REFUSED },
+	{ "SET_LOC_ALPHA", 0xc0104626, T_MXCFB_REFUSED },
+	{ "SET_LOC_ALP_BUF", 0x40044627, T_MXCFB_REFUSED },
+	{ "SET_GAMMA", 0x40844628, T_MXCFB_REFUSED },
+	{ "GET_FB_IPU_DI", 0x80044629, T_MXCFB_REFUSED },
+	{ "GET_DIFMT", 0x8004462a, T_MXCFB_REFUSED },
+	{ "GET_FB_BLANK", 0x8004462b, T_MXCFB_REFUSED },
+	{ "SET_WAVEFORM_MODES", 0x4018462b, T_MXCFB_REFUSED },
+	{ "SET_WAVEFORM_MODES_NTX", 0x4028462b, T_MXCFB_REFUSED },
+	{ "SET_WAVEFORM_MODES Kindle", 0x403c462b, T_MXCFB_REFUSED },
+	{ "SET_TEMPERATURE", 0x4004462c, T_MXCFB_REFUSED },
+	{ "CSC_UPDATE", 0x403c462d, T_MXCFB_REFUSED },
+	{ "SET_AUTO_UPDATE_MODE", 0x4004462d, T_MXCFB_REFUSED },
+	{ "HWTCON_SEND_UPDATE", 0x4024462e, T_MXCFB_REFUSED },
+	{ "SEND_UPDATE_V1", MXCFB_SEND_UPDATE, T_MXCFB_SEND },
+	{ "SEND_UPDATE_V1_NTX", 0x4044462e, T_MXCFB_REFUSED },
+	{ "SEND_UPDATE_V2", 0x4048462e, T_MXCFB_REFUSED },
+	{ "SEND_UPDATE_REX", 0x4050462e, T_MXCFB_REFUSED },
+	{ "SEND_UPDATE_ZELDA", 0x4058462e, T_MXCFB_REFUSED },
+	{ "SEND_UPDATE_MTK", 0x4060462e, T_MXCFB_REFUSED },
+	{ "WAIT_FOR_UPDATE_COMPLETE_V1", MXCFB_WAIT_FOR_UPDATE_COMPLETE,
+	  T_MXCFB_WAIT_COMPLETE },
+	{ "WAIT_FOR_UPDATE_COMPLETE_V3", 0xc008462f, T_MXCFB_REFUSED },
+	{ "SET_GPU_SPLIT_FMT", 0x40a4462f, T_MXCFB_REFUSED },
+	{ "SET_PWRDOWN_DELAY", 0x40044630, T_MXCFB_REFUSED },
+	{ "GET_PWRDOWN_DELAY", 0x80044631, T_MXCFB_REFUSED },
+	{ "SET_UPDATE_SCHEME", 0x40044632, T_MXCFB_REFUSED },
+	{ "SET_PAUSE", 0x40044633, T_MXCFB_REFUSED },
+	{ "GET_PAUSE", 0x40044634, T_MXCFB_REFUSED },
+	{ "GET_WORK_BUFFER", 0xc0044634, T_MXCFB_REFUSED },
+	{ "SET_RESUME", 0x40044635, T_MXCFB_REFUSED },
+	{ "DISABLE_EPDC_ACCESS", 0x00004635, T_MXCFB_REFUSED },
+	{ "WAIT_FOR_UPDATE_COMPLETE_V2", 0xc0084635, T_MXCFB_REFUSED },
+	{ "ENABLE_EPDC_ACCESS", 0x00004636, T_MXCFB_REFUSED },
+	{ "GET_WORK_BUFFER Kindle", 0xc0044636, T_MXCFB_REFUSED },
+	{ "WAIT_FOR_UPDATE_SUBMISSION", 0x40044637, T_MXCFB_REFUSED },
+	{ "WAIT_FOR_ANY_UPDATE_COMPLETE_MTK", 0xc0044637, T_MXCFB_REFUSED },
+	{ "GET_TEMPERATURE", 0x80044638, T_MXCFB_REFUSED },
+	{ "GET_WAVEFORM_TYPE", 0x80044639, T_MXCFB_REFUSED },
+	{ "GET_MATERIAL_TYPE", 0x8004463a, T_MXCFB_REFUSED },
+	{ "SET_UPDATE_FLAGS_MTK", 0x4004463b, T_MXCFB_REFUSED },
+	{ "GET_UPDATE_FLAGS_MTK", 0xc004463c, T_MXCFB_REFUSED },
+	{ "SET_NIGHTMODE", 0x8004464a, T_MXCFB_REFUSED },
+	{ "SET_NIGHTMODE_MTK", 0x8010464a, T_MXCFB_REFUSED },
+	{ "SET_HALFTONE", 0x4024464b, T_MXCFB_REFUSED },
+	{ "EPDC_GET_UPDATE_STATE", 0x80044655, T_MXCFB_REFUSED },
+	/* Type 'G', not 'F': the helper refuses it. */
+	{ "GET_PANEL_INFO_MTK", 0x80704730, T_MXCFB_FBDEV },
+	/* The implemented numbers with another size or direction. */
+	{ "SEND_UPDATE _IOWR", 0xc040462e, T_MXCFB_REFUSED },
+	{ "WAIT_FOR_UPDATE_COMPLETE _IOWR", 0xc004462f, T_MXCFB_REFUSED },
+	/* The ends of the range, and numbers unknown to every header. */
+	{ "'F' 0x21 none", 0x00004621, T_MXCFB_REFUSED },
+	{ "'F' 0x3d unknown", 0x4004463d, T_MXCFB_REFUSED },
+	{ "'F' 0x55 _IOW", 0x40044655, T_MXCFB_REFUSED },
+	{ "'F' 0x56", 0x40044656, T_MXCFB_FBDEV },
+	{ "'F' 0x20 none", 0x00004620, T_MXCFB_FBDEV },
+	/* The fbdev core's own (handled before fb_ioctl) and another type. */
+	{ "FBIOGET_VSCREENINFO", FBIOGET_VSCREENINFO, T_MXCFB_FBDEV },
+	{ "FBIOBLANK", FBIOBLANK, T_MXCFB_FBDEV },
+	{ "'E' 0x2e", 0x4040452e, T_MXCFB_FBDEV },
+};
+
+/* The fbdev helper's answer, told apart from every errno. */
+#define T_FBDEV_ANSWER	4321
+
+/* What the stub fbdev helper was called with. */
+struct t_fbdev_calls {
+	unsigned int	n;
+	unsigned int	cmd;
+	unsigned long	arg;
+};
+
+static int t_fbdev_ioctl(struct fb_info *info, unsigned int cmd,
+			 unsigned long arg)
+{
+	struct t_fbdev_calls *calls = kunit_get_current_test()->priv;
+
+	calls->n++;
+	calls->cmd = cmd;
+	calls->arg = arg;
+	return T_FBDEV_ANSWER;
+}
+
+static const struct fb_ops t_fbdev_ops = { .fb_ioctl = t_fbdev_ioctl };
+
+/*
+ * An fb_info whose helper's device is @ebc's and whose framebuffer is
+ * XRGB8888, as the fbdev client sets them; a send reads only the format
+ * of the framebuffer.
+ */
+static struct fb_info *t_mxcfb_info(struct kunit *test,
+				    struct rk3026_ebc *ebc)
+{
+	struct drm_fb_helper *helper = kunit_kzalloc(test, sizeof(*helper),
+						     GFP_KERNEL);
+	struct drm_framebuffer *fb = kunit_kzalloc(test, sizeof(*fb),
+						   GFP_KERNEL);
+	struct fb_info *info = kunit_kzalloc(test, sizeof(*info), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, helper);
+	KUNIT_ASSERT_NOT_NULL(test, fb);
+	KUNIT_ASSERT_NOT_NULL(test, info);
+	fb->format = drm_format_info(DRM_FORMAT_XRGB8888);
+	helper->dev = &ebc->drm;
+	helper->fb = fb;
+	info->par = helper;
+	return info;
+}
+
+/*
+ * The shim's fb_ioctl, number by number, with a bad pointer: a refused
+ * number answers -ENOTTY and never reaches the fbdev helper; a number
+ * that is not the shim's reaches it unchanged, with its argument, and
+ * gets its answer; an implemented one copies its argument in and fails
+ * on the pointer (-EFAULT) without reaching the helper. The implemented
+ * numbers with a valid argument are driven by ebc_test_glue_mxcfb_ioctl.
+ */
+static void ebc_test_mxcfb_ioctl(struct kunit *test)
+{
+	static const struct fb_ops no_ioctl_ops = {};
+	/* Not a mapped user address: a copy from it fails. */
+	const unsigned long bad = 1;
+	struct rk3026_ebc *ebc = kunit_kzalloc(test, sizeof(*ebc), GFP_KERNEL);
+	struct t_fbdev_calls calls = {};
+	struct fb_info *info;
+	unsigned int i;
+	int ret;
+
+	KUNIT_ASSERT_NOT_NULL(test, ebc);
+	info = t_mxcfb_info(test, ebc);
+	ebc->orig_fbops = &t_fbdev_ops;
+	test->priv = &calls;
+
+	for (i = 0; i < ARRAY_SIZE(t_mxcfb_cmd_cases); i++) {
+		const struct t_mxcfb_cmd *c = &t_mxcfb_cmd_cases[i];
+		unsigned int before = calls.n;
+
+		calls.cmd = 0;
+		calls.arg = 0;
+		ret = rk3026_ebc_mxcfb_ioctl(info, c->cmd, bad);
+		switch (c->answer) {
+		case T_MXCFB_FBDEV:
+			KUNIT_EXPECT_EQ_MSG(test, ret, T_FBDEV_ANSWER, "%s",
+					    c->desc);
+			KUNIT_EXPECT_EQ_MSG(test, calls.n, before + 1, "%s",
+					    c->desc);
+			KUNIT_EXPECT_EQ_MSG(test, calls.cmd, c->cmd, "%s",
+					    c->desc);
+			KUNIT_EXPECT_EQ_MSG(test, calls.arg, bad, "%s",
+					    c->desc);
+			break;
+		case T_MXCFB_REFUSED:
+			KUNIT_EXPECT_EQ_MSG(test, ret, -ENOTTY, "%s", c->desc);
+			KUNIT_EXPECT_EQ_MSG(test, calls.n, before, "%s",
+					    c->desc);
+			break;
+		case T_MXCFB_SEND:
+		case T_MXCFB_WAIT_COMPLETE:
+			KUNIT_EXPECT_EQ_MSG(test, ret, -EFAULT, "%s", c->desc);
+			KUNIT_EXPECT_EQ_MSG(test, calls.n, before, "%s",
+					    c->desc);
+			break;
+		}
+	}
+
+	/* Without a helper fb_ioctl, a number not the shim's is -ENOTTY. */
+	ebc->orig_fbops = &no_ioctl_ops;
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_ioctl(info, FBIO_WAITFORVSYNC,
+						     bad), -ENOTTY);
+	test->priv = NULL;
+}
+
+/*
+ * The implemented numbers are the ones the clients' headers spell for
+ * 32-bit ARM, where _IOC has the asm-generic layout. powerpc, mips,
+ * sparc, alpha and parisc encode the direction differently, so the
+ * macros (and their clients' numbers) differ there.
+ */
+static void ebc_test_mxcfb_abi(struct kunit *test)
+{
+	if (_IOC_DIRSHIFT != 30 || _IOC_WRITE != 1U)
+		kunit_skip(test, "_IOC layout is not the asm-generic one");
+
+	KUNIT_EXPECT_EQ(test, MXCFB_SEND_UPDATE, 0x4040462eU);
+	KUNIT_EXPECT_EQ(test, MXCFB_WAIT_FOR_UPDATE_COMPLETE, 0x4004462fU);
+}
+
 static struct kunit_case rk3026_ebc_mxcfb_test_cases[] = {
 	KUNIT_CASE_PARAM(ebc_test_mxcfb_map, t_mxcfb_gen_params),
 	KUNIT_CASE(ebc_test_mxcfb_full_class),
 	KUNIT_CASE(ebc_test_mxcfb_auto_resolve),
+	KUNIT_CASE(ebc_test_mxcfb_ioctl),
+	KUNIT_CASE(ebc_test_mxcfb_abi),
 	{}
 };
 
@@ -7972,6 +8195,111 @@ static void ebc_test_glue_mxcfb_send(struct kunit *test)
 	t_expect_white(test, ebc->next_shadow);
 	KUNIT_EXPECT_EQ(test, ebc->stats.updates, 5);
 }
+
+/* A page of user memory in the test's own mm, for the ioctls to read. */
+static unsigned long t_user_page(struct kunit *test)
+{
+	unsigned long addr = kunit_vm_mmap(test, NULL, 0, PAGE_SIZE,
+					   PROT_READ | PROT_WRITE,
+					   MAP_ANONYMOUS | MAP_PRIVATE, 0);
+
+	KUNIT_ASSERT_FALSE_MSG(test, !addr || IS_ERR_VALUE(addr),
+			       "no user page: %lx", addr);
+	return addr;
+}
+
+static void t_user_u32(struct kunit *test, unsigned long addr, u32 v)
+{
+	KUNIT_ASSERT_EQ(test, copy_to_user((void __user *)addr, &v, sizeof(v)),
+			0UL);
+}
+
+/*
+ * The shim's fb_ioctl over @ebc for the ioctl tests: the client's
+ * framebuffer is the plane's (t_plane_fb()), the fbdev helper is the stub
+ * that counts into @calls, and an MXCFB_SEND_UPDATE request (region 2,1
+ * 4x2, GC16 PARTIAL, marker 5) is in a page of user memory at *@req_at,
+ * with room for a marker behind it at *@marker_at.
+ */
+static struct fb_info *t_mxcfb_ioctl_setup(struct kunit *test,
+					   struct rk3026_ebc *ebc,
+					   struct t_fbdev_calls *calls,
+					   unsigned long *req_at,
+					   unsigned long *marker_at)
+{
+	const struct mxcfb_update_data req = {
+		.update_region = { .left = 2, .top = 1, .width = 4,
+				   .height = 2 },
+		.waveform_mode = MXCFB_WAVEFORM_MODE_GC16,
+		.update_mode = MXCFB_UPDATE_MODE_PARTIAL,
+		.update_marker = 5,
+		.temp = MXCFB_TEMP_USE_AMBIENT,
+	};
+	struct fb_info *info = t_mxcfb_info(test, ebc);
+
+	*req_at = t_user_page(test);
+	*marker_at = *req_at + sizeof(req);
+	KUNIT_ASSERT_EQ(test, copy_to_user((void __user *)*req_at, &req,
+					   sizeof(req)), 0UL);
+	info->screen_buffer = (char *)t_plane_fb(test, 0);
+	info->fix.line_length = T_W * 4;
+	ebc->orig_fbops = &t_fbdev_ops;
+	test->priv = calls;
+	return info;
+}
+
+/*
+ * The implemented numbers through the shim's fb_ioctl, their arguments
+ * in user memory: MXCFB_SEND_UPDATE converts the client's framebuffer
+ * (screen_buffer, line_length) and queues the update with its marker;
+ * MXCFB_WAIT_FOR_UPDATE_COMPLETE returns at once for a marker never
+ * sent, and for a sent one when its part has finished, not before.
+ * Neither reaches the fbdev helper.
+ */
+static void ebc_test_glue_mxcfb_ioctl(struct kunit *test)
+{
+	struct rk3026_ebc *ebc = t_policy_ebc(test);
+	struct t_glue_work *w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
+	struct t_fbdev_calls calls = {};
+	unsigned long req_at, marker_at;
+	struct fb_info *info;
+	u32 seq;
+
+	KUNIT_ASSERT_NOT_NULL(test, w);
+	info = t_mxcfb_ioctl_setup(test, ebc, &calls, &req_at, &marker_at);
+
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_ioctl(info, MXCFB_SEND_UPDATE,
+						     req_at), 0);
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_marker_seq_lookup(&ebc->markers, 5,
+							     &seq));
+	KUNIT_EXPECT_TRUE(test, ebc->mxcfb_active);
+	KUNIT_EXPECT_EQ(test, t_px(ebc->next_shadow, 2, 1), 0);
+	KUNIT_EXPECT_EQ(test, t_px(ebc->next_shadow, 5, 2), 0);
+	KUNIT_EXPECT_EQ(test, t_px(ebc->next_shadow, 6, 1), 15);
+
+	t_user_u32(test, marker_at, 42);
+	KUNIT_EXPECT_EQ(test,
+			rk3026_ebc_mxcfb_ioctl(info,
+					       MXCFB_WAIT_FOR_UPDATE_COMPLETE,
+					       marker_at), 0);
+
+	/* Its part comes later, dropped with the CRTC off: that ends it. */
+	ebc->crtc_on = false;
+	w->ebc = ebc;
+	w->parts = 1;
+	INIT_DELAYED_WORK(&w->work, t_glue_refresh);
+	t_user_u32(test, marker_at, 5);
+	schedule_delayed_work(&w->work, msecs_to_jiffies(50));
+	KUNIT_EXPECT_EQ(test,
+			rk3026_ebc_mxcfb_ioctl(info,
+					       MXCFB_WAIT_FOR_UPDATE_COMPLETE,
+					       marker_at), 0);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_seq_finished(&ebc->pending, seq));
+	flush_delayed_work(&w->work);
+	KUNIT_EXPECT_EQ(test, w->last.outcome, EBC_OUTCOME_CRTC_OFF);
+	KUNIT_EXPECT_EQ(test, calls.n, 0);
+	test->priv = NULL;
+}
 #endif
 /*
  * The CPU time of a part in its record: the blit of its newest update, as
@@ -11626,6 +11954,7 @@ static struct kunit_case rk3026_ebc_glue_test_cases[] = {
 	KUNIT_CASE(ebc_test_glue_sleep_crtc_wait),
 #if IS_ENABLED(CONFIG_DRM_RK3026_EBC_MXCFB)
 	KUNIT_CASE(ebc_test_glue_mxcfb_send),
+	KUNIT_CASE(ebc_test_glue_mxcfb_ioctl),
 #endif
 	KUNIT_CASE(ebc_test_glue_timing),
 	KUNIT_CASE(ebc_test_glue_timing_skipped),

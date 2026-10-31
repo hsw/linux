@@ -267,8 +267,23 @@ static int mxcfb_wait_for_update(struct rk3026_ebc *ebc, unsigned long arg)
 	return rk3026_ebc_wait_marker(ebc, marker);
 }
 
-static int ebc_fb_ioctl(struct fb_info *info, unsigned int cmd,
-			unsigned long arg)
+/*
+ * The fb_ioctl of the emulated fbdev. The i.MX EPDC dialect and its Kobo,
+ * Kindle, PocketBook and reMarkable variants use 'F' 0x21..0x55 (with the
+ * i.MX IPU commands that shared the fb's number space): their sends
+ * (0x2e) and waits (0x2f, 0x35, 0x37) in every struct size, the
+ * temperature, power-down delay, auto-update, update scheme, waveform-set
+ * and pause setters and getters, the work-buffer and EPDC-access test
+ * hooks, and PocketBook's EPDC_GET_UPDATE_STATE (0x55). The two V1
+ * commands are implemented; every other number there is refused with
+ * -ENOTTY here, before the fbdev helper, so a client that probes for one
+ * (PocketBook's B288 test takes 0 as "present") gets a defined failure
+ * whatever a later helper does with the number. Every other number,
+ * FBIO_WAITFORVSYNC (= MXCFB_WAIT_FOR_VSYNC) among them, is the helper's.
+ */
+VISIBLE_IF_KUNIT int rk3026_ebc_mxcfb_ioctl(struct fb_info *info,
+					    unsigned int cmd,
+					    unsigned long arg)
 {
 	struct drm_fb_helper *helper = info->par;
 	struct rk3026_ebc *ebc = drm_to_ebc(helper->dev);
@@ -280,10 +295,15 @@ static int ebc_fb_ioctl(struct fb_info *info, unsigned int cmd,
 		return mxcfb_wait_for_update(ebc, arg);
 	}
 
+	if (_IOC_TYPE(cmd) == 'F' && _IOC_NR(cmd) >= MXCFB_IOC_NR_FIRST &&
+	    _IOC_NR(cmd) <= MXCFB_IOC_NR_LAST)
+		return -ENOTTY;
+
 	if (ebc->orig_fbops->fb_ioctl)
 		return ebc->orig_fbops->fb_ioctl(info, cmd, arg);
 	return -ENOTTY;
 }
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_mxcfb_ioctl);
 
 static int ebc_fb_open(struct fb_info *info, int user)
 {
@@ -343,7 +363,7 @@ void rk3026_ebc_mxcfb_install(struct rk3026_ebc *ebc, struct fb_info *info)
 	*ops = *info->fbops;
 
 	ebc->orig_fbops = info->fbops;
-	ops->fb_ioctl = ebc_fb_ioctl;
+	ops->fb_ioctl = rk3026_ebc_mxcfb_ioctl;
 	ops->fb_open = ebc_fb_open;
 	ops->fb_release = ebc_fb_release;
 	ebc->fbops = ops;

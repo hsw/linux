@@ -19,6 +19,11 @@
  * KOReader's mxcfb_kobo_h.lua definitions byte for byte
  * (MXCFB_SEND_UPDATE_V1 = 0x4040462e, MXCFB_WAIT_FOR_UPDATE_COMPLETE_V1 =
  * 0x4004462f, sizeof(struct mxcfb_update_data_v1) == 64).
+ *
+ * Every other number of the dialect - the other variants' sends and
+ * waits, the i.MX, Kobo and Kindle setters and getters, the IPU commands
+ * that share the fb's ioctl space - is in 'F' 0x21..0x55 and is refused
+ * with -ENOTTY (rk3026_ebc_mxcfb_ioctl()).
  */
 #ifndef _RK3026_EBC_MXCFB_H
 #define _RK3026_EBC_MXCFB_H
@@ -56,6 +61,14 @@ static_assert(sizeof(struct mxcfb_update_data) == 64);
 
 #define MXCFB_SEND_UPDATE		_IOW('F', 0x2e, struct mxcfb_update_data)
 #define MXCFB_WAIT_FOR_UPDATE_COMPLETE	_IOW('F', 0x2f, __u32)
+
+/*
+ * The command numbers of the mxcfb dialect across its variants, from
+ * MXCFB_WAIT_FOR_VSYNC + 1 to EPDC_GET_UPDATE_STATE. MXCFB_WAIT_FOR_VSYNC
+ * (0x20) is FBIO_WAITFORVSYNC and stays with the fbdev helper.
+ */
+#define MXCFB_IOC_NR_FIRST		0x21
+#define MXCFB_IOC_NR_LAST		0x55
 
 /* update_mode */
 #define MXCFB_UPDATE_MODE_PARTIAL	0

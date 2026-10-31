@@ -117,14 +117,23 @@ VISIBLE_IF_KUNIT u32 rk3026_ebc_mxcfb_to_ebc_mode(u32 waveform_mode,
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_mxcfb_to_ebc_mode);
 
 /*
- * One MXCFB_SEND_UPDATE request, already copied in: the region clamped to
- * the panel, the waveform and the flags mapped
+ * One MXCFB_SEND_UPDATE request, already copied in: the arguments checked,
+ * the region clamped to the panel, the waveform and the flags mapped
  * (rk3026_ebc_mxcfb_to_ebc_mode()), and, in one @image_lock section, the
  * client's pixels converted from @src, its framebuffer with @pitch bytes
  * per row, and the update queued.
  *
- * Returns 0, -EINVAL if nothing of the region is on the panel, or -EBUSY
- * with the CRTC off.
+ * The checks are i.MX's: an update_mode other than PARTIAL or FULL and a
+ * waveform number above MXCFB_WAVEFORM_MODE_MAX other than AUTO are
+ * invalid. Two flags change which image is meant and cannot be honoured,
+ * so the update is refused rather than drawn without them:
+ * EPDC_FLAG_USE_ALT_BUFFER names a physical address, and the shmem fbdev
+ * has none a client could name; EPDC_FLAG_TEST_COLLISION asks for a dry
+ * run. Other flags this shim does not read are ignored, as on i.MX.
+ *
+ * Returns 0, -EINVAL for an argument above or if nothing of the region is
+ * on the panel, or -EBUSY with the CRTC off. A refused send queues
+ * nothing and leaves the panel to whoever had it.
  */
 VISIBLE_IF_KUNIT int rk3026_ebc_mxcfb_send(struct rk3026_ebc *ebc,
 					   const void *src, unsigned int pitch,
@@ -134,6 +143,14 @@ VISIBLE_IF_KUNIT int rk3026_ebc_mxcfb_send(struct rk3026_ebc *ebc,
 	struct drm_rect clip;
 	bool auto_mode;
 	u32 mode;
+
+	if (req->update_mode > MXCFB_UPDATE_MODE_FULL)
+		return -EINVAL;
+	if (req->waveform_mode > MXCFB_WAVEFORM_MODE_MAX &&
+	    req->waveform_mode != MXCFB_WAVEFORM_MODE_AUTO)
+		return -EINVAL;
+	if (req->flags & (EPDC_FLAG_USE_ALT_BUFFER | EPDC_FLAG_TEST_COLLISION))
+		return -EINVAL;
 
 	clip.x1 = min_t(u32, req->update_region.left, ebc->width);
 	clip.y1 = min_t(u32, req->update_region.top, ebc->height);

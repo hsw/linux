@@ -84,9 +84,16 @@ static_assert(sizeof(struct mxcfb_update_data) == 64);
 #define MXCFB_WAVEFORM_MODE_REAGL	6
 #define MXCFB_WAVEFORM_MODE_REAGLD	7
 #define MXCFB_WAVEFORM_MODE_AUTO	257
+/* The highest waveform number; any above it but AUTO is invalid. */
+#define MXCFB_WAVEFORM_MODE_MAX		255
 
-/* flags: only FORCE_MONOCHROME (as in i.MX mxcfb.h) is read. */
+/*
+ * flags (as in i.MX mxcfb.h): FORCE_MONOCHROME is honoured, USE_ALT_BUFFER
+ * and TEST_COLLISION are refused, every other bit is ignored.
+ */
 #define EPDC_FLAG_FORCE_MONOCHROME	0x02
+#define EPDC_FLAG_USE_ALT_BUFFER	0x100
+#define EPDC_FLAG_TEST_COLLISION	0x200
 
 /* temp: read the panel thermometer instead of using the supplied value */
 #define MXCFB_TEMP_USE_AMBIENT		0x1000

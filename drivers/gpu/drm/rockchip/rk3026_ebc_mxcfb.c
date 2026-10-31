@@ -220,6 +220,14 @@ static int mxcfb_send_update(struct rk3026_ebc *ebc, struct fb_info *info,
 }
 
 /*
+ * A wait on a marker: MXCFB_WAIT_FOR_UPDATE_COMPLETE (EBC_WAIT_DONE)
+ * until the update's part has finished, MXCFB_WAIT_FOR_UPDATE_SUBMISSION
+ * (EBC_WAIT_TAKE) until the refresh thread has taken the update into a
+ * part, before the part's waveform: a client that waits for the
+ * submission may prepare its next update while the panel draws this one,
+ * and what the part then does with the update (skipped, dropped with the
+ * CRTC off, carried for a retry) is not waited for.
+ *
  * The fbdev core calls fb_ioctl under lock_fb_info(), so a client blocked
  * here (up to rk3026_ebc_wait_timeout_ms() when the refresh thread is stuck)
  * holds the fb_info lock: a send, FBIOPAN_DISPLAY or FBIOBLANK from another
@@ -227,14 +235,15 @@ static int mxcfb_send_update(struct rk3026_ebc *ebc, struct fb_info *info,
  * no waveform only as long as a single thread both sends and waits, as
  * e-reader clients do.
  */
-static int mxcfb_wait_for_update(struct rk3026_ebc *ebc, unsigned long arg)
+static int mxcfb_wait_for_update(struct rk3026_ebc *ebc, unsigned long arg,
+				 enum rk3026_ebc_wait_for until)
 {
 	u32 marker;
 
 	if (copy_from_user(&marker, (void __user *)arg, sizeof(marker)))
 		return -EFAULT;
 
-	return rk3026_ebc_wait_marker(ebc, marker);
+	return rk3026_ebc_wait_marker(ebc, marker, until);
 }
 
 /*
@@ -245,7 +254,9 @@ static int mxcfb_wait_for_update(struct rk3026_ebc *ebc, unsigned long arg)
  * temperature, power-down delay, auto-update, update scheme, waveform-set
  * and pause setters and getters, the work-buffer and EPDC-access test
  * hooks, and PocketBook's EPDC_GET_UPDATE_STATE (0x55). The two V1
- * commands are implemented; every other number there is refused with
+ * commands and the submission wait are implemented (0x37 _IOW with a u32
+ * marker is i.MX's MXCFB_WAIT_FOR_UPDATE_SUBMISSION, not Kobo's
+ * SET_TEMP_AUTO_UPDATE_PERIOD); every other number there is refused with
  * -ENOTTY here, before the fbdev helper, so a client that probes for one
  * (PocketBook's B288 test takes 0 as "present") gets a defined failure
  * whatever a later helper does with the number. Every other number,
@@ -262,7 +273,9 @@ VISIBLE_IF_KUNIT int rk3026_ebc_mxcfb_ioctl(struct fb_info *info,
 	case MXCFB_SEND_UPDATE:
 		return mxcfb_send_update(ebc, info, arg);
 	case MXCFB_WAIT_FOR_UPDATE_COMPLETE:
-		return mxcfb_wait_for_update(ebc, arg);
+		return mxcfb_wait_for_update(ebc, arg, EBC_WAIT_DONE);
+	case MXCFB_WAIT_FOR_UPDATE_SUBMISSION:
+		return mxcfb_wait_for_update(ebc, arg, EBC_WAIT_TAKE);
 	}
 
 	if (_IOC_TYPE(cmd) == 'F' && _IOC_NR(cmd) >= MXCFB_IOC_NR_FIRST &&

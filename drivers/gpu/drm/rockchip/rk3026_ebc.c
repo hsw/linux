@@ -300,80 +300,10 @@ static u32 dbg_last_status;
  * known: with no RESET at the temperature the repair is the part's own
  * drive, which then never clears @prev_unknown, and every part stays
  * exempt from the skip until force_mode is cleared.
- *
- * swap_mst: put NEXT in WIN_MST0 -- the order this driver shipped between
- * 2026-08-03 and 2026-08-05, which drives one-directionally: the panel only ever
- * bleaches toward white and never darkens. It exists to reproduce that failure,
- * not as an equal alternative. The default is now the vendor's order, prev in
- * MST0 (docs/re/EBC-REGISTERS.md §5).
- *
- * ⚠️ Takes effect on the SECOND scan, not the first: WIN_MST0/1 are shadowed.
- * See ebc_set_image_addr().
  */
 static int force_mode = -1;
 module_param(force_mode, int, 0644);
 MODULE_PARM_DESC(force_mode, "override the refresh mode (0-12; -1 = use the update's own)");
-
-static bool swap_mst;
-module_param(swap_mst, bool, 0644);
-MODULE_PARM_DESC(swap_mst, "put next in WIN_MST0 (the transposed order that only drives toward white)");
-
-/*
- * Knobs for the ONE open panel defect (docs/PENDING.md P15): a uniform
- * full-screen black renders as strong black crossed by regular, slightly
- * slanted white vertical stripes.
- *
- * ⚠️ DO NOT TOUCH EITHER KNOB YET. The axis the artifact lives on is NOT
- * established, and an earlier revision of this comment asserted that it was --
- * claiming the stripes must vary along the source-driver axis. That was
- * inference, not measurement, and the framebuffer is 1024x758 on a physically
- * portrait device, so which fb axis maps to which physical one is exactly the
- * thing in question. Retracted rather than reworded.
- *
- * What IS measured on hardware (2026-08-03/04), all with writes confirmed to
- * have landed via the `differ from prev` count:
- *
- *   - the stripes appear for EVERY pattern -- black, white, hsplit, vsplit,
- *     geometry and ybands alike -- so they are largely content-INDEPENDENT
- *   - ⚠️ "`fbpoke ybands` produced NO bands, so content that varies line-to-line
- *     is not reaching the glass" is RETRACTED (2026-08-05). Re-run on the card
- *     that carries the AXI-clock fix, from a forced black baseline, ybands
- *     produced clear bands. The source address DOES advance per line, and the
- *     stride hypothesis is dead. The original reading was taken on a card whose
- *     aclk was still 24 MHz -- check `scan: aclk` before trusting a panel result
- *   - `fbpoke xbands` and `ramp` show structure only in a strip near the top
- *     rather than across the panel. Both were drawn while the MST order was
- *     still transposed, so every greyscale reading from them is suspect; re-run
- *     now that direction is correct before theorising
- *
- * ⚠️ And sdck's suspicious value is NOT obviously wrong: Android drives this
- * panel with EPD_CTRL bit-identical to ours (0x5110ff03, same 0xff = 255), so
- * 255 is evidently correct and something else differs.
- *
- * ⚠️ Uniform images cannot reveal a mapping fault -- uniform in, uniform out.
- * Every apparent success before these probes (black, white, the RESET refresh)
- * was uniform, which is the same blind spot that hid the transposed MST order
- * for a whole session.
- *
- * sdck: source-driver clocks per line. Computed as width/4, but the field is
- * 8 bits and 1024/4 = 256 does not fit -- the driver's `width < 0x400` test
- * silently yields 0xff instead, which is either exactly right (if the field
- * encodes count-1) or one short (if it does not). Nothing establishes which.
- *
- * win_vir: the window's virtual width. ✅ **The unit is settled: PIXELS.** Android
- * drives this panel with WIN_VIR = 0x00000400 live (docs/VENDOR-BLOBS.md §6,
- * tier 0) = 1024 = width exactly, high half zero. So the knob is now only for
- * deliberately trying a *wrong* stride, not for resolving an ambiguity -- and
- * WIN_VIR is ELIMINATED as the cause of `ybands` showing no bands, because our
- * low half already matched.
- */
-static int sdck = -1;
-module_param(sdck, int, 0644);
-MODULE_PARM_DESC(sdck, "override EPD_CTRL SDCK (-1 = width/4 saturated to 0xff)");
-
-static uint win_vir;
-module_param(win_vir, uint, 0644);
-MODULE_PARM_DESC(win_vir, "override WIN_VIR's low half in pixels (0 = panel width)");
 
 /*
  * DIAGNOSTIC, REVERT ME. Provoke the abort that docs/PENDING.md P62 repairs.
@@ -580,7 +510,7 @@ static void ebc_set_window(struct rk3026_ebc *ebc)
 	 * unit question the P15 notes raised -- pixels, not bytes and not
 	 * 4-pixel groups, since 0x400 == width exactly.
 	 */
-	ebc_write(ebc, EBC_WIN_VIR, win_vir ? win_vir : ebc->width);
+	ebc_write(ebc, EBC_WIN_VIR, ebc->width);
 	ebc_write(ebc, EBC_WIN_ACT, size);
 	ebc_write(ebc, EBC_WIN_DSP, size);
 	ebc_write(ebc, EBC_WIN_DSP_ST,
@@ -601,14 +531,11 @@ static void ebc_set_border(struct rk3026_ebc *ebc)
 static void ebc_set_epd_ctrl(struct rk3026_ebc *ebc)
 {
 	u32 gdck = ebc->timing.hsync_len.typ + ebc->gdck_sta;
-	u32 n = ebc->width < 0x400 ? ebc->width / 4 : 0xff;
-
-	if (sdck >= 0)
-		n = sdck;
 
 	ebc_write(ebc, EBC_EPD_CTRL,
 		  EPD_GDCK_STA(gdck) | EPD_LGONL(gdck + ebc->lgonl) |
-		  EPD_SDCK(n) | EPD_GATE_SCAN_DIR | EPD_SOURCE_SCAN_DIR);
+		  EPD_SDCK(rk3026_ebc_sdck(ebc->width)) |
+		  EPD_GATE_SCAN_DIR | EPD_SOURCE_SCAN_DIR);
 }
 
 static void ebc_set_dsp_ctrl(struct rk3026_ebc *ebc, u32 mode)
@@ -655,7 +582,7 @@ static void ebc_set_dsp_ctrl(struct rk3026_ebc *ebc, u32 mode)
  *
  * ⚠️ WIN_MST0/1 are SHADOWED: a write does not affect the scan that follows it,
  * only the one after, because the shadow goes active on a latch the scan itself
- * performs. So flipping this (or swap_mst) and running ONE scan tests nothing —
+ * performs. So flipping this and running ONE scan tests nothing --
  * the first scan still uses the previous pair. Verify against the `armed`
  * readback, not against what was just written.
  *
@@ -667,11 +594,9 @@ static void ebc_set_dsp_ctrl(struct rk3026_ebc *ebc, u32 mode)
 static void ebc_set_image_addr(struct rk3026_ebc *ebc, u32 x, u32 y)
 {
 	u32 off = (x + y * ebc->width) / 2;
-	dma_addr_t m0 = swap_mst ? ebc->next_phys : ebc->prev_phys;
-	dma_addr_t m1 = swap_mst ? ebc->prev_phys : ebc->next_phys;
 
-	ebc_write(ebc, EBC_WIN_MST0, lower_32_bits(m0) + off);
-	ebc_write(ebc, EBC_WIN_MST1, lower_32_bits(m1) + off);
+	ebc_write(ebc, EBC_WIN_MST0, lower_32_bits(ebc->prev_phys) + off);
+	ebc_write(ebc, EBC_WIN_MST1, lower_32_bits(ebc->next_phys) + off);
 	ebc_config_done(ebc);
 }
 

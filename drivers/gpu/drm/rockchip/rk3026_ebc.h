@@ -1263,6 +1263,30 @@ void rk3026_ebc_blit_convert(u8 *dst, const void *src, unsigned int src_pitch,
 			     int x1, int x2, int y1, int y2,
 			     unsigned int width);
 const char *rk3026_ebc_blit_impl(void);
+void rk3026_ebc_blit_r8_rows(u8 *dst, const void *src, unsigned int src_pitch,
+			     int x1, int x2, int y1, int y2,
+			     unsigned int width);
+bool rk3026_ebc_blit_r8_convert(u8 *dst, const void *src,
+				unsigned int src_pitch, int x1, int x2, int y1,
+				int y2, unsigned int width);
+
+/**
+ * rk3026_ebc_grey_level - the panel level of an 8-bit grey
+ * @g: the grey, 0 black to 255 white
+ *
+ * The nearest of the 16 levels, (g * 15 + 127) / 255: 17 k - 8 to
+ * 17 k + 8 give level k, so the greys k * 17 that a 16-level dither emits
+ * are exactly level k, and the others round instead of losing their low
+ * four bits. Computed as (g * 15 + 135) >> 8, the same for every 8-bit g:
+ * no division, which a core without a hardware divider would make a
+ * library call of.
+ *
+ * Returns the level, 0 to 15.
+ */
+static inline u8 rk3026_ebc_grey_level(u8 g)
+{
+	return (g * 15 + 135) >> 8;
+}
 
 /* rk3026_ebc_core.c */
 u32 rk3026_ebc_dsp_ctrl_mode(u32 mode);

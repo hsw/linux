@@ -68,23 +68,19 @@
 #define DRIVER_NAME		"rk3026-ebc"
 #define EBC_WAVEFORM_FW		"rockchip/rk3026-c67ml.rkf"
 /*
- * Per-CHUNK frame budget, and a chunk is at most EBC_LUT_MAX_FRAMES (64) frames.
+ * Per-chunk frame budget; a chunk is at most EBC_LUT_MAX_FRAMES (64) frames.
  *
- * Measured on hardware 2026-08-03 with dclk_ebc at 66 MHz: 54 frames take
- * 790-800 ms, i.e. ~14.8 ms/frame, so a full 64-frame chunk is ~950 ms. 5 s is
- * a little over 5x that.
+ * Measured with dclk_ebc at 66 MHz: 54 frames take 790-800 ms, ~14.8 ms a
+ * frame, so a full 64-frame chunk takes ~950 ms; 5 s is a little over five
+ * times that.
  *
- * This replaces a deliberately absurd 60000 that was set while the dot clock was
- * still stuck at 12 MHz, so it could not read as a considered value.
- *
- * ⚠️ Do NOT tighten this toward the measured time. The timeout path abandons
- * the waveform partway (it stops the controller, see ebc_stop_scan(), and drops
- * the rails), and a panel left mid-transition accumulates real ghosting and
- * darkening that persists into Android -- that is exactly what a 3000 ms
- * budget did against a 3.1 s waveform on 2026-08-02. A budget that is merely
- * tight is not a benign mis-tuning on this hardware, it is cumulative damage.
- * The timeout exists for a controller that has stopped answering, nothing
- * else.
+ * Do not tighten this toward the measured time. The timeout path abandons
+ * the waveform partway (it stops the controller, see ebc_stop_scan(), and
+ * drops the rails), and a panel left mid-transition keeps ghosting and
+ * darkening that later updates do not remove: a 3000 ms budget against a
+ * 3.1 s waveform did exactly that. A tight budget is not a harmless
+ * mis-tuning here, it is cumulative damage. The timeout exists for a
+ * controller that has stopped answering, nothing else.
  */
 #define EBC_FRAME_TIMEOUT_MARGIN	4
 #define EBC_FRAME_TIMEOUT_MIN_MS	5000
@@ -142,11 +138,8 @@ static void ebc_rails_rearm(struct rk3026_ebc *ebc)
  * idle cleanup the refresh thread queues on a spent budget is a FULL of
  * its own (rk3026_ebc_idle_tick()).
  *
- * An early version defaulted to PART and rendered washed grey where
- * force_mode=1 rendered solid black, in one whole-frame observation, and
- * plane parts were kept off PART since. A later camera run on this panel
- * did not reproduce that: PART drew a grey ramp from white as FULL drew it,
- * solid black included, so a grey plane part goes PART now.
+ * A grey plane part goes PART: on this panel PART draws a grey ramp from
+ * white as FULL draws it, solid black included (camera run).
  */
 #define EBC_MODE_DEFAULT	EBC_MODE_FULL
 
@@ -301,17 +294,9 @@ static void ebc_set_window(struct rk3026_ebc *ebc)
 
 	ebc_write(ebc, EBC_WIN_CTRL, WIN_CTRL_FIXED);
 	/*
-	 * WIN_VIR is the window's virtual width, in PIXELS, and the high half
-	 * stays ZERO -- Android drives this panel with 0x00000400 live
-	 * (docs/VENDOR-BLOBS.md §6, tier 0), i.e. 1024 with nothing above it,
-	 * while every other register in the block matches us bit-for-bit.
-	 *
-	 * We used to write `width | height << 16` here. That made WIN_VIR the
-	 * ONLY divergence from a known-good configuration, so it is removed:
-	 * matching the vendor costs nothing and the alternative is carrying an
-	 * unexplained delta into every panel experiment. It also settles the
-	 * unit question the P15 notes raised -- pixels, not bytes and not
-	 * 4-pixel groups, since 0x400 == width exactly.
+	 * WIN_VIR is the window's virtual width in pixels, the high half zero:
+	 * the controller's line step. The vendor kernel programs 0x00000400 on
+	 * a 1024 pixel panel, the width exactly.
 	 */
 	ebc_write(ebc, EBC_WIN_VIR, ebc->width);
 	ebc_write(ebc, EBC_WIN_ACT, size);
@@ -350,43 +335,22 @@ static void ebc_set_dsp_ctrl(struct rk3026_ebc *ebc, u32 mode)
 }
 
 /*
- * MST0 holds PREV -- the image on the panel -- and MST1 holds NEXT, the one
- * being driven towards.
+ * MST0 holds prev, the image on the glass, and MST1 holds next, the one
+ * being driven towards. The controller looks its LUT up by (prev, next):
+ * with the two swapped a black frame renders light and a white one darker,
+ * the transposed lookup that only ever drives toward white; with prev in
+ * MST0 white brightens and black darkens, as measured on the panel. The
+ * vendor kernel uses the same order: the buffer it releases after a scan,
+ * the one that was on the glass, is the one it put in MST0.
  *
- * Two independent lines of evidence, which finally agree:
+ * The MST order and the LUT index order are a pair: inverting one alone
+ * inverts the transition lookup. Do not change one without testing the
+ * direction on the glass.
  *
- * - The audited vendor kernel (docs/re/EBC-REGISTERS.md §5). ebc_register_update
- *   at 0xc0607414 loads [dev+0x18c] into arg1 -> MST0 and [dev+0x190] into
- *   arg2 -> MST1, dispatched through ops+0x14. ebc_thread proves which is which:
- *   it stores the freshly dequeued buffer to 0x190 (0xc0609728), drives, then
- *   ebc_buf_release()s 0x18c (0xc06098f8) and rotates 0x18c = 0x190. The buffer
- *   released after the scan is the one that was on the glass.
- *
- * - Hardware, 2026-08-05: with next in MST0 a black frame renders LIGHT and a
- *   white frame renders darker -- the transposed lookup, driving one-directionally
- *   toward white. With prev in MST0, white brightens and black darkens.
- *   Reproduced twice, same card, same boot, identical transitions, every draw
- *   with a nonzero `differ from prev`.
- *
- * ⚠️ This REVERSES what this driver did between 2026-08-03 and 2026-08-05
- * (f2227388e331), which put next in MST0 on the strength of docs/VENDOR-BLOBS.md
- * §5 -- a decompile of a linux/.refs/rychly object with no evidentiary standing.
- * The comment that stood here called that "PROVEN ON HARDWARE" and credited it
- * with making the panel image; the session it cites changed more than one thing
- * at once, so it never isolated MST order at all.
- *
- * ⚠️ An even earlier comment claimed the order this code now uses was
- * "established ON HARDWARE", in a session where the panel rendered nothing. It
- * happened to be right, and it was still a belief recorded as a measurement.
- * Being accidentally correct is not evidence.
- *
- * ⚠️ MST order and LUT index order are a PAIR: inverting one alone inverts the
- * transition lookup. Do not change one without re-testing direction on glass.
- *
- * ⚠️ WIN_MST0/1 are SHADOWED: a write does not affect the scan that follows it,
- * only the one after, because the shadow goes active on a latch the scan itself
- * performs. So flipping this and running ONE scan tests nothing --
- * the first scan still uses the previous pair.
+ * WIN_MST0/1 are shadowed: a write takes effect not on the scan that
+ * follows it but on the one after, as the shadow becomes active on a latch
+ * the scan itself performs. A change of the order tested with one scan
+ * tests nothing: that scan still uses the previous pair.
  *
  * Both hold absolute physical addresses, biased by the window origin at two
  * pixels per byte. The row stride is the panel width: the images are packed
@@ -425,7 +389,7 @@ static void ebc_frame_kick(struct rk3026_ebc *ebc, const u8 *lut,
 
 	/*
 	 * Drain everything the CPU has written before the controller is told to
-	 * fetch it. Two distinct things need this and neither had it:
+	 * fetch it. Two distinct things need this:
 	 *
 	 *  - the IMAGE, in prev_virt/next_virt, which are DMA_ATTR_WRITE_COMBINE
 	 *    (ebc_setup_buffers). Write-combining means the thread's copies into
@@ -434,19 +398,11 @@ static void ebc_frame_kick(struct rk3026_ebc *ebc, const u8 *lut,
 	 *  - the LUT SRAM and the register group just above, written with
 	 *    writel_relaxed() throughout, which by definition orders nothing.
 	 *
-	 * Why this is the prime suspect for docs/PENDING.md P15 rather than a
-	 * theoretical tidy-up: it predicts exactly the observed asymmetry. Uniform
-	 * black/white always rendered, because when every byte is identical it does
-	 * not matter which stores landed or in what order. `ybands` renders, because
-	 * 64-line bands are long contiguous runs and whole bursts survive. `xbands`
-	 * does not, because variation WITHIN a line is the finest granularity and
-	 * exactly what write-combining coalesces away. And the vendor path draws the
-	 * same patterns correctly from the same 4bpp packing (proven on hardware
-	 * 2026-08-05), so the format is not the problem.
-	 *
-	 * The vendor does the equivalent explicitly: flush_cache_all() + outer_sync()
-	 * after every generated frame, on a pool that is additionally mapped uncached
-	 * (docs/re/EBC-DATAPATH.md).
+	 * A missing drain would show first in content that varies within a line:
+	 * write-combining coalesces stores, so uniform images and long runs of
+	 * identical lines still draw correctly whichever stores landed late.
+	 * The vendor kernel flushes the caches after every generated frame, on
+	 * a pool it maps uncached.
 	 */
 	wmb();
 
@@ -1522,37 +1478,36 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 	 *
 	 * This is not an optimisation, it is a correctness and wear fix. Every
 	 * update arrives here TWICE: FBIOPAN_DISPLAY alone produces two atomic
-	 * commits through drm_fb_helper's fbdev emulation (measured 2026-08-06 --
-	 * skipping the client's msync changes nothing), and ebc_plane_atomic_update()
+	 * commits through drm_fb_helper's fbdev emulation (skipping the
+	 * client's msync changes nothing), and ebc_plane_atomic_update()
 	 * queues the damage of each without asking whether the pixels moved. So
 	 * the second scan runs a complete waveform with prev == next.
 	 *
 	 * A GC16 waveform with identical prev and next is NOT a no-op: it still
 	 * runs its whole flash sequence, so it re-shows the previous image and
 	 * settles back. At 12 MHz that is a visible three-second replay after
-	 * every single draw, which is what "the previous image comes back" was.
-	 * Left alone it is also continuous wear -- fbcon's cursor blink drove a
-	 * 38-frame full waveform every ~1.1 s indefinitely (docs/PENDING.md P29).
+	 * every single draw. Left alone it is also continuous wear: fbcon's
+	 * cursor blink drove a 38-frame full waveform every ~1.1 s for ever.
 	 *
 	 * The test is on the cached snapshot against the cached prev, never on
 	 * the write-combined images. rk3026_ebc_should_skip() holds the
 	 * exemptions:
 	 *
-	 * ⚠️ EBC_MODE_RESET is exempt, and the test is on the PART's own mode,
+	 * EBC_MODE_RESET is exempt, and the test is on the PART's own mode,
 	 * not the possibly-forced one. The boot-time clear legitimately has
 	 * prev == next == white: the controller indexes its LUT by (prev, next),
 	 * so the driver must MAKE the panel white rather than assume it is, and
 	 * skipping that would leave whatever the previous OS left on the glass.
 	 * Keying off `mode` instead would let force_mode disable the boot clear.
 	 *
-	 * ⚠️ DO NOT DROP the @prev_unknown exemption. The skip is a decision made
+	 * DO NOT DROP the @prev_unknown exemption. The skip is a decision made
 	 * from @shadows.prev, and the flag says it is not evidence; without the
 	 * exemption an aborted waveform makes the draw that would repair the
 	 * glass the one thrown away, and the panel is unreachable from userspace.
-	 * It does not weaken the skip -- a successful refresh clears the flag, so
-	 * P29's case (fbcon redrawing one image forever) still skips.
+	 * It does not weaken the skip: a successful refresh clears the flag, so
+	 * fbcon redrawing one image for ever still skips.
 	 *
-	 * ⚠️ An MXCFB_SEND_UPDATE in a full-class mode is exempt too
+	 * An MXCFB_SEND_UPDATE in a full-class mode is exempt too
 	 * (@has_mxcfb_full; full class = what rk3026_ebc_dsp_ctrl_mode() gives
 	 * DISPLAY_MODE alone: FULL, i.e. GC16, REAGL or AUTO with
 	 * UPDATE_MODE_FULL and REAGLD, OED_PART for GL16 with UPDATE_MODE_FULL,
@@ -1564,7 +1519,7 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 	 * skipped as identical. Plane updates and partial-class mxcfb sends
 	 * still skip.
 	 *
-	 * ⚠️ The idle cleanup is exempt as well (@cleanup_idle): it redraws the
+	 * The idle cleanup is exempt as well (@cleanup_idle): it redraws the
 	 * glass as it is, so its snapshot is identical as a rule, and the
 	 * flash is what it was queued for (rk3026_ebc_idle_tick()).
 	 */
@@ -1631,7 +1586,7 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 	 * images describing the glass again, and @next_virt still holding the
 	 * snapshot, so the part below is driven from a true prev.
 	 *
-	 * ⚠️ It must run BEFORE the LUT is fetched. rk3026_ebc_waveform_lut()
+	 * It must run BEFORE the LUT is fetched. rk3026_ebc_waveform_lut()
 	 * decodes into one buffer inside the container and hands out a pointer to
 	 * it, so loading the RESET waveform overwrites whatever was fetched
 	 * earlier -- fetching first would silently drive the requested mode's
@@ -1681,7 +1636,7 @@ finish:
 	 * A repair RESET that failed never got that far: the part is carried
 	 * and prev stays, marked unknown.
 	 *
-	 * ⚠️ The swap STAYS UNCONDITIONAL once the waveform was entered. Keeping
+	 * The swap STAYS UNCONDITIONAL once the waveform was entered. Keeping
 	 * the old prev after a timeout looks like the fix and is not: prev would
 	 * then hold a still older image, equally false and carrying no mark
 	 * saying so. @prev_unknown is the mark, and the next draw acts on it.
@@ -2094,7 +2049,7 @@ static int ebc_refresh_thread(void *data)
  * waveform included: @done_seq moves only in the @image_lock section
  * after the scan.
  *
- * ⚠️ Nothing pending is NOT finished: the thread takes a part out of
+ * Nothing pending is NOT finished: the thread takes a part out of
  * @pending before it drives it, and in that window nothing is pending while a
  * full waveform is about to run -- so a wait on that returned at once and the
  * first blit of a boot raced the boot RESET. Nor is @image_lock a
@@ -2475,7 +2430,7 @@ static void ebc_crtc_atomic_enable(struct drm_crtc *crtc,
 	 *
 	 * Drive the panel to a known white before anything is composed on it.
 	 *
-	 * ⚠️ The RESET's white fill of @next_shadow (rk3026_ebc_add_update())
+	 * The RESET's white fill of @next_shadow (rk3026_ebc_add_update())
 	 * MUST NOT race a client blit into the same buffer: the enabling commit
 	 * also carries the first plane update, and the default commit_tail runs
 	 * the planes FIRST, so the blit landed and was then overwritten white
@@ -2973,38 +2928,10 @@ static int ebc_alloc_shadow(struct rk3026_ebc *ebc, u8 **img)
 }
 
 /*
- * ONE allocation, the two frames adjacent -- prev first, next at +img_size.
- *
- * This mirrors the vendor exactly, and the difference was measured rather than
- * guessed. Live vendor registers during a working refresh (2026-08-05):
- *
- *	MST0 = 0x7c800000   MST1 = 0x7c85ec00   delta 0x5ec00 == img_size
- *
- * Ours, from two separate dmam_alloc_attrs() calls:
- *
- *	MST0 = 0x7f600000   MST1 = 0x7f680000   delta 0x80000, with a 0x14400 gap
- *
- * By the time this was written that was the LAST known difference between the
- * vendor's setup and ours. Everything else had been checked and matched: all
- * 21 registers including EPD_CTRL/DSP_CTRL/DSP_START/INT, the LUT SRAM word
- * count for the mode, the rails (ENABLE 0x3f, PG 0xfa, VCOM1 0xb4, vcom_ctl
- * high, LDO4 on), the clocks, the MST order, the 4bpp packing, the geometry, and
- * -- verified with devmem at the physical addresses -- the image bytes
- * themselves, correct across the whole frame with the right 32-byte xbands
- * period on lines 0, 1 and 100.
- *
- * And the failure shape fits: uniform content drove the whole panel while
- * structured content appeared only in a strip at one edge, i.e. the panel was
- * inert wherever the controller saw prev == next. That is what a second fetch
- * landing somewhere other than where we think would produce, while leaving every
- * CPU-side check passing.
- *
- * ⚠️ HYPOTHESIS, not established: nothing in the audited vendor code says the
- * controller requires contiguity or derives the second address itself. What is
- * established is only that the vendor's two buffers ARE contiguous and ours were
- * not. If this does not fix it, the contiguity idea is dead and should be
- * recorded as such rather than left hanging -- but the layout is worth keeping
- * regardless, because matching a known-good configuration costs nothing.
+ * One allocation, the two images adjacent: prev first, next at +img_size,
+ * as the vendor kernel lays them out (its MST1 is MST0 + img_size on a
+ * working refresh). Nothing shows that the controller needs them
+ * contiguous; the layout matches a known-good configuration at no cost.
  */
 static int ebc_setup_buffers(struct rk3026_ebc *ebc)
 {
@@ -3069,12 +2996,7 @@ static void ebc_hw_setup(struct rk3026_ebc *ebc)
 	/*
 	 * Route the shared display pads to EBC, and put the LVDS block in the
 	 * state the panel needs. All three bits are written, not just the pad
-	 * select -- see the GRF_EBC_SEL_* comment in rk3026_ebc.h.
-	 *
-	 * This driver wrote bit 0 alone until 2026-08-06 and appeared to work,
-	 * because on those boots the register already held 0x301. On a boot from
-	 * a freshly written card it read 0x101 and drew nothing. ⚠️ What put the
-	 * 0x300 there is NOT established -- not this driver, not U-Boot.
+	 * select: see the GRF_EBC_SEL_* comment in rk3026_ebc.h.
 	 */
 	if (ebc->grf)
 		regmap_write(ebc->grf, GRF_EBC_SEL_REG,
@@ -3101,20 +3023,9 @@ static int ebc_hw_init(struct rk3026_ebc *ebc)
 	 * on schedule while no pixel data is ever read: exactly the signature of
 	 * a scan that reports success and leaves the glass untouched.
 	 *
-	 * ⚠️ This was `if (0 && ebc->mclk)` from 2026-08-03 to 2026-08-05. It was
-	 * disabled because the two cards that enabled it were also the two whose
-	 * U-Boot console hung at misc_init_r on the FOLLOWING boot -- but that
-	 * was never shown to be caused by this, and the same session's dead
-	 * console was later traced to a flat battery and a hub (docs/INDEX.md).
-	 * Three separate reviews since concluded the disable was not addressing a
-	 * real cause; none of them re-enabled it. Being probably-not-the-hang
-	 * does not make skipping the AXI clock correct.
-	 *
-	 * The real hazard the old comment named IS real and is fixed in the same
-	 * change: clk-rk3026.c modelled aclk_vio1_niu and aclk_ebc as two GATE
-	 * objects on the SAME bit (CLKGATE_CON9 b10), so a disable from either
-	 * closes the bit under the other -- and ebc_hw_fini() disables mclk. It
-	 * is now one clock: ACLK_EBC is a FACTOR of aclk_vio1_niu, no second gate.
+	 * ACLK_EBC is a factor of aclk_vio1_niu in the clock driver, not a
+	 * second gate on the same bit, so disabling it in ebc_hw_fini()
+	 * does not close the bit under the NIU.
 	 */
 	if (ebc->mclk) {
 		ret = clk_prepare_enable(ebc->mclk);
@@ -3123,37 +3034,19 @@ static int ebc_hw_init(struct rk3026_ebc *ebc)
 	}
 
 	/*
-	 * dclk boots muxed to CPLL, which sits in slow mode at 24 MHz -- 12 MHz
-	 * after the divider, against the panel's 20 MHz source-clock spec, and a
+	 * dclk boots muxed to CPLL, which sits in slow mode at 24 MHz: 12 MHz
+	 * after the divider, against the panel's 20 MHz source clock, and a
 	 * 54-frame scan then takes 4260 ms instead of 790.
 	 *
-	 * ⚠️ Order matters and cost a session. clk_set_rate() alone returns
-	 * SUCCESS and leaves the hardware at 12 MHz: CCF reparents, writes the
-	 * mux, then writes the divider -- and CLKSEL_CON23 reads back 0xff000100,
-	 * which is exactly a hiword-style divider write applied as a plain 32-bit
-	 * store, clearing the mux bit the same call had just set. clk_get_rate()
-	 * then reports the rate CCF believes, not the one the panel gets. So the
-	 * parent is asserted LAST, and the register is logged rather than trusted.
-	 */
-	/*
-	 * PARENT FIRST, THEN RATE. This order is load-bearing and it is the
-	 * REVERSE of what this function did until 2026-08-06.
+	 * Parent first, then rate. clk_set_rate() may satisfy a request from
+	 * either parent, so a rate can be answered with CPLL and a divider;
+	 * reparenting to GPLL afterwards keeps that divider and lands on
+	 * another rate, both calls returning success.
 	 *
-	 * clk_set_rate() is free to satisfy a request from either parent, so
-	 * asking for 12 MHz can be answered with CPLL (slow mode, 24 MHz) and a
-	 * divider of 1. Reparenting afterwards to GPLL keeps that divider and
-	 * 132/2 lands on 66 MHz -- the rate is destroyed by the very call that
-	 * follows it, silently, with both calls returning success. That is why a
-	 * cold boot still measured 940 ms for 64 frames when the driver had asked
-	 * for 12 MHz.
-	 *
-	 * Asserting the parent last was CORRECT while CLKSEL_CON23 was declared
-	 * with the HIWORD_MASK flags, because the divider write then landed as
-	 * 0xff000100 and cleared the mux bit. Those flags are gone from
-	 * clk-rk3026.c, so the workaround outlived the bug it was working around.
-	 *
-	 * ⚠️ Verify against the frame time (the scan_end tracepoint's ms), never
-	 * clk_get_rate(): 38 frames take ~3000 ms at 12 MHz and ~560 ms at 66.
+	 * Check the rate against the frame time (the scan_end tracepoint's
+	 * ms) rather than clk_get_rate(), which reports the rate the clock
+	 * framework believes, not a mux the hardware left elsewhere: 38
+	 * frames take ~3000 ms at 12 MHz and ~560 ms at 66.
 	 */
 	if (ebc->dclk_parent) {
 		ret = clk_set_parent(ebc->dclk, ebc->dclk_parent);
@@ -3164,8 +3057,8 @@ static int ebc_hw_init(struct rk3026_ebc *ebc)
 	/*
 	 * The rate comes from the DEVICE TREE, not a compiled-in constant: it is
 	 * a property of this panel and this board. of_get_display_timing() has
-	 * already parsed `panel-timing { clock-frequency }` into timing.pixelclock,
-	 * and the driver used to ignore it in favour of EBC_PIXEL_RATE.
+	 * already parsed `panel-timing { clock-frequency }` into timing.pixelclock;
+	 * EBC_PIXEL_RATE_FALLBACK is only for a DT without it.
 	 *
 	 * dclk runs at four times the source clock because the 8-bit source bus
 	 * carries four 2-bit pixels per clock.
@@ -3436,8 +3329,8 @@ static int ebc_probe(struct platform_device *pdev)
 	 * Panel thermometer, in the EPD PMIC. The waveform LUT is selected by
 	 * temperature, so probing before the zone exists does not degrade this
 	 * driver, it drives every update from the wrong bucket for the life of
-	 * the boot -- silently, behind one dev_warn. That was the old
-	 * behaviour and it is why a wrong LUT could never be seen in a log.
+	 * the boot -- silently, behind one dev_warn, so a wrong LUT would never
+	 * be seen in a log.
 	 *
 	 * Ordering against the sensor is DECLARED, not hoped for, and it is
 	 * declared in two places because one is not expressible:
@@ -3451,9 +3344,8 @@ static int ebc_probe(struct platform_device *pdev)
 	 *   link either. A device link models a driver-bound supplier, and a
 	 *   thermal zone device has no driver -- so the link never reaches
 	 *   DL_STATE_CONSUMER_PROBE and device_links_driver_bound() splats
-	 *   WARN_ON(link->status != DL_STATE_CONSUMER_PROBE) (core.c:1383) the
-	 *   moment this driver binds. That warning was added here on
-	 *   2026-08-03 and removed the same day; do not reintroduce it.
+	 *   WARN_ON(link->status != DL_STATE_CONSUMER_PROBE) the moment this
+	 *   driver binds. Do not add such a link.
 	 *
 	 * So EPROBE_DEFER is not a lesser substitute for a declaration here,
 	 * it is the mechanism: the ordering that CAN be declared already is,

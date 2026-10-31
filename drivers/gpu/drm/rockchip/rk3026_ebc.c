@@ -106,8 +106,9 @@
  * The panel's high-voltage rails and VCOM are on only around refreshes: the
  * refresh thread switches them on for a part it will drive, before its take
  * (rk3026_ebc_do_refresh()) or when the take's quiet gap opens for it
- * (rk3026_ebc_take_ready()), and off this long after the last waveform
- * ended (or after they came up, if none was driven); while a gap is open
+ * (rk3026_ebc_take_ready()), and off @rails_off_ms after the last
+ * waveform ended (or after they came up, if none was driven; probe sets
+ * EBC_RAILS_OFF_MS, debugfs rails_off_ms overrides it); while a gap is open
  * they are held past the deadline (rk3026_ebc_thread_step()), at most the
  * gap's cap. A short delay keeps a burst of updates (typing, a scrolling
  * console) from cycling the PMIC per update. Only a driven waveform moves
@@ -116,16 +117,14 @@
  * the rails come up for a part the look finds will not be driven. Stock
  * powers off right after each update; leaving the rails and VCOM up between
  * updates holds a DC bias on the panel.
+ *
+ * This sets the deadline @rails_off_ms from now. Under @rails_lock or on
+ * the thread.
  */
-static unsigned int rails_off_ms = 200;
-module_param(rails_off_ms, uint, 0644);
-MODULE_PARM_DESC(rails_off_ms, "switch the panel rails off this long after the last refresh, in ms (default 200)");
-
-/* Rails-off deadline: rails_off_ms from now. Under @rails_lock or on the thread. */
 static void ebc_rails_rearm(struct rk3026_ebc *ebc)
 {
 	WRITE_ONCE(ebc->rails_off_at,
-		   jiffies + msecs_to_jiffies(READ_ONCE(rails_off_ms)));
+		   jiffies + msecs_to_jiffies(READ_ONCE(ebc->rails_off_ms)));
 }
 
 /*
@@ -903,7 +902,7 @@ err:
 			    ret);
 	/* Next attempt one delay from now (at least 100 ms), not in a tight loop. */
 	WRITE_ONCE(ebc->rails_off_at,
-		   jiffies + msecs_to_jiffies(max(READ_ONCE(rails_off_ms), 100U)));
+		   jiffies + msecs_to_jiffies(max(READ_ONCE(ebc->rails_off_ms), 100U)));
 	return ret;
 }
 
@@ -911,7 +910,7 @@ err:
  * The refresh thread brings the rails up for a part it will drive, before
  * it takes the part (rk3026_ebc_do_refresh()), or when the take's gap opens
  * for it (rk3026_ebc_take_ready()). Rails already up are left as they are,
- * their off deadline too: only a driven waveform moves it (rails_off_ms),
+ * their off deadline too: only a driven waveform moves it (@rails_off_ms),
  * and the thread looks at it between parts alone, and not while a gap is
  * open, so the rails cannot drop between this and the drive.
  *
@@ -997,7 +996,7 @@ static const u8 *ebc_take_target(struct rk3026_ebc *ebc)
  * the CRTC is on, a waveform is loaded, and its scan would move something
  * or is exempt from the skip (rk3026_ebc_should_skip(), on the target
  * compared with the glass: rk3026_ebc_target_differs()). Under @image_lock.
- * A part that will not be driven never raises the rails (rails_off_ms).
+ * A part that will not be driven never raises the rails (@rails_off_ms).
  */
 static bool ebc_part_drives(struct rk3026_ebc *ebc,
 			    const struct rk3026_ebc_set *part)
@@ -1737,7 +1736,7 @@ finish:
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_do_refresh);
 
 /*
- * Idle power-off: rails_off_ms passed since the last waveform. Only this
+ * Idle power-off: @rails_off_ms passed since the last waveform. Only this
  * thread drives the panel and it is here, so no waveform is in flight. Queued
  * work does not hold the rails up: an update that needs them brings them up
  * again, and one that is skipped never needed them.
@@ -2471,7 +2470,7 @@ static void ebc_crtc_atomic_enable(struct drm_crtc *crtc,
 	/*
 	 * The high-voltage rails and VCOM are not switched here: the refresh
 	 * thread brings them up for each waveform, the boot RESET below
-	 * included, and drops them once nothing is pending (rails_off_ms).
+	 * included, and drops them once nothing is pending (@rails_off_ms).
 	 * V3P3, the logic rail, stays with the CRTC.
 	 *
 	 * Drive the panel to a known white before anything is composed on it.
@@ -3398,6 +3397,8 @@ static int ebc_probe(struct platform_device *pdev)
 	ebc->take_cap_ms = EBC_TAKE_CAP_MS;
 	/* Every part in its own mode. */
 	ebc->force_mode = -1;
+	/* The rails stay up this long after a waveform. */
+	ebc->rails_off_ms = EBC_RAILS_OFF_MS;
 
 	/* E Ink GDCK_STA / LGONL; no display-timing binding covers them. */
 	if (of_property_read_u32(dev->of_node, "rockchip,gdck-sta",

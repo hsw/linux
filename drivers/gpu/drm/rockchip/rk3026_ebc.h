@@ -311,6 +311,14 @@ struct rk3026_ebc_du_budget {
 #define EBC_DU_CLEANUP_IDLE_MS	2000
 
 /*
+ * How long the panel rails stay up after the last waveform, as probe sets
+ * it (@rails_off_ms in struct rk3026_ebc): a burst of updates does not
+ * cycle the PMIC per update, and the rails do not hold a DC bias on the
+ * panel between bursts.
+ */
+#define EBC_RAILS_OFF_MS	200
+
+/*
  * What rk3026_ebc_resolve_mode() needs to drive a two-level auto plane part
  * in A2 rather than DU:
  *
@@ -1061,7 +1069,7 @@ struct rk3026_ebc {
 	/*
 	 * Panel rails off when idle. @epd_supply and @vcom_supply are switched
 	 * by the refresh thread alone: on before a waveform is driven, off at
-	 * @rails_off_at (rails_off_ms after the last waveform ended, or after
+	 * @rails_off_at (@rails_off_ms after the last waveform ended, or after
 	 * they came up), and off at CRTC disable.
 	 * @rails_lock serialises the thread against ebc_crtc_atomic_disable().
 	 *
@@ -1080,6 +1088,11 @@ struct rk3026_ebc {
 	bool			v3p3_on;
 	/* Rails-off deadline, in jiffies; only meaningful while @rails_on. */
 	unsigned long		rails_off_at;
+	/*
+	 * The delay to it: probe sets EBC_RAILS_OFF_MS, debugfs may change
+	 * it, and the thread reads it with READ_ONCE().
+	 */
+	u32			rails_off_ms;
 	/*
 	 * The CRTC is enabled, so a part may drive the panel. Under
 	 * @image_lock: the thread samples it in the section that takes a

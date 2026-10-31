@@ -387,25 +387,6 @@ static void ebc_frame_kick(struct rk3026_ebc *ebc, const u8 *lut,
 	for (i = 0; i < words; i++)
 		ebc_write(ebc, EBC_LUT_BASE + i * 4, get_unaligned_le32(src + i * 4));
 
-	/*
-	 * Drain everything the CPU has written before the controller is told to
-	 * fetch it. Two distinct things need this:
-	 *
-	 *  - the IMAGE, in prev_virt/next_virt, which are DMA_ATTR_WRITE_COMBINE
-	 *    (ebc_setup_buffers). Write-combining means the thread's copies into
-	 *    them sit in a merge buffer with no ordering against the EBC's AXI
-	 *    master reading the same memory.
-	 *  - the LUT SRAM and the register group just above, written with
-	 *    writel_relaxed() throughout, which by definition orders nothing.
-	 *
-	 * A missing drain would show first in content that varies within a line:
-	 * write-combining coalesces stores, so uniform images and long runs of
-	 * identical lines still draw correctly whichever stores landed late.
-	 * The vendor kernel flushes the caches after every generated frame, on
-	 * a pool it maps uncached.
-	 */
-	wmb();
-
 	ebc_write(ebc, EBC_WIN_DSP_ST,
 		  (t->hsync_len.typ + t->hback_porch.typ + 1) |
 		  ((t->vsync_len.typ + 4) << 16));
@@ -427,16 +408,14 @@ static void ebc_frame_kick(struct rk3026_ebc *ebc, const u8 *lut,
 	ebc_config_done(ebc);
 
 	/*
-	 * Second drain, and the placement is the point: everything from WIN_DSP_ST
-	 * down to CONFIG_DONE above is writel_relaxed(), so the barrier after the
-	 * LUT does NOT order this register group against the FRAME_START below.
-	 * Without this the controller can be started before its own window and
-	 * frame count have landed.
+	 * FRAME_START with writel(), not the relaxed accessor: its barrier
+	 * completes every earlier CPU write before the controller starts, the
+	 * image stores still in the write-combining buffers
+	 * (prev_virt/next_virt, ebc_setup_buffers()) and the relaxed LUT and
+	 * register writes above alike.
 	 */
-	wmb();
-
 	ebc->dsp_start |= DSP_FRAME_START;
-	ebc_write(ebc, EBC_DSP_START, ebc->dsp_start);
+	writel(ebc->dsp_start, ebc->regs + EBC_DSP_START);
 }
 
 static irqreturn_t ebc_irq(int irq, void *data)

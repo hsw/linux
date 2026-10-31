@@ -21,6 +21,7 @@
 #include <linux/dma-fence.h>
 #include <linux/dma-mapping.h>
 #include <linux/firmware.h>
+#include <linux/hw_bitfield.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/kthread.h>
@@ -275,15 +276,14 @@ static void ebc_set_timing(struct rk3026_ebc *ebc)
 	u32 line = ebc->width / 4;
 
 	ebc_write(ebc, EBC_DSP_HTIMING0,
-		  lsl | ((lsl + line + lbl + lel) << 16));
+		  EBC_HALVES(lsl, lsl + line + lbl + lel));
 	ebc_write(ebc, EBC_DSP_HTIMING1,
-		  (lsl + lbl) | ((lsl + line + lbl) << 16));
+		  EBC_HALVES(lsl + lbl, lsl + line + lbl));
 	ebc_write(ebc, EBC_DSP_VTIMING0,
-		  fsl | ((fsl + ebc->height + fel + fbl) << 16));
+		  EBC_HALVES(fsl, fsl + ebc->height + fel + fbl));
 	ebc_write(ebc, EBC_DSP_VTIMING1,
-		  (fsl + fbl) | ((fsl + fbl + ebc->height) << 16));
-	ebc_write(ebc, EBC_DSP_ACT_INFO,
-		  ebc->width | (ebc->height << 16));
+		  EBC_HALVES(fsl + fbl, fsl + fbl + ebc->height));
+	ebc_write(ebc, EBC_DSP_ACT_INFO, EBC_HALVES(ebc->width, ebc->height));
 	ebc_config_done(ebc);
 }
 
@@ -291,7 +291,7 @@ static void ebc_set_timing(struct rk3026_ebc *ebc)
 static void ebc_set_window(struct rk3026_ebc *ebc)
 {
 	const struct display_timing *t = &ebc->timing;
-	u32 size = ebc->width | (ebc->height << 16);
+	u32 size = EBC_HALVES(ebc->width, ebc->height);
 
 	ebc_write(ebc, EBC_WIN_CTRL, WIN_CTRL_FIXED);
 	/*
@@ -303,8 +303,8 @@ static void ebc_set_window(struct rk3026_ebc *ebc)
 	ebc_write(ebc, EBC_WIN_ACT, size);
 	ebc_write(ebc, EBC_WIN_DSP, size);
 	ebc_write(ebc, EBC_WIN_DSP_ST,
-		  (t->hsync_len.typ + t->hback_porch.typ + 1) |
-		  ((t->vsync_len.typ + 4) << 16));
+		  EBC_HALVES(t->hsync_len.typ + t->hback_porch.typ + 1,
+			     t->vsync_len.typ + 4));
 	ebc_config_done(ebc);
 }
 
@@ -380,7 +380,7 @@ static void ebc_frame_kick(struct rk3026_ebc *ebc, const u8 *lut,
 			   u32 chunk, u32 frames, bool last)
 {
 	const u8 *src = lut + chunk * EBC_LUT_MAX_FRAMES * EBC_LUT_FRAME_BYTES;
-	u32 size = ebc->width | (ebc->height << 16);
+	u32 size = EBC_HALVES(ebc->width, ebc->height);
 	const struct display_timing *t = &ebc->timing;
 
 	/*
@@ -391,8 +391,8 @@ static void ebc_frame_kick(struct rk3026_ebc *ebc, const u8 *lut,
 			 frames * EBC_LUT_FRAME_BYTES / 4);
 
 	ebc_write(ebc, EBC_WIN_DSP_ST,
-		  (t->hsync_len.typ + t->hback_porch.typ + 1) |
-		  ((t->vsync_len.typ + 4) << 16));
+		  EBC_HALVES(t->hsync_len.typ + t->hback_porch.typ + 1,
+			     t->vsync_len.typ + 4));
 	ebc_write(ebc, EBC_WIN_DSP, size);
 	ebc_write(ebc, EBC_WIN_ACT, size);
 
@@ -2995,7 +2995,9 @@ static void ebc_hw_setup(struct rk3026_ebc *ebc)
 	 */
 	if (ebc->grf)
 		regmap_write(ebc->grf, GRF_EBC_SEL_REG,
-			     (GRF_EBC_SEL_MASK << 16) | GRF_EBC_SEL_MASK);
+			     FIELD_PREP_WM16(GRF_EBC_SEL_BIT, 1) |
+			     FIELD_PREP_WM16(GRF_LVDS_PLL_PD_BIT, 1) |
+			     FIELD_PREP_WM16(GRF_LVDS_OUT_SEL_BIT, 1));
 
 	ebc_program_regs(ebc);
 }

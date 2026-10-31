@@ -9,6 +9,7 @@
 #define _RK3026_EBC_H
 
 #include <linux/atomic.h>
+#include <linux/bitfield.h>
 #include <linux/bits.h>
 #include <linux/completion.h>
 #include <linux/ktime.h>
@@ -53,6 +54,16 @@
 #define EBC_CONFIG_DONE		0x50
 
 /*
+ * The timing, size and position registers hold two 16-bit fields: the
+ * horizontal value (or the width) low, the vertical one (or the height)
+ * high.
+ */
+#define EBC_LOW_HALF		GENMASK(15, 0)
+#define EBC_HIGH_HALF		GENMASK(31, 16)
+#define EBC_HALVES(lo, hi)	(FIELD_PREP(EBC_LOW_HALF, (lo)) | \
+				 FIELD_PREP(EBC_HIGH_HALF, (hi)))
+
+/*
  * Waveform LUT SRAM, mapped inside the same window at +0x1000: 0x40 frames of
  * 0x40 bytes. Each frame is 16 words indexed by the old grey level, 2 bits per
  * new grey level. A waveform longer than 0x40 frames is sent in chunks.
@@ -65,8 +76,8 @@
 
 /* EBC_DSP_START. */
 #define DSP_FRAME_START		BIT(0)
-#define DSP_FRAME_NUM_MASK	(0x3fu << 2)
-#define DSP_FRAME_NUM(x)	(((x) & 0x3f) << 2)
+#define DSP_FRAME_NUM_MASK	GENMASK(7, 2)
+#define DSP_FRAME_NUM(x)	FIELD_PREP(DSP_FRAME_NUM_MASK, (x))
 
 /*
  * EBC_EPD_CTRL. SDCK counts source-driver clocks per line (width/4,
@@ -75,9 +86,12 @@
  */
 #define EPD_SOURCE_SCAN_DIR	BIT(0)
 #define EPD_GATE_SCAN_DIR	BIT(1)
-#define EPD_SDCK(x)		(((x) & 0xff) << 8)
-#define EPD_LGONL(x)		(((x) & 0x7ff) << 16)
-#define EPD_GDCK_STA(x)		(((x) & 0x1f) << 27)
+#define EPD_SDCK_MASK		GENMASK(15, 8)
+#define EPD_SDCK(x)		FIELD_PREP(EPD_SDCK_MASK, (x))
+#define EPD_LGONL_MASK		GENMASK(26, 16)
+#define EPD_LGONL(x)		FIELD_PREP(EPD_LGONL_MASK, (x))
+#define EPD_GDCK_STA_MASK	GENMASK(31, 27)
+#define EPD_GDCK_STA(x)		FIELD_PREP(EPD_GDCK_STA_MASK, (x))
 
 /* EBC_WIN_CTRL: win enable, AHB burst, 4bpp format. */
 #define WIN_CTRL_FIXED		0x20fc0u
@@ -88,7 +102,8 @@
 #define EBC_INT_FRAMEEND_CLEAR	BIT(6)
 #define EBC_INT_DISPLAYEND_CLEAR BIT(7)
 #define EBC_INT_FRAMEFLAG_CLEAR	BIT(8)
-#define EBC_INT_FRAME_NUM(x)	(((x) & 0x7f) << 9)
+#define EBC_INT_FRAME_NUM_MASK	GENMASK(15, 9)
+#define EBC_INT_FRAME_NUM(x)	FIELD_PREP(EBC_INT_FRAME_NUM_MASK, (x))
 /* Bits 3+5, set by every frame start. */
 #define EBC_INT_ENABLE		0x28u
 
@@ -118,8 +133,6 @@
 #define GRF_EBC_SEL_BIT		BIT(0)
 #define GRF_LVDS_PLL_PD_BIT	BIT(8)
 #define GRF_LVDS_OUT_SEL_BIT	BIT(9)
-#define GRF_EBC_SEL_MASK	(GRF_EBC_SEL_BIT | GRF_LVDS_PLL_PD_BIT | \
-				 GRF_LVDS_OUT_SEL_BIT)
 
 /*
  * Source-driver clock: 306 x 769 x 85 Hz = 20 MHz, which is the figure the

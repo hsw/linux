@@ -709,19 +709,21 @@ struct rk3026_ebc_marker_ring {
 };
 
 /*
- * Widens @r to whole bytes, an even x on both edges (two pixels a byte), and
- * clamps it to an image of @width x @height pixels. Returns false if nothing
- * of it is left.
+ * Clamps @r to an image of @width x @height pixels (@width even) and widens
+ * it to whole bytes, an even x on both edges (two pixels a byte). Returns
+ * false if nothing of it is left.
  */
 static inline bool rk3026_ebc_widen_clip(struct drm_rect *r,
 					 unsigned int width,
 					 unsigned int height)
 {
-	r->x1 = max(r->x1, 0) & ~1;
-	r->x2 = min_t(int, round_up(r->x2, 2), (int)width);
-	r->y1 = max(r->y1, 0);
-	r->y2 = min_t(int, r->y2, (int)height);
-	return r->x1 < r->x2 && r->y1 < r->y2;
+	const struct drm_rect image = DRM_RECT_INIT(0, 0, width, height);
+
+	if (!drm_rect_intersect(r, &image))
+		return false;
+	r->x1 = round_down(r->x1, 2);
+	r->x2 = round_up(r->x2, 2);
+	return true;
 }
 
 /* The update queued with @seq has finished once @done_seq reached it. */

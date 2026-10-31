@@ -7915,7 +7915,8 @@ static int t_mxcfb_part(struct rk3026_ebc *ebc, const u32 *src,
  * A send from the request to the pending set: the region clamped to the
  * panel, the waveform and the flags mapped, auto_mode, the marker and the
  * temperature passed on, the client's pixels converted, with the time
- * that took, and the panel claimed from the plane. A RESET converts
+ * that took, and the panel claimed from the plane; a region whose end
+ * would wrap a u32 is clamped like any other. A RESET converts
  * nothing; a region off the panel and a send with the CRTC off are
  * refused, and queue nothing.
  */
@@ -7974,6 +7975,14 @@ static void ebc_test_glue_mxcfb_send(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, part.has_mxcfb_full);
 	KUNIT_EXPECT_TRUE(test, drm_rect_equals(&part.box, &clamped));
 
+	/* A width and a height whose end would wrap: clamped the same. */
+	req.update_region.width = U32_MAX - 4;
+	req.update_region.height = U32_MAX;
+	KUNIT_EXPECT_EQ(test, t_mxcfb_part(ebc, black, &req, &part), 0);
+	KUNIT_EXPECT_TRUE(test, drm_rect_equals(&part.box, &clamped));
+	req.update_region.width = 6;
+	req.update_region.height = 2;
+
 	/* INIT: a RESET, the target white, nothing converted. */
 	req.waveform_mode = MXCFB_WAVEFORM_MODE_INIT;
 	KUNIT_EXPECT_EQ(test, t_mxcfb_part(ebc, black, &req, &part), 0);
@@ -7993,7 +8002,7 @@ static void ebc_test_glue_mxcfb_send(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, part.merged, 0);
 	KUNIT_EXPECT_FALSE(test, ebc->mxcfb_active);
 	t_expect_white(test, ebc->next_shadow);
-	KUNIT_EXPECT_EQ(test, ebc->stats.updates, 4);
+	KUNIT_EXPECT_EQ(test, ebc->stats.updates, 5);
 }
 #endif
 /*
@@ -8189,6 +8198,42 @@ static void t_expect_rect(struct kunit *test, const struct drm_rect *r,
 	KUNIT_EXPECT_EQ(test, r->y1, y1);
 	KUNIT_EXPECT_EQ(test, r->x2, x2);
 	KUNIT_EXPECT_EQ(test, r->y2, y2);
+}
+
+/*
+ * The clip widening: odd edges out to whole bytes, the rect clamped at each
+ * edge of the image, coordinates far outside it included, and nothing left
+ * of a rect off the image or empty.
+ */
+static void ebc_test_widen_clip(struct kunit *test)
+{
+	struct drm_rect r;
+
+	r = DRM_RECT_INIT(3, 1, 4, 2);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_widen_clip(&r, T_W, T_H));
+	t_expect_rect(test, &r, 2, 1, 8, 3);
+
+	r = (struct drm_rect){ .x1 = -5, .y1 = -3, .x2 = T_W + 7, .y2 = T_H + 9 };
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_widen_clip(&r, T_W, T_H));
+	t_expect_rect(test, &r, 0, 0, T_W, T_H);
+
+	r = (struct drm_rect){ .x1 = T_W - 1, .y1 = T_H - 1,
+			       .x2 = INT_MAX, .y2 = INT_MAX };
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_widen_clip(&r, T_W, T_H));
+	t_expect_rect(test, &r, T_W - 2, T_H - 1, T_W, T_H);
+
+	r = (struct drm_rect){ .x1 = INT_MIN, .y1 = INT_MIN, .x2 = 1, .y2 = 1 };
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_widen_clip(&r, T_W, T_H));
+	t_expect_rect(test, &r, 0, 0, 2, 1);
+
+	r = DRM_RECT_INIT(T_W, 0, 4, T_H);
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_widen_clip(&r, T_W, T_H));
+	r = DRM_RECT_INIT(0, T_H, 2, 1);
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_widen_clip(&r, T_W, T_H));
+	r = DRM_RECT_INIT(-4, 0, 4, T_H);
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_widen_clip(&r, T_W, T_H));
+	r = DRM_RECT_INIT(5, 2, 0, 1);
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_widen_clip(&r, T_W, T_H));
 }
 
 static bool t_plane_box(struct t_damage *d, unsigned int width,
@@ -10633,6 +10678,7 @@ static struct kunit_case rk3026_ebc_glue_test_cases[] = {
 	KUNIT_CASE(ebc_test_glue_timing_skipped),
 	KUNIT_CASE(ebc_test_glue_timing_dropped),
 	KUNIT_CASE(ebc_test_glue_blit_time),
+	KUNIT_CASE(ebc_test_widen_clip),
 	KUNIT_CASE(ebc_test_plane_box),
 	KUNIT_CASE(ebc_test_glue_plane_box_update),
 	KUNIT_CASE(ebc_test_glue_plane_box_merge),
@@ -10714,18 +10760,22 @@ static size_t t_fix_size(const struct t_fix *f)
 }
 
 /*
- * @r widened to whole bytes, an even x on both edges, and clamped to @f, as
+ * @r clamped to @f and widened to whole bytes, an even x on both edges, as
  * the driver widens a clip, into @w; false if nothing of it is left. The
  * tests' own copy, so the references do not share the driver's code.
  */
 static bool t_widen(const struct t_fix *f, const struct drm_rect *r,
 		    struct drm_rect *w)
 {
-	w->x1 = max(r->x1, 0) & ~1;
-	w->x2 = min_t(int, round_up(r->x2, 2), f->w);
+	w->x1 = max(r->x1, 0);
+	w->x2 = min_t(int, r->x2, f->w);
 	w->y1 = max(r->y1, 0);
 	w->y2 = min_t(int, r->y2, f->h);
-	return w->x1 < w->x2 && w->y1 < w->y2;
+	if (w->x1 >= w->x2 || w->y1 >= w->y2)
+		return false;
+	w->x1 &= ~1;
+	w->x2 = round_up(w->x2, 2);
+	return true;
 }
 
 static u8 *t_fix_img(struct kunit *test, const struct t_fix *f)

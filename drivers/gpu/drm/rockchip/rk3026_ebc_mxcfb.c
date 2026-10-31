@@ -130,16 +130,19 @@ VISIBLE_IF_KUNIT int rk3026_ebc_mxcfb_send(struct rk3026_ebc *ebc,
 					   const void *src, unsigned int pitch,
 					   const struct mxcfb_update_data *req)
 {
+	const struct mxcfb_rect *r = &req->update_region;
+	const struct drm_rect panel = DRM_RECT_INIT(0, 0, ebc->width,
+						    ebc->height);
 	struct rk3026_ebc_update upd;
 	struct drm_rect clip;
 	bool auto_mode;
 	u32 mode;
 
-	clip.x1 = min_t(u32, req->update_region.left, ebc->width);
-	clip.y1 = min_t(u32, req->update_region.top, ebc->height);
-	clip.x2 = min_t(u32, clip.x1 + req->update_region.width, ebc->width);
-	clip.y2 = min_t(u32, clip.y1 + req->update_region.height, ebc->height);
-	if (clip.x1 >= clip.x2 || clip.y1 >= clip.y2)
+	/* Each term at most the panel size first, so the sums cannot wrap. */
+	clip = DRM_RECT_INIT(min(r->left, ebc->width), min(r->top, ebc->height),
+			     min(r->width, ebc->width),
+			     min(r->height, ebc->height));
+	if (!drm_rect_intersect(&clip, &panel))
 		return -EINVAL;
 
 	mode = rk3026_ebc_mxcfb_to_ebc_mode(req->waveform_mode,

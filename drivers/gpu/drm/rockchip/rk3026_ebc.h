@@ -863,7 +863,7 @@ struct rk3026_ebc {
 	u32			height;
 	u32			gdck_sta;
 	u32			lgonl;
-	unsigned int		rotation;
+	enum drm_panel_orientation rotation;
 
 	/* The two 4bpp images the EBC scans: on-panel and target. */
 	void			*prev_virt;

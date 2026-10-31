@@ -51,6 +51,7 @@
 #include <drm/drm_gem_shmem_helper.h>
 #include <drm/drm_managed.h>
 #include <drm/drm_modeset_helper_vtables.h>
+#include <drm/drm_panel.h>
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_vblank.h>
 
@@ -3187,7 +3188,6 @@ static int ebc_probe(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	struct rk3026_ebc *ebc;
 	struct drm_device *drm;
-	u32 rotation;
 	int ret;
 
 	ebc = devm_drm_dev_alloc(dev, &ebc_drm_driver, struct rk3026_ebc, drm);
@@ -3302,25 +3302,10 @@ static int ebc_probe(struct platform_device *pdev)
 	 * Panel mounting angle, counter-clockwise, as the common "rotation"
 	 * property. The panel table in the vendor firmware carries 270.
 	 */
-	ebc->rotation = DRM_MODE_PANEL_ORIENTATION_UNKNOWN;
-	if (!of_property_read_u32(dev->of_node, "rotation", &rotation)) {
-		switch (rotation) {
-		case 0:
-			ebc->rotation = DRM_MODE_PANEL_ORIENTATION_NORMAL;
-			break;
-		case 90:
-			ebc->rotation = DRM_MODE_PANEL_ORIENTATION_RIGHT_UP;
-			break;
-		case 180:
-			ebc->rotation = DRM_MODE_PANEL_ORIENTATION_BOTTOM_UP;
-			break;
-		case 270:
-			ebc->rotation = DRM_MODE_PANEL_ORIENTATION_LEFT_UP;
-			break;
-		default:
-			dev_warn(dev, "ignoring rotation %u\n", rotation);
-			break;
-		}
+	ret = of_drm_get_panel_orientation(dev->of_node, &ebc->rotation);
+	if (ret) {
+		dev_warn(dev, "ignoring rotation (%d)\n", ret);
+		ebc->rotation = DRM_MODE_PANEL_ORIENTATION_UNKNOWN;
 	}
 
 	/*

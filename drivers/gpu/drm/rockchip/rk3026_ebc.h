@@ -102,37 +102,17 @@
 #define EBC_CONFIG_DONE_VAL	0xffff
 
 /*
- * GRF 0x150 -- /proc/iomem calls this region "rk3026-lvds", and it carries
- * three bits this driver must ESTABLISH rather than inherit.
+ * GRF 0x150, the LVDS control register, carries three bits this driver
+ * sets rather than inherits:
  *
  * bit 0  EBC vs LCDC on the shared pads.
  * bit 8  LVDS PLL power-down.
  * bit 9  LVDS-vs-LVTTL output select.
  *
- * 🔴 Bits 8 and 9 are REQUIRED, measured 2026-08-06. The driver used to write
- * bit 0 alone, and the panel rendered anyway on earlier boots, where this
- * register read 0x301. On a boot from a freshly written card it read 0x101 and
- * nothing drew; a single `devmem 0x20008150 32 0x03010301` and the same circle
- * appeared. One variable, same boot. Proven to be established rather than found
- * by forcing the register to 0x001, hot-swapping this driver, and reading 0x301
- * back after probe.
- *
- * ⚠️ WHERE THE 0x300 CAME FROM ON THOSE EARLIER BOOTS IS NOT ESTABLISHED, and a
- * previous revision of this comment asserted it was Android. That was never
- * checked and the maintainer had deliberately not been booting Android. What IS
- * ruled out: this driver (it wrote bit 0 only) and U-Boot (it never references
- * 0x150 -- grepped). What remains open: persistence from some earlier state
- * (INDEX records GRF surviving a warm SND reset and being cleared by U-Boot's
- * FST reset), or a reset default that differs by boot path. Do not repeat the
- * Android story as if it were the mechanism.
- *
- * ⚠️ This is still the class of defect docs/PENDING.md P7 names -- a driver that
- * works by inheriting state from whatever ran before is not working -- and the
- * fix is the same whatever the source turns out to be: write the bits.
- *
- * ⚠️ And do not trust an earlier note of mine calling these bits a no-op. They
- * read back already-set, which is why they looked inert; the test could not
- * distinguish "does nothing" from "already set by something else".
+ * Bits 8 and 9 are required: with the register at 0x101 nothing draws,
+ * and 0x301, nothing else changed, brings the image up. Something before
+ * the kernel left them set on some boots, which made them look inert; the
+ * driver writes all three.
  */
 #define GRF_EBC_SEL_REG		0x150
 #define GRF_EBC_SEL_BIT		BIT(0)
@@ -145,11 +125,10 @@
  * Source-driver clock: 306 x 769 x 85 Hz = 20 MHz, which is the figure the
  * panel table carries and what DRM's mode->clock describes.
  *
- * dclk_ebc runs at four times that. The vendor stores 20 MHz in its panel
- * info and then shifts it left by two before clk_set_rate (rk29_ebc_probe:
- * "ldr r1,[r4,#144]; lsl r1,r1,#2"), because DSP_CTRL's fixed
- * SCLK_DIVIDE_RATE field divides the dot clock by four. Programming 20 MHz
- * here would run every waveform at a quarter of its intended frame rate.
+ * dclk_ebc runs at four times that, as the vendor kernel sets it, because
+ * DSP_CTRL's fixed SCLK_DIVIDE_RATE field divides the dot clock by four.
+ * Programming 20 MHz here would run every waveform at a quarter of its
+ * intended frame rate.
  */
 /*
  * Fallback only. The real source-driver clock comes from the DEVICE TREE --
@@ -161,19 +140,12 @@
 #define EBC_PIXEL_RATE_FALLBACK	20000000
 
 /*
- * There is deliberately NO EBC_DCLK_RATE here.
- *
- * It existed briefly on 2026-08-06 as a compiled-in 12000000 and was wrong in
- * principle before it was wrong in practice: the rate is a property of this
- * panel on this board, so it belongs in the device tree. It now comes from
- * `panel-timing { clock-frequency }` via ebc_dclk_rate(), which is x4 the source
- * clock. The measurement that set the value, and why 12 MHz is a WORKAROUND
- * rather than the answer, is recorded beside the property in
- * dts/rk3026-onyx-c67ml-magellan.dts.
- *
- * ⚠️ Do not reintroduce a constant here to "override" the DT. Two sources for
- * one number is how the driver came to ask for 12 MHz while the hardware ran at
- * 66, and how the dts said 20 MHz while nothing read it.
+ * There is deliberately no EBC_DCLK_RATE: the rate is a property of the
+ * panel on its board, so it comes from the device tree,
+ * `panel-timing { clock-frequency }` via ebc_dclk_rate(), four times the
+ * source clock. The board's dts records the measurement behind its value.
+ * Do not add a constant that overrides the DT: two sources for one number
+ * is how a driver asks for one rate while the hardware runs at another.
  */
 
 /*
@@ -866,17 +838,17 @@ struct rk3026_ebc {
 	struct clk		*aclk;
 	/* The EBC's own AXI master port; "aclk" is the video NIU, not this. */
 	struct clk		*mclk;
-	/* Asserted as dclk's parent after set_rate — see ebc_hw_init(). */
+	/* Asserted as dclk's parent before set_rate, see ebc_hw_init(). */
 	struct clk		*dclk_parent;
 	/* SRST_EBC_AXI/AHB, optional: ebc_stop_scan() after a chunk timeout. */
 	struct reset_control	*rst;
 	struct regulator	*epd_supply;
 	/*
 	 * VCOM (the panel's common electrode) and V3P3 (its logic supply). Both
-	 * are separate rails on the TPS65185 and both were unconsumed until
-	 * 2026-08-03, so nothing ever enabled them: the vendor writes
-	 * ENABLE = 0xAF, i.e. V3P3_EN set, and drives VCOM through its own
-	 * VCOM_CTRL pin, which upstream models as the vcom regulator's ena_gpiod.
+	 * are separate rails on the TPS65185, and nothing enables them unless
+	 * this driver consumes them: the vendor writes ENABLE = 0xAF, i.e.
+	 * V3P3_EN set, and drives VCOM through its own VCOM_CTRL pin, which
+	 * upstream models as the vcom regulator's ena_gpiod.
 	 * Left unconsumed, that pin stays low -- and low does not merely disable
 	 * the amplifier, it actively DISCHARGES VCOM (SLVSAQ8G pin 12).
 	 */
@@ -925,7 +897,7 @@ struct rk3026_ebc {
 	 * @shadows.prev_unknown: @shadows.prev does not describe the glass.
 	 * Set when a waveform starts, cleared ONLY when every frame has been
 	 * driven, so a timeout, an error path or a path nobody has written yet
-	 * all leave it set by construction. ⚠️ Do not turn this into a list of
+	 * all leave it set by construction. Do not turn this into a list of
 	 * clears on the known abort paths: the one that matters is the path not
 	 * yet written. Read at the next draw, which then clears the panel first.
 	 * Written by the refresh thread alone: rk3026_ebc_drive() owns it during

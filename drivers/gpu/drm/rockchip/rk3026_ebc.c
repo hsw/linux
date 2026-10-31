@@ -536,8 +536,7 @@ static int ebc_rails_off(struct rk3026_ebc *ebc);
  */
 static bool ebc_rails_up(struct rk3026_ebc *ebc)
 {
-	return READ_ONCE(ebc->epd_on) &&
-	       (!ebc->vcom_supply || READ_ONCE(ebc->vcom_on));
+	return READ_ONCE(ebc->epd_on) && READ_ONCE(ebc->vcom_on);
 }
 
 /*
@@ -776,7 +775,7 @@ static int ebc_rails_on(struct rk3026_ebc *ebc)
 		/* Off again after the delay even if nothing is driven. */
 		ebc_rails_rearm(ebc);
 	}
-	if (ebc->vcom_supply && !ebc->vcom_on) {
+	if (!ebc->vcom_on) {
 		ret = regulator_enable(ebc->vcom_supply);
 		if (ret) {
 			dev_err_ratelimited(ebc->dev, "failed to enable VCOM: %d\n", ret);
@@ -2412,7 +2411,7 @@ static void ebc_crtc_atomic_enable(struct drm_crtc *crtc,
 	 * being in regulation (SLVSAQ8G: "Positive boost (DCDC1) must be in
 	 * regulation before VCOM can be enabled").
 	 */
-	if (ebc->v3p3_supply && !ebc->v3p3_on) {
+	if (!ebc->v3p3_on) {
 		ret = regulator_enable(ebc->v3p3_supply);
 		if (ret) {
 			dev_err(ebc->dev, "failed to enable v3p3: %d\n", ret);
@@ -3205,27 +3204,21 @@ static int ebc_probe(struct platform_device *pdev)
 				     "failed to get EPD rail supply\n");
 
 	/*
-	 * Optional so a device tree predating these properties still probes, but a
-	 * board that omits them cannot image -- see the struct comment. V3P3 is
-	 * enabled with the CRTC, VCOM by the refresh thread around each
-	 * waveform (ebc_rails_on()), never here.
+	 * A device tree without these properties still probes, with a dummy
+	 * regulator and the core's warning: without vcom-supply nothing
+	 * images, without v3p3-supply the panel relies on its logic rail being
+	 * on already -- see the struct comment. V3P3 is enabled with the CRTC,
+	 * VCOM by the refresh thread around each waveform (ebc_rails_on()),
+	 * never here.
 	 */
-	ebc->v3p3_supply = devm_regulator_get_optional(dev, "v3p3");
-	if (IS_ERR(ebc->v3p3_supply)) {
-		if (PTR_ERR(ebc->v3p3_supply) != -ENODEV)
-			return dev_err_probe(dev, PTR_ERR(ebc->v3p3_supply),
-					     "failed to get v3p3 supply\n");
-		ebc->v3p3_supply = NULL;
-		dev_warn(dev, "no v3p3-supply; the panel's logic rail is unmanaged\n");
-	}
-	ebc->vcom_supply = devm_regulator_get_optional(dev, "vcom");
-	if (IS_ERR(ebc->vcom_supply)) {
-		if (PTR_ERR(ebc->vcom_supply) != -ENODEV)
-			return dev_err_probe(dev, PTR_ERR(ebc->vcom_supply),
-					     "failed to get vcom supply\n");
-		ebc->vcom_supply = NULL;
-		dev_warn(dev, "no vcom-supply; VCOM stays discharged and nothing will image\n");
-	}
+	ebc->v3p3_supply = devm_regulator_get(dev, "v3p3");
+	if (IS_ERR(ebc->v3p3_supply))
+		return dev_err_probe(dev, PTR_ERR(ebc->v3p3_supply),
+				     "failed to get v3p3 supply\n");
+	ebc->vcom_supply = devm_regulator_get(dev, "vcom");
+	if (IS_ERR(ebc->vcom_supply))
+		return dev_err_probe(dev, PTR_ERR(ebc->vcom_supply),
+				     "failed to get vcom supply\n");
 
 	init_completion(&ebc->frame_done);
 	init_waitqueue_head(&ebc->update_wq);

@@ -4511,6 +4511,7 @@ static void ebc_test_glue_reset_keeps_pre(struct kunit *test)
 	ebc->waveform = t_rkf_wf(test, ebc->dev, &seg, 1, 0);
 	ebc->next_virt = t_img_alloc(test, 15);
 	ebc->epd_on = true;
+	ebc->vcom_on = true;
 
 	for (y = r.y1; y < r.y2; y++)
 		for (x = r.x1; x < r.x2; x++)
@@ -4792,6 +4793,7 @@ static struct rk3026_ebc *t_policy_ebc(struct kunit *test)
 	ebc->waveform = t_rkf_wf(test, ebc->dev, &seg, 1, 0);
 	ebc->next_virt = t_img_alloc(test, 15);
 	ebc->epd_on = true;
+	ebc->vcom_on = true;
 	return ebc;
 }
 
@@ -6063,6 +6065,7 @@ static int t_rails(struct rk3026_ebc *ebc)
 		ebc->rails_off_at = jiffies + msecs_to_jiffies(200);
 	}
 	ebc->epd_on = true;
+	ebc->vcom_on = true;
 	ebc->rails_on = true;
 	return 0;
 }
@@ -6073,6 +6076,7 @@ static struct rk3026_ebc *t_rails_ebc(struct kunit *test, struct t_drives *d)
 	struct rk3026_ebc *ebc = t_driven_ebc(test, d, true);
 
 	ebc->epd_on = false;
+	ebc->vcom_on = false;
 	kunit_activate_static_stub(test, rk3026_ebc_raise_rails, t_rails);
 	return ebc;
 }
@@ -6416,6 +6420,7 @@ static void ebc_test_glue_gap_lone(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, d.n, 2);
 
 	ebc->epd_on = false;
+	ebc->vcom_on = false;
 	ebc->rails_on = false;
 	d.rails = 0;
 	t_fb_box(fb, 4, 2, 6, 4, 0xffffff);
@@ -6429,6 +6434,7 @@ static void ebc_test_glue_gap_lone(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, last.gap_us, 0);
 
 	ebc->epd_on = false;
+	ebc->vcom_on = false;
 	ebc->rails_on = false;
 	d.rails = 0;
 	ebc->take_quiet_us = 0;
@@ -6507,6 +6513,7 @@ static void ebc_test_glue_gap_cursor_blink(struct kunit *test)
 	d.ramp = ms_to_ktime(37);
 	for (i = 0; i < 2; i++) {
 		ebc->epd_on = false;
+		ebc->vcom_on = false;
 		ebc->rails_on = false;
 		d.now = ktime_add_ms(t0, 210 * i);
 		t_fb_box(fb, 4, 2, 6, 4, i ? 0xffffff : 0);
@@ -6623,6 +6630,7 @@ static void ebc_test_glue_gap_cap(struct kunit *test)
 	ktime_t t0 = d.now;
 
 	ebc->epd_on = true;
+	ebc->vcom_on = true;
 	ebc->rails_on = true;
 	ebc->rails_off_at = jiffies + msecs_to_jiffies(200);
 	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
@@ -6686,6 +6694,7 @@ static void ebc_test_glue_gap_exempt(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, d.rails, 1);
 
 	ebc->epd_on = false;
+	ebc->vcom_on = false;
 	ebc->rails_on = false;
 	t_fb_box(fb, 4, 2, 6, 4, 0xffffff);
 	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, fb, T_W * 4, &a));
@@ -6728,6 +6737,7 @@ static void ebc_test_glue_gap_big_full(struct kunit *test)
 	ktime_t t0 = d.now;
 
 	ebc->epd_on = true;
+	ebc->vcom_on = true;
 	ebc->rails_on = true;
 	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, black, T_W * 4,
 							&big));
@@ -7135,6 +7145,7 @@ static void ebc_test_glue_rails_exempt(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, d.rails, 1);
 
 	ebc->epd_on = false;
+	ebc->vcom_on = false;
 	ebc->rails_on = false;
 	ebc->shadows.prev_unknown = true;
 	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, white, T_W * 4,
@@ -7734,6 +7745,7 @@ static void ebc_test_glue_sleep_gap_ramp(struct kunit *test)
 
 	/* The suspend switched the rails off (ebc_suspend()). */
 	ebc->epd_on = false;
+	ebc->vcom_on = false;
 	ebc->rails_on = false;
 	rk3026_ebc_sleep_end(ebc);
 	KUNIT_EXPECT_TRUE(test, t_woken(ebc, &d));

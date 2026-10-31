@@ -4767,17 +4767,20 @@ static void ebc_test_glue_wait_marker(struct kunit *test)
 {
 	struct rk3026_ebc *ebc = t_ebc_alloc(test);
 	struct t_glue_work *w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
-	u32 seq;
+	u32 s0, seq;
 
 	KUNIT_ASSERT_NOT_NULL(test, w);
 	ebc->crtc_on = false;
 
-	/* Marker 0 and a marker never sent: nothing to wait for. */
-	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_marker(ebc, 0), 0);
+	/* Marker 0 is no marker: invalid. One never sent: nothing to wait. */
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_marker(ebc, 0), -EINVAL);
 	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_marker(ebc, 42), 0);
 
 	/* The thread does not come: the wait times out. */
+	s0 = t_send(ebc, &t_panel, EBC_MODE_PART, 0, EBC_SOURCE_MXCFB);
 	seq = t_send(ebc, &t_panel, EBC_MODE_PART, 7, EBC_SOURCE_MXCFB);
+	/* Also with an unmarked update pending, marker 0 is invalid. */
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_marker(ebc, 0), -EINVAL);
 	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_seq(ebc, seq, 20, true),
 			-ETIMEDOUT);
 	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_seq(ebc, seq, 20, false),
@@ -4791,9 +4794,11 @@ static void ebc_test_glue_wait_marker(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_marker(ebc, 7), 0);
 	flush_delayed_work(&w->work);
 	KUNIT_EXPECT_EQ(test, w->last.outcome, EBC_OUTCOME_CRTC_OFF);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_seq_finished(&ebc->pending, s0));
 	KUNIT_EXPECT_TRUE(test, rk3026_ebc_seq_finished(&ebc->pending, seq));
 	/* Finished: a wait returns at once. */
 	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_seq(ebc, seq, 0, false), 0);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_marker(ebc, 0), -EINVAL);
 }
 
 /* A wait on the RESET ends at the RESET, not at what was sent after it. */
@@ -8269,8 +8274,8 @@ static struct fb_info *t_mxcfb_ioctl_setup(struct kunit *test,
  * in user memory: MXCFB_SEND_UPDATE converts the client's framebuffer
  * (screen_buffer, line_length) and queues the update with its marker;
  * MXCFB_WAIT_FOR_UPDATE_COMPLETE returns at once for a marker never
- * sent, and for a sent one when its part has finished, not before.
- * Neither reaches the fbdev helper.
+ * sent, -EINVAL for marker 0, and for a sent one when its part has
+ * finished, not before. Neither reaches the fbdev helper.
  */
 static void ebc_test_glue_mxcfb_ioctl(struct kunit *test)
 {
@@ -8298,6 +8303,11 @@ static void ebc_test_glue_mxcfb_ioctl(struct kunit *test)
 			rk3026_ebc_mxcfb_ioctl(info,
 					       MXCFB_WAIT_FOR_UPDATE_COMPLETE,
 					       marker_at), 0);
+	t_user_u32(test, marker_at, 0);
+	KUNIT_EXPECT_EQ(test,
+			rk3026_ebc_mxcfb_ioctl(info,
+					       MXCFB_WAIT_FOR_UPDATE_COMPLETE,
+					       marker_at), -EINVAL);
 
 	/* Its part comes later, dropped with the CRTC off: that ends it. */
 	ebc->crtc_on = false;

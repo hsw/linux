@@ -2806,7 +2806,6 @@ static const struct drm_crtc_funcs ebc_crtc_funcs = {
 	.set_config		= drm_atomic_helper_set_config,
 	.page_flip		= drm_atomic_helper_page_flip,
 	.reset			= drm_atomic_helper_crtc_reset,
-	.destroy		= drm_crtc_cleanup,
 	.atomic_duplicate_state	= drm_atomic_helper_crtc_duplicate_state,
 	.atomic_destroy_state	= drm_atomic_helper_crtc_destroy_state,
 };
@@ -2816,10 +2815,6 @@ static const struct drm_crtc_helper_funcs ebc_crtc_helper_funcs = {
 	.atomic_flush		= ebc_crtc_atomic_flush,
 	.atomic_enable		= ebc_crtc_atomic_enable,
 	.atomic_disable		= ebc_crtc_atomic_disable,
-};
-
-static const struct drm_encoder_funcs ebc_encoder_funcs = {
-	.destroy		= drm_encoder_cleanup,
 };
 
 static int ebc_connector_get_modes(struct drm_connector *connector)
@@ -2850,7 +2845,6 @@ static int ebc_connector_get_modes(struct drm_connector *connector)
 static const struct drm_connector_funcs ebc_connector_funcs = {
 	.reset			= drm_atomic_helper_connector_reset,
 	.fill_modes		= drm_helper_probe_single_connector_modes,
-	.destroy		= drm_connector_cleanup,
 	.atomic_duplicate_state	= drm_atomic_helper_connector_duplicate_state,
 	.atomic_destroy_state	= drm_atomic_helper_connector_destroy_state,
 };
@@ -3416,20 +3410,20 @@ static int ebc_probe(struct platform_device *pdev)
 	 */
 	drm_plane_enable_fb_damage_clips(&ebc->plane);
 
-	ret = drm_crtc_init_with_planes(drm, &ebc->crtc, &ebc->plane, NULL,
-					&ebc_crtc_funcs, NULL);
+	ret = drmm_crtc_init_with_planes(drm, &ebc->crtc, &ebc->plane, NULL,
+					 &ebc_crtc_funcs, NULL);
 	if (ret)
 		return ret;
 	drm_crtc_helper_add(&ebc->crtc, &ebc_crtc_helper_funcs);
 
-	ret = drm_encoder_init(drm, &ebc->encoder, &ebc_encoder_funcs,
-			       DRM_MODE_ENCODER_NONE, NULL);
+	ret = drmm_encoder_init(drm, &ebc->encoder, NULL,
+				DRM_MODE_ENCODER_NONE, NULL);
 	if (ret)
 		return ret;
 	ebc->encoder.possible_crtcs = drm_crtc_mask(&ebc->crtc);
 
-	ret = drm_connector_init(drm, &ebc->connector, &ebc_connector_funcs,
-				 DRM_MODE_CONNECTOR_Unknown);
+	ret = drmm_connector_init(drm, &ebc->connector, &ebc_connector_funcs,
+				  DRM_MODE_CONNECTOR_Unknown, NULL);
 	if (ret)
 		return ret;
 	drm_connector_helper_add(&ebc->connector, &ebc_connector_helper_funcs);

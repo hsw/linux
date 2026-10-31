@@ -1374,6 +1374,8 @@ u32 rk3026_ebc_mxcfb_to_ebc_mode(u32 waveform_mode, u32 update_mode,
 int rk3026_ebc_mxcfb_send(struct rk3026_ebc *ebc, const void *src,
 			  unsigned int pitch,
 			  const struct mxcfb_update_data *req);
+void rk3026_ebc_mxcfb_invert(u8 *img, const struct drm_rect *clip,
+			     unsigned int width, unsigned int height);
 int rk3026_ebc_mxcfb_wait(struct rk3026_ebc *ebc, u32 marker,
 			  enum rk3026_ebc_wait_for until);
 enum rk3026_ebc_mxcfb_cmd rk3026_ebc_mxcfb_classify(unsigned int cmd);

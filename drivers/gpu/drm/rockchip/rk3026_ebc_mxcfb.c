@@ -18,6 +18,7 @@
 #include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
+#include <linux/unaligned.h>
 
 #include <drm/drm_fb_helper.h>
 #include <drm/drm_managed.h>
@@ -117,6 +118,35 @@ VISIBLE_IF_KUNIT u32 rk3026_ebc_mxcfb_to_ebc_mode(u32 waveform_mode,
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_mxcfb_to_ebc_mode);
 
 /*
+ * EPDC_FLAG_ENABLE_INVERSION on @img, a packed 4bpp image of @width x
+ * @height pixels: every level of @clip, widened to whole bytes and clamped
+ * as rk3026_ebc_blit_xrgb8888() widens it, becomes 15 - level. Flipping
+ * every bit of a byte does that for both of its pixels.
+ */
+VISIBLE_IF_KUNIT void rk3026_ebc_mxcfb_invert(u8 *img,
+					      const struct drm_rect *clip,
+					      unsigned int width,
+					      unsigned int height)
+{
+	struct drm_rect r = *clip;
+	int y;
+
+	if (!rk3026_ebc_widen_clip(&r, width, height))
+		return;
+
+	for (y = r.y1; y < r.y2; y++) {
+		u8 *d = img + ((size_t)y * width + r.x1) / 2;
+		int n = (r.x2 - r.x1) / 2;
+
+		for (; n >= 4; n -= 4, d += 4)
+			put_unaligned(~get_unaligned((u32 *)d), (u32 *)d);
+		for (; n > 0; n--, d++)
+			*d = ~*d;
+	}
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_mxcfb_invert);
+
+/*
  * One MXCFB_SEND_UPDATE request, already copied in: the arguments checked,
  * the region clamped to the panel, the waveform and the flags mapped
  * (rk3026_ebc_mxcfb_to_ebc_mode()), and, in one @image_lock section, the
@@ -130,6 +160,22 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_mxcfb_to_ebc_mode);
  * EPDC_FLAG_USE_ALT_BUFFER names a physical address, and the shmem fbdev
  * has none a client could name; EPDC_FLAG_TEST_COLLISION asks for a dry
  * run. Other flags this shim does not read are ignored, as on i.MX.
+ *
+ * EPDC_FLAG_ENABLE_INVERSION draws the region inverted, every level as
+ * 15 - level: the converted region is inverted after the blit, in the same
+ * section (rk3026_ebc_mxcfb_invert()). The region is the blit's, widened
+ * to whole bytes, so the other pixel of an edge byte, which the blit
+ * converts from the framebuffer as well, is inverted with it. The target
+ * image then holds what the glass is to show, not what the framebuffer
+ * holds: the snapshot's change test, the DU test of AUTO and the threshold
+ * of a two-level mode see the image as drawn, and a later send of the same
+ * pixels without the flag draws them as the framebuffer has them. The
+ * threshold (level >= 8 white) of an inverted level is the inverse of the
+ * threshold of the level, so FORCE_MONOCHROME and the inversion may come
+ * in either order. INIT converts nothing and whitens the region, with the
+ * flag as without it. The plane path never inverts: once the panel is the
+ * plane's again, its next update redraws the whole panel from the
+ * framebuffer (@plane_resync).
  *
  * Returns 0, -EINVAL for an argument above or if nothing of the region is
  * on the panel, or -EBUSY with the CRTC off. A refused send queues
@@ -199,8 +245,12 @@ VISIBLE_IF_KUNIT int rk3026_ebc_mxcfb_send(struct rk3026_ebc *ebc,
 	WRITE_ONCE(ebc->mxcfb_active, true);
 
 	/* A RESET discards the pixels: rk3026_ebc_add_update() whitens them. */
-	if (upd.mode != EBC_MODE_RESET)
+	if (upd.mode != EBC_MODE_RESET) {
 		upd.blit_us = rk3026_ebc_blit_xrgb8888(ebc, src, pitch, &clip);
+		if (req->flags & EPDC_FLAG_ENABLE_INVERSION)
+			rk3026_ebc_mxcfb_invert(ebc->next_shadow, &clip,
+						ebc->width, ebc->height);
+	}
 	rk3026_ebc_add_update(ebc, &upd);
 	mutex_unlock(&ebc->image_lock);
 	return 0;

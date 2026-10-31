@@ -1333,6 +1333,8 @@ u32 rk3026_ebc_mxcfb_to_ebc_mode(u32 waveform_mode, u32 update_mode,
 int rk3026_ebc_mxcfb_send(struct rk3026_ebc *ebc, const void *src,
 			  unsigned int pitch,
 			  const struct mxcfb_update_data *req);
+int rk3026_ebc_mxcfb_ioctl(struct fb_info *info, unsigned int cmd,
+			   unsigned long arg);
 #endif
 #else
 static inline void rk3026_ebc_mxcfb_install(struct rk3026_ebc *ebc,

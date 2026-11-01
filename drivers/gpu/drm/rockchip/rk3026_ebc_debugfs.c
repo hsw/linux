@@ -52,6 +52,9 @@
  *   debug_timeout    the next chunks whose wait is cut to 1 ms so that
  *                    it times out and the abort path runs, read-write;
  *                    counts down to 0, as probe sets it. A test knob.
+ *   mst_probe        WIN_MST latch probe, read-write, 0 as probe sets it:
+ *                    bit 0 logs the WIN_MST0/1 readbacks of every drive,
+ *                    bit 1 programs the transposed pair. A debug knob.
  *   rails_off_ms     how long the panel rails stay up after the last
  *                    waveform, read-write; 0: off at the thread's next
  *                    look. Probe sets EBC_RAILS_OFF_MS.
@@ -440,6 +443,7 @@ void rk3026_ebc_debugfs_init(struct rk3026_ebc *ebc)
 	debugfs_create_file_unsafe("force_mode", 0644, dir, ebc,
 				   &rk3026_ebc_force_mode_fops);
 	debugfs_create_atomic_t("debug_timeout", 0644, dir, &ebc->debug_timeout);
+	debugfs_create_u32("mst_probe", 0644, dir, &ebc->mst_probe);
 	debugfs_create_u32("rails_off_ms", 0644, dir, &ebc->rails_off_ms);
 }
 

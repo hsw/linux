@@ -358,13 +358,178 @@ static void ebc_set_dsp_ctrl(struct rk3026_ebc *ebc, u32 mode)
  * at width / 2 bytes per line (rk3026_ebc_blit_xrgb8888()), and WIN_VIR, from
  * which the controller takes its line step, is the width as well.
  */
+/*
+ * WIN_MST latch probe (debugfs mst_probe, debug only): one sample of both
+ * registers at @point of @chunk, stamped. Kept in @mst and printed by
+ * ebc_mst_print() when the drive ends, never here: this runs between a
+ * kick and its wait. Returns the stamp.
+ */
+static u64 ebc_mst_sample(struct rk3026_ebc *ebc, u8 point, u32 chunk)
+{
+	struct rk3026_ebc_mst_probe *p = &ebc->mst;
+	struct rk3026_ebc_mst_sample *s;
+	u64 ns = ktime_get_ns();
+
+	if (!(p->flags & EBC_MST_PROBE_LOG))
+		return ns;
+	if (chunk >= EBC_MST_PROBE_CHUNKS && point != EBC_MST_END)
+		return ns;
+	if (p->n >= ARRAY_SIZE(p->s)) {
+		p->dropped++;
+		return ns;
+	}
+
+	s = &p->s[p->n++];
+	s->ns = ns;
+	s->mst0 = ebc_read(ebc, EBC_WIN_MST0);
+	s->mst1 = ebc_read(ebc, EBC_WIN_MST1);
+	s->point = point;
+	s->chunk = chunk;
+	return ns;
+}
+
+static void ebc_mst_name(char *buf, size_t len,
+			 const struct rk3026_ebc_mst_sample *s)
+{
+	switch (s->point) {
+	case EBC_MST_PRE:
+		strscpy(buf, "pre", len);
+		break;
+	case EBC_MST_ARMED:
+		strscpy(buf, "armed", len);
+		break;
+	case EBC_MST_KICK:
+		snprintf(buf, len, "kick%u+0", s->chunk);
+		break;
+	case EBC_MST_KICK_20US:
+		snprintf(buf, len, "kick%u+20us", s->chunk);
+		break;
+	case EBC_MST_KICK_200US:
+		snprintf(buf, len, "kick%u+200us", s->chunk);
+		break;
+	case EBC_MST_KICK_30MS:
+		snprintf(buf, len, "kick%u+30ms", s->chunk);
+		break;
+	case EBC_MST_MID:
+		snprintf(buf, len, "mid%u", s->chunk);
+		break;
+	case EBC_MST_END:
+		snprintf(buf, len, "end%u", s->chunk);
+		break;
+	default:
+		strscpy(buf, "done", len);
+		break;
+	}
+}
+
+/*
+ * The drive's probe lines: the pair the driver means, then every sample,
+ * its time from chunk 0's FRAME_START write. The points before it (pre,
+ * armed) carry a minus; a drive that never kicked counts from its first
+ * sample.
+ */
+static void ebc_mst_print(struct rk3026_ebc *ebc, u32 mode, u32 frames)
+{
+	struct rk3026_ebc_mst_probe *p = &ebc->mst;
+	u64 t0 = p->t0;
+	u32 i;
+
+	if (!p->flags)
+		return;
+
+	dev_info(ebc->dev,
+		 "mst: phys prev %08x next %08x mode %u frames %u chunks %u probe %u\n",
+		 lower_32_bits(ebc->prev_phys), lower_32_bits(ebc->next_phys),
+		 mode, frames, DIV_ROUND_UP(frames, EBC_LUT_MAX_FRAMES),
+		 p->flags);
+
+	if (!t0 && p->n)
+		t0 = p->s[0].ns;
+
+	for (i = 0; i < p->n; i++) {
+		const struct rk3026_ebc_mst_sample *s = &p->s[i];
+		bool before = s->ns < t0;
+		u64 d = before ? t0 - s->ns : s->ns - t0;
+		char name[24];
+
+		ebc_mst_name(name, sizeof(name), s);
+		dev_info(ebc->dev, "mst: %s mst0 %08x mst1 %08x %c%lluus\n",
+			 name, s->mst0, s->mst1, before ? '-' : '+',
+			 div_u64(d, NSEC_PER_USEC));
+	}
+	if (p->dropped)
+		dev_info(ebc->dev, "mst: %u samples dropped\n", p->dropped);
+
+	p->n = 0;
+	p->dropped = 0;
+}
+
+/*
+ * The chunk's wait with the probe's samples around it: right after the
+ * FRAME_START write, 20 us, 200 us and 30 ms on (frame 0 is ~12 ms here),
+ * once about halfway through the chunk's frames if it has not ended, and at
+ * its end. The two waits add up to @budget; a budget too short to split
+ * (debug_timeout) is one wait and has no mid sample. Without bit 0 it is
+ * the single wait of the normal driver.
+ */
+#define EBC_MST_PROBE_MID_MS_PER_FRAME	6
+
+static bool ebc_mst_wait(struct rk3026_ebc *ebc, u32 chunk, u32 frames,
+			 unsigned int budget)
+{
+	unsigned long total = msecs_to_jiffies(budget), first;
+	u64 ns;
+	bool ok;
+
+	if (!(ebc->mst.flags & EBC_MST_PROBE_LOG) ||
+	    chunk >= EBC_MST_PROBE_CHUNKS) {
+		ok = wait_for_completion_timeout(&ebc->frame_done, total);
+		if (ok)
+			ebc_mst_sample(ebc, EBC_MST_END, chunk);
+		return ok;
+	}
+
+	ns = ebc_mst_sample(ebc, EBC_MST_KICK, chunk);
+	if (!chunk)
+		ebc->mst.t0 = ns;
+	udelay(20);
+	ebc_mst_sample(ebc, EBC_MST_KICK_20US, chunk);
+	udelay(180);
+	ebc_mst_sample(ebc, EBC_MST_KICK_200US, chunk);
+	usleep_range(30000, 31000);
+	ebc_mst_sample(ebc, EBC_MST_KICK_30MS, chunk);
+
+	first = msecs_to_jiffies(frames * EBC_MST_PROBE_MID_MS_PER_FRAME);
+	if (first >= total) {
+		ok = wait_for_completion_timeout(&ebc->frame_done, total);
+	} else {
+		ok = wait_for_completion_timeout(&ebc->frame_done, first);
+		if (!ok) {
+			ebc_mst_sample(ebc, EBC_MST_MID, chunk);
+			ok = wait_for_completion_timeout(&ebc->frame_done,
+							 total - first);
+		}
+	}
+	if (ok)
+		ebc_mst_sample(ebc, EBC_MST_END, chunk);
+	return ok;
+}
+
 static void ebc_set_image_addr(struct rk3026_ebc *ebc, u32 x, u32 y)
 {
 	u32 off = (x + y * ebc->width) / 2;
+	u32 mst0 = lower_32_bits(ebc->prev_phys) + off;
+	u32 mst1 = lower_32_bits(ebc->next_phys) + off;
 
-	ebc_write(ebc, EBC_WIN_MST0, lower_32_bits(ebc->prev_phys) + off);
-	ebc_write(ebc, EBC_WIN_MST1, lower_32_bits(ebc->next_phys) + off);
+	/* Probe bit 1: the transposed pair, the content roles unchanged. */
+	if (ebc->mst.flags & EBC_MST_PROBE_SWAP)
+		swap(mst0, mst1);
+
+	ebc_mst_sample(ebc, EBC_MST_PRE, 0);
+	ebc_write(ebc, EBC_WIN_MST0, mst0);
+	ebc_write(ebc, EBC_WIN_MST1, mst1);
 	ebc_config_done(ebc);
+	ebc_mst_sample(ebc, EBC_MST_ARMED, 0);
 }
 
 /*
@@ -644,6 +809,11 @@ VISIBLE_IF_KUNIT int rk3026_ebc_drive(struct rk3026_ebc *ebc, const u8 *lut,
 	last->lut_mode = lut_mode;
 	last->frames = frames;
 
+	ebc->mst.flags = READ_ONCE(ebc->mst_probe);
+	ebc->mst.n = 0;
+	ebc->mst.dropped = 0;
+	ebc->mst.t0 = 0;
+
 	ebc_set_dsp_ctrl(ebc, mode);
 	ebc_set_image_addr(ebc, 0, 0);
 
@@ -667,8 +837,7 @@ VISIBLE_IF_KUNIT int rk3026_ebc_drive(struct rk3026_ebc *ebc, const u8 *lut,
 
 		reinit_completion(&ebc->frame_done);
 		ebc_frame_kick(ebc, lut, chunk, n, done + n >= frames);
-		ok = wait_for_completion_timeout(&ebc->frame_done,
-						msecs_to_jiffies(budget));
+		ok = ebc_mst_wait(ebc, chunk, n, budget);
 		if (!ok) {
 			dev_warn_ratelimited(ebc->dev, "frame timeout\n");
 			ebc_stop_scan(ebc);
@@ -691,6 +860,8 @@ VISIBLE_IF_KUNIT int rk3026_ebc_drive(struct rk3026_ebc *ebc, const u8 *lut,
 		WRITE_ONCE(ebc->shadows.prev_unknown, false);
 	last->outcome = EBC_OUTCOME_DRIVEN;
 out:
+	ebc_mst_sample(ebc, EBC_MST_DONE, 0);
+	ebc_mst_print(ebc, mode, frames);
 	last->driven = done;
 	last->scan_ms = ktime_ms_delta(ktime_get(), start);
 	trace_rk3026_ebc_scan_end(mode, frames, done, last->scan_ms, ret,

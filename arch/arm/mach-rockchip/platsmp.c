@@ -40,7 +40,12 @@ static int has_pmu = true;
  * GRF_SOC_CON0 bit 12 maps the internal SRAM (and with it the trampoline)
  * there. Any global reset with that remap set restarts CPU0 in the
  * trampoline instead of the BootROM (the GRF keeps its state), so map the
- * SRAM only while a core is being started.
+ * SRAM only while a core is being started. The same SoC also restarts a
+ * core on the soft reset assert (see pmu_set_power_domain()).
+ *
+ * rk3026_grf is the one key for both quirks: it is set only when the
+ * RK3026 GRF is found and mapped, so the reset pulse, the remap set and
+ * the remap clears either all run or none does.
  */
 #define RK3026_GRF_SOC_CON0		0x140
 #define RK3026_GRF_IMEM_REMAP_SET	(BIT(28) | BIT(12))
@@ -51,8 +56,11 @@ static void __iomem *rk3026_grf;
 /*
  * A plain write, not the syscon regmap: setting the remap must not take a
  * lock, whose unlock ends in SEV (see the "on" path of
- * pmu_set_power_domain()). The write-enable mask in bits 31:16 makes it
- * touch bit 12 only, so it needs no lock against other GRF users.
+ * pmu_set_power_domain()). Bits 31:16 of GRF_SOC_CON0 are the write-enable
+ * mask of bits 15:0, as drivers/soc/rockchip/grf.c writes the same
+ * register on the RK3036 and RK3128 (FIELD_PREP_WM16_CONST) and the vendor
+ * kernel clears this remap (grf_writel(1 << (12 + 16), GRF_SOC_CON0)), so
+ * the write touches bit 12 only and needs no lock against other GRF users.
  */
 static void rk3026_imem_remap(bool on)
 {
@@ -108,14 +116,13 @@ static int pmu_set_power_domain(int pd, bool on)
 	 * or else the active processors might be stalled when the individual
 	 * processor is powered down.
 	 *
-	 * Without a PMU there is nothing to power down. On the RK3026 the
-	 * core soft reset does not hold the core: the write restarts it at
-	 * the reset vector, so asserting it here (before the SRAM trampoline
-	 * exists, or for a core that just went offline) would let the core
-	 * run stale SRAM contents. Leave a stopped core in its WFI loop and
-	 * restart it in the "on" path below.
+	 * On the RK3026 the core soft reset does not hold the core: the
+	 * write restarts it at the reset vector, so asserting it here (before
+	 * the SRAM trampoline exists, or for a core that just went offline)
+	 * would let the core run stale SRAM contents. Leave a stopped core in
+	 * its WFI loop and restart it in the "on" path below.
 	 */
-	if (!IS_ERR(rstc) && !on && has_pmu)
+	if (!IS_ERR(rstc) && !on && !rk3026_grf)
 		reset_control_assert(rstc);
 
 	if (has_pmu) {
@@ -137,20 +144,20 @@ static int pmu_set_power_domain(int pd, bool on)
 		}
 	}
 
-	if (!IS_ERR(rstc) && on && has_pmu)
+	if (!IS_ERR(rstc) && on && !rk3026_grf)
 		reset_control_deassert(rstc);
 
-	if (!IS_ERR(rstc) && on && !has_pmu) {
+	if (!IS_ERR(rstc) && on && rk3026_grf) {
 		unsigned long flags;
 
 		/*
-		 * Without a PMU the reset write is what restarts the core
-		 * (RK3026: the core starts at the reset vector on the assert,
-		 * a plain deassert of a reset asserted earlier does nothing).
-		 * Assert right before the deassert, as the vendor kernel does;
-		 * the trampoline is in SRAM by now.
+		 * RK3026: the reset write is what restarts the core (it starts
+		 * at the reset vector on the assert, a plain deassert of a
+		 * reset asserted earlier does nothing). Assert right before
+		 * the deassert, as the vendor kernel does; the trampoline is
+		 * in SRAM by now.
 		 *
-		 * RK3026: map the SRAM at 0 right before that assert. A core
+		 * Map the SRAM at 0 right before that assert. A core
 		 * parked by the BootROM waits in WFE at a low address; once
 		 * the SRAM is mapped, any SEV wakes it to fetch SRAM contents
 		 * at that address instead of the trampoline. Every spin_unlock
@@ -402,6 +409,15 @@ static void __init rk3036_smp_prepare_cpus(unsigned int max_cpus)
 	if (np) {
 		rk3026_grf = of_iomap(np, 0);
 		of_node_put(np);
+		if (!rk3026_grf) {
+			/*
+			 * An RK3026 without its quirks would assert the core
+			 * reset below and restart CPU1 into whatever the
+			 * loader left at 0: start no core at all.
+			 */
+			pr_err("%s: could not map the RK3026 GRF\n", __func__);
+			return;
+		}
 		/* the loader may have left the remap set */
 		rk3026_imem_remap(false);
 	}
@@ -422,6 +438,11 @@ static int rockchip_cpu_kill(unsigned int cpu)
 	 * We need a delay here to ensure that the dying CPU can finish
 	 * executing v7_coherency_exit() and reach the WFI/WFE state
 	 * prior to having the power domain disabled.
+	 *
+	 * On the RK3026 nothing follows: there is no power domain and the
+	 * core reset is left alone, so the core stays in its WFI loop until
+	 * the next start pulses the reset. The delay is all the vendor
+	 * kernel's cpu_kill does there too; keep it.
 	 */
 	mdelay(1);
 

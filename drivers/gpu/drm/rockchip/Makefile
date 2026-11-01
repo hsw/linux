@@ -30,5 +30,8 @@ CFLAGS_rk3026_ebc_blit_neon.o += $(CC_FLAGS_FPU)
 CFLAGS_REMOVE_rk3026_ebc_blit_neon.o += $(CC_FLAGS_NO_FPU)
 
 obj-$(CONFIG_DRM_RK3026_EBC) += rk3026-ebc.o
+tests/rk3026_ebc_kunit_test-y := tests/rk3026_ebc_kunit.o \
+				 tests/rk3026_ebc_kunit_ref.o
+obj-$(CONFIG_DRM_RK3026_EBC_KUNIT_TEST) += tests/rk3026_ebc_kunit_test.o
 # rk3026_ebc_trace.h, for <trace/define_trace.h>
 CFLAGS_rk3026_ebc.o := -I$(src)

@@ -697,7 +697,7 @@
 		resets = <&cru SRST_EMMC>;
 		reset-names = "reset";
 		pinctrl-names = "default";
-		pinctrl-0 = <&emmc_clk &emmc_cmd &emmc_bus8>;
+		pinctrl-0 = <&emmc_clk &emmc_cmd &emmc_rstnout &emmc_pwren &emmc_bus8>;
 		status = "disabled";
 	};
 
@@ -1042,15 +1042,25 @@
 
 		emmc {
 			/*
-			 * GPIO2_A7 CLKOUT and GPIO1_C6 CMD are the FUNC2
-			 * alternates of NAND_DQS / NAND_CS2 (this board has NAND
-			 * populated, so these groups are mutually exclusive).
+			 * The controller's pads are the FUNC2 alternates of the
+			 * NAND ones (CLKOUT/NAND_DQS, CMD/NAND_CS2, RSTNOUT/
+			 * NAND_CS3, PWREN/NAND_WP, D0-D7/NAND_D0-D7), so the
+			 * two groups are mutually exclusive on a board that
+			 * fits one of the two chips.
 			 */
 			emmc_clk: emmc-clk {
 				rockchip,pins = <2 7 2 &pcfg_pull_none>;
 			};
 			emmc_cmd: emmc-cmd {
 				rockchip,pins = <1 22 2 &pcfg_pull_default>;
+			};
+			/* RST_n: the controller drives it in dw_mci_reset(). */
+			emmc_rstnout: emmc-rstnout {
+				rockchip,pins = <1 23 2 &pcfg_pull_default>;
+			};
+			/* PWREN, written by dw_mci_set_ios(). */
+			emmc_pwren: emmc-pwren {
+				rockchip,pins = <2 5 2 &pcfg_pull_default>;
 			};
 			emmc_bus8: emmc-bus8 {
 				rockchip,pins = <1 24 2 &pcfg_pull_default>,

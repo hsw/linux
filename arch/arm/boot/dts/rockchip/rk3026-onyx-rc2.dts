@@ -14,8 +14,9 @@
  * unplugging the cable switches it off.
  *
  * Deliberately left out until each part is checked on the board:
- *  - the eMMC (0x1021c000) and the NAND controller (0x10500000): the NFC pads
- *    are the eMMC data lines on this board. Both nodes are deleted;
+ *  - the NAND controller (0x10500000): the flash pads it would use are the
+ *    eMMC's on this board and no NAND chip is fitted, so its node stays
+ *    deleted. The eMMC (0x1021c000) is enabled, read-only for now;
  *  - control of the ACT8931 (i2c0 0x5b) beyond the CPU supply: its other
  *    rails are described as fixed regulators at the voltages the chip
  *    holds, and its node in rk3026-onyx-rc2-sys.dtsi pins every output but
@@ -65,15 +66,19 @@
  */
 #define RC2_VDD_ARM_RAMP	500
 
-/delete-node/ &emmc;
 /delete-node/ &nfc;
 
 / {
 	model = "Onyx Boox Robinson Crusoe 2";
 	compatible = "onyx,rc2", "rockchip,rk3026";
 
+	/*
+	 * mmc1 for the eMMC, so the card keeps mmcblk0 whatever order the two
+	 * hosts probe in (the initramfs and the rootfs find the card by name).
+	 */
 	aliases {
 		mmc0 = &sdmmc;
+		mmc1 = &emmc;
 	};
 
 	memory@60000000 {
@@ -542,6 +547,40 @@
 	pinctrl-names = "default";
 	pinctrl-0 = <&sdmmc_clk &sdmmc_cmd &sdmmc_bus4 &sdmmc_cd_gpio>;
 	vmmc-supply = <&vcc_sd>;
+	status = "okay";
+};
+
+/*
+ * The internal eMMC, on the third MMC controller (mmc@1021c000). It is NOT
+ * behind the NAND controller: the stock firmware reaches it exactly here.
+ * `rk30xxnand_ko`'s NandInit ioremaps 0x1021c000, its eMMC branch (taken on
+ * this board after the raw-NAND FTL init fails -- dmesg "FtlInit!" then
+ * "CardId = 2", "SdmmcInit ret = 0!") drives that controller's PWREN/RST_N
+ * and DMA FIFO at 0x1021c200 over the PL330, requests IRQ 48 and DMA channel
+ * 14, and `emmcGpioInit` muxes GPIO1_C6, GPIO1_C7, GPIO1_D0-D7, GPIO2_A5 and
+ * GPIO2_A7 to their EMMC function (GRF+0xc0/0xc4/0xc8 = 0xf000a000/
+ * 0xffffaaaa/0xcc008800). The NAND controller's IRQ 50 never fires while
+ * IRQ 48 counts the traffic. Its node stays deleted and CONFIG_MTD stays off.
+ *
+ * Clock and divider as the SD card's and as the vendor's `emmc` clock:
+ * GPLL 768 MHz / 16 = 48 MHz on the CIU, the controller's divider gives
+ * 24 MHz on the chip. The vendor ends at 96 MHz; 24 MHz is the first step.
+ *
+ * No fifo-mode: dw_mmc's Linux side does not read the property, only U-Boot
+ * does, and there is no eMMC node in the U-Boot DTB. The controller therefore
+ * runs with the HCON the reset left (internal DMA), which the round records.
+ * Nothing here writes the user area yet -- the kernel enumerates the chip and
+ * scans partitions, and writes only EXT_CSD.
+ */
+&emmc {
+	assigned-clocks = <&cru SCLK_EMMC>;
+	assigned-clock-parents = <&cru PLL_GPLL>;
+	assigned-clock-rates = <48000000>;
+	bus-width = <8>;
+	cap-mmc-highspeed;
+	max-frequency = <25000000>;
+	non-removable;
+	disable-wp;
 	status = "okay";
 };
 

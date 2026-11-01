@@ -22,7 +22,9 @@ rockchipdrm-$(CONFIG_ROCKCHIP_RK3066_HDMI) += rk3066_hdmi.o
 
 obj-$(CONFIG_DRM_ROCKCHIP) += rockchipdrm.o
 
-rk3026-ebc-y := rk3026_ebc.o rk3026_ebc_waveform.o
-rk3026-ebc-$(CONFIG_DRM_RK3026_EBC_MXCFB) += rk3026_ebc_mxcfb.o
+rk3026-ebc-y := rk3026_ebc.o rk3026_ebc_blit.o rk3026_ebc_core.o \
+		rk3026_ebc_waveform.o
 
 obj-$(CONFIG_DRM_RK3026_EBC) += rk3026-ebc.o
+# rk3026_ebc_trace.h, for <trace/define_trace.h>
+CFLAGS_rk3026_ebc.o := -I$(src)

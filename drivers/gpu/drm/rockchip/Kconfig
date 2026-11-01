@@ -164,6 +164,7 @@ config DRM_RK3026_EBC
 	select DRM_CLIENT_SELECTION
 	select DRM_GEM_SHMEM_HELPER
 	select DRM_KMS_HELPER
+	select DRM_PANEL
 	select MFD_SYSCON
 	select VIDEOMODE_HELPERS
 	help
@@ -176,16 +177,3 @@ config DRM_RK3026_EBC
 	  container in /lib/firmware; without one the panel stays blank.
 
 	  This driver is also available as a module called rk3026-ebc.
-
-config DRM_RK3026_EBC_MXCFB
-	bool "mxcfb ioctl compatibility for the RK3026 EBC"
-	depends on DRM_RK3026_EBC
-	depends on DRM_FBDEV_EMULATION
-	default y
-	help
-	  Add the i.MX EPDC ("mxcfb") MXCFB_SEND_UPDATE and
-	  MXCFB_WAIT_FOR_UPDATE_COMPLETE ioctls to the emulated fbdev, so
-	  e-reader userspace can pick a waveform mode, supply a panel
-	  temperature and wait for a refresh to finish. This is not an
-	  upstream interface; without it the display degrades to
-	  single-mode partial refresh rather than breaking.

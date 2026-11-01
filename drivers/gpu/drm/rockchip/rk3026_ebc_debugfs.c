@@ -35,6 +35,10 @@
  *                    finish, read-write; 0: no gap. Used up to
  *                    EBC_TAKE_CAP_MAX_MS: the rails are held while the take
  *                    waits. Probe sets EBC_TAKE_CAP_MS.
+ *   fbdev_console_lock
+ *                    the fbdev emulation's damage is committed under the
+ *                    console lock (rk3026_ebc_fbdev_fb_dirty()), read-write
+ *                    Y/N; N commits without it. Probe sets Y.
  *   timing           text, the blit and snapshot times of the last part and
  *                    the last driven one (rk3026_ebc_timing_show())
  *   flip_timeout_ms  how long a commit event is held at most before the
@@ -469,6 +473,8 @@ void rk3026_ebc_debugfs_init(struct rk3026_ebc *ebc)
 	debugfs_create_u32("a2_max_area", 0644, dir, &ebc->a2_max_area);
 	debugfs_create_u32("take_quiet_us", 0644, dir, &ebc->take_quiet_us);
 	debugfs_create_u32("take_cap_ms", 0644, dir, &ebc->take_cap_ms);
+	debugfs_create_bool("fbdev_console_lock", 0644, dir,
+			    &ebc->fbdev_console_lock);
 	debugfs_create_file("timing", 0444, dir, ebc, &rk3026_ebc_timing_fops);
 	debugfs_create_u32("flip_timeout_ms", 0644, dir, &ebc->flip_timeout_ms);
 	debugfs_create_u32("flip_held", 0444, dir, &ebc->flip_held);

@@ -694,6 +694,31 @@
 		status = "disabled";
 	};
 
+	/*
+	 * Crypto engine at 0x10200000. Nothing documents this block: it is absent from the RK302X datasheet and the
+	 * RK30xx TRM, and its only register reference in existence is the RK3026 BootROM, which drives it for secure
+	 * boot (SHA-256 over the key block, RSA-2048 signature check; rc2-stock/analysis/bootrom/).
+	 *
+	 * The layout is NOT the rk3288 one the driver was written for: the ROM's hash block sits at 0xc0/0xc4 where
+	 * rk3288_crypto.h has AES_KEY_2/AES_KEY_3, and its hash DMA registers are at 0x18/0x1c against HRDMAS/HRDMAL
+	 * at 0x1c/0x20, while INTSTS (0x00, bit 4 hash done) and CTRL (0x08, bit 3 hash start) do match. So the
+	 * compatible below is a probe experiment -- enough for the driver to register its algorithms and for
+	 * rc2-cryptobench to time and check them -- not a claim that it is correct.
+	 *
+	 * Only HCLK_CRYPTO exists in the clock driver, so it is listed once per name the rk3288 variant wants; the
+	 * node's job in the clock tree is to keep that gate claimed and open.
+	 */
+	crypto: crypto@10200000 {
+		compatible = "rockchip,rk3288-crypto";
+		reg = <0x10200000 0x4000>;
+		interrupts = <GIC_SPI 72 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&cru HCLK_CRYPTO>, <&cru HCLK_CRYPTO>,
+			 <&cru HCLK_CRYPTO>, <&cru HCLK_CRYPTO>;
+		clock-names = "aclk", "hclk", "sclk", "apb_pclk";
+		resets = <&cru SRST_CRYPTO>;
+		reset-names = "crypto-rst";
+	};
+
 	nfc: nand-controller@10500000 {
 		compatible = "rockchip,rk3036-nfc", "rockchip,rk2928-nfc";
 		reg = <0x10500000 0x4000>;

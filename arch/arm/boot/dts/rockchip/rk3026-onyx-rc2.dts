@@ -123,11 +123,6 @@
 		};
 	};
 
-	cpus {
-		/* The loader sets the IMEM remap and holds CPU1 in reset. */
-		enable-method = "rockchip,rk3036-smp";
-	};
-
 	/*
 	 * The Rockchip SDK's operating points, voltages above. cpufreq-dt
 	 * raises the voltage before the frequency and lowers it after.

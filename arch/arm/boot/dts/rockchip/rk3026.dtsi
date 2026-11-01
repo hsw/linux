@@ -37,6 +37,7 @@
 	cpus {
 		#address-cells = <1>;
 		#size-cells = <0>;
+		enable-method = "rockchip,rk3036-smp";
 
 		cpu0: cpu@0 {
 			device_type = "cpu";
@@ -195,11 +196,10 @@
 		ranges = <0 0x10080000 0x2000>;
 
 		/*
-		 * CPU1 leaves reset at address 0. A loader that sets
-		 * GRF_SOC_CON0 bit 12 maps IMEM there, and the kernel puts
-		 * its trampoline at IMEM + 0 (rockchip,rk3036-smp, Cortex-A9
-		 * path of platsmp.c). The board dts sets enable-method only
-		 * when its loader sets that remap.
+		 * CPU1 leaves reset at address 0, where GRF_SOC_CON0 bit 12
+		 * maps IMEM. The kernel puts its trampoline at IMEM + 0 and
+		 * sets that remap only while it starts a core
+		 * (rockchip,rk3036-smp, Cortex-A9 path of platsmp.c).
 		 */
 		smp-sram@0 {
 			compatible = "rockchip,rk3066-smp-sram";

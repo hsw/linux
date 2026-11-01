@@ -14137,6 +14137,50 @@ static void ebc_test_blit_rows(struct kunit *test)
 	t_rows_sets(test, rk3026_ebc_blit_rows, rk3026_ebc_ref_blit_rows);
 }
 
+/*
+ * Odd clip edges. t_widen() forces x1 even and round_up(x2, 2), so every clip
+ * the two tests above use has an even length and the row loop's step (4 or 16
+ * pixels) always divides it; the block bound and the tail then agree whatever
+ * the bound is. With an odd length they do not: the block loop runs one
+ * iteration past the clip and the tail writes a byte the block already wrote.
+ */
+static void t_rows_odd(struct kunit *test, t_rows_fn *rows,
+		       t_rows_fn *ref_rows)
+{
+	static const struct t_fix f = { "112x3", 112, 3 };
+	unsigned int pitch = f.w * 4;
+	u8 *out = t_fix_img(test, &f);
+	u8 *ref = t_fix_img(test, &f);
+	u8 *src = kunit_kmalloc(test, (size_t)pitch * f.h, GFP_KERNEL);
+	struct rnd_state rs;
+	int x1, len, bad = 0;
+
+	KUNIT_ASSERT_NOT_NULL(test, src);
+	prandom_seed_state(&rs, 4242);
+	prandom_bytes_state(&rs, src, (size_t)pitch * f.h);
+
+	for (x1 = 0; x1 <= 16; x1++) {
+		for (len = 1; len <= 34; len++) {
+			if (x1 + len > f.w)
+				continue;
+			if (t_rows_vs_ref(test, &f, rows, ref_rows, out, ref,
+					  src, pitch, x1, x1 + len, 0, f.h,
+					  &rs))
+				continue;
+			if (!bad)
+				kunit_info(test, "first odd clip %d..%d\n", x1,
+					   x1 + len);
+			bad++;
+		}
+	}
+	KUNIT_EXPECT_EQ_MSG(test, bad, 0, "clips that differ from the reference");
+}
+
+static void ebc_test_blit_rows_odd(struct kunit *test)
+{
+	t_rows_odd(test, rk3026_ebc_blit_rows, rk3026_ebc_ref_blit_rows);
+}
+
 /* The 4-px stores and the 2-px tail from every start. */
 static void ebc_test_blit_rows_tails(struct kunit *test)
 {
@@ -14192,6 +14236,13 @@ static void ebc_test_blit_neon_tails(struct kunit *test)
 	t_rows_tails(test, t_rows_neon, rk3026_ebc_blit_rows);
 }
 
+/* As ebc_test_blit_rows_odd(), for the NEON rows. */
+static void ebc_test_blit_neon_odd(struct kunit *test)
+{
+	if (!t_neon_ready(test))
+		return;
+	t_rows_odd(test, t_rows_neon, rk3026_ebc_blit_rows);
+}
 #else
 /* No NEON rows: a skip. */
 static void ebc_test_blit_neon_rows(struct kunit *test)
@@ -14200,6 +14251,11 @@ static void ebc_test_blit_neon_rows(struct kunit *test)
 }
 
 static void ebc_test_blit_neon_tails(struct kunit *test)
+{
+	t_neon_ready(test);
+}
+
+static void ebc_test_blit_neon_odd(struct kunit *test)
 {
 	t_neon_ready(test);
 }
@@ -14752,8 +14808,10 @@ static struct kunit_case rk3026_ebc_conv_test_cases[] = {
 	KUNIT_CASE(ebc_test_ref_blit),
 	KUNIT_CASE(ebc_test_blit_rows),
 	KUNIT_CASE(ebc_test_blit_rows_tails),
+	KUNIT_CASE(ebc_test_blit_rows_odd),
 	KUNIT_CASE(ebc_test_blit_neon_rows),
 	KUNIT_CASE(ebc_test_blit_neon_tails),
+	KUNIT_CASE(ebc_test_blit_neon_odd),
 	KUNIT_CASE(ebc_test_blit_convert),
 	KUNIT_CASE(ebc_test_grey_level),
 	KUNIT_CASE(ebc_test_r8_rows),

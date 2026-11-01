@@ -711,7 +711,7 @@
 	crypto: crypto@10200000 {
 		compatible = "rockchip,rk3288-crypto";
 		reg = <0x10200000 0x4000>;
-		interrupts = <GIC_SPI 72 IRQ_TYPE_LEVEL_HIGH>;
+		interrupts = <GIC_SPI 40 IRQ_TYPE_LEVEL_HIGH>;
 		clocks = <&cru HCLK_CRYPTO>, <&cru HCLK_CRYPTO>,
 			 <&cru HCLK_CRYPTO>, <&cru HCLK_CRYPTO>;
 		clock-names = "aclk", "hclk", "sclk", "apb_pclk";

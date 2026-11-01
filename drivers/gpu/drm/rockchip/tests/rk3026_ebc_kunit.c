@@ -4443,6 +4443,274 @@ static void ebc_test_rkf_auto_overlay(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, t_rkf_frames(wf, EBC_MODE_PART), 3);
 }
 
+/*
+ * The decoded LUT *bytes*, and the temperature slot that selects them.
+ *
+ * Every test above asks for a frame count and nothing else, so the whole
+ * expansion path -- RESET, GRAY2, and the GRAY2 overlay onto GRAY16 -- is free
+ * to produce any bytes at all and still pass. These pin the bytes, and the
+ * bucket walk that chooses which offset-table slot a temperature reads.
+ */
+
+/* The GRAY16 temperature table, where rkf_modes[] reads it. */
+#define T_RKF_GRAY16_TEMP	0x0d0
+
+struct t_rkf_plan {
+	u32	table;		/* the mode's offset-table base */
+	u8	frames;
+	u8	pat;		/* stream fill seed, so no decoded word is zero */
+	u8	slot;		/* offset-table slot to publish in */
+};
+
+/*
+ * Not a constant fill: a constant stream decodes to a constant symbol, and
+ * then a wrong byte index in the expansion still lands on the same value.
+ */
+static void t_rkf_fill(u8 *p, size_t n, u8 seed)
+{
+	size_t i;
+
+	for (i = 0; i < n; i++)
+		p[i] = (u8)(seed * 31 + i * 97 + (i >> 3));
+}
+
+/*
+ * A varied weight table, stored obfuscated as a pristine one is. The all-ones
+ * table t_rkf_alloc() writes is degenerate: the canonical tree comes out a
+ * comb, one symbol takes almost the whole stream, and the decoded bytes are
+ * nearly constant however the stream is filled.
+ */
+static void t_rkf_weights(u8 *buf)
+{
+	static const u32 key[2] = { 0xaa55aa55, 0x55aa55aa };
+	int i;
+
+	for (i = 0; i < 256; i++)
+		put_unaligned_le32((u32)(1 + i % 13) ^ key[i & 1],
+				   buf + 0x6d0 + i * 4);
+}
+
+static size_t t_rkf_stream_of(u32 table, u8 frames)
+{
+	switch (table) {
+	case T_RKF_RESET:
+		return (frames + 3) >> 2;
+	case T_RKF_GRAY2:
+		return frames * 8;
+	default:
+		return frames * EBC_LUT_FRAME_BYTES;
+	}
+}
+
+/*
+ * As t_rkf_wf(), but each segment's stream is filled with plan->pat and the
+ * GRAY16 temperature table is a real boundary table, so the bucket walk is not
+ * a constant: bucket i for temp < 0x10 * (i + 1).
+ */
+static struct ebc_waveform *t_rkf_build(struct kunit *test, struct device *dev,
+					const struct t_rkf_plan *plan,
+					unsigned int n)
+{
+	struct ebc_waveform *wf;
+	size_t size = T_RKF_PAYLOAD;
+	unsigned int i;
+	u8 *buf;
+
+	for (i = 0; i < n; i++)
+		size += 4 + t_rkf_stream_of(plan[i].table, plan[i].frames);
+	buf = t_rkf_alloc(test, size, size + 4);
+	t_rkf_weights(buf);
+
+	for (i = 0; i < 0x32; i++)
+		buf[T_RKF_GRAY16_TEMP + i] = 0x10 * (i + 1);
+
+	size = T_RKF_PAYLOAD;
+	for (i = 0; i < n; i++) {
+		size_t len = t_rkf_stream_of(plan[i].table, plan[i].frames);
+
+		put_unaligned_le32(size, buf + plan[i].table + plan[i].slot * 4);
+		buf[size] = plan[i].frames;
+		t_rkf_fill(buf + size + 4, len, plan[i].pat);
+		size += 4 + len;
+	}
+	t_rkf_seal(buf, size);
+
+	wf = rk3026_ebc_waveform_parse(dev, buf, size + 4);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, wf);
+	return wf;
+}
+
+static const u8 *t_rkf_lut_of(struct kunit *test, struct device *dev,
+			      const struct t_rkf_plan *plan, unsigned int n,
+			      u32 mode, int temp, u32 *frames)
+{
+	struct ebc_waveform *wf = t_rkf_build(test, dev, plan, n);
+
+	*frames = 0;
+	return rk3026_ebc_waveform_lut(wf, mode, temp, frames);
+}
+
+/*
+ * The bytes below were captured from the unmutated tree at
+ * 0df2f9e2e76c and are the whole point of the test: they are what the panel
+ * would be driven with. A mutant that changes any of them is caught here.
+ */
+static void ebc_test_rkf_lut_bytes(struct kunit *test)
+{
+	static const struct t_rkf_plan reset[] = { { T_RKF_RESET, 2, 0x5a, 0 } };
+	static const struct t_rkf_plan gray16[] = { { T_RKF_GRAY16, 2, 0xa5, 0 } };
+	static const struct t_rkf_plan gray2[] = { { T_RKF_GRAY2, 2, 0x3c, 0 } };
+	static const struct t_rkf_plan overlay[] = {
+		{ T_RKF_GRAY16, 2, 0xa5, 0 }, { T_RKF_GRAY2, 2, 0x3c, 0 },
+	};
+	static const u8 want_reset[2 * EBC_LUT_FRAME_BYTES] = {
+		0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+		0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+		0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+		0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+		0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+		0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+		0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+		0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	};
+	static const u8 want_gray16[2 * EBC_LUT_FRAME_BYTES] = {
+		0xf3, 0x46, 0xbd, 0x8c, 0x59, 0xcc, 0x31, 0x18,
+		0x99, 0xa6, 0xe9, 0xa8, 0xc0, 0x1d, 0x09, 0xa7,
+		0xe8, 0x03, 0x6f, 0xd5, 0xf6, 0xb3, 0x59, 0xb3,
+		0x20, 0x47, 0x3b, 0xca, 0xf1, 0xfa, 0x07, 0x55,
+		0xe0, 0x6e, 0x64, 0x7f, 0x4b, 0x4b, 0xa8, 0xe1,
+		0xe0, 0x65, 0xce, 0x8e, 0xa5, 0xb3, 0x23, 0xa0,
+		0x39, 0x3b, 0xed, 0x9f, 0x8b, 0xe8, 0x2c, 0x9b,
+		0x20, 0xb2, 0x24, 0xdb, 0xd7, 0x44, 0x6f, 0x10,
+		0xa4, 0x32, 0xcd, 0x3f, 0x99, 0x4b, 0x1b, 0x32,
+		0x61, 0xc0, 0x08, 0xf6, 0xf0, 0x24, 0x25, 0x98,
+		0x17, 0x0b, 0xf4, 0xf9, 0x39, 0x87, 0x19, 0x5e,
+		0xcf, 0x08, 0x97, 0xbe, 0xa5, 0xd9, 0xad, 0x24,
+		0x8e, 0x81, 0x7b, 0xba, 0xd5, 0x85, 0xdb, 0x9b,
+		0x0c, 0x75, 0x2c, 0x7f, 0x91, 0x61, 0xbb, 0xc0,
+		0x98, 0xe8, 0x63, 0x0a, 0x8a, 0x19, 0x8d, 0x89,
+		0x90, 0xf5, 0x2f, 0xd8, 0x31, 0xf4, 0x72, 0x3e,
+	};
+	static const u8 want_gray2[2 * EBC_LUT_FRAME_BYTES] = {
+		0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0xc0,
+		0x00, 0x00, 0x00, 0xc0, 0x02, 0x00, 0x00, 0x40,
+		0x03, 0x00, 0x00, 0x80, 0x02, 0x00, 0x00, 0x80,
+		0x01, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00,
+		0x02, 0x00, 0x00, 0x40, 0x01, 0x00, 0x00, 0x40,
+		0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+		0x02, 0x00, 0x00, 0xc0, 0x02, 0x00, 0x00, 0x00,
+		0x03, 0x00, 0x00, 0x40, 0x03, 0x00, 0x00, 0x40,
+		0x03, 0x00, 0x00, 0x80, 0x03, 0x00, 0x00, 0x00,
+		0x02, 0x00, 0x00, 0xc0, 0x03, 0x00, 0x00, 0x40,
+		0x01, 0x00, 0x00, 0x80, 0x01, 0x00, 0x00, 0xc0,
+		0x01, 0x00, 0x00, 0xc0, 0x01, 0x00, 0x00, 0x00,
+		0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0,
+		0x03, 0x00, 0x00, 0x40, 0x03, 0x00, 0x00, 0xc0,
+		0x02, 0x00, 0x00, 0x40, 0x02, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0xc0,
+	};
+	static const u8 want_overlay[2 * EBC_LUT_FRAME_BYTES] = {
+		0xf0, 0x46, 0xbd, 0x8c, 0x58, 0xcc, 0x31, 0xd8,
+		0x98, 0xa6, 0xe9, 0xe8, 0xc2, 0x1d, 0x09, 0x67,
+		0xeb, 0x03, 0x6f, 0x95, 0xf6, 0xb3, 0x59, 0xb3,
+		0x21, 0x47, 0x3b, 0x0a, 0xf3, 0xfa, 0x07, 0x15,
+		0xe2, 0x6e, 0x64, 0x7f, 0x49, 0x4b, 0xa8, 0x61,
+		0xe2, 0x65, 0xce, 0x0e, 0xa5, 0xb3, 0x23, 0x20,
+		0x3a, 0x3b, 0xed, 0xdf, 0x8a, 0xe8, 0x2c, 0x1b,
+		0x23, 0xb2, 0x24, 0x5b, 0xd7, 0x44, 0x6f, 0x50,
+		0xa7, 0x32, 0xcd, 0xbf, 0x9b, 0x4b, 0x1b, 0x32,
+		0x62, 0xc0, 0x08, 0xf6, 0xf3, 0x24, 0x25, 0x58,
+		0x15, 0x0b, 0xf4, 0xb9, 0x39, 0x87, 0x19, 0xde,
+		0xcd, 0x08, 0x97, 0xfe, 0xa5, 0xd9, 0xad, 0x24,
+		0x8d, 0x81, 0x7b, 0x3a, 0xd4, 0x85, 0xdb, 0xdb,
+		0x0f, 0x75, 0x2c, 0x7f, 0x93, 0x61, 0xbb, 0xc0,
+		0x9a, 0xe8, 0x63, 0x4a, 0x8a, 0x19, 0x8d, 0x09,
+		0x90, 0xf5, 0x2f, 0x18, 0x31, 0xf4, 0x72, 0xfe,
+	};
+	struct device *dev = t_rkf_dev(test);
+	const u8 *lut;
+	u32 frames;
+
+	lut = t_rkf_lut_of(test, dev, reset, ARRAY_SIZE(reset),
+			   EBC_MODE_RESET, 25, &frames);
+	KUNIT_ASSERT_NOT_NULL(test, lut);
+	KUNIT_ASSERT_EQ(test, frames, 2);
+	KUNIT_EXPECT_MEMEQ(test, lut, want_reset, sizeof(want_reset));
+
+	lut = t_rkf_lut_of(test, dev, gray16, ARRAY_SIZE(gray16),
+			   EBC_MODE_FULL, 25, &frames);
+	KUNIT_ASSERT_NOT_NULL(test, lut);
+	KUNIT_ASSERT_EQ(test, frames, 2);
+	KUNIT_EXPECT_MEMEQ(test, lut, want_gray16, sizeof(want_gray16));
+
+	lut = t_rkf_lut_of(test, dev, gray2, ARRAY_SIZE(gray2),
+			   EBC_MODE_BLACK_WHITE, 25, &frames);
+	KUNIT_ASSERT_NOT_NULL(test, lut);
+	KUNIT_ASSERT_EQ(test, frames, 2);
+	KUNIT_EXPECT_MEMEQ(test, lut, want_gray2, sizeof(want_gray2));
+
+	lut = t_rkf_lut_of(test, dev, overlay, ARRAY_SIZE(overlay),
+			   EBC_MODE_AUTO, 25, &frames);
+	KUNIT_ASSERT_NOT_NULL(test, lut);
+	KUNIT_ASSERT_EQ(test, frames, 2);
+	KUNIT_EXPECT_MEMEQ(test, lut, want_overlay, sizeof(want_overlay));
+}
+
+/*
+ * The temperature bucket walks the mode's table and picks the offset slot.
+ * With an all-zero table every temperature lands in slot 0, so nothing above
+ * can tell the walk apart from a constant.
+ */
+static void ebc_test_rkf_temp_slot(struct kunit *test)
+{
+	static const struct t_rkf_plan plan[] = {
+		{ T_RKF_GRAY16, 1, 0x11, 0 },
+		{ T_RKF_GRAY16, 1, 0x22, 1 },
+		{ T_RKF_GRAY16, 1, 0x33, 2 },
+	};
+	struct device *dev = t_rkf_dev(test);
+	const u8 *cold, *warm, *hot, *over, *under;
+	u32 f;
+
+	/* 0x05 -> slot 0, 0x25 -> slot 1, 0x35 -> slot 2, under the first
+	 * boundary -> slot 0, over the table -> the clamp, i.e. slot 2.
+	 */
+	cold = t_rkf_lut_of(test, dev, plan, ARRAY_SIZE(plan), EBC_MODE_FULL,
+			    0x05, &f);
+	warm = t_rkf_lut_of(test, dev, plan, ARRAY_SIZE(plan), EBC_MODE_FULL,
+			    0x25, &f);
+	hot = t_rkf_lut_of(test, dev, plan, ARRAY_SIZE(plan), EBC_MODE_FULL,
+			   0x35, &f);
+	over = t_rkf_lut_of(test, dev, plan, ARRAY_SIZE(plan), EBC_MODE_FULL,
+			    0x60, &f);
+	under = t_rkf_lut_of(test, dev, plan, ARRAY_SIZE(plan), EBC_MODE_FULL,
+			     -5, &f);
+
+	KUNIT_ASSERT_NOT_NULL(test, cold);
+	KUNIT_ASSERT_NOT_NULL(test, warm);
+	KUNIT_ASSERT_NOT_NULL(test, hot);
+	KUNIT_ASSERT_NOT_NULL(test, over);
+	KUNIT_ASSERT_NOT_NULL(test, under);
+
+	/* Three temperatures, three slots, three different streams. */
+	KUNIT_EXPECT_NE(test, memcmp(cold, warm, EBC_LUT_FRAME_BYTES), 0);
+	KUNIT_EXPECT_NE(test, memcmp(warm, hot, EBC_LUT_FRAME_BYTES), 0);
+	KUNIT_EXPECT_NE(test, memcmp(cold, hot, EBC_LUT_FRAME_BYTES), 0);
+	/* Below the first boundary is the first slot, above the table is the
+	 * clamp at 0x31, which is the last slot the table names.
+	 */
+	KUNIT_EXPECT_EQ(test, memcmp(cold, under, EBC_LUT_FRAME_BYTES), 0);
+	KUNIT_EXPECT_EQ(test, memcmp(hot, over, EBC_LUT_FRAME_BYTES), 0);
+}
+
 /* Containers whose size field does not match the buffer are refused. */
 static void ebc_test_rkf_parse_bounds(struct kunit *test)
 {
@@ -4500,6 +4768,8 @@ static struct kunit_case rk3026_ebc_waveform_test_cases[] = {
 	KUNIT_CASE(ebc_test_rkf_truncated_modes),
 	KUNIT_CASE(ebc_test_rkf_fallbacks),
 	KUNIT_CASE(ebc_test_rkf_auto_overlay),
+	KUNIT_CASE(ebc_test_rkf_lut_bytes),
+	KUNIT_CASE(ebc_test_rkf_temp_slot),
 	KUNIT_CASE(ebc_test_rkf_parse_bounds),
 	{}
 };
@@ -13870,6 +14140,7 @@ static void ebc_test_blit_neon_tails(struct kunit *test)
 		return;
 	t_rows_tails(test, t_rows_neon, rk3026_ebc_blit_rows);
 }
+
 #else
 /* No NEON rows: a skip. */
 static void ebc_test_blit_neon_rows(struct kunit *test)

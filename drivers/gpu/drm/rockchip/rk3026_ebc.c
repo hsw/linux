@@ -17,6 +17,7 @@
  */
 
 #include <linux/clk.h>
+#include <linux/console.h>
 #include <linux/delay.h>
 #include <linux/dma-fence.h>
 #include <linux/dma-mapping.h>
@@ -3082,14 +3083,155 @@ static const struct drm_mode_config_helper_funcs ebc_mode_config_helper_funcs = 
 DEFINE_DRM_GEM_FOPS(ebc_fops);
 
 #ifdef CONFIG_DRM_FBDEV_EMULATION
+/* Fold the damage reported since the worker took @clip into @clip. */
+static void ebc_fbdev_fold(struct drm_fb_helper *helper,
+			   struct drm_clip_rect *clip)
+{
+	struct drm_clip_rect *pending = &helper->damage_clip;
+	unsigned long flags;
+
+	spin_lock_irqsave(&helper->damage_lock, flags);
+	clip->x1 = min(clip->x1, pending->x1);
+	clip->y1 = min(clip->y1, pending->y1);
+	clip->x2 = max(clip->x2, pending->x2);
+	clip->y2 = max(clip->y2, pending->y2);
+	pending->x1 = USHRT_MAX;
+	pending->y1 = USHRT_MAX;
+	pending->x2 = 0;
+	pending->y2 = 0;
+	spin_unlock_irqrestore(&helper->damage_lock, flags);
+}
+
+/* Whether @clip holds any area. */
+static bool ebc_clip_set(const struct drm_clip_rect *clip)
+{
+	return clip->x1 < clip->x2 && clip->y1 < clip->y2;
+}
+
+/* Whether @clip, or the damage reported since the worker took it, is set. */
+static bool ebc_fbdev_damaged(struct drm_fb_helper *helper,
+			      const struct drm_clip_rect *clip)
+{
+	const struct drm_clip_rect *pending = &helper->damage_clip;
+	unsigned long flags;
+	bool damaged;
+
+	if (ebc_clip_set(clip))
+		return true;
+	spin_lock_irqsave(&helper->damage_lock, flags);
+	damaged = ebc_clip_set(pending);
+	spin_unlock_irqrestore(&helper->damage_lock, flags);
+	return damaged;
+}
+
+/**
+ * rk3026_ebc_fbdev_fb_dirty - commit fbdev damage under the console lock
+ * @helper: the fbdev emulation's helper
+ * @clip: the damage the worker took, in framebuffer pixels
+ *
+ * The fbdev damage worker (drm_fb_helper_damage_work()) holds no lock
+ * shared with fbcon, so without this the plane update's blit reads the
+ * shmem framebuffer while fbcon, on another CPU, may still be scrolling
+ * it. The target then holds the screen from two scroll positions, and the
+ * part that drives it leaves the tear on the panel for a whole waveform.
+ *
+ * The commit runs under console_lock(): fbcon draws only under it, so the
+ * blit sees whole console writes. Damage that fbcon reported between the
+ * worker taking @clip and the lock is folded into @clip and taken off the
+ * helper, so every damaged area is read from the same console state. On
+ * an error the worker puts @clip back as its pending damage. With nothing
+ * to commit, as on the worker's run after a fold took its damage, it
+ * returns at once, without the lock. With debugfs fbdev_console_lock N
+ * the commit runs without the lock; the damage reported meanwhile is
+ * still folded in.
+ *
+ * This leans on drm_fb_helper_fb_dirty() as it is: it takes @clip off
+ * @damage_clip under @damage_lock before it calls fb_dirty, an empty clip
+ * is x1 = y1 = USHRT_MAX, x2 = y2 = 0, and fb_dirty is the emulation's only
+ * callback (rk3026_ebc_fbdev_wrap()).
+ *
+ * Lock order: console_lock, then the modeset locks of the commit
+ * (drm_atomic_helper_dirtyfb()), then @image_lock in the plane update;
+ * the order fbcon itself uses for blank and set_par. The lock is never
+ * taken inside the commit: fbcon blank holds it while it waits for the
+ * modeset locks. The commit blocks, and the console stays locked while
+ * it waits: for a KMS client's blocking commit that holds the modeset
+ * locks (a CRTC enable waits for its RESET), or behind a commit event
+ * held for its part (drm_atomic_helper_wait_for_dependencies()), up to
+ * @flip_timeout_ms. fbcon and the console output of printk wait as long,
+ * and console_unlock() then prints the backlog to every console from
+ * this worker. drm_fb_helper_set_suspend_unlocked(), which this driver
+ * does not call on sleep, cancels the damage worker before it takes the
+ * console lock.
+ *
+ * Returns what the wrapped fb_dirty returns, or 0 with nothing to commit.
+ */
+VISIBLE_IF_KUNIT int rk3026_ebc_fbdev_fb_dirty(struct drm_fb_helper *helper,
+					       struct drm_clip_rect *clip)
+{
+	struct rk3026_ebc *ebc = drm_to_ebc(helper->dev);
+	bool lock;
+	int ret;
+
+	if (!ebc_fbdev_damaged(helper, clip))
+		return 0;
+	lock = READ_ONCE(ebc->fbdev_console_lock);
+	if (lock)
+		console_lock();
+	ebc_fbdev_fold(helper, clip);
+	ret = ebc->fbdev_funcs->fb_dirty(helper, clip);
+	if (lock)
+		console_unlock();
+	return ret;
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_fbdev_fb_dirty);
+
+static const struct drm_fb_helper_funcs ebc_fbdev_helper_funcs = {
+	.fb_dirty	= rk3026_ebc_fbdev_fb_dirty,
+};
+
+/**
+ * rk3026_ebc_fbdev_wrap - put rk3026_ebc_fbdev_fb_dirty() in front of the
+ *			   fbdev emulation's fb_dirty
+ * @ebc: the device
+ * @helper: the fbdev emulation's helper, after its fbdev probe
+ *
+ * Called at each fbdev probe, which sets the callbacks anew. A set with
+ * more than fb_dirty, or without it, warns once: only callbacks that
+ * have fb_dirty and nothing else are wrapped (drm_fbdev_shmem.c's), as
+ * the wrapper forwards fb_dirty alone; any other set is kept as it is,
+ * and its damage is committed without the console lock.
+ */
+VISIBLE_IF_KUNIT void rk3026_ebc_fbdev_wrap(struct rk3026_ebc *ebc,
+					    struct drm_fb_helper *helper)
+{
+	const struct drm_fb_helper_funcs *funcs = helper->funcs;
+
+	if (drm_WARN_ON_ONCE(helper->dev, !funcs->fb_dirty ||
+			     funcs->fb_restore || funcs->fb_set_suspend))
+		return;
+	/*
+	 * Plain stores: this runs in the fbdev probe, before the emulation
+	 * registers its fb_info, so nothing calls fb_dirty yet; the damage
+	 * worker that does is queued only after that, and queueing a work
+	 * orders these stores before it runs.
+	 */
+	ebc->fbdev_funcs = funcs;
+	helper->funcs = &ebc_fbdev_helper_funcs;
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_fbdev_wrap);
+
 static int ebc_fbdev_probe(struct drm_fb_helper *helper,
 			   struct drm_fb_helper_surface_size *sizes)
 {
+	struct rk3026_ebc *ebc = drm_to_ebc(helper->dev);
 	int ret = drm_fbdev_shmem_driver_fbdev_probe(helper, sizes);
 
-	if (!ret)
-		rk3026_ebc_mxcfb_install(drm_to_ebc(helper->dev), helper->info);
-	return ret;
+	if (ret)
+		return ret;
+	rk3026_ebc_mxcfb_install(ebc, helper->info);
+	rk3026_ebc_fbdev_wrap(ebc, helper);
+	return 0;
 }
 #endif
 
@@ -3562,6 +3704,8 @@ static int ebc_probe(struct platform_device *pdev)
 	/* A burst of updates is taken once it has been quiet this long. */
 	ebc->take_quiet_us = EBC_TAKE_QUIET_US;
 	ebc->take_cap_ms = EBC_TAKE_CAP_MS;
+	/* fbdev damage is read under the console lock. */
+	ebc->fbdev_console_lock = true;
 	/* Every part in its own mode. */
 	ebc->force_mode = -1;
 	/* The rails stay up this long after a waveform. */

@@ -187,6 +187,9 @@
 
 struct clk;
 struct dentry;
+struct drm_clip_rect;
+struct drm_fb_helper;
+struct drm_fb_helper_funcs;
 struct fb_info;
 struct fb_ops;
 struct firmware;
@@ -1150,6 +1153,17 @@ struct rk3026_ebc {
 	bool			mxcfb_active;
 
 	/*
+	 * fbdev damage commits (rk3026_ebc_fbdev_fb_dirty()). @fbdev_funcs
+	 * are the fbdev emulation's own callbacks, wrapped by the driver's;
+	 * set at each fbdev probe (rk3026_ebc_fbdev_wrap()), unused when
+	 * they are not wrapped. @fbdev_console_lock: commit under the console
+	 * lock. Probe sets it; debugfs may change it, and the damage worker
+	 * reads it with READ_ONCE().
+	 */
+	const struct drm_fb_helper_funcs *fbdev_funcs;
+	bool			fbdev_console_lock;
+
+	/*
 	 * The commit being applied: rk3026_ebc_commit_begin() clears
 	 * @commit_queued, and its plane update sets it with @commit_seq, the
 	 * seq of the update it queued (rk3026_ebc_plane_update(), under
@@ -1291,6 +1305,12 @@ void rk3026_ebc_sleep_end(struct rk3026_ebc *ebc);
 void rk3026_ebc_sleep_restore(struct rk3026_ebc *ebc);
 int rk3026_ebc_crtc_wait(struct rk3026_ebc *ebc, u32 seq,
 			 unsigned int timeout_ms);
+#if IS_ENABLED(CONFIG_DRM_FBDEV_EMULATION)
+int rk3026_ebc_fbdev_fb_dirty(struct drm_fb_helper *helper,
+			      struct drm_clip_rect *clip);
+void rk3026_ebc_fbdev_wrap(struct rk3026_ebc *ebc,
+			   struct drm_fb_helper *helper);
+#endif
 #endif
 
 /* rk3026_ebc_blit.c */

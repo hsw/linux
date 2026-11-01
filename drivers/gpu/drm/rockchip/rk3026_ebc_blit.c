@@ -11,6 +11,10 @@
  * and the nibble is its top four bits. rk3026_ebc_blit_rows() takes the
  * same few operations for every pixel, with no test of the content, so
  * every page costs the same.
+ *
+ * With CONFIG_DRM_RK3026_EBC_NEON, rk3026_ebc_blit_convert() runs the NEON
+ * rows of rk3026_ebc_blit_neon.c instead where it can, and these rows
+ * everywhere else.
  */
 
 #include <linux/compiler.h>
@@ -22,7 +26,13 @@
 
 #include <kunit/visibility.h>
 
+#if IS_ENABLED(CONFIG_DRM_RK3026_EBC_NEON)
+#include <asm/neon.h>
+#include <asm/simd.h>
+#endif
+
 #include "rk3026_ebc.h"
+#include "rk3026_ebc_blit_neon.h"
 
 /*
  * The luma of one XRGB8888 pixel @p in bits 31:24, so its nibble is in bits
@@ -88,8 +98,60 @@ void rk3026_ebc_blit_rows(u8 *dst, const void *src, unsigned int src_pitch,
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_blit_rows);
 
+#if IS_ENABLED(CONFIG_DRM_RK3026_EBC_NEON)
+/*
+ * Rows per kernel-mode NEON section. A section disables preemption and
+ * softirqs; 64 full rows of a 1448x1072 panel take about 0.5 ms on a
+ * Cortex-A9 at 600 MHz.
+ */
+#define EBC_NEON_BAND_ROWS	64
+
+/* Exported here: rk3026_ebc_blit_neon.c includes no kernel header. */
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_blit_rows_neon);
+
+/* The NEON rows are built in and this CPU can run them. */
+static bool ebc_neon_cpu(void)
+{
+	return cpu_has_neon();
+}
+
+/*
+ * The NEON rows on the clip, one band of rows per section, if NEON may run
+ * here and the clip holds at least one 16-pixel block; else false and
+ * nothing written.
+ */
+static bool ebc_blit_neon(u8 *dst, const void *src, unsigned int src_pitch,
+			  int x1, int x2, int y1, int y2, unsigned int width)
+{
+	int y;
+
+	if (x2 - x1 < 16 || !ebc_neon_cpu() || !may_use_simd())
+		return false;
+
+	for (y = y1; y < y2; y += EBC_NEON_BAND_ROWS) {
+		int end = min(y + EBC_NEON_BAND_ROWS, y2);
+
+		scoped_ksimd()
+			rk3026_ebc_blit_rows_neon(dst, src, src_pitch, x1, x2,
+						  y, end, width);
+	}
+	return true;
+}
+#else
+static bool ebc_neon_cpu(void)
+{
+	return false;
+}
+
+static bool ebc_blit_neon(u8 *dst, const void *src, unsigned int src_pitch,
+			  int x1, int x2, int y1, int y2, unsigned int width)
+{
+	return false;
+}
+#endif
+
 /**
- * rk3026_ebc_blit_convert - convert XRGB8888 rows
+ * rk3026_ebc_blit_convert - convert XRGB8888 rows, with NEON if it can
  * @dst: target image, @width / 2 bytes per row, low nibble first
  * @src: XRGB8888 source, top-left of the whole framebuffer
  * @src_pitch: source stride in bytes
@@ -99,13 +161,18 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_blit_rows);
  * @y2: end row, above @y1
  * @width: image width in pixels
  *
- * The conversion of the refresh path: rk3026_ebc_blit_rows().
+ * rk3026_ebc_blit_rows_neon() when the driver has it, the CPU has NEON,
+ * may_use_simd() allows it and the clip is at least 16 pixels wide;
+ * rk3026_ebc_blit_rows() otherwise. Both write the same bytes, so the
+ * choice only changes the time.
  */
 void rk3026_ebc_blit_convert(u8 *dst, const void *src, unsigned int src_pitch,
 			     int x1, int x2, int y1, int y2,
 			     unsigned int width)
 {
-	rk3026_ebc_blit_rows(dst, src, src_pitch, x1, x2, y1, y2, width);
+	if (!ebc_blit_neon(dst, src, src_pitch, x1, x2, y1, y2, width))
+		rk3026_ebc_blit_rows(dst, src, src_pitch, x1, x2, y1, y2,
+				     width);
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_blit_convert);
 
@@ -115,10 +182,11 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_blit_convert);
  * For the probe line and debugfs "timing", so a measured blit time says
  * which loop it is from.
  *
- * Returns "scalar", the rows of rk3026_ebc_blit_rows().
+ * Returns "neon" if rk3026_ebc_blit_convert() takes the NEON rows for a
+ * clip of 16 pixels or more in process context, else "scalar".
  */
 const char *rk3026_ebc_blit_impl(void)
 {
-	return "scalar";
+	return ebc_neon_cpu() ? "neon" : "scalar";
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_blit_impl);

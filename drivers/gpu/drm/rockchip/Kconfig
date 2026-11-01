@@ -177,3 +177,15 @@ config DRM_RK3026_EBC
 	  container in /lib/firmware; without one the panel stays blank.
 
 	  This driver is also available as a module called rk3026-ebc.
+
+config DRM_RK3026_EBC_NEON
+	bool "NEON conversion for the RK3026 EBC"
+	depends on DRM_RK3026_EBC && ARM && KERNEL_MODE_NEON
+	default y
+	help
+	  Convert the XRGB8888 framebuffer to the panel's 4-bit grey with
+	  NEON where the CPU has it, in short kernel-mode NEON sections.
+	  The plain C conversion stays for every other case and gives the
+	  same bytes, so turning this off only makes the conversion slower.
+
+	  If unsure, say Y.

@@ -1067,7 +1067,7 @@ struct rk3026_ebc {
 	 * still on. @rails_on is "either is on", for the thread's lockless
 	 * timeout. All three under @rails_lock.
 	 */
-	struct mutex		rails_lock;
+	struct mutex		rails_lock;	/* rails vs CRTC disable */
 	bool			rails_on;
 	bool			epd_on;
 	bool			vcom_on;
@@ -1107,8 +1107,8 @@ struct rk3026_ebc {
 	struct ebc_waveform	*waveform;
 
 	/*
-	 * mxcfb shim state; unused when the shim is not built. @fbops is
-	 * drm-managed, see rk3026_ebc_mxcfb_install().
+	 * mxcfb shim state; unused when the shim is not built. @fbops is the
+	 * shim's writable, drm-managed copy, see rk3026_ebc_mxcfb_install().
 	 */
 	struct fb_ops		*fbops;
 	const struct fb_ops	*orig_fbops;

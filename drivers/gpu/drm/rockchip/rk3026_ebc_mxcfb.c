@@ -9,7 +9,8 @@
  * translates it into the driver's internal update API.
  *
  * It is deliberately a leaf: nothing in the DRM driver depends on it, and
- * building without it leaves a working single-mode partial-refresh display.
+ * building without it leaves a working display whose updates all take the
+ * plane path, with the waveform picked from the content.
  *
  * Copyright (C) 2026
  */
@@ -287,6 +288,7 @@ static int ebc_fb_release(struct fb_info *info, int user)
  */
 void rk3026_ebc_mxcfb_install(struct rk3026_ebc *ebc, struct fb_info *info)
 {
+	/* Not const: a copy whose entry points this shim replaces. */
 	struct fb_ops *ops;
 
 	if (!info || !info->fbops)

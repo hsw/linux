@@ -188,8 +188,10 @@ config DRM_RK3026_EBC_MXCFB
 	  MXCFB_WAIT_FOR_UPDATE_COMPLETE ioctls to the emulated fbdev, so
 	  e-reader userspace can pick a waveform mode, supply a panel
 	  temperature and wait for a refresh to finish. This is not an
-	  upstream interface; without it the display degrades to
-	  single-mode partial refresh rather than breaking.
+	  upstream interface; without it every update takes the plane
+	  path, whose waveform the driver picks from the content, so
+	  the display keeps working without client-chosen modes,
+	  temperatures or completion waits.
 
 config DRM_RK3026_EBC_NEON
 	bool "NEON conversion for the RK3026 EBC"

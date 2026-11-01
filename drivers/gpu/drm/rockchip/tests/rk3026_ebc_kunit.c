@@ -4503,13 +4503,28 @@ static size_t t_rkf_stream_of(u32 table, u8 frames)
 }
 
 /*
+ * Undo the obfuscation of the weight table in place, as reading a container
+ * back out of the driver's staging buffer does. The CRC word is left as it
+ * was: for a plain table the driver re-applies the key before hashing, so the
+ * same word still closes.
+ */
+static void t_rkf_unobfuscate(u8 *buf)
+{
+	static const u32 key[2] = { 0xaa55aa55, 0x55aa55aa };
+	int i;
+
+	for (i = 0; i < 256 * 4; i++)
+		buf[0x6d0 + i] ^= (key[(i / 4) & 1] >> (8 * (i & 3))) & 0xff;
+}
+
+/*
  * As t_rkf_wf(), but each segment's stream is filled with plan->pat and the
  * GRAY16 temperature table is a real boundary table, so the bucket walk is not
  * a constant: bucket i for temp < 0x10 * (i + 1).
  */
 static struct ebc_waveform *t_rkf_build(struct kunit *test, struct device *dev,
 					const struct t_rkf_plan *plan,
-					unsigned int n)
+					unsigned int n, bool plain)
 {
 	struct ebc_waveform *wf;
 	size_t size = T_RKF_PAYLOAD;
@@ -4534,6 +4549,8 @@ static struct ebc_waveform *t_rkf_build(struct kunit *test, struct device *dev,
 		size += 4 + len;
 	}
 	t_rkf_seal(buf, size);
+	if (plain)
+		t_rkf_unobfuscate(buf);
 
 	wf = rk3026_ebc_waveform_parse(dev, buf, size + 4);
 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, wf);
@@ -4544,7 +4561,7 @@ static const u8 *t_rkf_lut_of(struct kunit *test, struct device *dev,
 			      const struct t_rkf_plan *plan, unsigned int n,
 			      u32 mode, int temp, u32 *frames)
 {
-	struct ebc_waveform *wf = t_rkf_build(test, dev, plan, n);
+	struct ebc_waveform *wf = t_rkf_build(test, dev, plan, n, false);
 
 	*frames = 0;
 	return rk3026_ebc_waveform_lut(wf, mode, temp, frames);
@@ -4665,6 +4682,39 @@ static void ebc_test_rkf_lut_bytes(struct kunit *test)
 }
 
 /*
+ * A container whose weight table is already plain decodes to the same LUT as
+ * the obfuscated one it was made from.
+ *
+ * The weight table of a pristine container is stored obfuscated, and the
+ * driver XORs the checkerboard key back out of it -- which is the only way
+ * rkf_crc32()'s key argument is ever non-NULL, and it is only non-NULL on the
+ * other branch. t_rkf_alloc() always stores the table obfuscated, so no test
+ * above ever reaches the plain one.
+ */
+static void ebc_test_rkf_plain_weights(struct kunit *test)
+{
+	static const struct t_rkf_plan plan[] = {
+		{ T_RKF_GRAY16, 2, 0xa5, 0 }, { T_RKF_GRAY2, 2, 0x3c, 0 },
+	};
+	struct device *dev = t_rkf_dev(test);
+	struct ebc_waveform *obf, *pln;
+	const u8 *a, *b;
+	u32 fa = 0, fb = 0;
+
+	obf = t_rkf_build(test, dev, plan, ARRAY_SIZE(plan), false);
+	pln = t_rkf_build(test, dev, plan, ARRAY_SIZE(plan), true);
+
+	a = rk3026_ebc_waveform_lut(obf, EBC_MODE_AUTO, 25, &fa);
+	b = rk3026_ebc_waveform_lut(pln, EBC_MODE_AUTO, 25, &fb);
+
+	KUNIT_ASSERT_NOT_NULL(test, a);
+	KUNIT_ASSERT_NOT_NULL(test, b);
+	KUNIT_ASSERT_EQ(test, fa, 2);
+	KUNIT_ASSERT_EQ(test, fb, 2);
+	KUNIT_EXPECT_MEMEQ(test, a, b, 2 * EBC_LUT_FRAME_BYTES);
+}
+
+/*
  * The temperature bucket walks the mode's table and picks the offset slot.
  * With an all-zero table every temperature lands in slot 0, so nothing above
  * can tell the walk apart from a constant.
@@ -4770,6 +4820,7 @@ static struct kunit_case rk3026_ebc_waveform_test_cases[] = {
 	KUNIT_CASE(ebc_test_rkf_auto_overlay),
 	KUNIT_CASE(ebc_test_rkf_lut_bytes),
 	KUNIT_CASE(ebc_test_rkf_temp_slot),
+	KUNIT_CASE(ebc_test_rkf_plain_weights),
 	KUNIT_CASE(ebc_test_rkf_parse_bounds),
 	{}
 };

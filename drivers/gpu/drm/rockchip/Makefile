@@ -24,6 +24,7 @@ obj-$(CONFIG_DRM_ROCKCHIP) += rockchipdrm.o
 
 rk3026-ebc-y := rk3026_ebc.o rk3026_ebc_blit.o rk3026_ebc_core.o \
 		rk3026_ebc_waveform.o
+rk3026-ebc-$(CONFIG_DEBUG_FS) += rk3026_ebc_debugfs.o
 rk3026-ebc-$(CONFIG_DRM_RK3026_EBC_NEON) += rk3026_ebc_blit_neon.o
 CFLAGS_rk3026_ebc_blit_neon.o += $(CC_FLAGS_FPU)
 CFLAGS_REMOVE_rk3026_ebc_blit_neon.o += $(CC_FLAGS_NO_FPU)

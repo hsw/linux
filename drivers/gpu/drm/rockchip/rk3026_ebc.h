@@ -1339,4 +1339,13 @@ int rk3026_ebc_rkf_decode(const s16 *left, const s16 *right, int root,
 			  size_t len);
 #endif
 
+/* rk3026_ebc_debugfs.c */
+#if IS_ENABLED(CONFIG_DEBUG_FS)
+void rk3026_ebc_debugfs_init(struct rk3026_ebc *ebc);
+void rk3026_ebc_debugfs_fini(struct rk3026_ebc *ebc);
+#else
+static inline void rk3026_ebc_debugfs_init(struct rk3026_ebc *ebc) { }
+static inline void rk3026_ebc_debugfs_fini(struct rk3026_ebc *ebc) { }
+#endif
+
 #endif /* _RK3026_EBC_H */

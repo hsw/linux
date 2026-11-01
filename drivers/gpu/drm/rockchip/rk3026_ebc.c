@@ -3125,6 +3125,11 @@ static void ebc_stop_thread(void *data)
 	kthread_stop(ebc->refresh_thread);
 }
 
+static void ebc_debugfs_fini(void *data)
+{
+	rk3026_ebc_debugfs_fini(data);
+}
+
 static void ebc_release_reserved_mem(void *data)
 {
 	of_reserved_mem_device_release(data);
@@ -3361,6 +3366,11 @@ static int ebc_probe(struct platform_device *pdev)
 	if (IS_ERR(ebc->refresh_thread))
 		return PTR_ERR(ebc->refresh_thread);
 	ret = devm_add_action_or_reset(dev, ebc_stop_thread, ebc);
+	if (ret)
+		return ret;
+
+	rk3026_ebc_debugfs_init(ebc);
+	ret = devm_add_action_or_reset(dev, ebc_debugfs_fini, ebc);
 	if (ret)
 		return ret;
 

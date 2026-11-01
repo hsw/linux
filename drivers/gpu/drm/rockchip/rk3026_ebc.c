@@ -2874,6 +2874,18 @@ static const struct drm_mode_config_helper_funcs ebc_mode_config_helper_funcs = 
 
 DEFINE_DRM_GEM_FOPS(ebc_fops);
 
+#ifdef CONFIG_DRM_FBDEV_EMULATION
+static int ebc_fbdev_probe(struct drm_fb_helper *helper,
+			   struct drm_fb_helper_surface_size *sizes)
+{
+	int ret = drm_fbdev_shmem_driver_fbdev_probe(helper, sizes);
+
+	if (!ret)
+		rk3026_ebc_mxcfb_install(drm_to_ebc(helper->dev), helper->info);
+	return ret;
+}
+#endif
+
 static const struct drm_driver ebc_drm_driver = {
 	.driver_features	= DRIVER_GEM | DRIVER_MODESET | DRIVER_ATOMIC,
 	.fops			= &ebc_fops,
@@ -2882,7 +2894,9 @@ static const struct drm_driver ebc_drm_driver = {
 	.major			= 1,
 	.minor			= 0,
 	DRM_GEM_SHMEM_DRIVER_OPS,
-	DRM_FBDEV_SHMEM_DRIVER_OPS,
+#ifdef CONFIG_DRM_FBDEV_EMULATION
+	.fbdev_probe		= ebc_fbdev_probe,
+#endif
 };
 
 /* --- bring-up --- */

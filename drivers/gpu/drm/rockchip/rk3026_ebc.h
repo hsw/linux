@@ -1348,4 +1348,20 @@ static inline void rk3026_ebc_debugfs_init(struct rk3026_ebc *ebc) { }
 static inline void rk3026_ebc_debugfs_fini(struct rk3026_ebc *ebc) { }
 #endif
 
+/* rk3026_ebc_mxcfb.c */
+#if IS_ENABLED(CONFIG_DRM_RK3026_EBC_MXCFB)
+void rk3026_ebc_mxcfb_install(struct rk3026_ebc *ebc, struct fb_info *info);
+#if IS_ENABLED(CONFIG_KUNIT)
+struct mxcfb_update_data;
+u32 rk3026_ebc_mxcfb_to_ebc_mode(u32 waveform_mode, u32 update_mode,
+				 u32 flags, bool *auto_mode);
+int rk3026_ebc_mxcfb_send(struct rk3026_ebc *ebc, const void *src,
+			  unsigned int pitch,
+			  const struct mxcfb_update_data *req);
+#endif
+#else
+static inline void rk3026_ebc_mxcfb_install(struct rk3026_ebc *ebc,
+					    struct fb_info *info) { }
+#endif
+
 #endif /* _RK3026_EBC_H */

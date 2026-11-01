@@ -381,6 +381,17 @@ struct rk3026_ebc_idle {
 #define EBC_FLIP_TIMEOUT_MAX_MS	8000
 
 /*
+ * How long an fbdev damage commit waits at most for the take of the
+ * fbdev's last update (ebc_fbdev_dirty()). Above the longest wait for a
+ * take on a known glass: a part ahead (a cold RESET and FULL, about
+ * 3.4 s), the take's gap (EBC_TAKE_CAP_MAX_MS) and the temperature read,
+ * under 5 s. Past it the refresh thread is stuck, or a repair RESET runs
+ * first, and the commit goes on: its blit may then be drawn over before
+ * the take, nothing is lost.
+ */
+#define EBC_FBDEV_PACE_MS	6000
+
+/*
  * The next part as rk3026_ebc_take_wait() reads it, under @image_lock:
  *
  * @first, @last: when its first and newest update were queued;
@@ -1153,15 +1164,25 @@ struct rk3026_ebc {
 	bool			mxcfb_active;
 
 	/*
-	 * fbdev damage commits (rk3026_ebc_fbdev_fb_dirty()). @fbdev_funcs
-	 * are the fbdev emulation's own callbacks, wrapped by the driver's;
-	 * set at each fbdev probe (rk3026_ebc_fbdev_wrap()), unused when
-	 * they are not wrapped. @fbdev_console_lock: commit under the console
-	 * lock. Probe sets it; debugfs may change it, and the damage worker
-	 * reads it with READ_ONCE().
+	 * fbdev damage commits (ebc_fbdev_dirty()). @fbdev_funcs are the
+	 * fbdev emulation's own callbacks, wrapped by the driver's; set at
+	 * each fbdev probe (rk3026_ebc_fbdev_wrap()), unused when they are
+	 * not wrapped. @fbdev_console_lock: commit under the console lock
+	 * (rk3026_ebc_fbdev_fb_dirty()). @fbdev_pace: wait for the take of
+	 * the fbdev's last update before the next commit
+	 * (rk3026_ebc_fbdev_held()). Probe sets both; debugfs may change
+	 * them, and the damage worker reads them with READ_ONCE().
+	 * @fbdev_seq: the seq of the fbdev's last update, 0 before the
+	 * first; written and read by the damage worker alone, which runs one
+	 * at a time. @fbdev_pace_ms: the bound of the wait, probe sets
+	 * EBC_FBDEV_PACE_MS; a field, not the constant, so that KUnit can
+	 * reach the bound quickly.
 	 */
 	const struct drm_fb_helper_funcs *fbdev_funcs;
 	bool			fbdev_console_lock;
+	bool			fbdev_pace;
+	u32			fbdev_seq;
+	unsigned int		fbdev_pace_ms;
 
 	/*
 	 * The commit being applied: rk3026_ebc_commit_begin() clears
@@ -1310,6 +1331,7 @@ int rk3026_ebc_fbdev_fb_dirty(struct drm_fb_helper *helper,
 			      struct drm_clip_rect *clip);
 void rk3026_ebc_fbdev_wrap(struct rk3026_ebc *ebc,
 			   struct drm_fb_helper *helper);
+bool rk3026_ebc_fbdev_held(const struct rk3026_ebc *ebc);
 #endif
 #endif
 

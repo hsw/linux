@@ -12776,19 +12776,32 @@ kunit_test_suite(rk3026_ebc_glue_test_suite);
 
 /* --- fbdev damage commits (rk3026_ebc_fbdev_fb_dirty()) --- */
 
-/* What the wrapped fb_dirty saw: its calls, the clip, the console lock. */
+/*
+ * What the wrapped fb_dirty saw: its calls, the clip, the console lock.
+ * With @ebc set it also notes whether the fbdev's last update was taken
+ * (@taken), then queues an update on @ebc, as a plane update does.
+ */
 static struct {
 	unsigned int calls;
 	struct drm_clip_rect clip;
 	bool console_locked;
 	int ret;
+	struct rk3026_ebc *ebc;
+	bool taken;
 } t_dirty;
 
 static int t_fb_dirty(struct drm_fb_helper *helper, struct drm_clip_rect *clip)
 {
+	struct rk3026_ebc *ebc = t_dirty.ebc;
+
 	t_dirty.calls++;
 	t_dirty.clip = *clip;
 	t_dirty.console_locked = is_console_locked();
+	if (ebc) {
+		t_dirty.taken = rk3026_ebc_seq_taken(&ebc->pending,
+						     ebc->fbdev_seq);
+		t_send(ebc, &t_panel, EBC_MODE_PART, 0, EBC_SOURCE_PLANE);
+	}
 	return t_dirty.ret;
 }
 
@@ -12798,8 +12811,8 @@ static const struct drm_fb_helper_funcs t_fbdev_funcs = {
 
 /*
  * A helper on a bare controller, wrapped as fbdev probe wraps it, with
- * @pending as its damage not yet taken and the console lock on as probe
- * sets it.
+ * @pending as its damage not yet taken, and the console lock and the
+ * pace on as probe sets them.
  */
 static struct drm_fb_helper *t_fbdev(struct kunit *test,
 				     struct rk3026_ebc *ebc,
@@ -12816,6 +12829,8 @@ static struct drm_fb_helper *t_fbdev(struct kunit *test,
 	rk3026_ebc_fbdev_wrap(ebc, helper);
 	KUNIT_ASSERT_PTR_EQ(test, ebc->fbdev_funcs, &t_fbdev_funcs);
 	ebc->fbdev_console_lock = true;
+	ebc->fbdev_pace = true;
+	ebc->fbdev_pace_ms = EBC_FBDEV_PACE_MS;
 	memset(&t_dirty, 0, sizeof(t_dirty));
 	return helper;
 }
@@ -12930,12 +12945,200 @@ static void ebc_test_fbdev_wrap(struct kunit *test)
 	t_expect_clip(test, &t_dirty.clip, 0, 0, 16, 6);
 }
 
+/*
+ * The wait of the next fbdev commit (rk3026_ebc_fbdev_held()): while the
+ * fbdev's last update is not taken, and only while its take will come.
+ * Seqs wrap.
+ */
+static void ebc_test_fbdev_held(struct kunit *test)
+{
+	static const struct {
+		const char *name;
+		u32 taken, last;
+		bool off, crtc_off, suspended, mxcfb;
+		bool held;
+	} cases[] = {
+		{ "none sent",		 0, 0, .held = false },
+		{ "taken",		 7, 7, .held = false },
+		{ "taken, more after",	 9, 7, .held = false },
+		{ "not taken",		 6, 7, .held = true },
+		{ "not taken, wrapped",	 U32_MAX, 0, .held = true },
+		{ "taken, wrapped",	 1, U32_MAX, .held = false },
+		{ "pace off",		 6, 7, .off = true },
+		{ "CRTC off",		 6, 7, .crtc_off = true },
+		{ "suspended",		 6, 7, .suspended = true },
+		{ "mxcfb client",	 6, 7, .mxcfb = true },
+	};
+	struct rk3026_ebc *ebc = t_ebc_alloc(test);
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		ebc->pending.taken_seq = cases[i].taken;
+		ebc->pending.queued_seq = cases[i].taken + 2;
+		ebc->fbdev_seq = cases[i].last;
+		ebc->fbdev_pace = !cases[i].off;
+		ebc->crtc_on = !cases[i].crtc_off;
+		ebc->suspended = cases[i].suspended;
+		ebc->mxcfb_active = cases[i].mxcfb;
+		KUNIT_EXPECT_EQ_MSG(test, rk3026_ebc_fbdev_held(ebc),
+				    cases[i].held, "%s", cases[i].name);
+	}
+}
+
+/* The refresh thread, later: damage reported on @helper, then one take. */
+struct t_fbdev_take {
+	struct t_glue_work	glue;
+	struct drm_fb_helper	*helper;
+};
+
+static void t_fbdev_take(struct work_struct *work)
+{
+	struct t_fbdev_take *t = container_of(to_delayed_work(work),
+					      struct t_fbdev_take, glue.work);
+	unsigned long flags;
+
+	spin_lock_irqsave(&t->helper->damage_lock, flags);
+	t->helper->damage_clip = (struct drm_clip_rect){ 64, 900, 96, 1072 };
+	spin_unlock_irqrestore(&t->helper->damage_lock, flags);
+	t_glue_refresh(work);
+}
+
+/* Milliseconds since @start. */
+static unsigned int t_ms_since(unsigned long start)
+{
+	return jiffies_to_msecs(jiffies - start);
+}
+
+/*
+ * Paced commits: with nothing sent, or the last update taken, a commit
+ * goes at once, and the update it queued becomes the fbdev's last; with
+ * that one not taken, the next commit waits for its take, the damage
+ * reported meanwhile folded in, or goes on at the bound; with the pace
+ * off, the CRTC off or the console lock off, as each says. A commit that
+ * queues nothing leaves the last update as it was. "At once" is checked
+ * well below the bound, which a wrong wait would have run out.
+ */
+static void ebc_test_fbdev_pace(struct kunit *test)
+{
+	struct rk3026_ebc *ebc = t_ebc_alloc(test);
+	struct drm_fb_helper *helper = t_fbdev(test, ebc, t_no_damage);
+	struct t_fbdev_take *t = kunit_kzalloc(test, sizeof(*t), GFP_KERNEL);
+	struct drm_clip_rect clip = { 0, 0, 16, 6 };
+	unsigned long start;
+	u32 last;
+
+	KUNIT_ASSERT_NOT_NULL(test, t);
+	t_dirty.ebc = ebc;
+
+	/* Nothing sent yet: at once. */
+	start = jiffies;
+	KUNIT_EXPECT_EQ(test, helper->funcs->fb_dirty(helper, &clip), 0);
+	KUNIT_EXPECT_LT(test, t_ms_since(start), EBC_FBDEV_PACE_MS / 2);
+	KUNIT_EXPECT_EQ(test, t_dirty.calls, 1);
+	KUNIT_EXPECT_TRUE(test, t_dirty.taken);
+	KUNIT_EXPECT_EQ(test, ebc->fbdev_seq, ebc->pending.queued_seq);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_fbdev_held(ebc));
+
+	/* Not taken, and no thread: the commit goes on at the bound. */
+	ebc->fbdev_pace_ms = 40;
+	start = jiffies;
+	KUNIT_EXPECT_EQ(test, helper->funcs->fb_dirty(helper, &clip), 0);
+	KUNIT_EXPECT_GE(test, t_ms_since(start), 30);
+	KUNIT_EXPECT_LT(test, t_ms_since(start), 1000);
+	KUNIT_EXPECT_EQ(test, t_dirty.calls, 2);
+	KUNIT_EXPECT_FALSE(test, t_dirty.taken);
+	KUNIT_EXPECT_EQ(test, ebc->fbdev_seq, ebc->pending.queued_seq);
+
+	/*
+	 * The take, later, ends the wait long before the bound, also without
+	 * the console lock; the damage reported during the wait joins the
+	 * commit.
+	 */
+	ebc->fbdev_pace_ms = EBC_FBDEV_PACE_MS;
+	ebc->fbdev_console_lock = false;
+	t->glue.ebc = ebc;
+	t->glue.parts = 1;
+	t->helper = helper;
+	INIT_DELAYED_WORK(&t->glue.work, t_fbdev_take);
+	start = jiffies;
+	schedule_delayed_work(&t->glue.work, msecs_to_jiffies(50));
+	KUNIT_EXPECT_EQ(test, helper->funcs->fb_dirty(helper, &clip), 0);
+	KUNIT_EXPECT_LT(test, t_ms_since(start), EBC_FBDEV_PACE_MS / 2);
+	flush_delayed_work(&t->glue.work);
+	KUNIT_EXPECT_EQ(test, t_dirty.calls, 3);
+	KUNIT_EXPECT_TRUE(test, t_dirty.taken);
+	t_expect_clip(test, &t_dirty.clip, 0, 0, 96, 1072);
+	t_expect_clip(test, &helper->damage_clip, USHRT_MAX, USHRT_MAX, 0, 0);
+	KUNIT_EXPECT_EQ(test, ebc->fbdev_seq, ebc->pending.queued_seq);
+
+	/* Pace off: at once, with the last update not taken. */
+	ebc->fbdev_pace = false;
+	start = jiffies;
+	KUNIT_EXPECT_EQ(test, helper->funcs->fb_dirty(helper, &clip), 0);
+	KUNIT_EXPECT_LT(test, t_ms_since(start), EBC_FBDEV_PACE_MS / 2);
+	KUNIT_EXPECT_EQ(test, t_dirty.calls, 4);
+	KUNIT_EXPECT_FALSE(test, t_dirty.taken);
+
+	/* CRTC off: at once; and with nothing queued the last update stays. */
+	last = ebc->fbdev_seq;
+	t_dirty.ebc = NULL;
+	t_send(ebc, &t_panel, EBC_MODE_PART, 0, EBC_SOURCE_PLANE);
+	ebc->fbdev_pace = true;
+	ebc->crtc_on = false;
+	start = jiffies;
+	KUNIT_EXPECT_EQ(test, helper->funcs->fb_dirty(helper, &clip), 0);
+	KUNIT_EXPECT_LT(test, t_ms_since(start), EBC_FBDEV_PACE_MS / 2);
+	KUNIT_EXPECT_EQ(test, t_dirty.calls, 5);
+	KUNIT_EXPECT_EQ(test, ebc->fbdev_seq, last);
+}
+
+/* A suspend, later (rk3026_ebc_sleep_begin()). */
+static void t_fbdev_sleep(struct work_struct *work)
+{
+	struct t_glue_work *w = container_of(to_delayed_work(work),
+					     struct t_glue_work, work);
+
+	rk3026_ebc_sleep_begin(w->ebc);
+}
+
+/*
+ * A commit waiting for a take that will not come, the bound far off: a
+ * suspend ends the wait, and the commit goes on with the update still
+ * not taken.
+ */
+static void ebc_test_fbdev_pace_suspend(struct kunit *test)
+{
+	struct rk3026_ebc *ebc = t_ebc_alloc(test);
+	struct drm_fb_helper *helper = t_fbdev(test, ebc, t_no_damage);
+	struct t_glue_work *w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
+	struct drm_clip_rect clip = { 0, 0, 16, 6 };
+	unsigned long start;
+
+	KUNIT_ASSERT_NOT_NULL(test, w);
+	t_dirty.ebc = ebc;
+	KUNIT_ASSERT_EQ(test, helper->funcs->fb_dirty(helper, &clip), 0);
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_fbdev_held(ebc));
+	w->ebc = ebc;
+	INIT_DELAYED_WORK(&w->work, t_fbdev_sleep);
+	start = jiffies;
+	schedule_delayed_work(&w->work, msecs_to_jiffies(20));
+	KUNIT_EXPECT_EQ(test, helper->funcs->fb_dirty(helper, &clip), 0);
+	flush_delayed_work(&w->work);
+	KUNIT_EXPECT_LT(test, t_ms_since(start), EBC_FBDEV_PACE_MS / 2);
+	KUNIT_EXPECT_EQ(test, t_dirty.calls, 2);
+	KUNIT_EXPECT_FALSE(test, t_dirty.taken);
+	KUNIT_EXPECT_TRUE(test, ebc->suspended);
+}
+
 static struct kunit_case rk3026_ebc_fbdev_test_cases[] = {
 	KUNIT_CASE(ebc_test_fbdev_dirty_locked),
 	KUNIT_CASE(ebc_test_fbdev_dirty_locked_quiet),
 	KUNIT_CASE(ebc_test_fbdev_dirty_empty),
 	KUNIT_CASE(ebc_test_fbdev_dirty_unlocked),
 	KUNIT_CASE(ebc_test_fbdev_wrap),
+	KUNIT_CASE(ebc_test_fbdev_held),
+	KUNIT_CASE(ebc_test_fbdev_pace),
+	KUNIT_CASE(ebc_test_fbdev_pace_suspend),
 	{}
 };
 

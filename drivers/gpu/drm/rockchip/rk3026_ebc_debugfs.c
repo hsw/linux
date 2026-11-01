@@ -39,6 +39,9 @@
  *                    the fbdev emulation's damage is committed under the
  *                    console lock (rk3026_ebc_fbdev_fb_dirty()), read-write
  *                    Y/N; N commits without it. Probe sets Y.
+ *   fbdev_pace       an fbdev damage commit waits for the take of the
+ *                    fbdev's last update (ebc_fbdev_dirty()), read-write
+ *                    Y/N; N commits at once. Probe sets Y.
  *   timing           text, the blit and snapshot times of the last part and
  *                    the last driven one (rk3026_ebc_timing_show())
  *   flip_timeout_ms  how long a commit event is held at most before the
@@ -475,6 +478,7 @@ void rk3026_ebc_debugfs_init(struct rk3026_ebc *ebc)
 	debugfs_create_u32("take_cap_ms", 0644, dir, &ebc->take_cap_ms);
 	debugfs_create_bool("fbdev_console_lock", 0644, dir,
 			    &ebc->fbdev_console_lock);
+	debugfs_create_bool("fbdev_pace", 0644, dir, &ebc->fbdev_pace);
 	debugfs_create_file("timing", 0444, dir, ebc, &rk3026_ebc_timing_fops);
 	debugfs_create_u32("flip_timeout_ms", 0644, dir, &ebc->flip_timeout_ms);
 	debugfs_create_u32("flip_held", 0444, dir, &ebc->flip_held);

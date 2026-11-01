@@ -3187,13 +3187,92 @@ VISIBLE_IF_KUNIT int rk3026_ebc_fbdev_fb_dirty(struct drm_fb_helper *helper,
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_fbdev_fb_dirty);
 
+/**
+ * rk3026_ebc_fbdev_held - whether the next fbdev damage commit waits
+ * @ebc: the device
+ *
+ * The fbdev's last update (@fbdev_seq) has not been taken yet, and its
+ * take will come: the CRTC is on, no suspend began and no mxcfb client
+ * owns the panel. Never with debugfs fbdev_pace N, nor before the first
+ * update (seq 0 counts as taken). Read without a lock; the damage worker
+ * re-reads it at every wake of @marker_wq.
+ *
+ * Returns true while the commit waits.
+ */
+VISIBLE_IF_KUNIT bool rk3026_ebc_fbdev_held(const struct rk3026_ebc *ebc)
+{
+	return READ_ONCE(ebc->fbdev_pace) &&
+	       !rk3026_ebc_seq_taken(&ebc->pending, ebc->fbdev_seq) &&
+	       READ_ONCE(ebc->crtc_on) && !READ_ONCE(ebc->suspended) &&
+	       !READ_ONCE(ebc->mxcfb_active);
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_fbdev_held);
+
+/**
+ * ebc_fbdev_dirty - pace the fbdev damage commits by the panel
+ * @helper: the fbdev emulation's helper
+ * @clip: the damage the worker took, in framebuffer pixels
+ *
+ * The panel has no vblank, so nothing paces the fbdev damage worker
+ * (drm_fb_helper_fb_dirty() waits only for a vblank), and a console
+ * flood commits and blits the whole damage tens of times a second, while
+ * the refresh thread takes a part a few times a second and all but the
+ * last of those blits are overwritten before it does.
+ *
+ * So a commit first waits for the take of the fbdev's previous update
+ * (rk3026_ebc_fbdev_held()), holding no lock: the damage reported
+ * meanwhile stays in the helper and joins this commit
+ * (rk3026_ebc_fbdev_fb_dirty()). With the panel idle, the previous
+ * update taken, it does not wait. The take and a suspend
+ * (rk3026_ebc_sleep_begin()) wake @marker_wq; a CRTC disable has the
+ * refresh thread take the pending parts and drop them. At the remove the
+ * thread runs until after ebc_remove() (a devm action stops it), so a
+ * wait during the unplug ends at the thread's next take, and the
+ * shutdown's CRTC disable ends the later ones; but with /dev/fb0 still
+ * open the damage work is cancelled only at its last close, and a commit
+ * after the thread's stop with the CRTC still on (a failed shutdown)
+ * waits out the bound. The conditions are read when the wait begins and
+ * at each wake: a commit already waiting when debugfs fbdev_pace goes N
+ * or an mxcfb client takes the panel goes on at the next take. The wait
+ * is bounded by @fbdev_pace_ms (EBC_FBDEV_PACE_MS): past it the thread is
+ * stuck or stopped, and the commit goes on without the take. A cancel of
+ * the damage work (drm_fb_helper_fini(),
+ * drm_fb_helper_set_suspend_unlocked()) waits at most that long. The wait
+ * sleeps in the helper's damage work, on system_wq, a part at most as a
+ * rule.
+ *
+ * Then the newest update queued during the commit becomes the fbdev's
+ * last: this commit's own, or another sender's queued meanwhile (a KMS
+ * client while the fbdev's framebuffer is off the plane), whose take the
+ * next commit then waits for; a commit during which nothing was queued
+ * leaves it.
+ *
+ * Returns what rk3026_ebc_fbdev_fb_dirty() returns.
+ */
+static int ebc_fbdev_dirty(struct drm_fb_helper *helper,
+			   struct drm_clip_rect *clip)
+{
+	struct rk3026_ebc *ebc = drm_to_ebc(helper->dev);
+	u32 seq, queued;
+	int ret;
+
+	wait_event_idle_timeout(ebc->marker_wq, !rk3026_ebc_fbdev_held(ebc),
+				msecs_to_jiffies(ebc->fbdev_pace_ms));
+	seq = READ_ONCE(ebc->pending.queued_seq);
+	ret = rk3026_ebc_fbdev_fb_dirty(helper, clip);
+	queued = READ_ONCE(ebc->pending.queued_seq);
+	if (queued != seq)
+		ebc->fbdev_seq = queued;
+	return ret;
+}
+
 static const struct drm_fb_helper_funcs ebc_fbdev_helper_funcs = {
-	.fb_dirty	= rk3026_ebc_fbdev_fb_dirty,
+	.fb_dirty	= ebc_fbdev_dirty,
 };
 
 /**
- * rk3026_ebc_fbdev_wrap - put rk3026_ebc_fbdev_fb_dirty() in front of the
- *			   fbdev emulation's fb_dirty
+ * rk3026_ebc_fbdev_wrap - put ebc_fbdev_dirty() in front of the fbdev
+ *			   emulation's fb_dirty
  * @ebc: the device
  * @helper: the fbdev emulation's helper, after its fbdev probe
  *
@@ -3201,7 +3280,7 @@ static const struct drm_fb_helper_funcs ebc_fbdev_helper_funcs = {
  * more than fb_dirty, or without it, warns once: only callbacks that
  * have fb_dirty and nothing else are wrapped (drm_fbdev_shmem.c's), as
  * the wrapper forwards fb_dirty alone; any other set is kept as it is,
- * and its damage is committed without the console lock.
+ * and its damage is committed without the console lock or the pace.
  */
 VISIBLE_IF_KUNIT void rk3026_ebc_fbdev_wrap(struct rk3026_ebc *ebc,
 					    struct drm_fb_helper *helper)
@@ -3699,8 +3778,13 @@ static int ebc_probe(struct platform_device *pdev)
 	/* A burst of updates is taken once it has been quiet this long. */
 	ebc->take_quiet_us = EBC_TAKE_QUIET_US;
 	ebc->take_cap_ms = EBC_TAKE_CAP_MS;
-	/* fbdev damage is read under the console lock. */
+	/*
+	 * fbdev damage is read under the console lock, and committed once
+	 * the panel took the last.
+	 */
 	ebc->fbdev_console_lock = true;
+	ebc->fbdev_pace = true;
+	ebc->fbdev_pace_ms = EBC_FBDEV_PACE_MS;
 	/* Every part in its own mode. */
 	ebc->force_mode = -1;
 	/* The rails stay up this long after a waveform. */

@@ -149,6 +149,7 @@ static int pmu_set_power_domain(int pd, bool on)
 
 	if (!IS_ERR(rstc) && on && rk3026_grf) {
 		unsigned long flags;
+		int err = 0;
 
 		/*
 		 * RK3026: the reset write is what restarts the core (it starts
@@ -171,9 +172,22 @@ static int pmu_set_power_domain(int pd, bool on)
 		 */
 		local_irq_save(flags);
 		rk3026_imem_remap(true);
-		reset_control_assert(rstc);
-		reset_control_deassert(rstc);
+		ret = reset_control_assert(rstc);
+		if (!ret)
+			err = reset_control_deassert(rstc);
+		else	/* the core was not restarted: drop the remap */
+			rk3026_imem_remap(false);
 		local_irq_restore(flags);
+
+		if (ret) {
+			pr_err("%s: could not assert reset of core %d: %d\n",
+			       __func__, pd, ret);
+			return ret;
+		}
+		/* the assert has restarted the core: let it come up or time out */
+		if (err)
+			pr_err("%s: could not deassert reset of core %d: %d\n",
+			       __func__, pd, err);
 	}
 
 	return 0;

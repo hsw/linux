@@ -3186,13 +3186,108 @@ VISIBLE_IF_KUNIT int rk3026_ebc_fbdev_fb_dirty(struct drm_fb_helper *helper,
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_fbdev_fb_dirty);
 
+/**
+ * rk3026_ebc_fbdev_held - whether an fbdev damage commit still waits
+ * @ebc: the device
+ * @taken: @pending.taken_seq as the wait began
+ *
+ * A part is in flight (@in_flight: taken, not finished), the one that was
+ * in flight when the wait began (no take since moved @pending.taken_seq
+ * off @taken: parts are taken one at a time, so a later take means that
+ * part finished), and its finish will come: the CRTC is on, no suspend
+ * began and no mxcfb client owns the panel. Never with debugfs fbdev_pace
+ * N. Read without a lock; the damage worker re-reads it at every wake of
+ * @marker_wq.
+ *
+ * One take does not move @pending.taken_seq: a carry taken alone at its
+ * retry keeps it, its seq being the newest taken already
+ * (rk3026_ebc_pending_take()). So a worker woken by a finish that armed
+ * the retry, but run only after the retry took the carry (from
+ * EBC_RETRY_FIRST_MS on), finds the carry in flight with @taken unchanged
+ * and waits for its finish too: one part more, within @fbdev_pace_ms.
+ *
+ * Returns true while the commit waits.
+ */
+VISIBLE_IF_KUNIT bool rk3026_ebc_fbdev_held(const struct rk3026_ebc *ebc,
+					    u32 taken)
+{
+	return READ_ONCE(ebc->fbdev_pace) && READ_ONCE(ebc->in_flight) &&
+	       READ_ONCE(ebc->pending.taken_seq) == taken &&
+	       READ_ONCE(ebc->crtc_on) && !READ_ONCE(ebc->suspended) &&
+	       !READ_ONCE(ebc->mxcfb_active);
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_fbdev_held);
+
+/**
+ * ebc_fbdev_dirty - pace the fbdev damage commits by the panel
+ * @helper: the fbdev emulation's helper
+ * @clip: the damage the worker took, in framebuffer pixels
+ *
+ * The panel has no vblank, so nothing paces the fbdev damage worker
+ * (drm_fb_helper_fb_dirty() waits only for a vblank), and a console
+ * flood commits and blits the whole damage tens of times a second, while
+ * the refresh thread takes a part a few times a second and all but the
+ * last of those blits are overwritten before it does.
+ *
+ * So while a part is in flight a commit first waits for its finish
+ * (rk3026_ebc_fbdev_held()), holding no lock: the damage reported
+ * meanwhile stays in the helper and joins this commit
+ * (rk3026_ebc_fbdev_fb_dirty()), and the update it queues is the next
+ * part the thread takes, so a console write that comes while a part is
+ * driven still reaches the next part. With no part in flight, or nothing
+ * to commit, it does not wait: a write on an idle panel, and every write
+ * in the short window between a part's finish and the next take, commits
+ * at once and joins the update about to be taken. So a flood commits
+ * about twice a part, not once: at the part's finish and in that window.
+ * The window is not latched: a latch would hold every write in it back a
+ * whole part, as waiting for the take of the update queued last would
+ * (on the RC2 the write to take time of typed text went from 136 to
+ * 364 ms, p50, one DU part later). A full-frame commit in the window
+ * restamps the take's quiet gap, so a flood takes a few % fewer parts a
+ * second. The cost of waiting for the finish is the wake, the commit and
+ * the blit between it and the next take: by estimate a few ms for a small
+ * damage, up to about 40 ms in a full-screen console flood (a full blit
+ * of 8 ms, the take's quiet gap), against a DU part of about 270 ms.
+ *
+ * The finish of the part, whatever became of it (driven, skipped,
+ * dropped, given up or its retry armed), clears @in_flight and wakes
+ * @marker_wq, and so does a suspend (rk3026_ebc_sleep_begin()); a CRTC
+ * disable has the refresh thread finish the part in flight and drop the
+ * pending ones. At the remove the thread runs until after ebc_remove() (a
+ * devm action stops it) and finishes the part it took before it stops,
+ * so a wait during the unplug ends at that finish and none begins after
+ * it. The conditions are read when the wait begins and at each wake: a
+ * commit already waiting when debugfs fbdev_pace goes N or an mxcfb
+ * client takes the panel goes on at the next wake. The wait is bounded by
+ * @fbdev_pace_ms (EBC_FBDEV_PACE_MS): past it the thread is stuck, and
+ * the commit goes on. A cancel of the damage work (drm_fb_helper_fini(),
+ * drm_fb_helper_set_suspend_unlocked()) waits at most that long. The wait
+ * sleeps in the helper's damage work, on system_wq, a part at most as a
+ * rule, two after a late wake over a carry's retry
+ * (rk3026_ebc_fbdev_held()).
+ *
+ * Returns what rk3026_ebc_fbdev_fb_dirty() returns.
+ */
+static int ebc_fbdev_dirty(struct drm_fb_helper *helper,
+			   struct drm_clip_rect *clip)
+{
+	struct rk3026_ebc *ebc = drm_to_ebc(helper->dev);
+	u32 taken = READ_ONCE(ebc->pending.taken_seq);
+
+	if (ebc_fbdev_damaged(helper, clip))
+		wait_event_idle_timeout(ebc->marker_wq,
+					!rk3026_ebc_fbdev_held(ebc, taken),
+					msecs_to_jiffies(ebc->fbdev_pace_ms));
+	return rk3026_ebc_fbdev_fb_dirty(helper, clip);
+}
+
 static const struct drm_fb_helper_funcs ebc_fbdev_helper_funcs = {
-	.fb_dirty	= rk3026_ebc_fbdev_fb_dirty,
+	.fb_dirty	= ebc_fbdev_dirty,
 };
 
 /**
- * rk3026_ebc_fbdev_wrap - put rk3026_ebc_fbdev_fb_dirty() in front of the
- *			   fbdev emulation's fb_dirty
+ * rk3026_ebc_fbdev_wrap - put ebc_fbdev_dirty() in front of the fbdev
+ *			   emulation's fb_dirty
  * @ebc: the device
  * @helper: the fbdev emulation's helper, after its fbdev probe
  *
@@ -3200,7 +3295,7 @@ static const struct drm_fb_helper_funcs ebc_fbdev_helper_funcs = {
  * more than fb_dirty, or without it, warns once: only callbacks that
  * have fb_dirty and nothing else are wrapped (drm_fbdev_shmem.c's), as
  * the wrapper forwards fb_dirty alone; any other set is kept as it is,
- * and its damage is committed without the console lock.
+ * and its damage is committed without the console lock or the pace.
  */
 VISIBLE_IF_KUNIT void rk3026_ebc_fbdev_wrap(struct rk3026_ebc *ebc,
 					    struct drm_fb_helper *helper)
@@ -3704,8 +3799,13 @@ static int ebc_probe(struct platform_device *pdev)
 	/* A burst of updates is taken once it has been quiet this long. */
 	ebc->take_quiet_us = EBC_TAKE_QUIET_US;
 	ebc->take_cap_ms = EBC_TAKE_CAP_MS;
-	/* fbdev damage is read under the console lock. */
+	/*
+	 * fbdev damage is read under the console lock, and committed once
+	 * the part in flight finished.
+	 */
 	ebc->fbdev_console_lock = true;
+	ebc->fbdev_pace = true;
+	ebc->fbdev_pace_ms = EBC_FBDEV_PACE_MS;
 	/* Every part in its own mode. */
 	ebc->force_mode = -1;
 	/* The rails stay up this long after a waveform. */

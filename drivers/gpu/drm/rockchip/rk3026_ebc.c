@@ -3306,6 +3306,12 @@ VISIBLE_IF_KUNIT void rk3026_ebc_fbdev_wrap(struct rk3026_ebc *ebc,
 	if (drm_WARN_ON_ONCE(helper->dev, !funcs->fb_dirty ||
 			     funcs->fb_restore || funcs->fb_set_suspend))
 		return;
+	/*
+	 * Plain stores: this runs in the fbdev probe, before the emulation
+	 * registers its fb_info, so nothing calls fb_dirty yet; the damage
+	 * worker that does is queued only after that, and queueing a work
+	 * orders these stores before it runs.
+	 */
 	ebc->fbdev_funcs = funcs;
 	helper->funcs = &ebc_fbdev_helper_funcs;
 }

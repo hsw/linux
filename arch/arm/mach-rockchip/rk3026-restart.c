@@ -109,10 +109,6 @@ static int rk3026_restart(struct sys_off_data *data)
 	rk3026_restart_usb_disconnect();
 	rk3026_restart_stop_wdt();
 
-	/* CPU0 must restart in the BootROM, not in the SMP trampoline */
-	regmap_write(rk3026_restart_grf, RK3026_GRF_SOC_CON0,
-		     RK3026_GRF_IMEM_REMAP_CLR);
-
 	memcpy_toio(rk3026_restart_code, rk3026_restart_sram, size);
 	writel(rk3026_restart_cru_phys, rk3026_restart_code + cru);
 	writel(rk3026_restart_grf_phys, rk3026_restart_code + grf);
@@ -163,6 +159,15 @@ static int __init rk3026_restart_init(void)
 	struct device_node *np;
 	struct resource res;
 	int ret;
+
+	/*
+	 * Test build: this handler stays out of the restart chain, so a
+	 * restart goes through the CRU's GLB_SRST_SND and only platsmp.c's
+	 * handler clears the SRAM remap.
+	 */
+	pr_notice("%s: core reset restart off, CRU global reset in use\n",
+		  __func__);
+	return 0;
 
 	np = of_find_compatible_node(NULL, NULL, "rockchip,rk3026-restart-sram");
 	if (!np)

@@ -10,6 +10,7 @@
 #include <linux/io.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
+#include <linux/reboot.h>
 #include <linux/regmap.h>
 #include <linux/mfd/syscon.h>
 
@@ -68,6 +69,19 @@ static void rk3026_imem_remap(bool on)
 
 	if (rk3026_grf)
 		writel(val, rk3026_grf + RK3026_GRF_SOC_CON0);
+}
+
+/*
+ * If a core fails to come online, the remap stays set: __cpu_up() calls
+ * no platform hook after its timeout. The CRU's global reset keeps the
+ * GRF, so CPU0 would then restart in the trampoline instead of the
+ * BootROM. Clear the remap on restart, before that reset.
+ */
+static int rk3026_restart_clear_remap(struct sys_off_data *data)
+{
+	rk3026_imem_remap(false);
+
+	return NOTIFY_DONE;
 }
 static struct reset_control *cpu_rstc[4];
 
@@ -434,6 +448,14 @@ static void __init rk3036_smp_prepare_cpus(unsigned int max_cpus)
 		}
 		/* the loader may have left the remap set */
 		rk3026_imem_remap(false);
+
+		/* ahead of the CRU's restart handler (priority 128) */
+		if (IS_ERR(register_sys_off_handler(SYS_OFF_MODE_RESTART,
+						    SYS_OFF_PRIO_HIGH,
+						    rk3026_restart_clear_remap,
+						    NULL)))
+			pr_warn("%s: no restart handler to clear the remap\n",
+				__func__);
 	}
 
 	rockchip_smp_prepare_cpus(max_cpus);

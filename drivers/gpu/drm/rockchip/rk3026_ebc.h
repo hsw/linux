@@ -1312,6 +1312,7 @@ ktime_t rk3026_ebc_clock(struct rk3026_ebc *ebc);
 bool rk3026_ebc_take_ready(struct rk3026_ebc *ebc, ktime_t now);
 u32 rk3026_ebc_crtc_off(struct rk3026_ebc *ebc);
 int rk3026_ebc_read_temp(struct rk3026_ebc *ebc);
+void ebc_panel_text(char *out, size_t out_len, const u8 *in, size_t len);
 void rk3026_ebc_thread_pass(struct rk3026_ebc *ebc, unsigned long now,
 			    struct rk3026_ebc_pass *s);
 u32 rk3026_ebc_setup_us(struct rk3026_ebc *ebc,
@@ -1437,6 +1438,8 @@ unsigned int rk3026_ebc_mode_rank(u32 mode);
 /* rk3026_ebc_waveform.c */
 struct ebc_waveform *rk3026_ebc_waveform_parse(struct device *dev,
 					       const u8 *buf, size_t len);
+struct ebc_waveform *rk3026_ebc_waveform_parse_wbf(struct device *dev,
+						   const u8 *buf, size_t len);
 const u8 *rk3026_ebc_waveform_lut(struct ebc_waveform *wf, u32 mode, int temp,
 				  u32 *frames);
 #if IS_ENABLED(CONFIG_KUNIT)

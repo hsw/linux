@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  * KUnit tests for the RK3026 EBC refresh bookkeeping (rk3026_ebc_core.c),
- * the waveform container bounds (rk3026_ebc_waveform.c), the mxcfb waveform
+ * the waveform container and the panel's own WBF file
+ * (rk3026_ebc_waveform.c), the mxcfb waveform
  * map (rk3026_ebc_mxcfb.c), the refresh thread's glue and the fbdev damage
  * commit (rk3026_ebc.c), and the snapshot and the blit against the
  * per-pixel references of rk3026_ebc_kunit_ref.c, and the NEON blit against
@@ -13,6 +14,7 @@
 #include <kunit/test.h>
 
 #include <linux/completion.h>
+#include <linux/crc32.h>
 #include <linux/console.h>
 #include <linux/delay.h>
 #include <linux/dma-fence.h>
@@ -4490,6 +4492,470 @@ static void ebc_test_rkf_parse_bounds(struct kunit *test)
 			-EINVAL);
 }
 
+/* --- WBF: the panel's own file (rk3026_ebc_waveform.c) --- */
+
+/*
+ * The layout is the real one - header, a mode table pointing at one range
+ * table per mode, a stream per (mode, range) - built small: one range unless a
+ * test asks for more, and a stream of two bytes, which is exactly one frame at
+ * 32 levels (four codes a byte, a repeat of 256, 1024 codes = 32 x 32). The
+ * terminator and the lone byte are the values a real file carries, so a zero
+ * code byte stays a code byte and not a lone-code toggle.
+ */
+#define T_WBF_MODES	8
+#define T_WBF_WMTA	0x40
+#define T_WBF_MODETAB	0x60
+#define T_WBF_EB	0xff
+#define T_WBF_SB	0xfc
+
+enum t_wbf_kind {
+	T_WBF_DIRECT,
+	T_WBF_RESET,
+	T_WBF_GRAY2,
+};
+
+struct t_wbf_mode {
+	u16	frames;
+	u8	kind;
+};
+
+/*
+ * One frame of a stream, as a file spells it; returns the bytes it took, not
+ * counting the terminator the caller writes. A code byte holds four codes, so
+ * a byte whose four fields must all be the same code is 0x55 for 1 and 0xaa
+ * for 2 - a byte of 0x01 would drive only every fourth level.
+ */
+static size_t t_wbf_frame(u8 *p, u8 kind, u8 frame)
+{
+	switch (kind) {
+	case T_WBF_RESET:
+		/* INIT drives a whole frame with one code. */
+		p[0] = frame % 2 ? 0xaa : 0x55;
+		p[1] = 0xff;
+		return 2;
+	case T_WBF_GRAY2:
+		/*
+		 * DU drives the outermost target levels only: raw levels 0 and
+		 * 1 are column 0, 30 and 31 are column 15, and everything in
+		 * between carries a zero code.
+		 */
+		p[0] = 0x55;
+		p[1] = 15;
+		p[2] = 0x00;
+		p[3] = 223;
+		p[4] = 0xaa;
+		p[5] = 15;
+		return 6;
+	default:
+		p[0] = 0x55;
+		p[1] = 0xff;
+		return 2;
+	}
+}
+
+static u32 t_wbf_crc32(const u8 *p, size_t n)
+{
+	return crc32_le(~0u, p, n) ^ ~0u;
+}
+
+/* Every address a file carries has a byte sum next to it, in the header too. */
+static u8 t_wbf_cs(const u8 *p, size_t n)
+{
+	u8 sum = 0;
+
+	while (n--)
+		sum += *p++;
+	return sum;
+}
+
+static void t_wbf_put24(u8 *p, u32 val)
+{
+	put_unaligned_le24(val, p);
+	p[3] = t_wbf_cs(p, 3);
+}
+
+/* The checksum covers the whole file with its own four bytes read as zero. */
+static void t_wbf_seal(u8 *buf, size_t size)
+{
+	put_unaligned_le32(0, buf);
+	put_unaligned_le32(t_wbf_crc32(buf, size), buf);
+}
+
+static size_t t_wbf_streams(u32 nmodes, u32 nranges)
+{
+	return ALIGN(T_WBF_MODETAB + nmodes * nranges * 4, 4);
+}
+
+/*
+ * A whole file: @nmodes modes, @nranges ranges, and a stream per (mode,
+ * range) whose frame count is the mode's own plus the range index, so a
+ * temperature test can tell the ranges apart. @temps holds the range bounds
+ * and their sentinel; *@len is the file size.
+ */
+static u8 *t_wbf_build(struct kunit *test, const struct t_wbf_mode *modes,
+		       u32 nmodes, const u8 *temps, u32 nranges, size_t *len)
+{
+	size_t fsz[T_WBF_MODES], sz, off, name, start;
+	u8 *buf;
+	u32 m, r, f, i;
+
+	KUNIT_ASSERT_LE(test, nmodes, T_WBF_MODES);
+	KUNIT_ASSERT_LE(test, nranges, 4);
+
+	sz = t_wbf_streams(nmodes, nranges);
+	for (m = 0; m < nmodes; m++) {
+		fsz[m] = modes[m].kind == T_WBF_GRAY2 ? 6 : 2;
+		for (r = 0; r < nranges; r++)
+			sz += (size_t)(modes[m].frames + r) * fsz[m] + 2;
+	}
+	name = sz;
+	sz += 1 + 4 + 2;	/* the waveform name and the slack behind it */
+
+	buf = kunit_kzalloc(test, sz, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, buf);
+
+	put_unaligned_le32(sz, buf + 0x04);
+	buf[0x10] = 0x19;	/* the mode version this format is */
+	put_unaligned_le24(name, buf + 0x1c);
+	buf[0x1f] = t_wbf_cs(buf + 0x08, 0x17);
+	put_unaligned_le24(T_WBF_WMTA, buf + 0x20);
+	buf[0x24] = 0x04;	/* 5 bits a pixel: 32 levels, every second one */
+	buf[0x25] = nmodes - 1;
+	buf[0x26] = nranges - 1;
+	buf[0x28] = T_WBF_EB;
+	buf[0x29] = T_WBF_SB;
+	buf[0x2f] = t_wbf_cs(buf + 0x20, 0x0f);
+	for (i = 0; i < nranges + 1; i++)
+		buf[0x30 + i] = temps[i];
+	buf[0x31 + nranges] = t_wbf_cs(buf + 0x30, nranges + 1);
+
+	off = t_wbf_streams(nmodes, nranges);
+	for (m = 0; m < nmodes; m++) {
+		t_wbf_put24(buf + T_WBF_WMTA + m * 4,
+			    T_WBF_MODETAB + m * nranges * 4);
+		for (r = 0; r < nranges; r++) {
+			t_wbf_put24(buf + T_WBF_MODETAB +
+				    (m * nranges + r) * 4, off);
+			start = off;
+			for (f = 0; f < modes[m].frames + r; f++)
+				off += t_wbf_frame(buf + off, modes[m].kind, f);
+			buf[off] = T_WBF_EB;
+			buf[off + 1] = t_wbf_cs(buf + start, off - start + 1);
+			off += 2;
+		}
+	}
+
+	buf[name] = 4;
+	memcpy(buf + name + 1, "test", 4);
+	buf[name + 5] = t_wbf_cs(buf + name, 5);
+	t_wbf_seal(buf, sz);
+	*len = sz;
+	return buf;
+}
+
+/* The errno of a parse, so the expect below stays on one line. */
+static int t_wbf_err(struct device *dev, const u8 *buf, size_t len)
+{
+	return PTR_ERR(rk3026_ebc_waveform_parse_wbf(dev, buf, len));
+}
+
+/* A parsed file; the buffer holds the streams, so the caller keeps it too. */
+static struct ebc_waveform *t_wbf_wf(struct kunit *test, struct device *dev,
+				     const struct t_wbf_mode *modes, u32 nmodes,
+				     const u8 *temps, u32 nranges)
+{
+	size_t len;
+	u8 *buf = t_wbf_build(test, modes, nmodes, temps, nranges, &len);
+
+	return rk3026_ebc_waveform_parse_wbf(dev, buf, len);
+}
+
+/* The eight modes a mode version 0x19 file carries, mode index + 1 frames. */
+static const struct t_wbf_mode t_wbf_all[T_WBF_MODES] = {
+	{ 1, T_WBF_RESET }, { 2, T_WBF_GRAY2 }, { 3, T_WBF_DIRECT },
+	{ 4, T_WBF_DIRECT }, { 5, T_WBF_DIRECT }, { 6, T_WBF_DIRECT },
+	{ 7, T_WBF_DIRECT }, { 8, T_WBF_DIRECT },
+};
+
+/* The same, with INIT one frame past the LUT window. */
+static const struct t_wbf_mode t_wbf_over[T_WBF_MODES] = {
+	{ 256, T_WBF_RESET }, { 2, T_WBF_GRAY2 }, { 3, T_WBF_DIRECT },
+	{ 4, T_WBF_DIRECT }, { 5, T_WBF_DIRECT }, { 6, T_WBF_DIRECT },
+	{ 7, T_WBF_DIRECT }, { 8, T_WBF_DIRECT },
+};
+
+static const u8 t_wbf_temps1[2] = { 0, 40 };
+
+/* Every work mode reaches the WBF mode the container path maps it to. */
+static void ebc_test_wbf_modes(struct kunit *test)
+{
+	struct device *dev = t_rkf_dev(test);
+	struct ebc_waveform *wf = t_wbf_wf(test, dev, t_wbf_all, T_WBF_MODES,
+					   t_wbf_temps1, 1);
+	struct ebc_waveform *short_wf;
+
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, wf);
+
+	KUNIT_EXPECT_EQ(test, t_rkf_frames(wf, EBC_MODE_RESET), 1);
+	KUNIT_EXPECT_EQ(test, t_rkf_frames(wf, EBC_MODE_BLACK_WHITE), 2);
+	KUNIT_EXPECT_EQ(test, t_rkf_frames(wf, EBC_MODE_FULL), 3);
+	KUNIT_EXPECT_EQ(test, t_rkf_frames(wf, EBC_MODE_PART), 3);
+	KUNIT_EXPECT_EQ(test, t_rkf_frames(wf, EBC_MODE_OED_PART), 4);
+	KUNIT_EXPECT_EQ(test, t_rkf_frames(wf, EBC_MODE_A2), 7);
+	KUNIT_EXPECT_EQ(test, t_rkf_frames(wf, EBC_MODE_DIRECT_A2), 7);
+	/* AUTO is GC16 with the DU overlay over it. */
+	KUNIT_EXPECT_EQ(test, t_rkf_frames(wf, EBC_MODE_AUTO), 3);
+
+	/* A mode the file does not carry is no LUT, not a wrong one. */
+	short_wf = t_wbf_wf(test, dev, t_wbf_all, 4, t_wbf_temps1, 1);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, short_wf);
+	KUNIT_EXPECT_EQ(test, t_rkf_frames(short_wf, EBC_MODE_A2), -1);
+}
+
+/* The decoded bytes: a direct frame is uniform, a GRAY2 one two columns. */
+static void ebc_test_wbf_lut_bytes(struct kunit *test)
+{
+	static const struct t_wbf_mode modes[3] = {
+		{ 1, T_WBF_RESET }, { 1, T_WBF_GRAY2 }, { 1, T_WBF_DIRECT },
+	};
+	struct device *dev = t_rkf_dev(test);
+	struct ebc_waveform *wf = t_wbf_wf(test, dev, modes, 3, t_wbf_temps1, 1);
+	u32 frames = 0;
+	const u8 *lut;
+	int i;
+
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, wf);
+
+	/* The code byte 0x55 is four codes of 1, one per level field. */
+	lut = rk3026_ebc_waveform_lut(wf, EBC_MODE_FULL, 25, &frames);
+	KUNIT_ASSERT_NOT_NULL(test, lut);
+	KUNIT_EXPECT_EQ(test, frames, 1);
+	for (i = 0; i < EBC_LUT_FRAME_BYTES / 4; i++)
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(lut + i * 4),
+				0x55555555u);
+
+	/* INIT fills a whole frame with its one code. */
+	lut = rk3026_ebc_waveform_lut(wf, EBC_MODE_RESET, 25, &frames);
+	KUNIT_ASSERT_NOT_NULL(test, lut);
+	KUNIT_EXPECT_EQ(test, frames, 1);
+	for (i = 0; i < EBC_LUT_FRAME_BYTES / 4; i++)
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(lut + i * 4),
+				0x55555555u);
+
+	/* DU: the drive to black in bits 1:0, to white in bits 31:30. */
+	lut = rk3026_ebc_waveform_lut(wf, EBC_MODE_BLACK_WHITE, 25, &frames);
+	KUNIT_ASSERT_NOT_NULL(test, lut);
+	KUNIT_EXPECT_EQ(test, frames, 1);
+	for (i = 0; i < EBC_LUT_FRAME_BYTES / 4; i++)
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(lut + i * 4),
+				0x80000001u);
+}
+
+/* A 4-bit file has half the levels, so the same stream is twice the frames. */
+static void ebc_test_wbf_levels(struct kunit *test)
+{
+	struct device *dev = t_rkf_dev(test);
+	size_t len;
+	u8 *buf = t_wbf_build(test, t_wbf_all, T_WBF_MODES, t_wbf_temps1, 1,
+			      &len);
+	struct ebc_waveform *wf;
+
+	buf[0x24] = 0x00;
+	t_wbf_seal(buf, len);
+	wf = rk3026_ebc_waveform_parse_wbf(dev, buf, len);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, wf);
+
+	KUNIT_EXPECT_EQ(test, t_rkf_frames(wf, EBC_MODE_FULL), 12);
+	KUNIT_EXPECT_EQ(test, t_rkf_frames(wf, EBC_MODE_RESET), 4);
+}
+
+/* The range table holds each range's lower bound: the last one at or below. */
+static void ebc_test_wbf_temps(struct kunit *test)
+{
+	static const u8 temps[3] = { 0, 20, 40 };
+	struct device *dev = t_rkf_dev(test);
+	struct ebc_waveform *wf = t_wbf_wf(test, dev, t_wbf_all, T_WBF_MODES,
+					   temps, 2);
+	u32 frames = 0;
+
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, wf);
+
+	/* Mode 2 has three frames in range 0 and four in range 1. */
+	KUNIT_EXPECT_NOT_NULL(test, rk3026_ebc_waveform_lut(wf, EBC_MODE_FULL,
+							    -1, &frames));
+	KUNIT_EXPECT_EQ(test, frames, 3);
+	KUNIT_EXPECT_NOT_NULL(test, rk3026_ebc_waveform_lut(wf, EBC_MODE_FULL,
+							    19, &frames));
+	KUNIT_EXPECT_EQ(test, frames, 3);
+	KUNIT_EXPECT_NOT_NULL(test, rk3026_ebc_waveform_lut(wf, EBC_MODE_FULL,
+							    20, &frames));
+	KUNIT_EXPECT_EQ(test, frames, 4);
+	KUNIT_EXPECT_NOT_NULL(test, rk3026_ebc_waveform_lut(wf, EBC_MODE_FULL,
+							    1000, &frames));
+	KUNIT_EXPECT_EQ(test, frames, 4);
+}
+
+/* AUTO is GC16 with the DU drive laid over its outermost levels. */
+static void ebc_test_wbf_auto_overlay(struct kunit *test)
+{
+	static const struct t_wbf_mode short_du[4] = {
+		{ 1, T_WBF_RESET }, { 2, T_WBF_GRAY2 }, { 3, T_WBF_DIRECT },
+		{ 3, T_WBF_DIRECT },
+	};
+	static const struct t_wbf_mode long_du[4] = {
+		{ 1, T_WBF_RESET }, { 2, T_WBF_GRAY2 }, { 1, T_WBF_DIRECT },
+		{ 1, T_WBF_DIRECT },
+	};
+	struct device *dev = t_rkf_dev(test);
+	struct ebc_waveform *wf;
+	const u8 *lut;
+	u32 frames = 0;
+	int i;
+
+	wf = t_wbf_wf(test, dev, short_du, 4, t_wbf_temps1, 1);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, wf);
+	lut = rk3026_ebc_waveform_lut(wf, EBC_MODE_AUTO, 25, &frames);
+	KUNIT_ASSERT_NOT_NULL(test, lut);
+	KUNIT_EXPECT_EQ(test, frames, 3);
+	/* The DU codes sit in the outer fields of the two frames it has... */
+	for (i = 0; i < 2 * EBC_LUT_FRAME_BYTES / 4; i++)
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(lut + i * 4),
+				0x95555555u);
+	/* ... and the GC16 frame it does not reach is left alone. */
+	for (i = 2 * EBC_LUT_FRAME_BYTES / 4;
+	     i < 3 * EBC_LUT_FRAME_BYTES / 4; i++)
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(lut + i * 4),
+				0x55555555u);
+
+	/* A DU stream longer than the GC16 one is no overlay at all. */
+	wf = t_wbf_wf(test, dev, long_du, 4, t_wbf_temps1, 1);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, wf);
+	lut = rk3026_ebc_waveform_lut(wf, EBC_MODE_AUTO, 25, &frames);
+	KUNIT_ASSERT_NOT_NULL(test, lut);
+	KUNIT_EXPECT_EQ(test, frames, 1);
+	for (i = 0; i < EBC_LUT_FRAME_BYTES / 4; i++)
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(lut + i * 4),
+				0x55555555u);
+}
+
+/* Files a parse has to refuse. */
+static void ebc_test_wbf_parse_rejects(struct kunit *test)
+{
+	static const u8 temps2[3] = { 0, 20, 40 };
+	struct device *dev = t_rkf_dev(test);
+	size_t len;
+	u8 *buf, *pad;
+
+	/* The header itself. */
+	buf = t_wbf_build(test, t_wbf_all, T_WBF_MODES, t_wbf_temps1, 1, &len);
+	KUNIT_EXPECT_EQ(test, t_wbf_err(dev, buf, 0x2f), -EINVAL);
+	KUNIT_EXPECT_EQ(test, t_wbf_err(dev, buf, 0), -EINVAL);
+
+	/* A size word below the header, past the buffer, past the format. */
+	buf = t_wbf_build(test, t_wbf_all, T_WBF_MODES, t_wbf_temps1, 1, &len);
+	put_unaligned_le32(0x20, buf + 0x04);
+	t_wbf_seal(buf, len);
+	KUNIT_EXPECT_EQ(test, t_wbf_err(dev, buf, len), -EINVAL);
+	put_unaligned_le32(len + 1, buf + 0x04);
+	KUNIT_EXPECT_EQ(test, t_wbf_err(dev, buf, len), -EINVAL);
+	put_unaligned_le32(0x80001, buf + 0x04);
+	KUNIT_EXPECT_EQ(test, t_wbf_err(dev, buf, len), -EINVAL);
+
+	/* A mode version, mode count and range count off the format. */
+	buf = t_wbf_build(test, t_wbf_all, T_WBF_MODES, t_wbf_temps1, 1, &len);
+	buf[0x10] = 0x18;
+	t_wbf_seal(buf, len);
+	KUNIT_EXPECT_EQ(test, t_wbf_err(dev, buf, len), -EINVAL);
+	buf[0x10] = 0x19;
+	buf[0x25] = 8;
+	t_wbf_seal(buf, len);
+	KUNIT_EXPECT_EQ(test, t_wbf_err(dev, buf, len), -EINVAL);
+	buf[0x25] = 7;
+	buf[0x26] = 0x20;
+	t_wbf_seal(buf, len);
+	KUNIT_EXPECT_EQ(test, t_wbf_err(dev, buf, len), -EINVAL);
+
+	/* A mode table inside the header, and one past the file. */
+	buf = t_wbf_build(test, t_wbf_all, T_WBF_MODES, t_wbf_temps1, 1, &len);
+	put_unaligned_le24(0x10, buf + 0x20);
+	t_wbf_seal(buf, len);
+	KUNIT_EXPECT_EQ(test, t_wbf_err(dev, buf, len), -EINVAL);
+	put_unaligned_le24(len - 4 * T_WBF_MODES + 1, buf + 0x20);
+	t_wbf_seal(buf, len);
+	KUNIT_EXPECT_EQ(test, t_wbf_err(dev, buf, len), -EINVAL);
+
+	/* A terminator that is also the lone byte: neither can be told apart. */
+	buf = t_wbf_build(test, t_wbf_all, T_WBF_MODES, t_wbf_temps1, 1, &len);
+	buf[0x29] = T_WBF_EB;
+	t_wbf_seal(buf, len);
+	KUNIT_EXPECT_EQ(test, t_wbf_err(dev, buf, len), -EINVAL);
+
+	/* Temperature bounds that do not ascend. */
+	buf = t_wbf_build(test, t_wbf_all, T_WBF_MODES, temps2, 2, &len);
+	buf[0x31] = 0;
+	t_wbf_seal(buf, len);
+	KUNIT_EXPECT_EQ(test, t_wbf_err(dev, buf, len), -EINVAL);
+
+	/* A file checksum that does not close. */
+	buf = t_wbf_build(test, t_wbf_all, T_WBF_MODES, t_wbf_temps1, 1, &len);
+	buf[0] ^= 1;
+	KUNIT_EXPECT_EQ(test, t_wbf_err(dev, buf, len), -EINVAL);
+
+	/* And one that does, so the case above is not refused for another reason. */
+	buf = t_wbf_build(test, t_wbf_all, T_WBF_MODES, t_wbf_temps1, 1, &len);
+	KUNIT_EXPECT_NOT_ERR_OR_NULL(test,
+				     rk3026_ebc_waveform_parse_wbf(dev, buf,
+								   len));
+	/* The same file with erased flash around it parses on its size word. */
+	pad = kunit_kzalloc(test, len + 0x100, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, pad);
+	memcpy(pad, buf, len);
+	memset(pad + len, 0xff, 0x100);
+	KUNIT_EXPECT_NOT_ERR_OR_NULL(test,
+				     rk3026_ebc_waveform_parse_wbf(dev, pad,
+								   len + 0x100));
+}
+
+/* Streams a walk has to refuse, and the LUT that goes with them. */
+static void ebc_test_wbf_stream_rejects(struct kunit *test)
+{
+	struct device *dev = t_rkf_dev(test);
+	size_t len, first = t_wbf_streams(T_WBF_MODES, 1);
+	u8 *buf;
+	struct ebc_waveform *wf;
+
+	/* A terminator no stream carries: the walk runs off the file. */
+	buf = t_wbf_build(test, t_wbf_all, T_WBF_MODES, t_wbf_temps1, 1, &len);
+	buf[0x28] = 0x7f;
+	t_wbf_seal(buf, len);
+	wf = rk3026_ebc_waveform_parse_wbf(dev, buf, len);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, wf);
+	KUNIT_EXPECT_EQ(test, t_rkf_frames(wf, EBC_MODE_RESET), -1);
+	KUNIT_EXPECT_EQ(test, t_rkf_frames(wf, EBC_MODE_FULL), -1);
+
+	/* A stream that is empty, and one that is not a whole frame. */
+	buf = t_wbf_build(test, t_wbf_all, T_WBF_MODES, t_wbf_temps1, 1, &len);
+	buf[first] = T_WBF_EB;
+	t_wbf_seal(buf, len);
+	wf = rk3026_ebc_waveform_parse_wbf(dev, buf, len);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, wf);
+	KUNIT_EXPECT_EQ(test, t_rkf_frames(wf, EBC_MODE_RESET), -1);
+
+	buf = t_wbf_build(test, t_wbf_all, T_WBF_MODES, t_wbf_temps1, 1, &len);
+	buf[first + 1] = 0;
+	t_wbf_seal(buf, len);
+	wf = rk3026_ebc_waveform_parse_wbf(dev, buf, len);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, wf);
+	KUNIT_EXPECT_EQ(test, t_rkf_frames(wf, EBC_MODE_RESET), -1);
+
+	/* A stream of 256 frames, one past what the LUT window holds. */
+	buf = t_wbf_build(test, t_wbf_over, T_WBF_MODES, t_wbf_temps1, 1, &len);
+	wf = rk3026_ebc_waveform_parse_wbf(dev, buf, len);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, wf);
+	KUNIT_EXPECT_EQ(test, t_rkf_frames(wf, EBC_MODE_RESET), -1);
+	KUNIT_EXPECT_EQ(test, t_rkf_frames(wf, EBC_MODE_FULL), 3);
+}
+
 static struct kunit_case rk3026_ebc_waveform_test_cases[] = {
 	KUNIT_CASE(ebc_test_rkf_decode),
 	KUNIT_CASE(ebc_test_rkf_decode_truncated),
@@ -4503,6 +4969,13 @@ static struct kunit_case rk3026_ebc_waveform_test_cases[] = {
 	KUNIT_CASE(ebc_test_rkf_fallbacks),
 	KUNIT_CASE(ebc_test_rkf_auto_overlay),
 	KUNIT_CASE(ebc_test_rkf_parse_bounds),
+	KUNIT_CASE(ebc_test_wbf_modes),
+	KUNIT_CASE(ebc_test_wbf_lut_bytes),
+	KUNIT_CASE(ebc_test_wbf_levels),
+	KUNIT_CASE(ebc_test_wbf_temps),
+	KUNIT_CASE(ebc_test_wbf_auto_overlay),
+	KUNIT_CASE(ebc_test_wbf_parse_rejects),
+	KUNIT_CASE(ebc_test_wbf_stream_rejects),
 	{}
 };
 
@@ -12622,6 +13095,37 @@ out:
 	t_kms_ctx_fini(ctx);
 }
 
+/* --- the panel passport's encoding (ebc_panel_text()) --- */
+
+/*
+ * The passport is not ASCII: digits stand for themselves, 10, 11 and 12 are
+ * '_', '.' and '-', the letters are shifted up and 0xff pads the field. A
+ * field read raw prints as mojibake, so the translation is worth a test.
+ */
+static void ebc_test_panel_text(struct kunit *test)
+{
+	static const u8 part[] = { 0xe9, 0xe8, 0x00, 0x06, 0x00, 0xef, 0xe8,
+				   0x01, 0xf9, 0x07, 0xff, 0xff };
+	static const u8 vcom[] = { 0x0c, 0x02, 0x0b, 0x00, 0x06, 0xff };
+	static const u8 odd[] = { 0x0d, 0x80, 0xe5 };
+	char text[40];
+
+	ebc_panel_text(text, sizeof(text), part, sizeof(part));
+	KUNIT_EXPECT_STREQ(test, text, "ED060KD1U7");
+	ebc_panel_text(text, sizeof(text), vcom, sizeof(vcom));
+	KUNIT_EXPECT_STREQ(test, text, "-2.06");
+	/* A byte the encoding does not use is a question mark, not a stop. */
+	ebc_panel_text(text, sizeof(text), odd, sizeof(odd));
+	KUNIT_EXPECT_STREQ(test, text, "??A");
+
+	/* A field longer than the buffer is cut and still terminated. */
+	ebc_panel_text(text, 4, part, sizeof(part));
+	KUNIT_EXPECT_STREQ(test, text, "ED0");
+	/* An empty field. */
+	ebc_panel_text(text, sizeof(text), part, 0);
+	KUNIT_EXPECT_STREQ(test, text, "");
+}
+
 static struct kunit_case rk3026_ebc_glue_test_cases[] = {
 	KUNIT_CASE(ebc_test_glue_add_update),
 	KUNIT_CASE(ebc_test_glue_crtc_off),
@@ -12762,6 +13266,7 @@ static struct kunit_case rk3026_ebc_glue_test_cases[] = {
 	KUNIT_CASE(ebc_test_glue_flip_take_sleep),
 	KUNIT_CASE(ebc_test_glue_kms_init),
 	KUNIT_CASE(ebc_test_glue_kms_palette),
+	KUNIT_CASE(ebc_test_panel_text),
 	{}
 };
 

@@ -30,8 +30,10 @@
 #include <linux/math64.h>
 #include <linux/mfd/syscon.h>
 #include <linux/module.h>
+#include <linux/nvmem-consumer.h>
 #include <linux/of.h>
 #include <linux/of_reserved_mem.h>
+#include <linux/pinctrl/consumer.h>
 #include <linux/platform_device.h>
 #include <linux/regmap.h>
 #include <linux/regulator/consumer.h>
@@ -3611,10 +3613,174 @@ static void ebc_release_fw(void *data)
 	release_firmware(data);
 }
 
+static void ebc_free_buf(void *data)
+{
+	kfree(data);
+}
+
+/*
+ * The pads the panel's flash shares with the board - the cover switch, the
+ * fuel gauge's alert, the charge-current select, the RTC interrupt - go back
+ * to their GPIO function once the read is over, as stock does around its own
+ * access. The board names the two states; a board without them keeps whatever
+ * mux the SPI controller left behind, which costs the read, not the boot.
+ */
+struct ebc_panel_pins {
+	struct pinctrl		*p;
+	struct pinctrl_state	*idle;
+};
+
+static void ebc_panel_pins_get(struct rk3026_ebc *ebc,
+			       struct ebc_panel_pins *pins)
+{
+	struct pinctrl_state *on;
+
+	pins->p = NULL;
+	pins->idle = NULL;
+
+	pins->p = devm_pinctrl_get(ebc->dev);
+	if (IS_ERR(pins->p)) {
+		pins->p = NULL;
+		return;
+	}
+
+	on = pinctrl_lookup_state(pins->p, "panel-flash");
+	pins->idle = pinctrl_lookup_state(pins->p, "panel-flash-idle");
+	if (IS_ERR(pins->idle))
+		pins->idle = NULL;
+	if (IS_ERR(on))
+		return;
+	if (pinctrl_select_state(pins->p, on))
+		dev_warn(ebc->dev, "cannot mux the pads to the panel flash\n");
+}
+
+static void ebc_panel_pins_put(struct rk3026_ebc *ebc,
+			       struct ebc_panel_pins *pins)
+{
+	if (pins->p && pins->idle &&
+	    pinctrl_select_state(pins->p, pins->idle))
+		dev_warn(ebc->dev, "cannot hand the panel flash pads back\n");
+}
+
+static void *ebc_panel_cell(struct rk3026_ebc *ebc, const char *name,
+			    size_t *len)
+{
+	struct nvmem_cell *cell;
+	void *buf;
+
+	cell = nvmem_cell_get(ebc->dev, name);
+	if (IS_ERR(cell))
+		return ERR_CAST(cell);
+
+	buf = nvmem_cell_read(cell, len);
+	nvmem_cell_put(cell);
+	return buf;
+}
+
+/*
+ * The panel flash carries the waveform the panel was made for, which is not
+ * necessarily the one in the image: the RC2's own panel holds an R177 for an
+ * ED060KD1U7 where stock and the firmware blob run an R110 for an
+ * ED060KD1C2. Nothing is written, the flash is only read.
+ */
+static struct ebc_waveform *ebc_waveform_from_panel(struct rk3026_ebc *ebc)
+{
+	struct ebc_panel_pins pins;
+	struct ebc_waveform *wf;
+	size_t len = 0;
+	void *buf;
+
+	if (!of_property_present(ebc->dev->of_node, "nvmem-cells"))
+		return NULL;
+
+	ebc_panel_pins_get(ebc, &pins);
+	buf = ebc_panel_cell(ebc, "waveform", &len);
+	ebc_panel_pins_put(ebc, &pins);
+
+	if (IS_ERR(buf)) {
+		dev_warn(ebc->dev, "panel waveform: %pe\n", buf);
+		return NULL;
+	}
+	if (devm_add_action_or_reset(ebc->dev, ebc_free_buf, buf))
+		return NULL;
+
+	wf = rk3026_ebc_waveform_parse_wbf(ebc->dev, buf, len);
+	if (IS_ERR(wf)) {
+		dev_warn(ebc->dev, "panel waveform rejected: %pe\n", wf);
+		return NULL;
+	}
+	return wf;
+}
+
+/*
+ * The passport is not ASCII: digits stand for themselves, 10, 11 and 12 are
+ * '_', '.' and '-', the letters are shifted up (0xcb..0xe4 is a..z, 0xe5..0xfe
+ * is A..Z) and 0xff pads the field, so the raw bytes print as mojibake.
+ */
+VISIBLE_IF_KUNIT void ebc_panel_text(char *out, size_t out_len, const u8 *in,
+				     size_t len)
+{
+	size_t i;
+
+	for (i = 0; i + 1 < out_len && i < len; i++) {
+		u8 c = in[i];
+
+		if (c == 0xff)
+			break;
+		if (c <= 9)
+			out[i] = '0' + c;
+		else if (c <= 12)
+			out[i] = "_.-"[c - 10];
+		else if (c >= 0xcb && c <= 0xe4)
+			out[i] = 'a' + c - 0xcb;
+		else if (c >= 0xe5 && c <= 0xfe)
+			out[i] = 'A' + c - 0xe5;
+		else
+			out[i] = '?';
+	}
+	out[i] = '\0';
+}
+EXPORT_SYMBOL_IF_KUNIT(ebc_panel_text);
+
+/* The passport the panel is shipped with, as the vendor kernel reports it. */
+static void ebc_panel_passport(struct rk3026_ebc *ebc)
+{
+	static const char * const names[] = { "part-number", "waveform-name",
+					      "vcom" };
+	struct ebc_panel_pins pins;
+	unsigned int i;
+
+	if (!of_property_present(ebc->dev->of_node, "nvmem-cells"))
+		return;
+
+	ebc_panel_pins_get(ebc, &pins);
+	for (i = 0; i < ARRAY_SIZE(names); i++) {
+		size_t len = 0;
+		char text[40];
+		void *buf;
+
+		buf = ebc_panel_cell(ebc, names[i], &len);
+		if (IS_ERR(buf))
+			continue;
+		ebc_panel_text(text, sizeof(text), buf, len);
+		dev_info(ebc->dev, "panel %s: %s\n", names[i], text);
+		kfree(buf);
+	}
+	ebc_panel_pins_put(ebc, &pins);
+}
+
 static int ebc_load_waveform(struct rk3026_ebc *ebc)
 {
 	struct ebc_waveform *wf;
 	int ret;
+
+	ebc_panel_passport(ebc);
+
+	wf = ebc_waveform_from_panel(ebc);
+	if (wf) {
+		ebc->waveform = wf;
+		return 0;
+	}
 
 	ret = request_firmware(&ebc->fw, EBC_WAVEFORM_FW, ebc->dev);
 	if (ret) {

@@ -426,8 +426,24 @@
 	assigned-clocks = <&cru PLL_CPLL>, <&cru DCLK_EBC>;
 	assigned-clock-parents = <0>, <&cru PLL_CPLL>;
 	assigned-clock-rates = <640000000>, <160000000>;
-	pinctrl-names = "default";
+	/*
+	 * The panel's flash is on SPI0, on pads the board shares with GPIOs
+	 * (see &spi below), so the driver borrows them for the one read that
+	 * fetches the waveform and hands them back straight after. A board
+	 * without the two states keeps whatever mux the SPI controller left.
+	 */
+	pinctrl-names = "default", "panel-flash", "panel-flash-idle";
 	pinctrl-0 = <&ebc_pins_rc2>;
+	pinctrl-1 = <&spi_clk &spi_txd &spi_rxd &spi_cs0>;
+	pinctrl-2 = <&spi_release>;
+	/*
+	 * The waveform the panel was made for, and the passport next to it,
+	 * read out of the panel's own flash; the driver falls back to the
+	 * firmware blob when the board has neither.
+	 */
+	nvmem-cells = <&panel_waveform>, <&panel_part_number>,
+		      <&panel_waveform_name>, <&panel_vcom>;
+	nvmem-cell-names = "waveform", "part-number", "waveform-name", "vcom";
 	memory-region = <&ebc_pool>;
 	/*
 	 * No v3p3-supply: the panel logic rail is the ACT8931's LDO4, which
@@ -450,6 +466,94 @@
 		vsync-len = <2>;
 		vback-porch = <4>;
 		vfront-porch = <4>;
+	};
+};
+
+/*
+ * The panel's own flash, a Macronix MX25U512 (JEDEC c2 25 33, 512 KiB, 1.8 V
+ * on the panel side) on SPI0, read only: nothing in this description ever
+ * writes it. It carries the waveform the panel was made for at 0x886
+ * (`WFM_ADDR` of the vendor SDK) and the panel's passport at 0x70000, which
+ * is where stock takes the panel id, the waveform name and the VCOM label
+ * from. The waveform partition ends where the passport starts; the file
+ * states its own size, so the erased bytes around it are ignored.
+ *
+ * The four pads are shared with board GPIOs: GPIO1_B0 is the cover switch,
+ * B1 the fuel gauge alert, B2 the charge-current select and B3 the RTC
+ * interrupt, and SPI0 CLK/TXD/RXD/CS0 are the same four. Stock muxes them to
+ * the controller only for its own access (`spi_ctl_pins_enable`); here the
+ * SPI controller takes them for its probe reads and the EBC driver borrows
+ * them again for the waveform read, then selects `spi_release` to give them
+ * back. A read of /dev/mtd0 after that needs the mux selected again.
+ */
+&spi {
+	/*
+	 * The SoC's own four groups, plus the chip's enable: GPIO2_B2
+	 * (`spi_ctl` of the vendor kernel) is a plain GPIO on this board, the
+	 * EBC's SDOE pad is not used, and it has to be up before the chip is
+	 * probed - so it is muxed here instead of left to the loader. The
+	 * hog in &gpio2 drives it.
+	 */
+	pinctrl-0 = <&spi_txd &spi_rxd &spi_clk &spi_cs0 &spi_flash_enable>;
+	status = "okay";
+
+	flash@0 {
+		compatible = "jedec,spi-nor";
+		reg = <0>;
+		spi-max-frequency = <6000000>;
+
+		partitions {
+			compatible = "fixed-partitions";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			waveform@886 {
+				compatible = "nvmem-cells";
+				label = "panel-waveform";
+				reg = <0x886 0x6f77a>;
+				read-only;
+				#address-cells = <1>;
+				#size-cells = <1>;
+
+				panel_waveform: waveform@0 {
+					reg = <0x0 0x6f77a>;
+				};
+			};
+
+			passport@70000 {
+				compatible = "nvmem-cells";
+				label = "panel-passport";
+				reg = <0x70000 0x310>;
+				read-only;
+				#address-cells = <1>;
+				#size-cells = <1>;
+
+				panel_part_number: part-number@0 {
+					reg = <0x0 0x10>;
+				};
+
+				panel_vcom: vcom@10 {
+					reg = <0x10 0x10>;
+				};
+
+				panel_waveform_name: waveform-name@20 {
+					reg = <0x20 0x20>;
+				};
+			};
+		};
+	};
+};
+
+/*
+ * The panel flash's enable, high: the chip is powered only while this line is
+ * up, and stock keeps it up for the whole board life.
+ */
+&gpio2 {
+	flash-enable-hog {
+		gpio-hog;
+		gpios = <RK_PB2 GPIO_ACTIVE_HIGH>;
+		output-high;
+		line-name = "panel-flash-enable";
 	};
 };
 
@@ -495,6 +599,33 @@
 					<2 RK_PC2 2 &pcfg_pull_none>,
 					<2 RK_PD0 2 &pcfg_pull_none>,
 					<2 RK_PD1 2 &pcfg_pull_none>;
+		};
+	};
+
+	/*
+	 * The panel flash's two groups, in a container of their own and not
+	 * in the dtsi's `spi` one: dtc's spi_bus_bridge check fires on any
+	 * node named spi* that has children and no bus cells, the dtsi's
+	 * container has neither, and a group added to it therefore makes the
+	 * check name the board file as a second definition as well.
+	 */
+	panel-flash {
+		/* The flash's enable as the GPIO it is; the value comes from the hog. */
+		spi_flash_enable: spi-flash-enable {
+			rockchip,pins = <2 RK_PB2 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+
+		/*
+		 * GPIO1_B0..B3 back to their GPIO function, the state the
+		 * board runs in outside a panel-flash access: the cover switch
+		 * (B0, no pull, as `lid_pin`), the RTC interrupt (B3, pull
+		 * default, as `rtc_int`) and the two unclaimed pads.
+		 */
+		spi_release: spi-release {
+			rockchip,pins = <1 RK_PB0 RK_FUNC_GPIO &pcfg_pull_none>,
+					<1 RK_PB1 RK_FUNC_GPIO &pcfg_pull_default>,
+					<1 RK_PB2 RK_FUNC_GPIO &pcfg_pull_default>,
+					<1 RK_PB3 RK_FUNC_GPIO &pcfg_pull_default>;
 		};
 	};
 

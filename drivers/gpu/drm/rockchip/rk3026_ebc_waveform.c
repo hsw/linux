@@ -55,6 +55,49 @@
 #define RKF_LUT_AUTO		8
 #define RKF_LUT_GRAYA2		9
 
+/* Largest WBF we accept: the panel flash a board can put one on is 512 KiB. */
+#define WBF_MAX_SIZE		0x80000
+#define WBF_HEADER_MIN		0x30
+/* Mode version 0x19: INIT DU GC16 GL16 GLR16 GLD16 A2 DU4, the Carta-era set. */
+#define WBF_MODE_VERSION	0x19
+#define WBF_MAX_MODES		8
+#define WBF_MAX_RANGES		0x20
+/* One code per (frame, target, source); 255 frames of 32 x 32 is the ceiling. */
+#define WBF_MAX_CODES		(EBC_WAVEFORM_MAX_FRAMES * 32 * 32)
+
+/* Header fields, all little-endian. */
+#define WBF_FILESIZE_OFF	0x04
+#define WBF_MODE_VER_OFF	0x10
+#define WBF_XWIA_OFF		0x1c
+#define WBF_WMTA_OFF		0x20
+#define WBF_LUTS_OFF		0x24
+#define WBF_MODE_COUNT_OFF	0x25
+#define WBF_RANGE_COUNT_OFF	0x26
+#define WBF_EB_OFF		0x28
+#define WBF_SB_OFF		0x29
+#define WBF_TEMPS_OFF		0x30
+
+/* WBF mode index -> container LUT mode, as tools/mainline-rc2/wbf2rkf.py maps it. */
+#define WBF_MODE_INIT		0
+#define WBF_MODE_DU		1
+#define WBF_MODE_GC16		2
+#define WBF_MODE_GL16		3
+#define WBF_MODE_A2		6
+
+/* The part of a parsed waveform that only the WBF source has. */
+struct ebc_wbf {
+	const u8	*d;
+	size_t		size;		/* the extent the header states */
+	u32		wmta;
+	u8		eb;
+	u8		sb;
+	u8		levels;		/* 16 or 32, from the bits-per-pixel field */
+	u8		step;		/* levels / 16: the 16-level view strides */
+	u8		modes;
+	u8		ranges;
+	u8		temps[WBF_MAX_RANGES + 1];
+};
+
 struct ebc_waveform {
 	struct device	*dev;
 	const u8	*base;
@@ -71,6 +114,9 @@ struct ebc_waveform {
 
 	u8		*lut;	/* frames * EBC_LUT_FRAME_BYTES */
 	u8		*raw;	/* Huffman output before the post-pass */
+
+	bool		is_wbf;
+	struct ebc_wbf	wbf;
 };
 
 /*
@@ -457,15 +503,367 @@ static u32 rkf_lut_mode(u32 ebc_mode)
 	}
 }
 
+/*
+ * WBF: E Ink's own waveform file, the format a panel keeps in its own flash
+ * (the RC2 panel carries 320_R177_AE6A41_ED060KD1U7_TC at 0x886 of its SPI
+ * flash). Where rkf is a Huffman-compressed container built for this driver,
+ * a WBF holds a table of pointers into run-length streams of 2-bit drive
+ * codes - one code per (frame, target level, source level), 5 bits per pixel
+ * per frame on the Carta-era files, so the 16 levels the driver wants are the
+ * even indices. Mode and temperature are addressed through the file's own
+ * tables, and a mode version 0x19 file has the same eight modes wbf2rkf.py
+ * maps: INIT/DU/GC16/GL16/A2 become RESET/GRAY2/GRAY16/MODE6/GRAYA2 and
+ * GLR16/GLD16 are dropped, exactly as the host converter does it.
+ *
+ * Nothing here writes the flash: the WBF is read out through nvmem, parsed in
+ * place, and every LUT the driver asks for is decoded out of it.
+ */
+
+static u32 wbf_u24(const u8 *p)
+{
+	return p[0] | (p[1] << 8) | (p[2] << 16);
+}
+
+/*
+ * The file checksum is a plain reflected CRC-32 (zlib's) over the whole file
+ * with the checksum word itself read as zero - the four leading bytes count,
+ * so the crc cannot start at byte 4. Bitwise, like the container CRC: one
+ * call per probe does not pay for a table.
+ */
+static u32 wbf_crc32(const u8 *p, size_t n)
+{
+	u32 crc = 0xffffffffu;
+	size_t i;
+	int k;
+
+	for (i = 0; i < n; i++) {
+		crc ^= i < 4 ? 0 : p[i];
+		for (k = 0; k < 8; k++)
+			crc = (crc >> 1) ^ (crc & 1 ? 0xedb88320u : 0);
+	}
+	return ~crc;
+}
+
+/*
+ * A stream is a list of bytes, four 2-bit codes each (least significant pair
+ * first), until the terminator byte; a lone "single" byte toggles a flag that
+ * makes the next byte stand for itself instead of carrying a repeat count.
+ * Codes arrive in file order: frame, then target level, then source level.
+ */
+typedef int (*wbf_emit_fn)(void *ctx, u32 idx, u8 code);
+
+static int wbf_walk(const struct ebc_wbf *w, u32 off, wbf_emit_fn emit,
+		    void *ctx, u32 *count)
+{
+	u32 i = off;
+	u32 n = 0;
+	bool single = false;
+
+	if (off < WBF_HEADER_MIN || off >= w->size)
+		return -EINVAL;
+
+	for (;;) {
+		u32 rep;
+		u8 b;
+		int k;
+
+		if (i >= w->size)
+			return -EINVAL;
+		b = w->d[i];
+		if (b == w->eb)
+			break;
+		if (b == w->sb) {
+			single = !single;
+			i++;
+			continue;
+		}
+		if (single) {
+			rep = 1;
+			i++;
+		} else {
+			if (i + 1 >= w->size)
+				return -EINVAL;
+			rep = w->d[i + 1] + 1;
+			i += 2;
+		}
+
+		for (; rep; rep--) {
+			for (k = 0; k < 4; k++) {
+				if (emit && emit(ctx, n, (b >> (2 * k)) & 3))
+					return -EINVAL;
+				if (++n > WBF_MAX_CODES)
+					return -EINVAL;
+			}
+		}
+	}
+
+	/* The count is codes, not frames: the caller divides by levels squared. */
+	if (count)
+		*count = n;
+	return 0;
+}
+
+/* Resolve a mode and a temperature to its stream, and count its frames. */
+static int wbf_stream(const struct ebc_wbf *w, u8 mode, int temp, u32 *frames,
+		      u32 *off)
+{
+	u32 mode_ptr, rng, lv2 = (u32)w->levels * w->levels;
+
+	if (mode >= w->modes)
+		return -EINVAL;
+
+	mode_ptr = wbf_u24(w->d + w->wmta + 4 * mode);
+	if (mode_ptr + 4 * w->ranges > w->size)
+		return -EINVAL;
+
+	/* The table holds each range's lower bound: the last one at or below. */
+	for (rng = 0; rng + 1 < w->ranges && temp >= w->temps[rng + 1]; rng++)
+		;
+	*off = wbf_u24(w->d + mode_ptr + 4 * rng);
+
+	if (wbf_walk(w, *off, NULL, NULL, frames))
+		return -EINVAL;
+	if (!*frames || *frames % lv2)
+		return -EINVAL;
+	*frames /= lv2;
+	if (*frames > EBC_WAVEFORM_MAX_FRAMES)
+		return -EINVAL;
+	return 0;
+}
+
+/* A full 16 x 16 frame per decoded frame: GC16, GL16 and A2 go through here. */
+struct wbf_direct {
+	u8	*lut;
+	u32	levels;
+	u32	step;
+	u32	max_frames;
+};
+
+static int wbf_emit_direct(void *ctx, u32 idx, u8 code)
+{
+	struct wbf_direct *c = ctx;
+	u32 levels = c->levels;
+	u32 frame = idx / (levels * levels);
+	u32 new = (idx / levels) % levels;
+	u32 old = idx % levels;
+	u8 *p;
+
+	if (frame >= c->max_frames)
+		return -EINVAL;
+	if (new % c->step || old % c->step)
+		return 0;
+	p = c->lut + frame * EBC_LUT_FRAME_BYTES + (old / c->step) * 4;
+	put_unaligned_le32(get_unaligned_le32(p) |
+			   ((u32)code << (2 * (new / c->step))), p);
+	return 0;
+}
+
+/*
+ * INIT drives every pixel of a frame the same way, so one code per frame
+ * reaches the LUT as a whole uniform frame. Only the 16 levels count, as in
+ * wbf2rkf.py's raw_reset().
+ */
+struct wbf_reset {
+	u8	*lut;
+	u32	levels;
+	u32	step;
+	u8	first;
+	bool	have;
+};
+
+static int wbf_emit_reset(void *ctx, u32 idx, u8 code)
+{
+	struct wbf_reset *c = ctx;
+	u32 levels = c->levels;
+	u32 new = (idx / levels) % levels;
+	u32 old = idx % levels;
+	u32 frame = idx / (levels * levels);
+	u32 word, i;
+
+	if (new % c->step || old % c->step)
+		return 0;
+	if (frame >= EBC_WAVEFORM_MAX_FRAMES)
+		return -EINVAL;
+
+	if (!c->have) {
+		c->first = code;
+		c->have = true;
+		word = c->first * 0x55555555u;
+		for (i = 0; i < EBC_LUT_FRAME_BYTES / 4; i++)
+			put_unaligned_le32(word, c->lut + frame * EBC_LUT_FRAME_BYTES + i * 4);
+		return 0;
+	}
+	if (code != c->first)
+		return -EINVAL;
+	if (new == levels - c->step && old == levels - c->step)
+		c->have = false;
+	return 0;
+}
+
+/*
+ * DU drives only toward the outermost levels, so it reaches the LUT as two
+ * columns: bits 1:0 of each word for the drive to black, bits 31:30 for the
+ * drive to white.
+ */
+struct wbf_gray2 {
+	u8	*lut;
+	u32	levels;
+	u32	step;
+	u32	max_frames;
+};
+
+static int wbf_emit_gray2(void *ctx, u32 idx, u8 code)
+{
+	struct wbf_gray2 *c = ctx;
+	u32 levels = c->levels;
+	u32 frame = idx / (levels * levels);
+	u32 new = (idx / levels) % levels;
+	u32 old = idx % levels;
+	u8 *p;
+
+	if (new % c->step || old % c->step)
+		return 0;
+	if (frame >= c->max_frames)
+		return -EINVAL;
+	new /= c->step;
+	old /= c->step;
+	if (new && new != 15)
+		return code ? -EINVAL : 0;
+
+	/*
+	 * Clear the field first: over a decoded GC16 LUT (the AUTO mode) the
+	 * DU drive replaces what is there, it does not add to it.
+	 */
+	p = c->lut + frame * EBC_LUT_FRAME_BYTES + old * 4;
+	put_unaligned_le32((get_unaligned_le32(p) & ~(3u << (new ? 30 : 0))) |
+			   (new ? ((u32)code << 30) : code), p);
+	return 0;
+}
+
+/* WBF mode index for a container LUT mode; 0xff when the file has no such mode. */
+static u8 wbf_mode_of(u32 lut_mode)
+{
+	switch (lut_mode) {
+	case RKF_LUT_RESET:
+		return WBF_MODE_INIT;
+	case RKF_LUT_GRAY16:
+	case RKF_LUT_AUTO:
+		return WBF_MODE_GC16;
+	case RKF_LUT_MODE6:
+		return WBF_MODE_GL16;
+	case RKF_LUT_GRAY2:
+		return WBF_MODE_DU;
+	case RKF_LUT_GRAYA2:
+		return WBF_MODE_A2;
+	default:
+		return 0xff;
+	}
+}
+
+static int wbf_load_direct(struct ebc_waveform *wf, u8 mode, int temp,
+			   u32 *frames)
+{
+	struct wbf_direct c = {
+		.lut = wf->lut,
+		.levels = wf->wbf.levels,
+		.step = wf->wbf.step,
+		.max_frames = EBC_WAVEFORM_MAX_FRAMES,
+	};
+	u32 off;
+
+	if (wbf_stream(&wf->wbf, mode, temp, frames, &off))
+		return -EINVAL;
+	return wbf_walk(&wf->wbf, off, wbf_emit_direct, &c, NULL) ?
+	       -EINVAL : 0;
+}
+
+static int wbf_load_reset(struct ebc_waveform *wf, int temp, u32 *frames)
+{
+	struct wbf_reset c = {
+		.lut = wf->lut,
+		.levels = wf->wbf.levels,
+		.step = wf->wbf.step,
+	};
+	u32 off;
+
+	if (wbf_stream(&wf->wbf, WBF_MODE_INIT, temp, frames, &off))
+		return -EINVAL;
+	return wbf_walk(&wf->wbf, off, wbf_emit_reset, &c, NULL) ?
+	       -EINVAL : 0;
+}
+
+static int wbf_load_gray2(struct ebc_waveform *wf, int temp, u32 *frames,
+			  u32 max_frames)
+{
+	struct wbf_gray2 c = {
+		.lut = wf->lut,
+		.levels = wf->wbf.levels,
+		.step = wf->wbf.step,
+		.max_frames = max_frames,
+	};
+	u32 off;
+
+	if (wbf_stream(&wf->wbf, WBF_MODE_DU, temp, frames, &off))
+		return -EINVAL;
+	if (*frames > max_frames)
+		return -EINVAL;
+	return wbf_walk(&wf->wbf, off, wbf_emit_gray2, &c, NULL) ?
+	       -EINVAL : 0;
+}
+
+/* The driver's own mode selection, mirrored onto WBF mode indices. */
+static int wbf_load_lut(struct ebc_waveform *wf, u32 lut_mode, int temp,
+			u32 *frames)
+{
+	u8 mode = wbf_mode_of(lut_mode);
+	u32 du, off;
+	struct wbf_gray2 c;
+
+	if (mode == 0xff)
+		return -ENOENT;
+
+	memset(wf->lut, 0, RKF_LUT_MAX);
+
+	switch (lut_mode) {
+	case RKF_LUT_RESET:
+		return wbf_load_reset(wf, temp, frames);
+
+	case RKF_LUT_GRAY2:
+		return wbf_load_gray2(wf, temp, frames, EBC_WAVEFORM_MAX_FRAMES);
+
+	case RKF_LUT_AUTO:
+		/*
+		 * AUTO is GC16 with the DU drive laid over the outermost
+		 * levels. A DU stream longer than the GC16 one is no overlay
+		 * at all, so it is left off - as the container path does.
+		 */
+		if (wbf_load_direct(wf, WBF_MODE_GC16, temp, frames))
+			return -EINVAL;
+		if (wbf_stream(&wf->wbf, WBF_MODE_DU, temp, &du, &off))
+			return 0;
+		if (du > *frames)
+			return 0;
+		c.lut = wf->lut;
+		c.levels = wf->wbf.levels;
+		c.step = wf->wbf.step;
+		c.max_frames = *frames;
+		return wbf_walk(&wf->wbf, off, wbf_emit_gray2, &c, &du) ?
+		       -EINVAL : 0;
+
+	default:
+		return wbf_load_direct(wf, mode, temp, frames);
+	}
+}
+
 /**
  * rk3026_ebc_waveform_lut - fetch the packed LUT for one mode and temperature
- * @wf: parsed container
+ * @wf: parsed waveform
  * @mode: EBC work mode
  * @temp: panel temperature in degrees Celsius
  * @frames: number of waveform frames, on success
  *
  * Returns a pointer to @frames * 0x40 bytes ready for the LUT SRAM window, or
- * NULL if the container has no waveform for this mode.
+ * NULL if the waveform has none for this mode.
  */
 const u8 *rk3026_ebc_waveform_lut(struct ebc_waveform *wf, u32 mode, int temp,
 				  u32 *frames)
@@ -480,7 +878,10 @@ const u8 *rk3026_ebc_waveform_lut(struct ebc_waveform *wf, u32 mode, int temp,
 	}
 
 	wf->cached_valid = false;
-	ret = rkf_load_lut(wf, lut_mode, temp, &wf->frames);
+	if (wf->is_wbf)
+		ret = wbf_load_lut(wf, lut_mode, temp, &wf->frames);
+	else
+		ret = rkf_load_lut(wf, lut_mode, temp, &wf->frames);
 	if (ret) {
 		dev_warn_ratelimited(wf->dev,
 				     "no waveform for mode %u at %d C (%d)\n",
@@ -600,3 +1001,114 @@ struct ebc_waveform *rk3026_ebc_waveform_parse(struct device *dev,
 	return wf;
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_waveform_parse);
+
+/**
+ * rk3026_ebc_waveform_parse_wbf - validate a WBF file and describe it
+ * @dev: device to allocate against and to log through
+ * @buf: the file, as read out of the panel's flash or a firmware blob
+ * @len: bytes in @buf; the file's own size word may be shorter, the rest is
+ *	 the erased flash around it
+ *
+ * The streams stay in @buf: every LUT is decoded on demand, so @buf has to
+ * outlive the returned waveform.
+ *
+ * Returns the waveform, or an ERR_PTR.
+ */
+struct ebc_waveform *rk3026_ebc_waveform_parse_wbf(struct device *dev,
+						   const u8 *buf, size_t len)
+{
+	struct ebc_waveform *wf;
+	size_t size;
+	const u8 *name;
+	u32 bits, crc, i;
+
+	if (len < WBF_HEADER_MIN) {
+		dev_err(dev, "wbf truncated: %zu bytes\n", len);
+		return ERR_PTR(-EINVAL);
+	}
+
+	size = get_unaligned_le32(buf + WBF_FILESIZE_OFF);
+	if (size < WBF_HEADER_MIN || size > len || size > WBF_MAX_SIZE) {
+		dev_err(dev, "wbf size %#zx out of range for %zu bytes\n",
+			size, len);
+		return ERR_PTR(-EINVAL);
+	}
+
+	if (buf[WBF_MODE_VER_OFF] != WBF_MODE_VERSION) {
+		dev_err(dev, "wbf mode version %#x, not %#x\n",
+			buf[WBF_MODE_VER_OFF], WBF_MODE_VERSION);
+		return ERR_PTR(-EINVAL);
+	}
+
+	wf = devm_kzalloc(dev, sizeof(*wf), GFP_KERNEL);
+	if (!wf)
+		return ERR_PTR(-ENOMEM);
+	wf->dev = dev;
+	wf->base = buf;
+	wf->size = size;
+	wf->is_wbf = true;
+
+	wf->wbf.d = buf;
+	wf->wbf.size = size;
+	wf->wbf.modes = buf[WBF_MODE_COUNT_OFF] + 1;
+	wf->wbf.ranges = buf[WBF_RANGE_COUNT_OFF] + 1;
+	wf->wbf.wmta = wbf_u24(buf + WBF_WMTA_OFF);
+	wf->wbf.eb = buf[WBF_EB_OFF];
+	wf->wbf.sb = buf[WBF_SB_OFF];
+
+	if (wf->wbf.modes > WBF_MAX_MODES || wf->wbf.ranges > WBF_MAX_RANGES) {
+		dev_err(dev, "wbf %u modes and %u ranges\n", wf->wbf.modes,
+			wf->wbf.ranges);
+		return ERR_PTR(-EINVAL);
+	}
+	if (wf->wbf.wmta < WBF_HEADER_MIN ||
+	    wf->wbf.wmta + 4 * wf->wbf.modes > size) {
+		dev_err(dev, "wbf mode table at %#x does not fit %#zx bytes\n",
+			wf->wbf.wmta, size);
+		return ERR_PTR(-EINVAL);
+	}
+	if (wf->wbf.eb == wf->wbf.sb) {
+		dev_err(dev, "wbf terminator and lone byte are both %#x\n",
+			wf->wbf.eb);
+		return ERR_PTR(-EINVAL);
+	}
+	if (WBF_TEMPS_OFF + wf->wbf.ranges + 1 > size) {
+		dev_err(dev, "wbf temperature table does not fit %#zx bytes\n",
+			size);
+		return ERR_PTR(-EINVAL);
+	}
+	for (i = 0; i < wf->wbf.ranges; i++) {
+		wf->wbf.temps[i] = buf[WBF_TEMPS_OFF + i];
+		if (i && wf->wbf.temps[i] <= wf->wbf.temps[i - 1]) {
+			dev_err(dev, "wbf temperature bounds not ascending at %u\n", i);
+			return ERR_PTR(-EINVAL);
+		}
+	}
+	wf->wbf.temps[wf->wbf.ranges] = buf[WBF_TEMPS_OFF + wf->wbf.ranges];
+
+	bits = (buf[WBF_LUTS_OFF] & 0x0c) == 0x04 ? 5 : 4;
+	wf->wbf.levels = 1 << bits;
+	wf->wbf.step = wf->wbf.levels / 16;
+
+	crc = wbf_crc32(buf, size);
+	if (crc != get_unaligned_le32(buf)) {
+		dev_err(dev, "wbf CRC mismatch: got %08x want %08x\n", crc,
+			get_unaligned_le32(buf));
+		return ERR_PTR(-EINVAL);
+	}
+
+	wf->lut = devm_kmalloc(dev, RKF_LUT_MAX, GFP_KERNEL);
+	if (!wf->lut)
+		return ERR_PTR(-ENOMEM);
+
+	/* The waveform name sits behind its own length byte; it may be absent. */
+	name = (const u8 *)"";
+	i = wbf_u24(buf + WBF_XWIA_OFF);
+	if (i >= WBF_HEADER_MIN && (size_t)i + 2 + buf[i] <= size)
+		name = buf + i;
+
+	dev_info(dev, "wbf waveform %.*s, %u modes, %u ranges, %zu bytes\n",
+		 name[0], name + 1, wf->wbf.modes, wf->wbf.ranges, size);
+	return wf;
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_waveform_parse_wbf);

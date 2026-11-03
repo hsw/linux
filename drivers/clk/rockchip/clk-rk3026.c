@@ -630,7 +630,7 @@ static struct rockchip_clk_branch rk3026_clk_branches[] __initdata = {
 	FACTOR_GATE(HCLK_VCODEC, "hclk_vcodec", "aclk_vcodec", 0, 1, 4,
 			RK2928_CLKGATE_CON(3), 12, GFLAGS),
 	/* aclk_vdpu: CLKSEL_CON(32), bit15=mux, bits[12:8]=div, CON3 bit11 */
-	COMPOSITE(0, "aclk_vdpu", mux_pll_src_cpll_gpll_p, 0,
+	COMPOSITE(ACLK_VDPU, "aclk_vdpu", mux_pll_src_cpll_gpll_p, 0,
 			RK2928_CLKSEL_CON(32), 15, 1, MFLAGS, 8, 5, DFLAGS,
 			RK2928_CLKGATE_CON(3), 11, GFLAGS),
 

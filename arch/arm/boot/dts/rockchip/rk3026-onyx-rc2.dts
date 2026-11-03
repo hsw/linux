@@ -285,7 +285,9 @@
 
 	/*
 	 * The panel thermometer in the TPS65185, which selects the waveform
-	 * temperature range. No trips: nothing is cooled.
+	 * temperature range. The EBC node names the same sensor; the zone is
+	 * registered on the sensor's behalf and only read. No trips: nothing
+	 * is cooled.
 	 */
 	thermal-zones {
 		epd-thermal {
@@ -437,6 +439,8 @@
 	vcom-supply = <&vcom>;
 	/* This panel's waveform, converted from the panel flash dump. */
 	firmware-name = "rockchip/ed060kd1c2.rkf";
+	/* Panel thermometer; the zone above names the same sensor. */
+	thermal-sensors = <&tps65185>;
 	rockchip,gdck-sta = <100>;
 	rockchip,lgonl = <281>;
 	rotation = <270>;

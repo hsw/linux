@@ -3724,6 +3724,57 @@ VISIBLE_IF_KUNIT int rk3026_ebc_kms_init(struct rk3026_ebc *ebc)
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_kms_init);
 
+/*
+ * The zone the panel temperature is read from, through the sensor phandle in
+ * this node. The sensor owns the zone -- here the EPD PMIC's thermometer
+ * through the hwmon bridge -- and this driver only reads it, so the phandle
+ * names the sensor and /thermal-zones is walked for the zone that names it
+ * back. The core's own lookup is by name because it has no phandle one.
+ *
+ * NULL is "no thermometer": no phandle, or no zone for it, and the caller
+ * falls back. ERR_PTR(-EPROBE_DEFER) is a zone that is declared but not
+ * registered yet -- a static device tree cannot tell the two apart by itself,
+ * the zone's driver not having probed is what does.
+ */
+static struct thermal_zone_device *ebc_thermal_zone(struct device *dev)
+{
+	struct device_node *sensor, *zones, *child, *zone = NULL;
+	struct thermal_zone_device *tzd;
+
+	sensor = of_parse_phandle(dev->of_node, "thermal-sensors", 0);
+	if (!sensor)
+		return NULL;
+
+	zones = of_find_node_by_path("/thermal-zones");
+	if (zones) {
+		for_each_child_of_node(zones, child) {
+			struct device_node *s;
+
+			s = of_parse_phandle(child, "thermal-sensors", 0);
+			if (s != sensor) {
+				of_node_put(s);
+				continue;
+			}
+			of_node_put(s);
+			/* Keep the zone, and give the walk's own reference back. */
+			zone = of_node_get(child);
+			of_node_put(child);
+			break;
+		}
+		of_node_put(zones);
+	}
+	of_node_put(sensor);
+	if (!zone)
+		return NULL;
+
+	/* The zone's device is registered under its node name. */
+	tzd = thermal_zone_get_zone_by_name(zone->name);
+	of_node_put(zone);
+	if (IS_ERR(tzd) && PTR_ERR(tzd) == -ENODEV)
+		return ERR_PTR(-EPROBE_DEFER);
+	return tzd;
+}
+
 static int ebc_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -3873,6 +3924,10 @@ static int ebc_probe(struct platform_device *pdev)
 	 * the boot -- silently, behind one dev_warn, so a wrong LUT would never
 	 * be seen in a log.
 	 *
+	 * The link to it is the sensor phandle in this node, not the zone's
+	 * node name: the name is board data, and a renamed zone would leave the
+	 * driver on the fallback temperature the same silent way.
+	 *
 	 * Ordering against the sensor is DECLARED, not hoped for, and it is
 	 * declared in two places because one is not expressible:
 	 *
@@ -3892,11 +3947,14 @@ static int ebc_probe(struct platform_device *pdev)
 	 * it is the mechanism: the ordering that CAN be declared already is,
 	 * through the supply, and the zone is waited for.
 	 */
-	ebc->tzd = thermal_zone_get_zone_by_name("epd-thermal");
+	ebc->tzd = ebc_thermal_zone(dev);
 	if (IS_ERR(ebc->tzd))
 		return dev_err_probe(dev, -EPROBE_DEFER,
-				     "epd-thermal zone not ready (%ld)\n",
+				     "panel thermal zone not ready (%ld)\n",
 				     PTR_ERR(ebc->tzd));
+	if (!ebc->tzd)
+		dev_warn(dev, "no thermal-sensors, panel temperature taken as %d C\n",
+			 EBC_TEMP_FALLBACK);
 
 	ret = of_reserved_mem_device_init(dev);
 	if (ret) {

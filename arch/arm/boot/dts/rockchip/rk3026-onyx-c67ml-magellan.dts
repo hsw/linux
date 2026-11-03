@@ -1016,6 +1016,8 @@
 	 */
 	/* The container the comment above describes. */
 	firmware-name = "rockchip/rk3026-c67ml.rkf";
+	/* Panel thermometer; the zone at the end of this file names it back. */
+	thermal-sensors = <&tps65185>;
 	rockchip,gdck-sta = <4>;
 	rockchip,lgonl = <262>;
 	rotation = <270>;

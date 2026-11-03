@@ -24,6 +24,7 @@ properties:
           - enum:
               - rockchip,px30-i2s
               - rockchip,rk1808-i2s
+              - rockchip,rk3026-i2s
               - rockchip,rk3036-i2s
               - rockchip,rk3128-i2s
               - rockchip,rk3188-i2s

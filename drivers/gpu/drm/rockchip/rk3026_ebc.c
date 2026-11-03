@@ -352,10 +352,10 @@ static void ebc_set_dsp_ctrl(struct rk3026_ebc *ebc, u32 mode)
  * inverts the transition lookup. Do not change one without testing the
  * direction on the glass.
  *
- * WIN_MST0/1 are shadowed: a write takes effect not on the scan that
- * follows it but on the one after, as the shadow becomes active on a latch
- * the scan itself performs. A change of the order tested with one scan
- * tests nothing: that scan still uses the previous pair.
+ * WIN_MST0/1 latch at the FRAME_START of the scan the write precedes: the
+ * readback shows the new pair from the FRAME_START write on and holds it for
+ * the whole scan. CONFIG_DONE does not latch them, and the block reset clears
+ * them, which is why this runs before every scan.
  *
  * Both hold absolute physical addresses, biased by the window origin at two
  * pixels per byte. The row stride is the panel width: the images are packed
@@ -737,10 +737,9 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_drive);
  * is driven through one fixed phase sequence with the pixel data irrelevant.
  *
  * That is what makes this repair cheap and content-preserving. It needs no third
- * buffer and no MST reprogramming (WIN_MST0/1 are shadowed, so a per-pass swap
- * would land on the wrong pass anyway); @next_virt keeps the snapshot
- * untouched through the RESET and is drawn immediately afterwards from a @prev
- * that is now true.
+ * buffer and no MST reprogramming, since the RESET reads neither image;
+ * @next_virt keeps the snapshot untouched through the RESET and is drawn
+ * immediately afterwards from a @prev that is now true.
  *
  * White is the state a RESET lands on -- the same assumption
  * rk3026_ebc_add_update() makes when it fills @next_shadow with 0xff for a

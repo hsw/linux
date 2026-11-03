@@ -435,6 +435,8 @@
 	 */
 	epd-supply = <&vposneg>;
 	vcom-supply = <&vcom>;
+	/* This panel's waveform, converted from the panel flash dump. */
+	firmware-name = "rockchip/ed060kd1c2.rkf";
 	rockchip,gdck-sta = <100>;
 	rockchip,lgonl = <281>;
 	rotation = <270>;

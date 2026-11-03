@@ -1150,6 +1150,7 @@ struct rk3026_ebc {
 	 */
 	bool			clks_on;
 
+	const char		*fw_name;
 	const struct firmware	*fw;
 	struct ebc_waveform	*waveform;
 

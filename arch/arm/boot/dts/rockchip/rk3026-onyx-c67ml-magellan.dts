@@ -1014,6 +1014,8 @@
 	 * buffer.  The earlier rk3026-c67ml.wbf was a different unit's v1.0.102:
 	 * trimmed, stale weight table, mode 9 offset table zeroed.
 	 */
+	/* The container the comment above describes. */
+	firmware-name = "rockchip/rk3026-c67ml.rkf";
 	rockchip,gdck-sta = <4>;
 	rockchip,lgonl = <262>;
 	rotation = <270>;

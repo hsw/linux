@@ -36,6 +36,7 @@
 #include <linux/regmap.h>
 #include <linux/regulator/consumer.h>
 #include <linux/reset.h>
+#include <linux/string.h>
 #include <linux/thermal.h>
 #include <linux/workqueue.h>
 
@@ -71,6 +72,11 @@
 #include "rk3026_ebc_trace.h"
 
 #define DRIVER_NAME		"rk3026-ebc"
+/*
+ * Waveform for a device tree that predates the "firmware-name" property. The
+ * waveform belongs to the panel, so which file to load is a board choice: the
+ * DT names it, and this is only what a board without the property gets.
+ */
 #define EBC_WAVEFORM_FW		"rockchip/rk3026-c67ml.rkf"
 /*
  * Per-chunk frame budget; a chunk is at most EBC_LUT_MAX_FRAMES (64) frames.
@@ -3613,13 +3619,24 @@ static void ebc_release_fw(void *data)
 
 static int ebc_load_waveform(struct rk3026_ebc *ebc)
 {
+	const char *name = ebc->fw_name;
 	struct ebc_waveform *wf;
 	int ret;
 
-	ret = request_firmware(&ebc->fw, EBC_WAVEFORM_FW, ebc->dev);
+	ret = request_firmware(&ebc->fw, name, ebc->dev);
+	if (ret && strcmp(name, EBC_WAVEFORM_FW)) {
+		/*
+		 * A rootfs or initramfs that still carries only the name this
+		 * driver used before the property existed, against a DT that
+		 * already names the panel's file.
+		 */
+		dev_warn(ebc->dev, "waveform %s not found (%d), trying %s\n",
+			 name, ret, EBC_WAVEFORM_FW);
+		name = EBC_WAVEFORM_FW;
+		ret = request_firmware(&ebc->fw, name, ebc->dev);
+	}
 	if (ret) {
-		dev_warn(ebc->dev, "waveform %s not found (%d)\n",
-			 EBC_WAVEFORM_FW, ret);
+		dev_warn(ebc->dev, "waveform %s not found (%d)\n", name, ret);
 		return 0;
 	}
 	ret = devm_add_action_or_reset(ebc->dev, ebc_release_fw,
@@ -3630,7 +3647,7 @@ static int ebc_load_waveform(struct rk3026_ebc *ebc)
 	wf = rk3026_ebc_waveform_parse(ebc->dev, ebc->fw->data, ebc->fw->size);
 	if (IS_ERR(wf)) {
 		dev_warn(ebc->dev, "waveform %s rejected (%ld)\n",
-			 EBC_WAVEFORM_FW, PTR_ERR(wf));
+			 name, PTR_ERR(wf));
 		return 0;
 	}
 	ebc->waveform = wf;
@@ -3840,6 +3857,14 @@ static int ebc_probe(struct platform_device *pdev)
 		dev_warn(dev, "ignoring rotation (%d)\n", ret);
 		ebc->rotation = DRM_MODE_PANEL_ORIENTATION_UNKNOWN;
 	}
+
+	/*
+	 * The waveform is written for one panel's drive voltages, so which file
+	 * to load is a board choice and the DT names it. The compiled-in name is
+	 * what a device tree that predates the property gets.
+	 */
+	if (of_property_read_string(dev->of_node, "firmware-name", &ebc->fw_name))
+		ebc->fw_name = EBC_WAVEFORM_FW;
 
 	/*
 	 * Panel thermometer, in the EPD PMIC. The waveform LUT is selected by
@@ -4097,4 +4122,9 @@ module_platform_driver(ebc_driver);
 
 MODULE_DESCRIPTION("Rockchip RK3026 EBC E-Ink DRM driver");
 MODULE_LICENSE("GPL");
+/*
+ * Only the fallback name can be listed: the DT's is not known when this is
+ * compiled. A board that names its own file is served by request_firmware()
+ * all the same, it just has no modinfo entry of its own.
+ */
 MODULE_FIRMWARE(EBC_WAVEFORM_FW);

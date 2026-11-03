@@ -13,6 +13,7 @@
 #include <linux/delay.h>
 #include <linux/i2c.h>
 #include <linux/gfp.h>
+#include <linux/interrupt.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/power_supply.h>
@@ -21,6 +22,7 @@
 #include <linux/time.h>
 #include <linux/workqueue.h>
 #include <linux/devm-helpers.h>
+#include <linux/pm_wakeirq.h>
 
 #define CW2015_SIZE_BATINFO		64
 
@@ -43,7 +45,16 @@
 #define CW2015_CONFIG_UPDATE_FLG	(0x01 << 1)
 #define CW2015_ATHD(x)			((x) << 3)
 #define CW2015_MASK_ATHD		GENMASK(7, 3)
+#define CW2015_ALERT_LEVEL_MAX		((int)CW2015_MASK_ATHD >> 3)
 #define CW2015_MASK_SOC			GENMASK(12, 0)
+
+/*
+ * REG_RRT_ALERT: bit 7 is the alert flag, the low 13 bits of the register
+ * pair are the time to empty. The flag is cleared by writing it back as 0;
+ * the byte written also carries the top bits of the time to empty, so it
+ * has to be read first.
+ */
+#define CW2015_ALRT_FLAG		BIT(7)
 
 /* reset gauge of no valid state of charge could be polled for 40s */
 #define CW2015_BAT_SOC_ERROR_MS		(40 * MSEC_PER_SEC)
@@ -75,6 +86,8 @@ struct cw_battery {
 
 	u32 poll_interval_ms;
 	u8 alert_level;
+
+	int alert_irq;
 
 	unsigned int read_errors;
 	unsigned int charge_stuck_cnt;
@@ -457,6 +470,33 @@ static void cw_bat_work(struct work_struct *work)
 			   msecs_to_jiffies(cw_bat->poll_interval_ms));
 }
 
+static irqreturn_t cw_bat_alert_irq(int irq, void *data)
+{
+	struct cw_battery *cw_bat = data;
+	unsigned int reg_val;
+	int ret;
+
+	ret = regmap_read(cw_bat->regmap, CW2015_REG_RRT_ALERT, &reg_val);
+	if (ret) {
+		dev_err(cw_bat->dev, "Failed to read the alert flag: %d\n", ret);
+		return IRQ_HANDLED;
+	}
+
+	if (!(reg_val & CW2015_ALRT_FLAG))
+		return IRQ_HANDLED;
+
+	/* clear the flag, leave the time to empty in the same byte alone */
+	regmap_write(cw_bat->regmap, CW2015_REG_RRT_ALERT,
+		     reg_val & ~CW2015_ALRT_FLAG);
+
+	dev_dbg(cw_bat->dev, "Alert on IRQ %d\n", irq);
+
+	/* report the alert now instead of at the next poll */
+	mod_delayed_work(cw_bat->battery_workqueue, &cw_bat->battery_delay_work, 0);
+
+	return IRQ_HANDLED;
+}
+
 static bool cw_battery_valid_time_to_empty(struct cw_battery *cw_bat)
 {
 	return	cw_bat->time_to_empty > 0 &&
@@ -559,6 +599,7 @@ static const struct power_supply_desc cw2015_bat_desc = {
 static int cw2015_parse_properties(struct cw_battery *cw_bat)
 {
 	struct device *dev = cw_bat->dev;
+	u32 alert_level;
 	int length;
 	int ret;
 
@@ -589,6 +630,17 @@ static int cw2015_parse_properties(struct cw_battery *cw_bat)
 		dev_dbg(cw_bat->dev, "Using default poll interval\n");
 		cw_bat->poll_interval_ms = CW2015_DEFAULT_POLL_INTERVAL_MS;
 	}
+
+	ret = device_property_read_u32(dev, "cellwise,alert-level-percent",
+				       &alert_level);
+	if (ret)
+		alert_level = 0;	/* the gauge's own power-up default */
+	else if (alert_level > CW2015_ALERT_LEVEL_MAX)
+		return dev_err_probe(dev, -EINVAL,
+				     "Alert level %u%% is above %d%%\n",
+				     alert_level, CW2015_ALERT_LEVEL_MAX);
+
+	cw_bat->alert_level = alert_level;
 
 	return 0;
 }
@@ -706,9 +758,31 @@ static int cw_bat_probe(struct i2c_client *client)
 		return ret;
 	}
 
+	if (client->irq) {
+		cw_bat->alert_irq = client->irq;
+		ret = devm_request_threaded_irq(&client->dev, client->irq, NULL,
+						cw_bat_alert_irq,
+						IRQF_ONESHOT | IRQF_TRIGGER_LOW,
+						dev_name(&client->dev), cw_bat);
+		if (ret)
+			return dev_err_probe(&client->dev, ret,
+					     "Failed to request alert IRQ\n");
+
+		if (device_property_read_bool(&client->dev, "wakeup-source")) {
+			device_init_wakeup(&client->dev, true);
+			dev_pm_set_wake_irq(&client->dev, client->irq);
+		}
+	}
+
 	queue_delayed_work(cw_bat->battery_workqueue,
 			   &cw_bat->battery_delay_work, msecs_to_jiffies(10));
 	return 0;
+}
+
+static void cw_bat_remove(struct i2c_client *client)
+{
+	dev_pm_clear_wake_irq(&client->dev);
+	device_init_wakeup(&client->dev, false);
 }
 
 static int __maybe_unused cw_bat_suspend(struct device *dev)
@@ -750,6 +824,7 @@ static struct i2c_driver cw_bat_driver = {
 		.pm = &cw_bat_pm_ops,
 	},
 	.probe = cw_bat_probe,
+	.remove = cw_bat_remove,
 	.id_table = cw_bat_id_table,
 };
 

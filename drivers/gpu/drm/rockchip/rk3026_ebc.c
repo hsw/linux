@@ -16,6 +16,7 @@
  * Copyright (C) 2026
  *
  * Probe commit for the pre-push gate (pr/ci-gate-probe, throwaway).
+ * Second commit: a real push from a linked worktree, which is what exports GIT_DIR.
  */
 
 #include <linux/clk.h>

@@ -34,17 +34,20 @@
 #include <linux/delay.h>
 #include <linux/init.h>
 #include <linux/io.h>
-#include <linux/mfd/syscon.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/reboot.h>
-#include <linux/regmap.h>
 #include <linux/sizes.h>
 #include <asm/system_misc.h>
 #include <dt-bindings/clock/rk3026-cru.h>
 
 #include "core.h"
 
+/*
+ * GRF_SOC_CON0 bit 12 (imem_remap) with bit 28 as its write mask, so this
+ * single write clears the remap and leaves the rest of the register alone
+ * (the same word platsmp.c sets to arm it).
+ */
 #define RK3026_GRF_SOC_CON0		0x140
 #define RK3026_GRF_IMEM_REMAP_CLR	BIT(28)
 
@@ -56,10 +59,10 @@
 
 static void __iomem *rk3026_restart_code;
 static void __iomem *rk3026_restart_cru;
+static void __iomem *rk3026_restart_grf;
 static phys_addr_t rk3026_restart_code_phys;
 static u32 rk3026_restart_cru_phys;
 static u32 rk3026_restart_grf_phys;
-static struct regmap *rk3026_restart_grf;
 static void __iomem *rk3026_restart_otg;
 static struct clk *rk3026_restart_otg_clk;
 
@@ -109,9 +112,14 @@ static int rk3026_restart(struct sys_off_data *data)
 	rk3026_restart_usb_disconnect();
 	rk3026_restart_stop_wdt();
 
-	/* CPU0 must restart in the BootROM, not in the SMP trampoline */
-	regmap_write(rk3026_restart_grf, RK3026_GRF_SOC_CON0,
-		     RK3026_GRF_IMEM_REMAP_CLR);
+	/*
+	 * CPU0 must restart in the BootROM, not in the SMP trampoline. Raw,
+	 * not through the syscon: regmap_write() takes the regmap's spinlock,
+	 * and a CPU1 stopped while holding it (a pinctrl or USB PHY GRF write)
+	 * never releases it, which would deadlock a panic or sysrq restart.
+	 */
+	writel(RK3026_GRF_IMEM_REMAP_CLR,
+	       rk3026_restart_grf + RK3026_GRF_SOC_CON0);
 
 	memcpy_toio(rk3026_restart_code, rk3026_restart_sram, size);
 	writel(rk3026_restart_cru_phys, rk3026_restart_code + cru);
@@ -202,9 +210,10 @@ static int __init rk3026_restart_init(void)
 		return ret;
 	rk3026_restart_grf_phys = res.start;
 
-	rk3026_restart_grf = syscon_regmap_lookup_by_compatible("rockchip,rk3026-grf");
-	if (IS_ERR(rk3026_restart_grf))
-		return PTR_ERR(rk3026_restart_grf);
+	/* mapped here, not through the syscon: see the handler's remap write */
+	rk3026_restart_grf = ioremap(res.start, SZ_4K);
+	if (!rk3026_restart_grf)
+		return -ENOMEM;
 
 	rk3026_restart_code = ioremap(rk3026_restart_code_phys, size);
 	if (!rk3026_restart_code)

@@ -821,6 +821,10 @@ static int sbs_get_battery_capacity(struct i2c_client *client,
 	return 0;
 }
 
+/* The serial number is a 16-bit word: four hex digits and the terminator. The
+ * read hands it over in an int, so mask it and the compiler can see that %04x
+ * cannot write more than those four digits.
+ */
 static char sbs_serial[5];
 static int sbs_get_battery_serial_number(struct i2c_client *client,
 	union power_supply_propval *val)
@@ -831,7 +835,7 @@ static int sbs_get_battery_serial_number(struct i2c_client *client,
 	if (ret < 0)
 		return ret;
 
-	sprintf(sbs_serial, "%04x", ret);
+	sprintf(sbs_serial, "%04x", ret & 0xffff);
 	val->strval = sbs_serial;
 
 	return 0;

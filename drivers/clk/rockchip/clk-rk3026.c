@@ -366,10 +366,18 @@ static struct rockchip_clk_branch rk3026_clk_branches[] __initdata = {
 	 * clk_notifier_register(), and the tick never follows cpufreq (P69).
 	 *
 	 * Keep CLK_DIVIDER_READ_ONLY: rk3026_cpuclk_rates[] owns this field.
+	 *
+	 * The gate is CLKGATE_CON(0) bit 0, the vendor's CLK_GATE_CORE_PERIPH,
+	 * which the vendor opens at boot (clock_data.c, clk_enable_nolock()).
+	 * CLKGATE_CON(9) bit 1 is a different gate, CLK_GATE_PCLK_DBG, already
+	 * modelled below as pclk_dbg_pre -- registering core_peri on that bit
+	 * as well left two refcounts on one physical gate, so a disable through
+	 * either closed it under the other, while the real CON0 bit 0 was
+	 * written by nothing at all.
 	 */
 	COMPOSITE_NOMUX(CORE_PERI, "core_peri", "armclk", CLK_IGNORE_UNUSED,
 			RK2928_CLKSEL_CON(1), 0, 4, DFLAGS | CLK_DIVIDER_READ_ONLY,
-			RK2928_CLKGATE_CON(9), 1, GFLAGS),
+			RK2928_CLKGATE_CON(0), 0, GFLAGS),
 	COMPOSITE_NOMUX(0, "aclk_core_pre", "armclk", CLK_IGNORE_UNUSED,
 			RK2928_CLKSEL_CON(1), 4, 3, DFLAGS | CLK_DIVIDER_READ_ONLY,
 			RK2928_CLKGATE_CON(0), 7, GFLAGS),

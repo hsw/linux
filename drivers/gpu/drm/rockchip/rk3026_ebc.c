@@ -14,6 +14,8 @@
  * hand work to it.
  *
  * Copyright (C) 2026
+ *
+ * Probe commit for the pre-push gate (pr/ci-gate-probe, throwaway).
  */
 
 #include <linux/clk.h>

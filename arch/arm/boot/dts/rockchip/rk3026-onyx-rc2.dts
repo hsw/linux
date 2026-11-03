@@ -549,6 +549,15 @@
 	status = "okay";
 };
 
+/*
+ * Left disabled: the RC2 has no adc-keys and nothing reads a channel. The
+ * reference is vcc_io, as on the C67ML (there the adc-keys thresholds are
+ * computed from it), and the binding requires the property.
+ */
+&saradc {
+	vref-supply = <&vcc_io>;
+};
+
 &usb_otg {
 	dr_mode = "peripheral";
 	status = "okay";

@@ -3385,8 +3385,20 @@ static int ebc_setup_buffers(struct rk3026_ebc *ebc)
 
 	ebc->prev_virt = dmam_alloc_attrs(ebc->dev, pool, &ebc->prev_phys,
 					  GFP_KERNEL, DMA_ATTR_WRITE_COMBINE);
-	if (!ebc->prev_virt)
-		return -ENOMEM;
+	if (!ebc->prev_virt) {
+		struct resource res;
+		resource_size_t avail;
+
+		/* The DT sizes the region apart from the panel: say both. */
+		if (of_reserved_mem_region_to_resource(ebc->dev->of_node, 0, &res))
+			return dev_err_probe(ebc->dev, -ENOMEM,
+					     "images: no %zu bytes for %ux%u\n",
+					     pool, ebc->width, ebc->height);
+		avail = resource_size(&res);
+		return dev_err_probe(ebc->dev, -ENOMEM,
+				     "images: no %zu bytes for %ux%u in memory-region %pR (%pa bytes)\n",
+				     pool, ebc->width, ebc->height, &res, &avail);
+	}
 
 	ebc->next_virt = ebc->prev_virt + ebc->img_size;
 	ebc->next_phys = ebc->prev_phys + ebc->img_size;

@@ -43,16 +43,23 @@
 };
 
 /*
- * CW2015 fuel gauge. Its ALRT line (GPIO1_B1) is not used: the driver
- * polls. With no battery profile here the driver keeps the profile the
- * gauge holds (the stock firmware loaded it; it survives as long as the
- * battery is connected).
+ * CW2015 fuel gauge. Its ALRT line (GPIO1_B1, active low, board pull-up)
+ * is the low-battery alert: it fires at ATHD, 0 % as stock had it, and the
+ * driver clears the flag, refreshes the gauge and reports it. The line is
+ * a wake source, so a suspended book wakes for it. With no battery profile
+ * here the driver keeps the profile the gauge holds (the stock firmware
+ * loaded it; it survives as long as the battery is connected).
  */
 &i2c0 {
 	battery@62 {
 		compatible = "cellwise,cw2015";
 		reg = <0x62>;
 		power-supplies = <&usb_charger>;
+		interrupt-parent = <&gpio1>;
+		interrupts = <RK_PB1 IRQ_TYPE_LEVEL_LOW>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&bat_alert>;
+		wakeup-source;
 	};
 };
 
@@ -153,6 +160,12 @@
 	rtc {
 		rtc_int: rtc-int {
 			rockchip,pins = <1 RK_PB3 RK_FUNC_GPIO &pcfg_pull_default>;
+		};
+	};
+
+	battery {
+		bat_alert: bat-alert {
+			rockchip,pins = <1 RK_PB1 RK_FUNC_GPIO &pcfg_pull_default>;
 		};
 	};
 };

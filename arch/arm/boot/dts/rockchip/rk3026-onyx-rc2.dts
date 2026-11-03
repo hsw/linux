@@ -111,15 +111,17 @@
 		};
 
 		/*
-		 * EBC images (two 4 bpp frames of 776 128 B, adjacent), 10 MiB
-		 * as on the C67ML, right below the top MiB so it stays clear of
-		 * the waveform, ramoops and loader windows. U-Boot puts the FDT
-		 * and an initrd below 0x70000000.
+		 * EBC images (two 4 bpp frames of 776 128 B, adjacent): a
+		 * reusable CMA region of their own, so movable pages use what
+		 * the one 1.5 MiB allocation leaves. CMA wants base and size
+		 * aligned to a pageblock (4 MiB). Below the top MiB, clear of
+		 * the waveform, ramoops and loader windows; U-Boot puts the
+		 * FDT and an initrd below 0x70000000.
 		 */
-		ebc_reserved: ebc@7f500000 {
+		ebc_reserved: ebc@7f400000 {
 			compatible = "shared-dma-pool";
-			reg = <0x7f500000 0xa00000>;
-			no-map;
+			reg = <0x7f400000 0x400000>;
+			reusable;
 		};
 	};
 

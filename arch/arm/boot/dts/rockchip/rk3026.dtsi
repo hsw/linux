@@ -753,6 +753,28 @@
 		status = "disabled";
 	};
 
+	/*
+	 * Hantro G1 decoder and encoder, the RK3066 block with the smaller
+	 * encoder revision. The decoder and the encoder AXI clocks have their
+	 * own gates; both AHB sides share HCLK_VCODEC. Both AXI clocks start
+	 * on GPLL, as the GPU's: the CPLL rate depends on the board and the
+	 * loader. The RK3026 has no power domain and no IOMMU for the VPU.
+	 */
+	vpu: video-codec@10104000 {
+		compatible = "rockchip,rk3026-vpu";
+		reg = <0x10104000 0x800>;
+		interrupts = <GIC_SPI 6 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 7 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "vepu", "vdpu";
+		clocks = <&cru ACLK_VDPU>, <&cru HCLK_VCODEC>,
+			 <&cru ACLK_VCODEC>, <&cru HCLK_VCODEC>;
+		clock-names = "aclk_vdpu", "hclk_vdpu",
+			      "aclk_vepu", "hclk_vepu";
+		assigned-clocks = <&cru ACLK_VDPU>, <&cru ACLK_VCODEC>;
+		assigned-clock-parents = <&cru PLL_GPLL>, <&cru PLL_GPLL>;
+		status = "disabled";
+	};
+
 	vop: vop@1010e000 {
 		compatible = "rockchip,rk3026-vop";
 		reg = <0x1010e000 0x2000>;

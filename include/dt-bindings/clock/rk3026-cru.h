@@ -178,8 +178,14 @@
  */
 #define HCLK_DISP_PRE		87
 
+/*
+ * Decoder (VDPU) AXI clock, CLKGATE_CON3 bit 11. ACLK_VCODEC is the encoder
+ * (VEPU) AXI clock; both AHB sides share HCLK_VCODEC.
+ */
+#define ACLK_VDPU		88
+
 /* Number of clocks */
-#define CLK_NR_CLKS		(HCLK_DISP_PRE + 1)
+#define CLK_NR_CLKS		(ACLK_VDPU + 1)
 
 /*
  * Soft Resets

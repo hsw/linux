@@ -76,6 +76,7 @@ properties:
               - rockchip,px30-grf
               - rockchip,px30-pmugrf
               - rockchip,px30-usb2phy-grf
+              - rockchip,rk3026-grf
               - rockchip,rk3036-grf
               - rockchip,rk3066-grf
               - rockchip,rk3128-grf
@@ -173,6 +174,30 @@ allOf:
           $ref: /schemas/phy/rockchip-usb-phy.yaml#
 
           unevaluatedProperties: false
+
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: rockchip,rk3026-grf
+
+    then:
+      properties:
+        usbphy:
+          type: object
+
+          $ref: /schemas/phy/rockchip-usb-phy.yaml#
+
+          unevaluatedProperties: false
+
+        usb-status:
+          type: object
+          properties:
+            compatible:
+              contains:
+                const: rockchip,rk3026-grf-usb-status
+
+          additionalProperties: true
 
   - if:
       properties:

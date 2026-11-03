@@ -592,6 +592,7 @@
 		clocks = <&cru ACLK_DMAC>;
 		clock-names = "apb_pclk";
 		#dma-cells = <1>;
+		arm,pl330-broken-no-flushp;
 		arm,pl330-periph-burst;
 	};
 
@@ -658,6 +659,8 @@
 		interrupts = <GIC_SPI 14 IRQ_TYPE_LEVEL_HIGH>;
 		clocks = <&cru HCLK_SDMMC>, <&cru SCLK_SDMMC>;
 		clock-names = "biu", "ciu";
+		dmas = <&dmac 10>;
+		dma-names = "rx-tx";
 		fifo-depth = <0x100>;
 		resets = <&cru SRST_MMC0>;
 		reset-names = "reset";
@@ -672,6 +675,8 @@
 		interrupts = <GIC_SPI 15 IRQ_TYPE_LEVEL_HIGH>;
 		clocks = <&cru HCLK_SDIO>, <&cru SCLK_SDIO>;
 		clock-names = "biu", "ciu";
+		dmas = <&dmac 11>;
+		dma-names = "rx-tx";
 		fifo-depth = <0x100>;
 		resets = <&cru SRST_SDIO>;
 		reset-names = "reset";
@@ -686,6 +691,8 @@
 		interrupts = <GIC_SPI 16 IRQ_TYPE_LEVEL_HIGH>;
 		clocks = <&cru HCLK_EMMC>, <&cru SCLK_EMMC>;
 		clock-names = "biu", "ciu";
+		dmas = <&dmac 12>;
+		dma-names = "rx-tx";
 		fifo-depth = <0x100>;
 		resets = <&cru SRST_EMMC>;
 		reset-names = "reset";

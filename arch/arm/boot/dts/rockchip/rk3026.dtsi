@@ -310,6 +310,26 @@
 				       <256000000>, <256000000>;
 	};
 
+	/*
+	 * The NoC QoS generators, one per master port: PRIORITY at +0x08 of
+	 * each port base (vendor mach-rk3026/include/mach/cpu_axi.h), CPU0
+	 * at +0x2000, CPU1W +0x2080, CPU1R +0x2100, PERI +0x4000, GPU
+	 * +0x5000, LCDC1 +0x7000, EBC +0x7080, LCDC0 +0x7180. The ports
+	 * reset to values that let CPU DRAM traffic outrank the display
+	 * fetch, so whoever needs the display first sets them (the EBC driver
+	 * does, its port being the one that is starved). One node for the
+	 * whole window, not one per port as on rk3066: nothing on rk3026
+	 * consumes a single port, and a port behind a gated NIU clock does
+	 * not answer, so the window is the EBC's to program anyway -- its
+	 * probe holds ACLK_LCDC1. The EBC finds it by compatible, not
+	 * through a phandle, so that the EBC node keeps no property of its
+	 * own: it has no schema yet, and one would show up in dtbs_check.
+	 */
+	qos: qos@10128000 {
+		compatible = "rockchip,rk3026-qos", "syscon";
+		reg = <0x10128000 0x8000>;
+	};
+
 	grf: syscon@20008000 {
 		compatible = "rockchip,rk3026-grf", "syscon", "simple-mfd";
 		reg = <0x20008000 0x1000>;

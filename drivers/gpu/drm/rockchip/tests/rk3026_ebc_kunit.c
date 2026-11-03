@@ -60,6 +60,7 @@
 #include "../rk3026_ebc.h"
 #include "../rk3026_ebc_blit_neon.h"
 #include "../rk3026_ebc_mxcfb.h"
+#include "../rk3026_ebc_qos.h"
 #include "rk3026_ebc_kunit_ref.h"
 
 /* A 16x6 panel: 8 bytes per line, two pixels per byte, low nibble first. */
@@ -14890,6 +14891,180 @@ static struct kunit_suite rk3026_ebc_conv_test_suite = {
 };
 
 kunit_test_suite(rk3026_ebc_conv_test_suite);
+
+/* --- the NoC QoS priorities the probe writes --- */
+
+/*
+ * The vendor kernel's cpu_axi_init() (arch/arm/mach-rk3026/common.c) as
+ * ABSOLUTE addresses, with each priority's two levels written out the way the
+ * vendor writes them: the high level is what the port runs at while it is
+ * under its bandwidth budget, the low one what it drops to when it is over.
+ * The driver's offsets are relative to the window, so a port base taken wrong
+ * by one port and right by another cannot pass this -- and a window base that
+ * moves takes every row with it.
+ *
+ * The EBC row is the driver's own addition: the vendor leaves that port at
+ * reset (0x8), and at the top it cannot be outranked by a CPU port that
+ * something raises again.
+ */
+struct t_qos_port {
+	u32	addr;
+	u8	high;
+	u8	low;
+};
+
+static const struct t_qos_port t_qos_ports[] = {
+	{ 0x1012a008, 0, 0 },	/* CPU0 */
+	{ 0x1012a088, 0, 0 },	/* CPU1W */
+	{ 0x1012a108, 0, 0 },	/* CPU1R */
+	{ 0x1012c008, 0, 0 },	/* PERI */
+	{ 0x1012d008, 2, 1 },	/* GPU */
+	{ 0x1012f008, 3, 3 },	/* LCDC1 */
+	{ 0x1012f088, 3, 3 },	/* EBC */
+	{ 0x1012f188, 3, 3 },	/* LCDC0 */
+};
+
+#define T_QOS_MAX	16
+#define T_QOS_EBC	0x1012f088
+
+struct t_qos {
+	struct kunit	*test;
+	size_t		n;
+	u32		addr[T_QOS_MAX];
+	u32		val[T_QOS_MAX];
+};
+
+static void t_qos_write(void *ctx, u32 off, u32 val)
+{
+	struct t_qos *q = ctx;
+
+	KUNIT_ASSERT_LT_MSG(q->test, q->n, T_QOS_MAX, "more than %d writes",
+			    T_QOS_MAX);
+	q->addr[q->n] = RK3026_QOS_BASE + off;
+	q->val[q->n] = val;
+	q->n++;
+}
+
+static void t_qos_record(struct kunit *test, struct t_qos *q)
+{
+	memset(q, 0, sizeof(*q));
+	q->test = test;
+	rk3026_ebc_qos_program(q, t_qos_write);
+}
+
+/* Every vendor port is written once, with the vendor's own value. */
+static void ebc_test_qos_ports(struct kunit *test)
+{
+	struct t_qos q;
+	size_t i, j;
+
+	t_qos_record(test, &q);
+	KUNIT_ASSERT_LE(test, q.n, T_QOS_MAX);
+
+	for (i = 0; i < ARRAY_SIZE(t_qos_ports); i++) {
+		size_t hits = 0;
+
+		for (j = 0; j < q.n; j++) {
+			if (q.addr[j] != t_qos_ports[i].addr)
+				continue;
+			hits++;
+			KUNIT_EXPECT_EQ(test, q.val[j],
+					((u32)t_qos_ports[i].high << 2) |
+					t_qos_ports[i].low);
+		}
+		KUNIT_EXPECT_EQ_MSG(test, hits, 1, "port %#x written %zu times",
+				    t_qos_ports[i].addr, hits);
+	}
+	KUNIT_EXPECT_EQ(test, q.n, ARRAY_SIZE(t_qos_ports));
+}
+
+/*
+ * The shape of every value: a legal (high, low) pair -- the generator
+ * requires high >= low, or the port would be promoted by going over its
+ * budget -- and nothing outside the window, which the window is mapped at
+ * (regmap writes at a stride of 4).
+ */
+static void ebc_test_qos_values(struct kunit *test)
+{
+	struct t_qos q;
+	size_t i, j;
+
+	t_qos_record(test, &q);
+	KUNIT_ASSERT_LE(test, q.n, T_QOS_MAX);
+
+	for (i = 0; i < q.n; i++) {
+		u32 high = (q.val[i] >> 2) & 3, low = q.val[i] & 3;
+
+		KUNIT_EXPECT_LE(test, low, high);
+		KUNIT_EXPECT_GE(test, q.addr[i], RK3026_QOS_BASE);
+		KUNIT_EXPECT_LT(test, q.addr[i],
+				RK3026_QOS_BASE + RK3026_QOS_SIZE);
+		KUNIT_EXPECT_EQ(test, q.addr[i] % 4, 0);
+		for (j = 0; j < i; j++)
+			KUNIT_EXPECT_NE(test, q.addr[j], q.addr[i]);
+	}
+}
+
+/*
+ * The point of the table: the CPU-side ports sit at the bottom, the display
+ * ports at the top, and the EBC is not below anything -- a port it must wait
+ * for is the bug this table exists to prevent.
+ */
+static void ebc_test_qos_rank(struct kunit *test)
+{
+	struct t_qos q;
+	u32 ebc = 0;
+	size_t i;
+
+	t_qos_record(test, &q);
+	KUNIT_ASSERT_LE(test, q.n, T_QOS_MAX);
+
+	for (i = 0; i < q.n; i++) {
+		if (q.addr[i] == T_QOS_EBC)
+			ebc = q.val[i];
+	}
+	KUNIT_EXPECT_EQ_MSG(test, ebc, 0xf, "the EBC port is not at the top");
+
+	for (i = 0; i < q.n; i++) {
+		bool display = q.addr[i] == 0x1012f008 ||
+			       q.addr[i] == 0x1012f088 ||
+			       q.addr[i] == 0x1012f188;
+
+		if (display)
+			KUNIT_EXPECT_EQ(test, q.val[i], 0xf);
+		else
+			KUNIT_EXPECT_LE(test, q.val[i], ebc);
+	}
+}
+
+/* Setting the same priorities again changes nothing (a second probe). */
+static void ebc_test_qos_idempotent(struct kunit *test)
+{
+	struct t_qos a, b;
+
+	t_qos_record(test, &a);
+	t_qos_record(test, &b);
+	KUNIT_ASSERT_LE(test, a.n, T_QOS_MAX);
+
+	KUNIT_EXPECT_EQ(test, a.n, b.n);
+	KUNIT_EXPECT_MEMEQ(test, a.addr, b.addr, a.n * sizeof(a.addr[0]));
+	KUNIT_EXPECT_MEMEQ(test, a.val, b.val, a.n * sizeof(a.val[0]));
+}
+
+static struct kunit_case rk3026_ebc_qos_test_cases[] = {
+	KUNIT_CASE(ebc_test_qos_ports),
+	KUNIT_CASE(ebc_test_qos_values),
+	KUNIT_CASE(ebc_test_qos_rank),
+	KUNIT_CASE(ebc_test_qos_idempotent),
+	{}
+};
+
+static struct kunit_suite rk3026_ebc_qos_test_suite = {
+	.name = "rk3026_ebc_qos",
+	.test_cases = rk3026_ebc_qos_test_cases,
+};
+
+kunit_test_suite(rk3026_ebc_qos_test_suite);
 
 MODULE_DESCRIPTION("KUnit tests for the RK3026 EBC driver");
 MODULE_LICENSE("GPL");

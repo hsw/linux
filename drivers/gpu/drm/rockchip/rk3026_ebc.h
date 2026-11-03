@@ -909,6 +909,12 @@ struct rk3026_ebc {
 	struct regulator	*vcom_supply;
 	struct regulator	*v3p3_supply;
 	struct regmap		*grf;
+	/*
+	 * The SoC's NoC QoS window, optional: the probe sets the ports'
+	 * priorities from it (rk3026_ebc_qos.c), which is what keeps the
+	 * fetch of a scan ahead of CPU DRAM traffic.
+	 */
+	struct regmap		*qos;
 	struct thermal_zone_device *tzd;
 	int			irq;
 

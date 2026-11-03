@@ -66,6 +66,7 @@
 #include <kunit/visibility.h>
 
 #include "rk3026_ebc.h"
+#include "rk3026_ebc_qos.h"
 
 #define CREATE_TRACE_POINTS
 #include "rk3026_ebc_trace.h"
@@ -3707,6 +3708,12 @@ VISIBLE_IF_KUNIT int rk3026_ebc_kms_init(struct rk3026_ebc *ebc)
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_kms_init);
 
+/* The NoC QoS window, as the regmap the QoS table is written through. */
+static void ebc_qos_write(void *ctx, u32 off, u32 val)
+{
+	regmap_write(ctx, off, val);
+}
+
 static int ebc_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -3787,6 +3794,25 @@ static int ebc_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, PTR_ERR(ebc->grf), "bad rockchip,grf\n");
 	if (!ebc->grf)
 		dev_warn(dev, "no rockchip,grf; skipping pad mux\n");
+
+	/*
+	 * The NoC QoS window. Not a part of the GRF and not the loader's job
+	 * here: its VIO ports are behind the clock this driver holds, so the
+	 * priorities are set below, from ebc_probe() -- see
+	 * rk3026_ebc_qos.c. Optional, so a device tree without it still
+	 * probes, at whatever priorities the loader left.
+	 *
+	 * Found by compatible rather than by a phandle from this node: the
+	 * EBC node has no binding yet, and every property added to it costs
+	 * a new dtbs_check line ("failed to match any schema").
+	 */
+	ebc->qos = syscon_regmap_lookup_by_compatible("rockchip,rk3026-qos");
+	if (IS_ERR(ebc->qos)) {
+		if (PTR_ERR(ebc->qos) == -EPROBE_DEFER)
+			return dev_err_probe(dev, -EPROBE_DEFER,
+					     "QoS window not ready\n");
+		ebc->qos = NULL;
+	}
 
 	ret = of_get_display_timing(dev->of_node, "panel-timing", &ebc->timing);
 	if (ret)
@@ -3902,6 +3928,14 @@ static int ebc_probe(struct platform_device *pdev)
 	ret = devm_add_action_or_reset(dev, ebc_hw_fini, ebc);
 	if (ret)
 		return ret;
+
+	/* Now that the clocks are on the VIO ports of the window answer. */
+	if (ebc->qos) {
+		rk3026_ebc_qos_program(ebc->qos, ebc_qos_write);
+		dev_info(dev, "NoC QoS: CPU ports lowered, display ports raised\n");
+	} else {
+		dev_info(dev, "no QoS window: CPU QoS stays the loader's\n");
+	}
 
 	/*
 	 * After the clocks and @int_reg are set up: the handler reads EBC_INT

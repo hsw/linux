@@ -132,7 +132,6 @@ static int rk3026_restart(struct sys_off_data *data)
 	size_t grf = rk3026_restart_sram_grf - rk3026_restart_sram;
 
 	rk3026_restart_usb_disconnect();
-	rk3026_restart_stop_wdt();
 
 	/*
 	 * CPU0 must restart in the BootROM, not in the SMP trampoline. Raw,
@@ -148,6 +147,13 @@ static int rk3026_restart(struct sys_off_data *data)
 	writel(rk3026_restart_grf_phys, rk3026_restart_code + grf);
 	/* the routine is fetched with the MMU off: the copy must be in SRAM */
 	wmb();
+
+	/*
+	 * Last, so that the watchdog still covers the steps above: a hang in
+	 * the GRF write or the copy is then a watchdog reset, not a board
+	 * that waits for the pinhole.
+	 */
+	rk3026_restart_stop_wdt();
 
 	soft_restart(rk3026_restart_code_phys);
 

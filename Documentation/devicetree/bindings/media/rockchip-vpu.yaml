@@ -16,6 +16,7 @@ properties:
   compatible:
     oneOf:
       - enum:
+          - rockchip,rk3026-vpu
           - rockchip,rk3036-vpu
           - rockchip,rk3066-vpu
           - rockchip,rk3288-vpu

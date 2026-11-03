@@ -39,11 +39,27 @@ properties:
       Specifies the interval in milliseconds gauge values are polled at
     minimum: 250
 
+  cellwise,alert-level-percent:
+    minimum: 0
+    maximum: 31
+    description: |
+      State of charge, in percent, at which the ALRT output is driven. The
+      power-up default is 0, the alert at empty; a value above it gives
+      userspace a margin before the cell protection cuts the battery off.
+      Needs interrupts.
+
+  interrupts:
+    maxItems: 1
+    description: |
+      ALRT, active low and held until the driver clears the alert flag.
+
   power-supplies:
     minItems: 1
     maxItems: 8 # Should be enough
 
   monitored-battery: true
+
+  wakeup-source: true
 
 required:
   - compatible
@@ -74,4 +90,23 @@ examples:
            monitored-battery = <&bat>;
            power-supplies = <&mains_charger>, <&usb_charger>;
        };
+    };
+
+  - |
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    i2c {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        cw2015@62 {
+            compatible = "cellwise,cw2015";
+            reg = <0x62>;
+            interrupt-parent = <&gpiob>;
+            interrupts = <1 IRQ_TYPE_LEVEL_LOW>;
+            pinctrl-names = "default";
+            pinctrl-0 = <&bat_alert>;
+            cellwise,alert-level-percent = <5>;
+            wakeup-source;
+        };
     };

@@ -700,6 +700,31 @@ const struct hantro_variant rk3066_vpu_variant = {
 	.num_clocks = ARRAY_SIZE(rk3066_vpu_clk_names)
 };
 
+/*
+ * The RK3026 has the RK3066 block with the smaller encoder revision
+ * (ID 0x8270): its encoder registers end at 0x200, where the decoder
+ * registers start.
+ */
+const struct hantro_variant rk3026_vpu_variant = {
+	.enc_offset = 0x0,
+	.enc_fmts = rockchip_vpu_enc_fmts,
+	.num_enc_fmts = ARRAY_SIZE(rockchip_vpu_enc_fmts),
+	.dec_offset = 0x200,
+	.dec_fmts = rk3066_vpu_dec_fmts,
+	.num_dec_fmts = ARRAY_SIZE(rk3066_vpu_dec_fmts),
+	.postproc_fmts = rockchip_vpu1_postproc_fmts,
+	.num_postproc_fmts = ARRAY_SIZE(rockchip_vpu1_postproc_fmts),
+	.postproc_ops = &hantro_g1_postproc_ops,
+	.codec = HANTRO_JPEG_ENCODER | HANTRO_MPEG2_DECODER |
+		 HANTRO_VP8_DECODER | HANTRO_H264_DECODER,
+	.codec_ops = rk3066_vpu_codec_ops,
+	.irqs = rockchip_vpu1_irqs,
+	.num_irqs = ARRAY_SIZE(rockchip_vpu1_irqs),
+	.init = rk3066_vpu_hw_init,
+	.clk_names = rk3066_vpu_clk_names,
+	.num_clocks = ARRAY_SIZE(rk3066_vpu_clk_names)
+};
+
 const struct hantro_variant rk3288_vpu_variant = {
 	.enc_offset = 0x0,
 	.enc_fmts = rockchip_vpu_enc_fmts,

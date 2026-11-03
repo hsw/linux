@@ -181,7 +181,11 @@
 #define EBC_MODE_DIRECT_A2	12
 #define EBC_MODE_MAX		12
 
-/* Temperatures above this are replaced by 25 degrees before bucket lookup. */
+/*
+ * A reading above this is past every waveform table's top boundary (48 C), so
+ * the bucket walk puts it on the hottest range; the reading is logged, not
+ * replaced. @EBC_TEMP_FALLBACK is what an unreadable thermometer gives.
+ */
 #define EBC_TEMP_MAX		50
 #define EBC_TEMP_FALLBACK	25
 

@@ -470,17 +470,24 @@ VISIBLE_IF_KUNIT int rk3026_ebc_read_temp(struct rk3026_ebc *ebc)
 
 	KUNIT_STATIC_STUB_REDIRECT(rk3026_ebc_read_temp, ebc);
 
-	if (!ebc->tzd || thermal_zone_get_temp(ebc->tzd, &temp))
+	if (!ebc->tzd || thermal_zone_get_temp(ebc->tzd, &temp)) {
+		dev_warn_ratelimited(ebc->dev,
+				     "no panel temperature, using %d C\n",
+				     EBC_TEMP_FALLBACK);
 		return EBC_TEMP_FALLBACK;
+	}
 
 	temp /= 1000;
-	/* A reading above 50 degrees is not trusted; fall back to 25. */
-	if (temp > EBC_TEMP_MAX) {
+	/*
+	 * A hot reading is passed on, not replaced: the waveform's bucket walk
+	 * clamps past its last boundary to the hottest range, which is the
+	 * range a hot panel wants. 25 was the middle of the tables and put a
+	 * panel in the sun on the 24-27 C one.
+	 */
+	if (temp > EBC_TEMP_MAX)
 		dev_warn_ratelimited(ebc->dev,
-				     "panel temperature %d out of range, using %d\n",
-				     temp, EBC_TEMP_FALLBACK);
-		temp = EBC_TEMP_FALLBACK;
-	}
+				     "panel temperature %d C past the waveform, hottest range\n",
+				     temp);
 	return temp;
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_read_temp);
@@ -996,15 +1003,14 @@ static int ebc_prepare(struct rk3026_ebc *ebc, bool temp_valid, int *temp,
 
 /*
  * The temperature @part is driven at: the newest one an update brought wins
- * over the sensor's (@temp, from ebc_prepare()); one above the tables is
- * replaced by the fallback.
+ * over the sensor's (@temp, from ebc_prepare()). Either is passed on as it
+ * stands: what a reading past the tables means is the waveform's business,
+ * and it clamps it to its own top range.
  */
 static int ebc_part_temp(const struct rk3026_ebc_set *part, int temp)
 {
 	if (part->temp_valid)
 		temp = part->temp;
-	if (temp > EBC_TEMP_MAX)
-		temp = EBC_TEMP_FALLBACK;
 	return temp;
 }
 

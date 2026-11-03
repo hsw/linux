@@ -17,7 +17,9 @@ properties:
       - const: rockchip,rk3328-pwm
       - const: rockchip,vop-pwm
       - items:
-          - const: rockchip,rk3036-pwm
+          - enum:
+              - rockchip,rk3026-pwm
+              - rockchip,rk3036-pwm
           - const: rockchip,rk2928-pwm
       - items:
           - enum:

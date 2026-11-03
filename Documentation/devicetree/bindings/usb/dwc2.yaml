@@ -31,6 +31,7 @@ properties:
       - items:
           - enum:
               - rockchip,px30-usb
+              - rockchip,rk3026-usb
               - rockchip,rk3036-usb
               - rockchip,rk3128-usb
               - rockchip,rk3188-usb

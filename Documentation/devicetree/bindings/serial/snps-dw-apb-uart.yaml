@@ -56,6 +56,7 @@ properties:
               - brcm,bcm21664-dw-apb-uart
               - rockchip,px30-uart
               - rockchip,rk1808-uart
+              - rockchip,rk3026-uart
               - rockchip,rk3036-uart
               - rockchip,rk3066-uart
               - rockchip,rk3128-uart

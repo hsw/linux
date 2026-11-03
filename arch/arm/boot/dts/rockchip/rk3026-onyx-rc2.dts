@@ -111,16 +111,15 @@
 		};
 
 		/*
-		 * EBC images (two 4 bpp frames of 776 128 B, adjacent): a
-		 * reusable CMA region of their own, so movable pages use what
-		 * the one 1.5 MiB allocation leaves. CMA wants base and size
-		 * aligned to a pageblock (4 MiB). Below the top MiB, clear of
-		 * the waveform, ramoops and loader windows; U-Boot puts the
-		 * FDT and an initrd below 0x70000000.
+		 * EBC frame pool: two 4 bpp frames of the 1448x1072 panel =
+		 * 1448 * 1072 B (1.48 MiB), rounded up to the 4 MiB CMA
+		 * granule. Reusable, so movable pages use what the frames
+		 * leave; the EBC reaches all of DDR, so the kernel places it.
 		 */
-		ebc_reserved: ebc@7f400000 {
+		ebc_pool: ebc-pool {
 			compatible = "shared-dma-pool";
-			reg = <0x7f400000 0x400000>;
+			size = <0x400000>;
+			alignment = <0x400000>;
 			reusable;
 		};
 	};
@@ -429,7 +428,7 @@
 	assigned-clock-rates = <640000000>, <160000000>;
 	pinctrl-names = "default";
 	pinctrl-0 = <&ebc_pins_rc2>;
-	memory-region = <&ebc_reserved>;
+	memory-region = <&ebc_pool>;
 	/*
 	 * No v3p3-supply: the panel logic rail is the ACT8931's LDO4, which
 	 * /init switches on before the driver loads.

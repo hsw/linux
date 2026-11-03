@@ -57,6 +57,15 @@
 #define RK3026_CRU_SOFTRST_CON(id)	(0x110 + (id) / 16 * 4)
 #define RK3026_CRU_SOFTRST_BIT(id)	BIT((id) % 16)
 
+/*
+ * The clock gates are not laid out like the reset bits: the ids in the
+ * binding are only clock table indices, so the register and the bit come
+ * from clk-rk3026.c. pclk_wdt is CLKGATE_CON7 bit 15.
+ */
+#define RK3026_CRU_CLKGATE_CON(con)	(0xd0 + (con) * 4)
+#define RK3026_CRU_PCLK_WDT_CON		7
+#define RK3026_CRU_PCLK_WDT_BIT		15
+
 static void __iomem *rk3026_restart_code;
 static void __iomem *rk3026_restart_cru;
 static void __iomem *rk3026_restart_grf;
@@ -92,11 +101,24 @@ static void rk3026_restart_usb_disconnect(void)
  * next kernel: a watchdog that expires in between resets the whole chip,
  * the power hold with it. Stop it with a pulse of its soft reset, as the
  * vendor's module sweep (and any global reset) did.
+ *
+ * The pulse needs pclk_wdt running, or it does nothing: the CRU resets the
+ * block synchronously, and a clock-gated DesignWare WDT has no clock to take
+ * it. The gate is open on the boot paths we use only by accident: the RC2
+ * board does not enable the watchdog node, so nothing holds pclk_wdt, and
+ * only the bootargs' clk_ignore_unused keeps clk_disable_unused() from
+ * gating it. A hand-off without that word (a stage2 ATAG boot, or a board
+ * whose watchdog node is off) would leave the pulse a no-op, and the SRAM
+ * routine opens the gates only afterwards. Ungate it here; no need to gate
+ * it again, the routine opens the whole register anyway.
  */
 static void rk3026_restart_stop_wdt(void)
 {
 	u32 bit = RK3026_CRU_SOFTRST_BIT(SRST_WDT);
 	void __iomem *reg = rk3026_restart_cru + RK3026_CRU_SOFTRST_CON(SRST_WDT);
+
+	writel(RK3026_CRU_PCLK_WDT_BIT << 16,
+	       rk3026_restart_cru + RK3026_CRU_CLKGATE_CON(RK3026_CRU_PCLK_WDT_CON));
 
 	writel(bit << 16 | bit, reg);
 	udelay(10);

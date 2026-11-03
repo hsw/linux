@@ -122,6 +122,22 @@
 			alignment = <0x400000>;
 			reusable;
 		};
+
+		/*
+		 * The default CMA area, shared by the devices without an
+		 * IOMMU and a region of their own (the VPU above all: a 1080p
+		 * H.264 stream holds about 33 MiB of NV12 capture buffers,
+		 * up to 80 MiB through the post-processor). Sized only: the
+		 * kernel finds it room clear of the fixed regions above,
+		 * aligned to a pageblock. Movable pages use it while no device
+		 * holds it.
+		 */
+		linux,cma {
+			compatible = "shared-dma-pool";
+			size = <0x6000000>;
+			reusable;
+			linux,cma-default;
+		};
 	};
 
 	cpus {

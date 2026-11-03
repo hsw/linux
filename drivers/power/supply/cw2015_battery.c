@@ -13,6 +13,7 @@
 #include <linux/delay.h>
 #include <linux/i2c.h>
 #include <linux/gfp.h>
+#include <linux/interrupt.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/power_supply.h>
@@ -43,7 +44,16 @@
 #define CW2015_CONFIG_UPDATE_FLG	(0x01 << 1)
 #define CW2015_ATHD(x)			((x) << 3)
 #define CW2015_MASK_ATHD		GENMASK(7, 3)
+#define CW2015_ALERT_LEVEL_MAX		((int)CW2015_MASK_ATHD >> 3)
 #define CW2015_MASK_SOC			GENMASK(12, 0)
+
+/*
+ * REG_RRT_ALERT: bit 7 is the alert flag, the low 13 bits of the register
+ * pair are the time to empty. The flag is cleared by writing it back as 0;
+ * the byte written also carries the top bits of the time to empty, so it
+ * has to be read first.
+ */
+#define CW2015_ALRT_FLAG		BIT(7)
 
 /* reset gauge of no valid state of charge could be polled for 40s */
 #define CW2015_BAT_SOC_ERROR_MS		(40 * MSEC_PER_SEC)
@@ -457,6 +467,44 @@ static void cw_bat_work(struct work_struct *work)
 			   msecs_to_jiffies(cw_bat->poll_interval_ms));
 }
 
+static irqreturn_t cw_bat_alert_irq(int irq, void *data)
+{
+	struct cw_battery *cw_bat = data;
+	unsigned int reg_val;
+	int ret;
+
+	/*
+	 * The line is level triggered: an interrupt that leaves the flag set,
+	 * or finds it clear, is not handled, so that the core can disable a
+	 * line that is stuck low instead of running this handler forever.
+	 */
+	ret = regmap_read(cw_bat->regmap, CW2015_REG_RRT_ALERT, &reg_val);
+	if (ret) {
+		dev_err_ratelimited(cw_bat->dev,
+				    "Failed to read the alert flag: %d\n", ret);
+		return IRQ_NONE;
+	}
+
+	if (!(reg_val & CW2015_ALRT_FLAG))
+		return IRQ_NONE;
+
+	/* clear the flag, leave the time to empty in the same byte alone */
+	ret = regmap_write(cw_bat->regmap, CW2015_REG_RRT_ALERT,
+			   reg_val & ~CW2015_ALRT_FLAG);
+	if (ret) {
+		dev_err_ratelimited(cw_bat->dev,
+				    "Failed to clear the alert flag: %d\n", ret);
+		return IRQ_NONE;
+	}
+
+	dev_dbg(cw_bat->dev, "Alert on IRQ %d\n", irq);
+
+	/* report the alert now instead of at the next poll */
+	mod_delayed_work(cw_bat->battery_workqueue, &cw_bat->battery_delay_work, 0);
+
+	return IRQ_HANDLED;
+}
+
 static bool cw_battery_valid_time_to_empty(struct cw_battery *cw_bat)
 {
 	return	cw_bat->time_to_empty > 0 &&
@@ -559,6 +607,7 @@ static const struct power_supply_desc cw2015_bat_desc = {
 static int cw2015_parse_properties(struct cw_battery *cw_bat)
 {
 	struct device *dev = cw_bat->dev;
+	u32 alert_level;
 	int length;
 	int ret;
 
@@ -589,6 +638,17 @@ static int cw2015_parse_properties(struct cw_battery *cw_bat)
 		dev_dbg(cw_bat->dev, "Using default poll interval\n");
 		cw_bat->poll_interval_ms = CW2015_DEFAULT_POLL_INTERVAL_MS;
 	}
+
+	ret = device_property_read_u32(dev, "cellwise,alert-level-percent",
+				       &alert_level);
+	if (ret)
+		alert_level = 0;	/* the gauge's own power-up default */
+	else if (alert_level > CW2015_ALERT_LEVEL_MAX)
+		return dev_err_probe(dev, -EINVAL,
+				     "Alert level %u%% is above %d%%\n",
+				     alert_level, CW2015_ALERT_LEVEL_MAX);
+
+	cw_bat->alert_level = alert_level;
 
 	return 0;
 }
@@ -704,6 +764,20 @@ static int cw_bat_probe(struct i2c_client *client)
 		dev_err_probe(&client->dev, ret,
 			"Failed to register delayed work\n");
 		return ret;
+	}
+
+	/*
+	 * With wakeup-source the I2C core has already made client->irq the
+	 * wake IRQ of the device, and it undoes that on remove and on a
+	 * failed probe.
+	 */
+	if (client->irq) {
+		ret = devm_request_threaded_irq(&client->dev, client->irq, NULL,
+						cw_bat_alert_irq, IRQF_ONESHOT,
+						dev_name(&client->dev), cw_bat);
+		if (ret)
+			return dev_err_probe(&client->dev, ret,
+					     "Failed to request alert IRQ\n");
 	}
 
 	queue_delayed_work(cw_bat->battery_workqueue,

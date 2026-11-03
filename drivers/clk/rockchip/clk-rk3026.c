@@ -919,10 +919,11 @@ static void __init rk3026_clk_power_up_plls(void __iomem *reg_base)
  * dividers below it, so every divider that can sit on GPLL is written here
  * first: below 768 MHz they only run slower, at 768 MHz nothing ends up
  * faster than under the vendor kernel. Only divider fields are written,
- * except for the muxes of the bus sources the vendor runs from GPLL
- * (aclk_cpu, aclk_peri and the display sources in CLKSEL_CON30/31), so a
- * clock that sits on CPLL stays there. The I2S source is left alone: the
- * vendor runs it at GPLL/1.
+ * except for the muxes of the sources the vendor runs from GPLL (aclk_cpu,
+ * aclk_peri, the display sources in CLKSEL_CON30/31 and the three MMC
+ * sources: sdmmc0, sdio and emmc all have general_pll_clk as their parent in
+ * clock_data.c), so a clock that sits on CPLL stays there. The I2S source is
+ * left alone: the vendor runs it at GPLL/1.
  *
  * Before registration on purpose: the clock framework caches a composite's
  * parent from the register when the branch is registered, so a later raw
@@ -948,8 +949,8 @@ struct rk3026_clksel_init {
 static const struct rk3026_clksel_init rk3026_gpll_dividers[] __initconst = {
 	{  1, 0x7300, 0x3100 },	/* hclk_cpu /2, pclk_cpu /4 */
 	{ 10, 0xb31f, 0x2103 },	/* aclk_peri GPLL /4, hclk_peri /2, pclk_peri /4 */
-	{ 11, 0x003f, 0x000f },	/* sclk_sdmmc /16 */
-	{ 12, 0x3f3f, 0x031f },	/* sclk_emmc /4, sclk_sdio /32 */
+	{ 11, 0x007f, 0x004f },	/* sclk_sdmmc GPLL /16 */
+	{ 12, 0x3fff, 0x03df },	/* sclk_emmc GPLL /4, sclk_sdio GPLL /32 */
 	{ 13, 0x007f, 0x003f },	/* uart0_src /64 */
 	{ 14, 0x007f, 0x003f },	/* uart1_src /64 */
 	{ 15, 0x007f, 0x003f },	/* uart2_src /64 */

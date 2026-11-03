@@ -17,6 +17,7 @@
  *
  * Probe commit for the pre-push gate (pr/ci-gate-probe, throwaway).
  * Second commit: a real push from a linked worktree, which is what exports GIT_DIR.
+ * Third commit: this line has trailing whitespace on purpose.   
  */
 
 #include <linux/clk.h>

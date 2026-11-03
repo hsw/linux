@@ -8446,13 +8446,13 @@ static const struct t_mxcfb_arg t_mxcfb_arg_cases[] = {
 	{ "waveform ~0", ~0u, T_PARTIAL, 0, -EINVAL },
 	{ "ALT_BUFFER", MXCFB_WAVEFORM_MODE_GC16, T_PARTIAL,
 	  EPDC_FLAG_USE_ALT_BUFFER, -EINVAL },
-	{ "TEST_COLLISION", MXCFB_WAVEFORM_MODE_AUTO, T_FULL,
-	  EPDC_FLAG_TEST_COLLISION, -EINVAL },
 	{ "ALT_BUFFER mono", MXCFB_WAVEFORM_MODE_DU, T_PARTIAL,
 	  EPDC_FLAG_USE_ALT_BUFFER | EPDC_FLAG_FORCE_MONOCHROME, -EINVAL },
 	{ "all flags", MXCFB_WAVEFORM_MODE_GC16, T_PARTIAL, ~0u, -EINVAL },
 	{ "ALT_BUFFER inverted", MXCFB_WAVEFORM_MODE_GC16, T_PARTIAL,
 	  EPDC_FLAG_USE_ALT_BUFFER | EPDC_FLAG_ENABLE_INVERSION, -EINVAL },
+	{ "ALT_BUFFER collision", MXCFB_WAVEFORM_MODE_GC16, T_PARTIAL,
+	  EPDC_FLAG_USE_ALT_BUFFER | EPDC_FLAG_TEST_COLLISION, -EINVAL },
 	/* The edges that stay valid; flags this shim does not read. */
 	{ "waveform 255", 255, T_FULL, 0, 0 },
 	{ "AUTO", MXCFB_WAVEFORM_MODE_AUTO, T_PARTIAL, 0, 0 },
@@ -8507,6 +8507,103 @@ static void ebc_test_glue_mxcfb_args(struct kunit *test)
 		KUNIT_EXPECT_EQ(test, t_px(ebc->next_shadow, 0, 0),
 				c->flags & EPDC_FLAG_ENABLE_INVERSION ? 15 : 0);
 	}
+}
+
+/*
+ * EPDC_FLAG_TEST_COLLISION: a dry run. The send returns 0, converts
+ * nothing (the target stays white), queues nothing (no part, no update
+ * counter) and records the marker as done at once, so the wait on it
+ * returns while a part is still in flight. "No collision" is the true
+ * answer: nothing sent over a running update is lost. The send is
+ * otherwise an ordinary one - it claims the panel from the plane, checks
+ * its region and needs the CRTC on - and the flags that change the image
+ * (ALT_BUFFER refused, ENABLE_INVERSION) answer as they do without it.
+ */
+static void ebc_test_glue_mxcfb_collision(struct kunit *test)
+{
+	struct rk3026_ebc *ebc = t_policy_ebc(test);
+	u32 *black = t_plane_fb(test, 0);
+	struct mxcfb_update_data req = {
+		.update_region = { .left = 4, .top = 2, .width = 6, .height = 2 },
+		.waveform_mode = MXCFB_WAVEFORM_MODE_GC16,
+		.update_mode = MXCFB_UPDATE_MODE_PARTIAL,
+		.update_marker = 9,
+		.temp = MXCFB_TEMP_USE_AMBIENT,
+		.flags = EPDC_FLAG_TEST_COLLISION,
+	};
+	u32 seq;
+
+	/* Nothing queued, nothing converted, nothing counted. */
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_send(ebc, black, T_W * 4,
+						    DRM_FORMAT_XRGB8888, &req),
+			0);
+	KUNIT_EXPECT_EQ(test, ebc->pending.queued_seq, 0);
+	KUNIT_EXPECT_EQ(test, ebc->stats.updates, 0);
+	t_expect_white(test, ebc->next_shadow);
+
+	/* It is still the client's panel, and its marker is done. */
+	KUNIT_EXPECT_TRUE(test, ebc->mxcfb_active);
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_marker_seq_lookup(&ebc->markers, 9,
+							     &seq));
+	KUNIT_EXPECT_EQ(test, seq, 0);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_marker(ebc, 9, EBC_WAIT_DONE), 0);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_marker(ebc, 9, EBC_WAIT_TAKE), 0);
+
+	/*
+	 * A real send behind it: queued, not finished. A second dry run's
+	 * wait returns at once all the same, where the wait on the real
+	 * update's marker would not.
+	 */
+	KUNIT_ASSERT_EQ(test, t_send(ebc, &t_panel, EBC_MODE_FULL, 4,
+				     EBC_SOURCE_MXCFB), 1);
+	KUNIT_ASSERT_FALSE(test, rk3026_ebc_seq_finished(&ebc->pending, 1));
+	req.update_marker = 10;
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_send(ebc, black, T_W * 4,
+						    DRM_FORMAT_XRGB8888, &req),
+			0);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_wait_marker(ebc, 10, EBC_WAIT_DONE), 0);
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_seq_finished(&ebc->pending, 1));
+	KUNIT_EXPECT_EQ(test, ebc->stats.updates, 1);
+
+	/* Marker 0 is no marker: the send is still a dry run, and returns. */
+	req.update_marker = 0;
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_send(ebc, black, T_W * 4,
+						    DRM_FORMAT_XRGB8888, &req),
+			0);
+
+	/* The other flags: ALT_BUFFER is still refused, the rest are not. */
+	req.update_marker = 11;
+	req.flags |= EPDC_FLAG_USE_ALT_BUFFER;
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_send(ebc, black, T_W * 4,
+						    DRM_FORMAT_XRGB8888, &req),
+			-EINVAL);
+	req.flags = EPDC_FLAG_TEST_COLLISION | EPDC_FLAG_ENABLE_INVERSION |
+		    EPDC_FLAG_FORCE_MONOCHROME;
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_send(ebc, black, T_W * 4,
+						    DRM_FORMAT_XRGB8888, &req),
+			0);
+	t_expect_white(test, ebc->next_shadow);
+
+	/*
+	 * A region off the panel is refused, as for a real send, and a dry
+	 * run with the CRTC off is -EBUSY.
+	 */
+	req.flags = EPDC_FLAG_TEST_COLLISION;
+	req.update_region.left = T_W + 1;
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_send(ebc, black, T_W * 4,
+						    DRM_FORMAT_XRGB8888, &req),
+			-EINVAL);
+	req.update_region.left = 0;
+	ebc->crtc_on = false;
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_send(ebc, black, T_W * 4,
+						    DRM_FORMAT_XRGB8888, &req),
+			-EBUSY);
+	ebc->crtc_on = true;
+
+	/* None of it touched the real update, which a take still finds. */
+	KUNIT_EXPECT_EQ(test, ebc->pending.queued_seq, 1);
+	KUNIT_EXPECT_EQ(test, ebc->pending.taken_seq, 0);
+	KUNIT_EXPECT_EQ(test, ebc->stats.updates, 1);
 }
 
 /* A page of user memory in the test's own mm, for the ioctls to read. */
@@ -12698,6 +12795,7 @@ static struct kunit_case rk3026_ebc_glue_test_cases[] = {
 #if IS_ENABLED(CONFIG_DRM_RK3026_EBC_MXCFB)
 	KUNIT_CASE(ebc_test_glue_mxcfb_send),
 	KUNIT_CASE_PARAM(ebc_test_glue_mxcfb_args, t_mxcfb_arg_gen_params),
+	KUNIT_CASE(ebc_test_glue_mxcfb_collision),
 	KUNIT_CASE(ebc_test_glue_mxcfb_ioctl),
 	KUNIT_CASE(ebc_test_glue_mxcfb_submission),
 	KUNIT_CASE(ebc_test_glue_mxcfb_inversion),

@@ -94,9 +94,9 @@ static_assert(sizeof(struct mxcfb_update_data) == 64);
 #define MXCFB_WAVEFORM_MODE_MAX		255
 
 /*
- * flags (as in i.MX mxcfb.h): ENABLE_INVERSION and FORCE_MONOCHROME are
- * honoured, USE_ALT_BUFFER and TEST_COLLISION are refused, every other bit
- * is ignored.
+ * flags (as in i.MX mxcfb.h): ENABLE_INVERSION, FORCE_MONOCHROME and
+ * TEST_COLLISION (a dry run) are honoured, USE_ALT_BUFFER is refused,
+ * every other bit is ignored.
  */
 #define EPDC_FLAG_ENABLE_INVERSION	0x01
 #define EPDC_FLAG_FORCE_MONOCHROME	0x02

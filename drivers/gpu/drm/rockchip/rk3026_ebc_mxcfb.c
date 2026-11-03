@@ -161,11 +161,27 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_mxcfb_invert);
  *
  * The checks are i.MX's: an update_mode other than PARTIAL or FULL and a
  * waveform number above MXCFB_WAVEFORM_MODE_MAX other than AUTO are
- * invalid. Two flags change which image is meant and cannot be honoured,
- * so the update is refused rather than drawn without them:
+ * invalid. One flag changes which image is meant and cannot be honoured,
+ * so the update is refused rather than drawn without it:
  * EPDC_FLAG_USE_ALT_BUFFER names a physical address, and the shmem fbdev
- * has none a client could name; EPDC_FLAG_TEST_COLLISION asks for a dry
- * run. Other flags this shim does not read are ignored, as on i.MX.
+ * has none a client could name, so @req->alt_buffer_data is never read
+ * and the framebuffer pixels would be drawn for a buffer the client
+ * named. Other flags this shim does not read are ignored, as on i.MX.
+ *
+ * EPDC_FLAG_TEST_COLLISION asks for a dry run, as on i.MX: nothing is
+ * converted and nothing is queued, and the marker is recorded as done at
+ * once, so a wait on it returns immediately and a client that reads the
+ * collision result is told "no collision" (a later V2/V3 wait reports
+ * collision_test 0). That is the true answer here: an update sent over a
+ * running one is never lost, the refresh thread takes it into the next
+ * part and draws it (rk3026_ebc_add_update()), so a client never has to
+ * resubmit. A dry run leaves @next_shadow, the pending set and the update
+ * counters alone: the pixels it names are drawn by the client's next real
+ * send, not by the dry run. It is a send like any other in that it claims
+ * the panel from the plane (@mxcfb_active) and needs the CRTC on
+ * (-EBUSY otherwise), and its region is checked and clamped as usual. The
+ * marker, if not 0, is recorded with the newest finished seq, so the wait
+ * returns at once even while a part is in flight.
  *
  * A C8 byte has two meanings on this driver. Through the fbdev and the
  * plane (the console, a KMS client) it is an index into the CRTC's
@@ -200,9 +216,10 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_mxcfb_invert);
  * once the panel is the plane's again, its next update redraws the whole
  * panel from the framebuffer (@plane_resync).
  *
- * Returns 0, -EINVAL if the format is neither, for an argument above or if
- * nothing of the region is on the panel, or -EBUSY with the CRTC off. A
- * refused send queues nothing and leaves the panel to whoever had it.
+ * Returns 0, also for a dry run that queues nothing, -EINVAL if the format
+ * is neither, for an argument above or if nothing of the region is on the
+ * panel, or -EBUSY with the CRTC off. A refused send queues nothing and
+ * leaves the panel to whoever had it.
  */
 VISIBLE_IF_KUNIT int rk3026_ebc_mxcfb_send(struct rk3026_ebc *ebc,
 					   const void *src, unsigned int pitch,
@@ -234,7 +251,7 @@ VISIBLE_IF_KUNIT int rk3026_ebc_mxcfb_send(struct rk3026_ebc *ebc,
 	if (req->waveform_mode > MXCFB_WAVEFORM_MODE_MAX &&
 	    req->waveform_mode != MXCFB_WAVEFORM_MODE_AUTO)
 		return -EINVAL;
-	if (req->flags & (EPDC_FLAG_USE_ALT_BUFFER | EPDC_FLAG_TEST_COLLISION))
+	if (req->flags & EPDC_FLAG_USE_ALT_BUFFER)
 		return -EINVAL;
 
 	/* Each term at most the panel size first, so the sums cannot wrap. */
@@ -282,6 +299,21 @@ VISIBLE_IF_KUNIT int rk3026_ebc_mxcfb_send(struct rk3026_ebc *ebc,
 	 * (rk3026_ebc_plane_update()).
 	 */
 	WRITE_ONCE(ebc->mxcfb_active, true);
+
+	/*
+	 * A dry run: no conversion, no queue, and the marker is recorded as
+	 * done at once. The newest finished seq is recorded rather than the
+	 * newest queued one, so a wait on the marker does not sit out a part
+	 * in flight: a dry run drives nothing, and nothing sent over a
+	 * running update is lost (rk3026_ebc_add_update()), so there is
+	 * nothing for it to collide with.
+	 */
+	if (req->flags & EPDC_FLAG_TEST_COLLISION) {
+		rk3026_ebc_marker_seq_record(&ebc->markers, req->update_marker,
+					     READ_ONCE(ebc->pending.done_seq));
+		mutex_unlock(&ebc->image_lock);
+		return 0;
+	}
 
 	/* A RESET discards the pixels: rk3026_ebc_add_update() whitens them. */
 	if (upd.mode != EBC_MODE_RESET) {

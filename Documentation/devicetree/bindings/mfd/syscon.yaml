@@ -108,6 +108,7 @@ select:
           - qcom,apq8064-mmss-sfpb
           - qcom,apq8064-sps-sic
           - rockchip,px30-qos
+          - rockchip,rk3026-qos
           - rockchip,rk3036-qos
           - rockchip,rk3066-qos
           - rockchip,rk3128-qos
@@ -222,6 +223,7 @@ properties:
               - qcom,apq8064-mmss-sfpb
               - qcom,apq8064-sps-sic
               - rockchip,px30-qos
+              - rockchip,rk3026-qos
               - rockchip,rk3036-qos
               - rockchip,rk3066-qos
               - rockchip,rk3128-qos

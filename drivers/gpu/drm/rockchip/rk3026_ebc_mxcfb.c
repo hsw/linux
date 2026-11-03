@@ -120,31 +120,9 @@ VISIBLE_IF_KUNIT u32 rk3026_ebc_mxcfb_to_ebc_mode(u32 waveform_mode,
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_mxcfb_to_ebc_mode);
 
 /*
- * EPDC_FLAG_ENABLE_INVERSION on @img, a packed 4bpp image of @width x
- * @height pixels: every level of @clip, widened to whole bytes and clamped
- * as rk3026_ebc_blit() widens it, becomes 15 - level. Flipping every bit
- * of a byte does that for both of its pixels.
+ * EPDC_FLAG_ENABLE_INVERSION is the core's rk3026_ebc_invert() on the
+ * region just blitted: this file only maps the flag to that call.
  */
-VISIBLE_IF_KUNIT void rk3026_ebc_mxcfb_invert(u8 *img,
-					      const struct drm_rect *clip,
-					      unsigned int width,
-					      unsigned int height)
-{
-	struct drm_rect r = *clip;
-	int y;
-
-	if (!rk3026_ebc_widen_clip(&r, width, height))
-		return;
-
-	for (y = r.y1; y < r.y2; y++) {
-		u8 *d = img + ((size_t)y * width + r.x1) / 2;
-		int i, n = (r.x2 - r.x1) / 2;
-
-		for (i = 0; i < n; i++)
-			d[i] = ~d[i];
-	}
-}
-EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_mxcfb_invert);
 
 /**
  * rk3026_ebc_mxcfb_send - one MXCFB_SEND_UPDATE request
@@ -185,7 +163,7 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_mxcfb_invert);
  *
  * EPDC_FLAG_ENABLE_INVERSION draws the region inverted, every level as
  * 15 - level: the converted region is inverted after the blit, in the same
- * section (rk3026_ebc_mxcfb_invert()), the levels of a C8 byte taken as
+ * section (rk3026_ebc_invert()), the levels of a C8 byte taken as
  * grey as well as those of an XRGB8888 pixel. The region is the blit's,
  * widened to whole bytes, so the other pixel of an edge byte, which the
  * blit converts from the framebuffer as well, is inverted with it. The
@@ -288,8 +266,8 @@ VISIBLE_IF_KUNIT int rk3026_ebc_mxcfb_send(struct rk3026_ebc *ebc,
 		upd.blit_us = rk3026_ebc_blit(ebc, src, pitch, blit_format,
 					      &clip);
 		if (req->flags & EPDC_FLAG_ENABLE_INVERSION)
-			rk3026_ebc_mxcfb_invert(ebc->next_shadow, &clip,
-						ebc->width, ebc->height);
+			rk3026_ebc_invert(ebc->next_shadow, &clip,
+					  ebc->width, ebc->height);
 	}
 	rk3026_ebc_add_update(ebc, &upd);
 	mutex_unlock(&ebc->image_lock);

@@ -1348,6 +1348,8 @@ void rk3026_ebc_blit_c8_rows(u8 *dst, const void *src, unsigned int src_pitch,
 			     int x1, int x2, int y1, int y2,
 			     unsigned int width, const u8 *levels);
 u8 rk3026_ebc_palette_level(u16 red, u16 green, u16 blue);
+void rk3026_ebc_invert(u8 *img, const struct drm_rect *clip,
+		       unsigned int width, unsigned int height);
 
 /**
  * rk3026_ebc_grey_level - the panel level of an 8-bit grey
@@ -1468,8 +1470,6 @@ u32 rk3026_ebc_mxcfb_to_ebc_mode(u32 waveform_mode, u32 update_mode,
 int rk3026_ebc_mxcfb_send(struct rk3026_ebc *ebc, const void *src,
 			  unsigned int pitch, u32 format,
 			  const struct mxcfb_update_data *req);
-void rk3026_ebc_mxcfb_invert(u8 *img, const struct drm_rect *clip,
-			     unsigned int width, unsigned int height);
 int rk3026_ebc_mxcfb_ioctl(struct fb_info *info, unsigned int cmd,
 			   unsigned long arg);
 #endif

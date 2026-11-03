@@ -14755,11 +14755,10 @@ static void ebc_test_palette_levels(struct kunit *test)
 	}
 }
 
-#if IS_ENABLED(CONFIG_DRM_RK3026_EBC_MXCFB)
 /*
- * An inverted mxcfb send's target on one source and every clip of @clips:
+ * An inverted send's target on one source and every clip of @clips:
  * rk3026_ebc_blit_convert(), the XRGB8888 conversion of rk3026_ebc_blit(),
- * and then rk3026_ebc_mxcfb_invert() on the clip as it came, against the
+ * and then rk3026_ebc_invert() on the clip as it came, against the
  * per-pixel reference with every level of the widened clip turned into
  * 15 - level, over the same junk, guards included. False after the first
  * difference.
@@ -14787,7 +14786,7 @@ static bool t_invert_clips(struct kunit *test, const struct t_fix *f,
 			rk3026_ebc_blit_convert(out, src, pitch, w.x1, w.x2,
 						w.y1, w.y2, f->w);
 		}
-		rk3026_ebc_mxcfb_invert(out, r, f->w, f->h);
+		rk3026_ebc_invert(out, r, f->w, f->h);
 		diff = t_fix_diff(f, ref, out);
 		if (diff != INT_MAX) {
 			KUNIT_FAIL(test, "%s pitch %u clip " DRM_RECT_FMT
@@ -14801,14 +14800,15 @@ static bool t_invert_clips(struct kunit *test, const struct t_fix *f,
 }
 
 /*
- * EPDC_FLAG_ENABLE_INVERSION on every fixture, source set, dense and
- * padded pitch, and clip, unaligned and clamped ones among them: every
- * level of the widened clip mirrored, nothing else written. The
- * conversion is the one the driver runs, so with the NEON rows built in
- * the NEON path must run here, as for the NEON cases, and the bytes are
- * those of the scalar reference.
+ * The core's rk3026_ebc_invert() - the mxcfb inversion flag's operation,
+ * now of the core - on every fixture, source set, dense and padded pitch,
+ * and clip, unaligned and clamped ones among them: every level of the
+ * widened clip mirrored, nothing else written. The conversion is the one
+ * the driver runs, so with the NEON rows built in the NEON path must run
+ * here, as for the NEON cases, and the bytes are those of the scalar
+ * reference. Runs with the shim off, like the rest of this suite.
  */
-static void ebc_test_mxcfb_invert(struct kunit *test)
+static void ebc_test_invert(struct kunit *test)
 {
 	unsigned int fi, pad, kind;
 	u32 seed;
@@ -14848,7 +14848,6 @@ static void ebc_test_mxcfb_invert(struct kunit *test)
 		}
 	}
 }
-#endif
 
 static struct kunit_case rk3026_ebc_conv_test_cases[] = {
 	KUNIT_CASE(ebc_test_ref_snapshot),
@@ -14872,9 +14871,7 @@ static struct kunit_case rk3026_ebc_conv_test_cases[] = {
 	KUNIT_CASE(ebc_test_c8_rows),
 	KUNIT_CASE(ebc_test_c8_rows_tails),
 	KUNIT_CASE(ebc_test_palette_levels),
-#if IS_ENABLED(CONFIG_DRM_RK3026_EBC_MXCFB)
-	KUNIT_CASE(ebc_test_mxcfb_invert),
-#endif
+	KUNIT_CASE(ebc_test_invert),
 	{}
 };
 

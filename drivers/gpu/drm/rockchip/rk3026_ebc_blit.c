@@ -26,6 +26,10 @@
  * C8 sources (one palette index per pixel) take rk3026_ebc_blit_c8_rows():
  * each index goes through a 256-entry table of levels, one
  * rk3026_ebc_palette_level() an entry of the palette.
+ *
+ * rk3026_ebc_invert() complements a region of the converted image in place,
+ * for the mxcfb inversion flag: an image operation of the core, not of the
+ * shim that asks for it.
  */
 
 #include <linux/compiler.h>
@@ -378,3 +382,40 @@ const char *rk3026_ebc_blit_impl(void)
 	return ebc_neon_cpu() ? "neon" : "scalar";
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_blit_impl);
+
+/**
+ * rk3026_ebc_invert - turn every level of a region into 15 - level
+ * @img: the packed 4bpp image, @width x @height pixels
+ * @clip: the region, clamped to the image and widened to whole bytes
+ * @width: the image's width in pixels, even
+ * @height: its height in lines
+ *
+ * The region a blit converted is complemented in place, the other pixel of
+ * an edge byte with it, so the image then holds what the glass is to show
+ * rather than what the framebuffer holds. Flipping every bit of a byte does
+ * that for both of its pixels, so the loop is one byte at a time. No image
+ * format reaches here: the caller blits first.
+ *
+ * The mxcfb shim's EPDC_FLAG_ENABLE_INVERSION is the only caller today; the
+ * plane path never inverts.
+ */
+VISIBLE_IF_KUNIT void rk3026_ebc_invert(u8 *img,
+					const struct drm_rect *clip,
+					unsigned int width,
+					unsigned int height)
+{
+	struct drm_rect r = *clip;
+	int y;
+
+	if (!rk3026_ebc_widen_clip(&r, width, height))
+		return;
+
+	for (y = r.y1; y < r.y2; y++) {
+		u8 *d = img + ((size_t)y * width + r.x1) / 2;
+		int i, n = (r.x2 - r.x1) / 2;
+
+		for (i = 0; i < n; i++)
+			d[i] = ~d[i];
+	}
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_invert);

@@ -71,6 +71,15 @@ properties:
   interrupts:
     maxItems: 1
 
+  "#thermal-sensor-cells":
+    const: 0
+    description:
+      The chip carries one panel thermometer, so a node that a thermal zone
+      points at through its "thermal-sensors" needs this. The driver exposes
+      the thermometer through hwmon and hwmon registers it as an OF thermal
+      sensor, so it is what makes such a zone resolvable; without a zone the
+      property is optional and upstream boards leave it out.
+
   regulators:
     type: object
     additionalProperties: false

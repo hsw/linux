@@ -1,0 +1,150 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/display/rockchip/rockchip,rk3026-ebc.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Rockchip RK3026 E Ink display controller (EBC)
+
+maintainers:
+  - Heiko Stuebner <heiko@sntech.de>
+
+description:
+  The EBC is the T-CON of the RK3026. It scans an image out of memory and
+  drives an 8-bit E Ink source bus, with a 2-bit drive code per pixel and a
+  LUT of up to 64 frames per update. The panel's grey levels and its drive
+  codes come from a waveform container loaded through the firmware API, one
+  LUT per mode and per temperature range, and the panel's own thermometer
+  picks the range.
+
+  The waveform belongs to the panel rather than to the controller, so the
+  file to load and the thermometer to read are board properties.
+
+properties:
+  compatible:
+    const: rockchip,rk3026-ebc
+
+  reg:
+    maxItems: 1
+
+  interrupts:
+    maxItems: 1
+
+  clocks:
+    minItems: 4
+    maxItems: 5
+
+  clock-names:
+    minItems: 4
+    maxItems: 5
+    items:
+      enum: [ hclk, dclk, aclk, mclk, dclk-parent ]
+
+  resets:
+    maxItems: 2
+
+  reset-names:
+    items:
+      - const: axi
+      - const: ahb
+
+  rockchip,grf:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      The general register file, whose LVDS pad mux routes the shared pads to
+      the EBC instead of the LCDC.
+
+  firmware-name:
+    description:
+      The waveform container for the panel this board carries. The LUTs are
+      written for one panel's drive voltages, so a board that carries another
+      panel names another container.
+
+  thermal-sensors:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    maxItems: 1
+    description:
+      The panel's thermometer. Its zone is registered on the sensor's behalf
+      and only read here; the phandle names the sensor, and the zone that
+      names the same sensor back is the one read.
+
+  epd-supply:
+    description: The panel's high-voltage rails, VPOS and VNEG.
+
+  v3p3-supply:
+    description: The panel's logic supply, on a board that has one.
+
+  vcom-supply:
+    description: The panel's common electrode.
+
+  memory-region:
+    maxItems: 1
+    description:
+      A reusable shared-dma-pool the controller's two 4 bpp images are
+      allocated from, hactive * vactive bytes in all. The pool's size must
+      cover that, rounded up to the CMA alignment. Without it the default CMA
+      area is used.
+
+  rockchip,gdck-sta:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: GDCK start position in the horizontal blanking, in pixels.
+
+  rockchip,lgonl:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: LGONL, the number of lines the panel's source drivers are on.
+
+  panel-timing:
+    $ref: /schemas/display/panel/panel-timing.yaml#
+
+  rotation:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    enum: [ 0, 90, 180, 270 ]
+    description: Panel mounting angle, counter-clockwise.
+
+required:
+  - compatible
+  - reg
+  - interrupts
+  - clocks
+  - clock-names
+  - epd-supply
+  - vcom-supply
+  - rockchip,gdck-sta
+  - rockchip,lgonl
+  - panel-timing
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/clock/rk3026-cru.h>
+    #include <dt-bindings/interrupt-controller/arm-gic.h>
+
+    ebc@10114000 {
+        compatible = "rockchip,rk3026-ebc";
+        reg = <0x10114000 0x4000>;
+        interrupts = <GIC_SPI 49 IRQ_TYPE_LEVEL_HIGH>;
+        clocks = <&cru HCLK_EBC>, <&cru DCLK_EBC>, <&cru ACLK_LCDC1>,
+                 <&cru ACLK_EBC>;
+        clock-names = "hclk", "dclk", "aclk", "mclk";
+        rockchip,grf = <&grf>;
+        epd-supply = <&vposneg>;
+        vcom-supply = <&vcom>;
+        firmware-name = "rockchip/ed060kd1c2.rkf";
+        thermal-sensors = <&tps65185>;
+        rockchip,gdck-sta = <100>;
+        rockchip,lgonl = <281>;
+        rotation = <270>;
+
+        panel-timing {
+            clock-frequency = <40000000>;
+            hactive = <1448>;
+            vactive = <1072>;
+            hsync-len = <17>;
+            hback-porch = <8>;
+            hfront-porch = <55>;
+            vsync-len = <2>;
+            vback-porch = <4>;
+            vfront-porch = <4>;
+        };
+    };

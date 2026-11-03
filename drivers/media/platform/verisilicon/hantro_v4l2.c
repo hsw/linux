@@ -386,14 +386,21 @@ static int hantro_try_fmt(const struct hantro_ctx *ctx,
 			pix_mp->plane_fmt[0].sizeimage +=
 				hantro_av1_mv_size(pix_mp->width,
 						   pix_mp->height);
-	} else if (!pix_mp->plane_fmt[0].sizeimage) {
+	} else {
 		/*
 		 * For coded formats the application can specify
 		 * sizeimage. If the application passes a zero sizeimage,
-		 * let's default to the maximum frame size.
+		 * let's default to the maximum frame size. On an encoder's
+		 * CAPTURE queue that is also the most one frame needs, so a
+		 * larger request is clamped to it rather than allocated.
 		 */
-		pix_mp->plane_fmt[0].sizeimage = fmt->header_size +
+		u32 max_size = fmt->header_size +
 			pix_mp->width * pix_mp->height * fmt->max_depth;
+
+		if (!pix_mp->plane_fmt[0].sizeimage ||
+		    (ctx->is_encoder &&
+		     pix_mp->plane_fmt[0].sizeimage > max_size))
+			pix_mp->plane_fmt[0].sizeimage = max_size;
 	}
 
 	return 0;

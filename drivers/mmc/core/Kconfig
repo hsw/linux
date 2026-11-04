@@ -46,6 +46,21 @@ config MMC_BLOCK
 	  mount the filesystem. Almost everyone wishing MMC support
 	  should say Y or M here.
 
+config MMC_BLOCK_EMMC_DEFAULT_RO
+	bool "Make the user area of an (e)MMC card read-only by default"
+	depends on MMC_BLOCK
+	help
+	  The user area of an MMC card (not SD or SDIO) starts with
+	  force_ro set, as its boot areas already do: the block device
+	  and its partitions are read-only until root clears it with
+	  "echo 0 > /sys/block/mmcblkN/force_ro". The card itself is
+	  not write-protected, so the switch can always be cleared.
+
+	  Useful on a board that boots from removable media and must not
+	  write the soldered-down eMMC by accident.
+
+	  If unsure, say N.
+
 config MMC_BLOCK_MINORS
 	int "Number of minors per block device"
 	depends on MMC_BLOCK

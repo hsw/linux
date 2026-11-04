@@ -2598,6 +2598,9 @@ static struct mmc_blk_data *mmc_blk_alloc_req(struct mmc_card *card,
 
 static struct mmc_blk_data *mmc_blk_alloc(struct mmc_card *card)
 {
+	bool default_ro = IS_ENABLED(CONFIG_MMC_BLOCK_EMMC_DEFAULT_RO) &&
+			  mmc_card_mmc(card);
+	struct mmc_blk_data *md;
 	sector_t size;
 
 	if (!mmc_card_sd(card) && mmc_card_blockaddr(card)) {
@@ -2615,8 +2618,12 @@ static struct mmc_blk_data *mmc_blk_alloc(struct mmc_card *card)
 			<< (card->csd.read_blkbits - 9);
 	}
 
-	return mmc_blk_alloc_req(card, &card->dev, size, false, NULL,
-					MMC_BLK_DATA_AREA_MAIN, 0);
+	md = mmc_blk_alloc_req(card, &card->dev, size, default_ro, NULL,
+			       MMC_BLK_DATA_AREA_MAIN, 0);
+	if (default_ro && !IS_ERR(md))
+		dev_info(&card->dev, "%s: user area read-only by default\n",
+			 md->disk->disk_name);
+	return md;
 }
 
 static int mmc_blk_alloc_part(struct mmc_card *card,

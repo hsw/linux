@@ -298,6 +298,9 @@ struct hantro_ctx {
  * @frmsize:	Supported range of frame sizes (only for bitstream formats).
  * @postprocessed: Indicates if this format needs the post-processor.
  * @match_depth: Indicates if format bit depth must match video bit depth
+ * @codec_modes: Raw decoder formats only: mask of BIT(HANTRO_MODE_*) of the
+ *		coded formats this format can be decoded to. 0 means all of
+ *		them.
  */
 struct hantro_fmt {
 	char *name;
@@ -309,6 +312,7 @@ struct hantro_fmt {
 	struct v4l2_frmsize_stepwise frmsize;
 	bool postprocessed;
 	bool match_depth;
+	unsigned int codec_modes;
 };
 
 struct hantro_reg {

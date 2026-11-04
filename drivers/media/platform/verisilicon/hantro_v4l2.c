@@ -109,6 +109,20 @@ hantro_check_depth_match(const struct hantro_fmt *fmt, int bit_depth)
 	return fmt_depth == bit_depth;
 }
 
+/*
+ * A raw decoder format may be limited to some coded formats (codec_modes):
+ * it is offered only while the OUTPUT queue holds one of them.
+ */
+static bool
+hantro_raw_fmt_allowed(const struct hantro_ctx *ctx, const struct hantro_fmt *fmt)
+{
+	if (ctx->is_encoder || !fmt->codec_modes || !ctx->vpu_src_fmt ||
+	    ctx->vpu_src_fmt->codec_mode == HANTRO_MODE_NONE)
+		return true;
+
+	return fmt->codec_modes & BIT(ctx->vpu_src_fmt->codec_mode);
+}
+
 static const struct hantro_fmt *
 hantro_find_format(const struct hantro_ctx *ctx, u32 fourcc)
 {
@@ -117,7 +131,8 @@ hantro_find_format(const struct hantro_ctx *ctx, u32 fourcc)
 
 	formats = hantro_get_formats(ctx, &num_fmts, HANTRO_AUTO_POSTPROC);
 	for (i = 0; i < num_fmts; i++)
-		if (formats[i].fourcc == fourcc)
+		if (formats[i].fourcc == fourcc &&
+		    hantro_raw_fmt_allowed(ctx, &formats[i]))
 			return &formats[i];
 
 	formats = hantro_get_postproc_formats(ctx, &num_fmts);
@@ -156,7 +171,8 @@ hantro_get_default_fmt(const struct hantro_ctx *ctx, bool bitstream,
 	for (i = 0; i < num_fmts; i++) {
 		if (bitstream == (formats[i].codec_mode !=
 				  HANTRO_MODE_NONE) &&
-		    hantro_check_depth_match(&formats[i], bit_depth))
+		    hantro_check_depth_match(&formats[i], bit_depth) &&
+		    hantro_raw_fmt_allowed(ctx, &formats[i]))
 			return &formats[i];
 	}
 
@@ -254,6 +270,8 @@ static int vidioc_enum_fmt(struct file *file, void *priv,
 		if (skip_mode_none == mode_none)
 			continue;
 		if (!hantro_check_depth_match(fmt, ctx->bit_depth) && !enum_all_formats)
+			continue;
+		if (!hantro_raw_fmt_allowed(ctx, fmt) && !enum_all_formats)
 			continue;
 		if (j == index) {
 			f->pixelformat = fmt->fourcc;

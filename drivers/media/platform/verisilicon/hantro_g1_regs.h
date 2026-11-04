@@ -234,7 +234,7 @@
 #define G1_REG_ADDR_DST					0x034
 #define G1_REG_ADDR_DST_CHROMA				0x038
 #define G1_REG_JPEG_CTRL				0x03c
-#define     G1_REG_JPEG_CTRL_SLICE_H(x)			(((x) & 0xf) << 0)
+#define     G1_REG_JPEG_CTRL_SLICE_H(x)			(((x) & 0xff) << 0)
 #define G1_REG_ADDR_REF(i)				(0x038 + ((i) * 0x4))
 #define     G1_REG_ADDR_REF_FIELD_E			BIT(1)
 #define     G1_REG_ADDR_REF_TOPC_E			BIT(0)

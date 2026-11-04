@@ -526,9 +526,14 @@
 
 /*
  * The SD clock as the vendor kernel runs it: GPLL 768 MHz / 16 = 48 MHz, so
- * the controller's divider gives 24 MHz on the card for 25 MHz and 400 kHz
- * for identification. Pinned to GPLL so it never follows CPLL, which the EBC
+ * the controller's divider gives 48 MHz on a high-speed card and 24 MHz on a
+ * default-speed one (mmc caps the request at min(csd max_dtr, max-frequency),
+ * so a 25 MHz cap held even a high-speed card at 24 MHz). 400 kHz for
+ * identification. Pinned to GPLL so it never follows CPLL, which the EBC
  * driver reprograms.
+ *
+ * 50 MHz is the SD high-speed ceiling. A high-speed SDHC card runs clean at
+ * 48 MHz on the RC2 (divider bypassed): about 20 MB/s read, 15 MB/s write.
  */
 &sdmmc {
 	assigned-clocks = <&cru SCLK_SDMMC>;
@@ -536,7 +541,7 @@
 	assigned-clock-rates = <48000000>;
 	bus-width = <4>;
 	cap-sd-highspeed;
-	max-frequency = <25000000>;
+	max-frequency = <50000000>;
 	cd-gpios = <&gpio2 RK_PA3 GPIO_ACTIVE_LOW>;
 	disable-wp;
 	fifo-mode;

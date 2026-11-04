@@ -20,13 +20,20 @@
 #include "hantro_hw.h"
 #include "hantro_jpeg.h"
 
+/* JPEG_MODE values: the sampling the decoder reads and writes. */
+#define G1_JPEG_MODE_GREY	0
+#define G1_JPEG_MODE_420	2
+#define G1_JPEG_MODE_422	3
+
 VISIBLE_IF_KUNIT int hantro_g1_jpeg_dec_mode(int subsampling)
 {
 	switch (subsampling) {
+	case V4L2_JPEG_CHROMA_SUBSAMPLING_GRAY:
+		return G1_JPEG_MODE_GREY;
 	case V4L2_JPEG_CHROMA_SUBSAMPLING_420:
-		return 2;
+		return G1_JPEG_MODE_420;
 	case V4L2_JPEG_CHROMA_SUBSAMPLING_422:
-		return 3;
+		return G1_JPEG_MODE_422;
 	default:
 		return -EINVAL;
 	}
@@ -35,6 +42,8 @@ VISIBLE_IF_KUNIT int hantro_g1_jpeg_dec_mode(int subsampling)
 VISIBLE_IF_KUNIT u32 hantro_g1_jpeg_dec_fourcc(int subsampling)
 {
 	switch (subsampling) {
+	case V4L2_JPEG_CHROMA_SUBSAMPLING_GRAY:
+		return V4L2_PIX_FMT_GREY;
 	case V4L2_JPEG_CHROMA_SUBSAMPLING_420:
 		return V4L2_PIX_FMT_NV12;
 	case V4L2_JPEG_CHROMA_SUBSAMPLING_422:
@@ -139,6 +148,8 @@ VISIBLE_IF_KUNIT void hantro_g1_jpeg_dec_regs(const struct v4l2_jpeg_header *hdr
 	const struct v4l2_jpeg_frame_header *frame = &hdr->frame;
 	const struct v4l2_jpeg_scan_header *scan = hdr->scan;
 	const struct v4l2_jpeg_reference *ht = hdr->huffman_tables;
+	static const u8 no_codes[16];
+	bool grey = scan->num_components == 1;
 	u32 mb_width = MB_WIDTH(frame->width);
 	u32 mb_height = MB_HEIGHT(frame->height);
 	u8 ta = scan->component[0].ac_entropy_coding_table_selector;
@@ -184,24 +195,29 @@ VISIBLE_IF_KUNIT void hantro_g1_jpeg_dec_regs(const struct v4l2_jpeg_header *hdr
 			regs->ctrl2 |= G1_REG_DEC_CTRL2_CR_DC_VLCTABLE;
 	}
 
-	if (hdr->restart_interval)
+	if (hdr->restart_interval) {
 		regs->ctrl2 |= G1_REG_DEC_CTRL2_SYNC_MARKER_E;
-	regs->ctrl5 = G1_REG_DEC_CTRL5_PJPEG_REST_FREQ(hdr->restart_interval);
+		regs->ctrl5 = G1_REG_DEC_CTRL5_PJPEG_REST_FREQ(hdr->restart_interval);
+	}
 
 	/*
-	 * A 4:2:2 MCU is 8 rows high: when the last macroblock row holds 8
-	 * picture rows or fewer, the stream has no MCUs for its lower half
-	 * and the decoder must fill it in.
+	 * A 4:2:2 MCU is 8 rows high, a greyscale one 8x8: when the last
+	 * macroblock row (column) holds 8 picture rows (columns) or fewer,
+	 * the stream has no MCUs for its lower (right) half and the decoder
+	 * must fill it in.
 	 */
-	if (frame->subsampling == V4L2_JPEG_CHROMA_SUBSAMPLING_422 &&
+	if ((grey || frame->subsampling == V4L2_JPEG_CHROMA_SUBSAMPLING_422) &&
 	    fill_needed(frame->height))
 		regs->ctrl4 |= G1_REG_DEC_CTRL4_PJPEG_FILDOWN_E;
+	if (grey && fill_needed(frame->width))
+		regs->ctrl2 |= G1_REG_DEC_CTRL2_JPEG_FILRIGHT_E;
 
 	/* No slice mode: the whole picture in one job. */
 	regs->jpeg_ctrl = G1_REG_JPEG_CTRL_SLICE_H(0);
 
-	vlc_code_counts(ht[2 + ta].start, ht[2 + !ta].start,
-			ht[td].start, ht[!td].start, regs->vlc);
+	/* A greyscale picture has no second table. */
+	vlc_code_counts(ht[2 + ta].start, grey ? no_codes : ht[2 + !ta].start,
+			ht[td].start, grey ? no_codes : ht[!td].start, regs->vlc);
 }
 
 /*
@@ -307,7 +323,8 @@ VISIBLE_IF_KUNIT int hantro_g1_jpeg_dec_check(const struct v4l2_jpeg_header *hdr
 		return -EINVAL;
 	}
 
-	if (frame->num_components != 3 ||
+	if (frame->num_components !=
+	    (frame->subsampling == V4L2_JPEG_CHROMA_SUBSAMPLING_GRAY ? 1 : 3) ||
 	    hantro_g1_jpeg_dec_fourcc(frame->subsampling) != fourcc) {
 		vpu_debug(1, "%u components, subsampling %d: not %p4cc\n",
 			  frame->num_components, frame->subsampling, &fourcc);
@@ -317,6 +334,33 @@ VISIBLE_IF_KUNIT int hantro_g1_jpeg_dec_check(const struct v4l2_jpeg_header *hdr
 	/* One interleaved scan with all the components, in frame order. */
 	if (scan->num_components != frame->num_components) {
 		vpu_debug(1, "non-interleaved scan\n");
+		return -EINVAL;
+	}
+
+	/*
+	 * In a one-component scan the decoder does not count the restart
+	 * interval: a restart marker it meets where it expects a block gives
+	 * an empty block and moves the rest of the picture on by one. Only a
+	 * marker at the end of a block row is taken without loss, so every
+	 * restart must fall there.
+	 */
+	if (scan->num_components == 1 &&
+	    hdr->restart_interval % DIV_ROUND_UP(frame->width, 8)) {
+		vpu_debug(1, "one component, restart interval %u: not whole rows\n",
+			  hdr->restart_interval);
+		return -EINVAL;
+	}
+
+	/*
+	 * A one-component picture that needs FILRIGHT but not FILDOWN comes
+	 * out with its last block row written as zero, without an error: on
+	 * the RK3026, 200 and 216 pixels wide and 400 high, with and without
+	 * restart markers. With FILDOWN set as well the picture is right.
+	 */
+	if (scan->num_components == 1 && fill_needed(frame->width) &&
+	    !fill_needed(frame->height)) {
+		vpu_debug(1, "one component, %ux%u: fill right without fill down\n",
+			  frame->width, frame->height);
 		return -EINVAL;
 	}
 
@@ -475,8 +519,11 @@ static int hantro_g1_jpeg_dec_start(struct hantro_ctx *ctx)
 
 	vdpu_write_relaxed(vpu, regs.stream, G1_REG_ADDR_STR);
 	vdpu_write_relaxed(vpu, dst_dma, G1_REG_ADDR_DST);
-	vdpu_write_relaxed(vpu, dst_dma + ctx->dst_fmt.plane_fmt[0].bytesperline *
-				ctx->dst_fmt.height, G1_REG_ADDR_DST_CHROMA);
+	/* A greyscale picture has no chroma plane. */
+	if (header.frame.num_components > 1)
+		vdpu_write_relaxed(vpu, dst_dma +
+				   ctx->dst_fmt.plane_fmt[0].bytesperline *
+				   ctx->dst_fmt.height, G1_REG_ADDR_DST_CHROMA);
 	vdpu_write_relaxed(vpu, ctx->jpeg_dec.priv.dma, G1_REG_ADDR_QTABLE);
 
 	hantro_end_prepare_run(ctx);

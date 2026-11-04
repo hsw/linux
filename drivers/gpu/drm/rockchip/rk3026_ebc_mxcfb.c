@@ -120,6 +120,52 @@ VISIBLE_IF_KUNIT u32 rk3026_ebc_mxcfb_to_ebc_mode(u32 waveform_mode,
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_mxcfb_to_ebc_mode);
 
 /*
+ * Dithering: EPDC_FLAG_USE_DITHERING_Y4, _Y1 and _NTX_D8.
+ *
+ * An i.MX EPDC client sets these to have 8-bit content dithered to what
+ * the panel can show: Y4 to the 16 grey levels, Y1 to black and white.
+ * NTX_D8, a dither request of the Netronix-based readers' kernels (Kobo,
+ * PocketBook, Cervantes), is taken as Y4: whatever number of levels it
+ * asks for, the panel's 16 are the finest dither it can show. The blit
+ * honours them on the update region with an ordered dither of the grey,
+ * the luma of an XRGB8888 pixel or the byte of a C8 one, in an 8x8
+ * pattern anchored to the panel (rk3026_ebc_blit_dither()), on the region
+ * widened to whole bytes (a pixel next to an odd edge takes this update's
+ * conversion): Y4 draws a grey with the two levels around it, Y1 with
+ * black and white, in the proportion that keeps its mean. The grey of a
+ * level itself (17 n for Y4; 0 and 255 for Y1) comes out flat, as without
+ * the flag, so black and white text and the 16 levels convert as before.
+ * Set together, Y1 wins over Y4 and NTX_D8, and Y4 with NTX_D8 is Y4.
+ *
+ * The flags choose the conversion only, never the waveform: the mode
+ * comes from waveform_mode, update_mode and FORCE_MONOCHROME as above. Y1
+ * is meant for the two-level waveforms, DU, A2 and AUTO with
+ * FORCE_MONOCHROME: every pixel it writes is black or white, so the
+ * snapshot's two-level step (level >= 8 is white) keeps the pattern as it
+ * is, and a partial AUTO update of it may resolve to DU. Y1 with
+ * FORCE_MONOCHROME is thus a dithered instead of a thresholded black and
+ * white, in the mode the flag maps to. With a 16-level waveform Y1 draws
+ * the same black and white pattern. Y4 (or NTX_D8) with a two-level
+ * waveform is thresholded at the snapshot like any grey; a client that
+ * wants a dithered two-level update asks for Y1. EPDC_FLAG_ENABLE_INVERSION
+ * inverts the dithered levels as it inverts any others.
+ *
+ * Without any of the three the conversion is the plain one, byte for
+ * byte. A RESET converts nothing, so its flags have no effect. The plane
+ * path (fbcon, a KMS client) has no flags and never dithers.
+ */
+VISIBLE_IF_KUNIT enum rk3026_ebc_dither rk3026_ebc_mxcfb_dither(u32 flags)
+{
+	if (flags & EPDC_FLAG_USE_DITHERING_Y1)
+		return EBC_DITHER_Y1;
+	if (flags & (EPDC_FLAG_USE_DITHERING_Y4 |
+		     EPDC_FLAG_USE_DITHERING_NTX_D8))
+		return EBC_DITHER_Y4;
+	return EBC_DITHER_NONE;
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_mxcfb_dither);
+
+/*
  * EPDC_FLAG_ENABLE_INVERSION on @img, a packed 4bpp image of @width x
  * @height pixels: every level of @clip, widened to whole bytes and clamped
  * as rk3026_ebc_blit() widens it, becomes 15 - level. Flipping every bit
@@ -155,9 +201,9 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_mxcfb_invert);
  * @req: the request, already copied in
  *
  * The arguments are checked, the region clamped to the panel, the waveform
- * and the flags mapped (rk3026_ebc_mxcfb_to_ebc_mode()), and, in one
- * @image_lock section, the client's pixels converted from @src and the
- * update queued.
+ * and the flags mapped (rk3026_ebc_mxcfb_to_ebc_mode(),
+ * rk3026_ebc_mxcfb_dither()), and, in one @image_lock section, the
+ * client's pixels converted from @src and the update queued.
  *
  * The checks are i.MX's: an update_mode other than PARTIAL or FULL and a
  * waveform number above MXCFB_WAVEFORM_MODE_MAX other than AUTO are
@@ -174,6 +220,8 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_mxcfb_invert);
  * is what an mxcfb client writes: it converts as R8, rounded to the
  * nearest of the 16 levels, whatever palette is set, so a client that
  * dithers to the greys 17 k gets level k exactly and needs no palette.
+ * With a dither flag the byte is dithered as the luma of an XRGB8888 pixel
+ * is.
  *
  * The plane still reads the same buffer as indices whenever it blits it:
  * the fbdev's damage of an mmap write before the client's first send,
@@ -212,6 +260,7 @@ VISIBLE_IF_KUNIT int rk3026_ebc_mxcfb_send(struct rk3026_ebc *ebc,
 	const struct mxcfb_rect *r = &req->update_region;
 	const struct drm_rect panel = DRM_RECT_INIT(0, 0, ebc->width,
 						    ebc->height);
+	enum rk3026_ebc_dither dither;
 	struct rk3026_ebc_update upd;
 	struct drm_rect clip;
 	u32 blit_format;
@@ -247,6 +296,7 @@ VISIBLE_IF_KUNIT int rk3026_ebc_mxcfb_send(struct rk3026_ebc *ebc,
 	mode = rk3026_ebc_mxcfb_to_ebc_mode(req->waveform_mode,
 					    req->update_mode, req->flags,
 					    &auto_mode);
+	dither = rk3026_ebc_mxcfb_dither(req->flags);
 	upd = (struct rk3026_ebc_update) {
 		.clip		= clip,
 		.mode		= mode,
@@ -286,7 +336,7 @@ VISIBLE_IF_KUNIT int rk3026_ebc_mxcfb_send(struct rk3026_ebc *ebc,
 	/* A RESET discards the pixels: rk3026_ebc_add_update() whitens them. */
 	if (upd.mode != EBC_MODE_RESET) {
 		upd.blit_us = rk3026_ebc_blit(ebc, src, pitch, blit_format,
-					      &clip, EBC_DITHER_NONE);
+					      &clip, dither);
 		if (req->flags & EPDC_FLAG_ENABLE_INVERSION)
 			rk3026_ebc_mxcfb_invert(ebc->next_shadow, &clip,
 						ebc->width, ebc->height);

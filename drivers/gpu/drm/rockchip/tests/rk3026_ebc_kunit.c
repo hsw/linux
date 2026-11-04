@@ -3598,6 +3598,10 @@ struct t_mxcfb {
 #define T_PARTIAL	MXCFB_UPDATE_MODE_PARTIAL
 #define T_FULL		MXCFB_UPDATE_MODE_FULL
 #define T_MONO		EPDC_FLAG_FORCE_MONOCHROME
+#define T_Y1		EPDC_FLAG_USE_DITHERING_Y1
+#define T_Y4		EPDC_FLAG_USE_DITHERING_Y4
+#define T_D8		EPDC_FLAG_USE_DITHERING_NTX_D8
+#define T_DITHER	(T_Y1 | T_Y4 | T_D8)
 
 static const struct t_mxcfb t_mxcfb_cases[] = {
 	{ "INIT partial", MXCFB_WAVEFORM_MODE_INIT, T_PARTIAL, EBC_MODE_RESET },
@@ -3786,6 +3790,67 @@ static void ebc_test_mxcfb_auto_resolve(struct kunit *test)
 					T_PARTIAL, 0, true, &reason),
 			EBC_MODE_PART);
 	KUNIT_EXPECT_EQ(test, reason, EBC_REASON_EXPLICIT);
+}
+
+/*
+ * The dither flags pick the conversion, NTX_D8 as Y4, Y1 over both,
+ * whatever else is set, and never the mode: every case of the waveform
+ * map gives the same mode and auto_mode with them set, cleared or toggled.
+ */
+static void ebc_test_mxcfb_dither_flags(struct kunit *test)
+{
+	unsigned int i, j;
+
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_dither(0), EBC_DITHER_NONE);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_dither(T_Y4), EBC_DITHER_Y4);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_dither(T_Y1), EBC_DITHER_Y1);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_dither(T_D8), EBC_DITHER_Y4);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_dither(T_Y4 | T_D8),
+			EBC_DITHER_Y4);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_dither(T_Y1 | T_Y4),
+			EBC_DITHER_Y1);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_dither(T_Y1 | T_D8),
+			EBC_DITHER_Y1);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_dither(T_DITHER),
+			EBC_DITHER_Y1);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_dither(T_MONO | T_Y1),
+			EBC_DITHER_Y1);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_dither(T_MONO | T_D8),
+			EBC_DITHER_Y4);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_dither(T_MONO), EBC_DITHER_NONE);
+	/* no other bit: neither its neighbours nor every other bit at once */
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_dither(T_D8 >> 1 | T_D8 << 1),
+			EBC_DITHER_NONE);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_dither(~T_DITHER),
+			EBC_DITHER_NONE);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_dither(~T_Y1), EBC_DITHER_Y4);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_dither(~(T_Y1 | T_Y4)),
+			EBC_DITHER_Y4);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_dither(~(T_Y1 | T_D8)),
+			EBC_DITHER_Y4);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_mxcfb_dither(~0u), EBC_DITHER_Y1);
+
+	for (i = 0; i < ARRAY_SIZE(t_mxcfb_cases); i++) {
+		const struct t_mxcfb *c = &t_mxcfb_cases[i];
+		const u32 flags[] = {
+			c->flags | T_DITHER, c->flags & ~T_DITHER,
+			c->flags ^ T_Y1, c->flags ^ T_Y4, c->flags ^ T_D8,
+		};
+
+		for (j = 0; j < ARRAY_SIZE(flags); j++) {
+			bool auto_mode = !c->auto_mode;
+
+			KUNIT_EXPECT_EQ_MSG(test,
+					    rk3026_ebc_mxcfb_to_ebc_mode(c->waveform,
+									 c->update_mode,
+									 flags[j],
+									 &auto_mode),
+					    c->mode, "%s flags %#x", c->desc,
+					    flags[j]);
+			KUNIT_EXPECT_EQ_MSG(test, auto_mode, c->auto_mode,
+					    "%s flags %#x", c->desc, flags[j]);
+		}
+	}
 }
 
 /* --- the mxcfb ioctl numbers --- */
@@ -4014,6 +4079,7 @@ static struct kunit_case rk3026_ebc_mxcfb_test_cases[] = {
 	KUNIT_CASE_PARAM(ebc_test_mxcfb_map, t_mxcfb_gen_params),
 	KUNIT_CASE(ebc_test_mxcfb_full_class),
 	KUNIT_CASE(ebc_test_mxcfb_auto_resolve),
+	KUNIT_CASE(ebc_test_mxcfb_dither_flags),
 	KUNIT_CASE(ebc_test_mxcfb_ioctl),
 	KUNIT_CASE(ebc_test_mxcfb_abi),
 	{}
@@ -9875,6 +9941,145 @@ static void ebc_test_glue_mxcfb_inversion_c8(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, part.blit_us, 0);
 	t_expect_white(test, ebc->next_shadow);
 }
+
+/*
+ * @ebc's target after one send of @flags on @req's region of @src, a
+ * @format fbdev (XRGB8888 or C8) of @pitch bytes a row, equals the target
+ * before it with the reference rows of @dither on the region widened to
+ * whole bytes, inverted with EPDC_FLAG_ENABLE_INVERSION: the rest of the
+ * panel untouched. The part it queued in @part.
+ */
+static void t_mxcfb_dither_send(struct kunit *test, struct rk3026_ebc *ebc,
+				const void *src, unsigned int pitch,
+				u32 format, struct mxcfb_update_data *req,
+				u32 flags, enum rk3026_ebc_dither dither,
+				struct rk3026_ebc_set *part)
+{
+	const struct mxcfb_rect *r = &req->update_region;
+	unsigned int cpp = format == DRM_FORMAT_C8 ? 1 : 4;
+	int x1 = r->left & ~1, x2 = round_up(r->left + r->width, 2);
+	int y1 = r->top, y2 = r->top + r->height, x, y;
+	u8 ref[T_SIZE];
+
+	memset(ebc->next_shadow, 0x5a, T_SIZE);
+	memcpy(ref, ebc->next_shadow, T_SIZE);
+	if (dither != EBC_DITHER_NONE)
+		rk3026_ebc_ref_blit_rows_dither(ref, src, pitch, x1, x2, y1, y2,
+						T_W, cpp,
+						dither == EBC_DITHER_Y1 ? 1 : 15);
+	else if (cpp == 4)
+		rk3026_ebc_ref_blit_rows(ref, src, pitch, x1, x2, y1, y2, T_W);
+	else
+		rk3026_ebc_ref_grey_rows(ref, src, pitch, x1, x2, y1, y2, T_W,
+					 NULL);
+	if (flags & EPDC_FLAG_ENABLE_INVERSION)
+		for (y = y1; y < y2; y++)
+			for (x = x1; x < x2; x += 2)
+				ref[y * T_PITCH + x / 2] ^= 0xff;
+	req->flags = flags;
+	KUNIT_EXPECT_EQ(test, t_mxcfb_part_fmt(ebc, src, pitch, format, req,
+					       part), 0);
+	KUNIT_EXPECT_MEMEQ_MSG(test, ebc->next_shadow, ref, T_SIZE,
+			       "cpp %u flags %#x", cpp, flags);
+}
+
+/*
+ * A send converts its region with the dither its flags ask for, from an
+ * XRGB8888 and from a C8 fbdev (the byte a grey, the console's palette
+ * set): the plain bytes without a dither flag, whatever else is set, Y4
+ * and Y1 dithered, NTX_D8 as Y4, Y1 over Y4 and NTX_D8, the inversion
+ * after the dither, and Y1 with FORCE_MONOCHROME in DU; on an odd region,
+ * widened to whole bytes, and on the whole panel. A plane update
+ * afterwards converts plainly.
+ */
+static void ebc_test_glue_mxcfb_dither(struct kunit *test)
+{
+	static const struct {
+		u32 flags;
+		enum rk3026_ebc_dither dither;
+	} sends[] = {
+		{ 0, EBC_DITHER_NONE },
+		/* every bit the shim may take but the dither, inversion, mono */
+		{ ~(T_DITHER | T_MONO | EPDC_FLAG_ENABLE_INVERSION |
+		    EPDC_FLAG_USE_ALT_BUFFER | EPDC_FLAG_TEST_COLLISION),
+		  EBC_DITHER_NONE },
+		{ T_Y4, EBC_DITHER_Y4 },
+		{ T_Y1, EBC_DITHER_Y1 },
+		{ T_D8, EBC_DITHER_Y4 },
+		{ T_Y1 | T_Y4, EBC_DITHER_Y1 },
+		{ T_Y4 | T_D8, EBC_DITHER_Y4 },
+		{ T_Y1 | T_D8, EBC_DITHER_Y1 },
+		{ T_Y4 | EPDC_FLAG_ENABLE_INVERSION, EBC_DITHER_Y4 },
+		{ T_Y1 | EPDC_FLAG_ENABLE_INVERSION, EBC_DITHER_Y1 },
+	};
+	const unsigned int gpitch = T_W + 5;
+	struct rk3026_ebc *ebc = t_policy_ebc(test);
+	struct drm_color_lut *lut = kunit_kcalloc(test, EBC_PALETTE_SIZE,
+						  sizeof(*lut), GFP_KERNEL);
+	u32 *xrgb = t_plane_fb(test, 0);
+	u8 *grey = kunit_kmalloc(test, gpitch * T_H, GFP_KERNEL);
+	struct mxcfb_update_data req = {
+		.update_region = { .left = 3, .top = 1, .width = 10,
+				   .height = 4 },
+		.waveform_mode = MXCFB_WAVEFORM_MODE_GC16,
+		.update_mode = MXCFB_UPDATE_MODE_PARTIAL,
+		.temp = MXCFB_TEMP_USE_AMBIENT,
+	};
+	struct rk3026_ebc_set part;
+	struct rnd_state rs;
+	u8 ref[T_SIZE];
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, lut);
+	KUNIT_ASSERT_NOT_NULL(test, grey);
+	prandom_seed_state(&rs, 4242);
+	for (i = 0; i < T_W * T_H; i++)
+		xrgb[i] = prandom_u32_state(&rs);
+	prandom_bytes_state(&rs, grey, gpitch * T_H);
+	t_lut_con16(lut);
+	rk3026_ebc_load_palette(ebc, lut);
+
+	for (i = 0; i < ARRAY_SIZE(sends); i++) {
+		t_mxcfb_dither_send(test, ebc, xrgb, T_W * 4,
+				    DRM_FORMAT_XRGB8888, &req, sends[i].flags,
+				    sends[i].dither, &part);
+		KUNIT_EXPECT_EQ(test, part.mode, EBC_MODE_PART);
+		t_mxcfb_dither_send(test, ebc, grey, gpitch, DRM_FORMAT_C8,
+				    &req, sends[i].flags, sends[i].dither,
+				    &part);
+		KUNIT_EXPECT_EQ(test, part.mode, EBC_MODE_PART);
+	}
+
+	/* The whole panel, 16 px wide: the NEON rows where they are built. */
+	req.update_region = (struct mxcfb_rect) { .width = T_W,
+						  .height = T_H };
+	for (i = 2; i < 4; i++) {
+		t_mxcfb_dither_send(test, ebc, xrgb, T_W * 4,
+				    DRM_FORMAT_XRGB8888, &req, sends[i].flags,
+				    sends[i].dither, &part);
+		t_mxcfb_dither_send(test, ebc, grey, gpitch, DRM_FORMAT_C8,
+				    &req, sends[i].flags, sends[i].dither,
+				    &part);
+	}
+
+	req.waveform_mode = MXCFB_WAVEFORM_MODE_AUTO;
+	t_mxcfb_dither_send(test, ebc, xrgb, T_W * 4, DRM_FORMAT_XRGB8888,
+			    &req, T_MONO | T_Y1, EBC_DITHER_Y1, &part);
+	KUNIT_EXPECT_EQ(test, part.mode, EBC_MODE_BLACK_WHITE);
+	KUNIT_EXPECT_FALSE(test, part.auto_ok);
+	t_mxcfb_dither_send(test, ebc, grey, gpitch, DRM_FORMAT_C8, &req,
+			    T_MONO | T_Y1, EBC_DITHER_Y1, &part);
+	KUNIT_EXPECT_EQ(test, part.mode, EBC_MODE_BLACK_WHITE);
+
+	/* The plane path: no flags, the plain bytes over the whole panel. */
+	ebc->mxcfb_active = false;
+	memset(ebc->next_shadow, 0x5a, T_SIZE);
+	rk3026_ebc_ref_blit_rows(ref, xrgb, T_W * 4, 0, T_W, 0, T_H, T_W);
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, xrgb, T_W * 4,
+							DRM_FORMAT_XRGB8888,
+							&t_panel));
+	KUNIT_EXPECT_MEMEQ(test, ebc->next_shadow, ref, T_SIZE);
+}
 #endif
 
 #if IS_ENABLED(CONFIG_DEBUG_FS)
@@ -12722,6 +12927,7 @@ static struct kunit_case rk3026_ebc_glue_test_cases[] = {
 #if IS_ENABLED(CONFIG_DRM_RK3026_EBC_MXCFB)
 	KUNIT_CASE(ebc_test_glue_mxcfb_c8),
 	KUNIT_CASE(ebc_test_glue_mxcfb_inversion_c8),
+	KUNIT_CASE(ebc_test_glue_mxcfb_dither),
 #endif
 #if IS_ENABLED(CONFIG_DEBUG_FS)
 	KUNIT_CASE(ebc_test_glue_debugfs_palette),

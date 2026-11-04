@@ -94,14 +94,21 @@ static_assert(sizeof(struct mxcfb_update_data) == 64);
 #define MXCFB_WAVEFORM_MODE_MAX		255
 
 /*
- * flags (as in i.MX mxcfb.h): ENABLE_INVERSION and FORCE_MONOCHROME are
- * honoured, USE_ALT_BUFFER and TEST_COLLISION are refused, every other bit
- * is ignored.
+ * flags (as in i.MX mxcfb.h): ENABLE_INVERSION, FORCE_MONOCHROME and the
+ * dither requests USE_DITHERING_Y1 (to black and white) and
+ * USE_DITHERING_Y4 (to the 16 grey levels) are honoured, as is
+ * USE_DITHERING_NTX_D8, a dither request of the Netronix-based readers'
+ * kernels (Kobo, PocketBook, Cervantes; KOReader's mxcfb_kobo_h.lua);
+ * USE_ALT_BUFFER and TEST_COLLISION are refused, every other bit is
+ * ignored.
  */
 #define EPDC_FLAG_ENABLE_INVERSION	0x01
 #define EPDC_FLAG_FORCE_MONOCHROME	0x02
 #define EPDC_FLAG_USE_ALT_BUFFER	0x100
 #define EPDC_FLAG_TEST_COLLISION	0x200
+#define EPDC_FLAG_USE_DITHERING_Y1	0x2000
+#define EPDC_FLAG_USE_DITHERING_Y4	0x4000
+#define EPDC_FLAG_USE_DITHERING_NTX_D8	0x100000
 
 /* temp: read the panel thermometer instead of using the supplied value */
 #define MXCFB_TEMP_USE_AMBIENT		0x1000

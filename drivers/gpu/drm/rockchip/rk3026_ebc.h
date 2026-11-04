@@ -245,7 +245,8 @@ enum rk3026_ebc_wait_for {
  * NONE is the plain conversion of the source format, as every update had
  * before the dithered one; Y4 and Y1 dither the grey in an 8x8 ordered
  * pattern to the 16 levels or to black and white (rk3026_ebc_blit_dither()).
- * Only an mxcfb send asks for a dither (EPDC_FLAG_USE_DITHERING_Y1 / _Y4).
+ * Only an mxcfb send asks for a dither (EPDC_FLAG_USE_DITHERING_Y1 / _Y4 /
+ * _NTX_D8).
  */
 enum rk3026_ebc_dither {
 	EBC_DITHER_NONE,
@@ -1485,6 +1486,7 @@ void rk3026_ebc_mxcfb_install(struct rk3026_ebc *ebc, struct fb_info *info);
 struct mxcfb_update_data;
 u32 rk3026_ebc_mxcfb_to_ebc_mode(u32 waveform_mode, u32 update_mode,
 				 u32 flags, bool *auto_mode);
+enum rk3026_ebc_dither rk3026_ebc_mxcfb_dither(u32 flags);
 int rk3026_ebc_mxcfb_send(struct rk3026_ebc *ebc, const void *src,
 			  unsigned int pitch, u32 format,
 			  const struct mxcfb_update_data *req);

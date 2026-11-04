@@ -109,6 +109,13 @@ hantro_check_depth_match(const struct hantro_fmt *fmt, int bit_depth)
 	return fmt_depth == bit_depth;
 }
 
+/* The JPEG decoder is the one stateful mode: the driver parses the headers. */
+static bool hantro_is_stateful_dec(const struct hantro_ctx *ctx)
+{
+	return !ctx->is_encoder &&
+	       ctx->vpu_src_fmt->codec_mode == HANTRO_MODE_JPEG_DEC;
+}
+
 static const struct hantro_fmt *
 hantro_find_format(const struct hantro_ctx *ctx, u32 fourcc)
 {
@@ -569,6 +576,17 @@ static int hantro_set_fmt_out(struct hantro_ctx *ctx,
 	ctx->src_fmt = *pix_mp;
 
 	/*
+	 * Only a decoder that parses the headers reads its bitstream
+	 * buffers; the attribute applies to the buffers allocated next.
+	 */
+	if (!ctx->is_encoder && !vb2_is_busy(vq)) {
+		if (hantro_is_stateful_dec(ctx))
+			vq->dma_attrs &= ~DMA_ATTR_NO_KERNEL_MAPPING;
+		else
+			vq->dma_attrs |= DMA_ATTR_NO_KERNEL_MAPPING;
+	}
+
+	/*
 	 * Current raw format might have become invalid with newly
 	 * selected codec, so reset it to default just to be safe and
 	 * keep internal driver state sane. User is mandated to set
@@ -656,16 +674,49 @@ static int hantro_set_fmt_cap(struct hantro_ctx *ctx,
 	return 0;
 }
 
+/*
+ * The stateful mode's job reads the CAPTURE format without the ioctl lock:
+ * it also starts from the mem2mem worker when the previous job ends. So the
+ * format stays as it is while the CAPTURE queue has buffers, as the stateful
+ * decoder interface asks anyway. An OUTPUT S_FMT sets the CAPTURE format
+ * back to its default, so it is refused then too, also when it enters or
+ * leaves that mode. The stateless modes are not affected.
+ */
+static bool hantro_cap_fmt_busy(struct hantro_ctx *ctx, u32 out_fourcc)
+{
+	const struct hantro_fmt *fmt;
+
+	if (ctx->is_encoder ||
+	    !vb2_is_busy(v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx)))
+		return false;
+
+	if (hantro_is_stateful_dec(ctx))
+		return true;
+
+	fmt = out_fourcc ? hantro_find_format(ctx, out_fourcc) : NULL;
+	return fmt && fmt->codec_mode == HANTRO_MODE_JPEG_DEC;
+}
+
 static int
 vidioc_s_fmt_out_mplane(struct file *file, void *priv, struct v4l2_format *f)
 {
-	return hantro_set_fmt_out(file_to_ctx(file), &f->fmt.pix_mp, HANTRO_AUTO_POSTPROC);
+	struct hantro_ctx *ctx = file_to_ctx(file);
+
+	if (hantro_cap_fmt_busy(ctx, f->fmt.pix_mp.pixelformat))
+		return -EBUSY;
+
+	return hantro_set_fmt_out(ctx, &f->fmt.pix_mp, HANTRO_AUTO_POSTPROC);
 }
 
 static int
 vidioc_s_fmt_cap_mplane(struct file *file, void *priv, struct v4l2_format *f)
 {
-	return hantro_set_fmt_cap(file_to_ctx(file), &f->fmt.pix_mp);
+	struct hantro_ctx *ctx = file_to_ctx(file);
+
+	if (hantro_cap_fmt_busy(ctx, 0))
+		return -EBUSY;
+
+	return hantro_set_fmt_cap(ctx, &f->fmt.pix_mp);
 }
 
 static int vidioc_g_selection(struct file *file, void *priv,
@@ -772,6 +823,47 @@ static int vidioc_encoder_cmd(struct file *file, void *priv,
 	return 0;
 }
 
+static int vidioc_try_decoder_cmd(struct file *file, void *priv,
+				  struct v4l2_decoder_cmd *dc)
+{
+	struct hantro_ctx *ctx = file_to_ctx(file);
+
+	if (!hantro_is_stateful_dec(ctx))
+		return v4l2_m2m_ioctl_stateless_try_decoder_cmd(file, priv, dc);
+
+	return v4l2_m2m_ioctl_try_decoder_cmd(file, priv, dc);
+}
+
+static int vidioc_decoder_cmd(struct file *file, void *priv,
+			      struct v4l2_decoder_cmd *dc)
+{
+	struct hantro_ctx *ctx = file_to_ctx(file);
+	int ret;
+
+	if (!hantro_is_stateful_dec(ctx))
+		return v4l2_m2m_ioctl_stateless_decoder_cmd(file, priv, dc);
+
+	ret = v4l2_m2m_ioctl_try_decoder_cmd(file, priv, dc);
+	if (ret < 0)
+		return ret;
+
+	if (!vb2_is_streaming(v4l2_m2m_get_src_vq(ctx->fh.m2m_ctx)))
+		return 0;
+
+	ret = v4l2_m2m_ioctl_decoder_cmd(file, priv, dc);
+	if (ret < 0)
+		return ret;
+
+	if (dc->cmd == V4L2_DEC_CMD_STOP &&
+	    v4l2_m2m_has_stopped(ctx->fh.m2m_ctx))
+		v4l2_event_queue_fh(&ctx->fh, &hantro_eos_event);
+
+	if (dc->cmd == V4L2_DEC_CMD_START)
+		vb2_clear_last_buffer_dequeued(&ctx->fh.m2m_ctx->cap_q_ctx.q);
+
+	return 0;
+}
+
 static int hantro_subscribe_event(struct v4l2_fh *fh,
 				  const struct v4l2_event_subscription *sub)
 {
@@ -814,8 +906,8 @@ const struct v4l2_ioctl_ops hantro_ioctl_ops = {
 	.vidioc_g_selection = vidioc_g_selection,
 	.vidioc_s_selection = vidioc_s_selection,
 
-	.vidioc_decoder_cmd = v4l2_m2m_ioctl_stateless_decoder_cmd,
-	.vidioc_try_decoder_cmd = v4l2_m2m_ioctl_stateless_try_decoder_cmd,
+	.vidioc_decoder_cmd = vidioc_decoder_cmd,
+	.vidioc_try_decoder_cmd = vidioc_try_decoder_cmd,
 
 	.vidioc_try_encoder_cmd = v4l2_m2m_ioctl_try_encoder_cmd,
 	.vidioc_encoder_cmd = vidioc_encoder_cmd,

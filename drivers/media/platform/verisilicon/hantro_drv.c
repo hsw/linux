@@ -206,7 +206,8 @@ queue_init(void *priv, struct vb2_queue *src_vq, struct vb2_queue *dst_vq)
 	/*
 	 * Driver does mostly sequential access, so sacrifice TLB efficiency
 	 * for faster allocation. Also, no CPU access on the source queue,
-	 * so no kernel mapping needed.
+	 * so no kernel mapping needed; the JPEG decoder, which parses the
+	 * bitstream headers, clears that at S_FMT.
 	 */
 	src_vq->dma_attrs = DMA_ATTR_ALLOC_SINGLE_PAGES |
 			    DMA_ATTR_NO_KERNEL_MAPPING;

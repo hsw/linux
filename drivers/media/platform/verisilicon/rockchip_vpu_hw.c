@@ -20,6 +20,9 @@
 
 #define ROCKCHIP_VPU981_MIN_SIZE 64
 
+/* Largest JPEG side the G1 decodes in one job (no slice mode). */
+#define G1_JPEG_DEC_MAX_SIZE 8176
+
 /*
  * Supported formats.
  */
@@ -171,6 +174,109 @@ static const struct hantro_fmt rk3066_vpu_dec_fmts[] = {
 			.min_height = FMT_MIN_HEIGHT,
 			.max_height = FMT_FHD_HEIGHT,
 			.step_height = MB_DIM,
+		},
+	},
+};
+
+/*
+ * The RK3066 list plus the JPEG decoder: NV16 and GREY are offered only for
+ * a JPEG OUTPUT, and the raw sizes go up to the JPEG limit. The video
+ * formats keep their 1920x1088 limit, which bounds the CAPTURE size of
+ * their contexts.
+ */
+static const struct hantro_fmt rk3026_vpu_dec_fmts[] = {
+	{
+		.fourcc = V4L2_PIX_FMT_NV12,
+		.codec_mode = HANTRO_MODE_NONE,
+		.frmsize = {
+			.min_width = FMT_MIN_WIDTH,
+			.max_width = G1_JPEG_DEC_MAX_SIZE,
+			.step_width = MB_DIM,
+			.min_height = FMT_MIN_HEIGHT,
+			.max_height = G1_JPEG_DEC_MAX_SIZE,
+			.step_height = MB_DIM,
+		},
+	},
+	{
+		.fourcc = V4L2_PIX_FMT_NV16,
+		.codec_mode = HANTRO_MODE_NONE,
+		.codec_modes = BIT(HANTRO_MODE_JPEG_DEC),
+		.frmsize = {
+			.min_width = FMT_MIN_WIDTH,
+			.max_width = G1_JPEG_DEC_MAX_SIZE,
+			.step_width = MB_DIM,
+			.min_height = FMT_MIN_HEIGHT,
+			.max_height = G1_JPEG_DEC_MAX_SIZE,
+			.step_height = MB_DIM,
+		},
+	},
+	{
+		.fourcc = V4L2_PIX_FMT_GREY,
+		.codec_mode = HANTRO_MODE_NONE,
+		.codec_modes = BIT(HANTRO_MODE_JPEG_DEC),
+		.frmsize = {
+			.min_width = FMT_MIN_WIDTH,
+			.max_width = G1_JPEG_DEC_MAX_SIZE,
+			.step_width = MB_DIM,
+			.min_height = FMT_MIN_HEIGHT,
+			.max_height = G1_JPEG_DEC_MAX_SIZE,
+			.step_height = MB_DIM,
+		},
+	},
+	{
+		.fourcc = V4L2_PIX_FMT_H264_SLICE,
+		.codec_mode = HANTRO_MODE_H264_DEC,
+		.max_depth = 2,
+		.frmsize = {
+			.min_width = FMT_MIN_WIDTH,
+			.max_width = FMT_FHD_WIDTH,
+			.step_width = MB_DIM,
+			.min_height = FMT_MIN_HEIGHT,
+			.max_height = FMT_FHD_HEIGHT,
+			.step_height = MB_DIM,
+		},
+	},
+	{
+		.fourcc = V4L2_PIX_FMT_MPEG2_SLICE,
+		.codec_mode = HANTRO_MODE_MPEG2_DEC,
+		.max_depth = 2,
+		.frmsize = {
+			.min_width = FMT_MIN_WIDTH,
+			.max_width = FMT_FHD_WIDTH,
+			.step_width = MB_DIM,
+			.min_height = FMT_MIN_HEIGHT,
+			.max_height = FMT_FHD_HEIGHT,
+			.step_height = MB_DIM,
+		},
+	},
+	{
+		.fourcc = V4L2_PIX_FMT_VP8_FRAME,
+		.codec_mode = HANTRO_MODE_VP8_DEC,
+		.max_depth = 2,
+		.frmsize = {
+			.min_width = FMT_MIN_WIDTH,
+			.max_width = FMT_FHD_WIDTH,
+			.step_width = MB_DIM,
+			.min_height = FMT_MIN_HEIGHT,
+			.max_height = FMT_FHD_HEIGHT,
+			.step_height = MB_DIM,
+		},
+	},
+	{
+		/*
+		 * The decoder compares the sizes in macroblocks, so a JPEG
+		 * size need not be a multiple of them.
+		 */
+		.fourcc = V4L2_PIX_FMT_JPEG,
+		.codec_mode = HANTRO_MODE_JPEG_DEC,
+		.max_depth = 2,
+		.frmsize = {
+			.min_width = FMT_MIN_WIDTH,
+			.max_width = G1_JPEG_DEC_MAX_SIZE,
+			.step_width = 8,
+			.min_height = FMT_MIN_HEIGHT,
+			.max_height = G1_JPEG_DEC_MAX_SIZE,
+			.step_height = 8,
 		},
 	},
 };
@@ -543,6 +649,13 @@ static const struct hantro_codec_ops rk3066_vpu_codec_ops[] = {
 		.init = hantro_vp8_dec_init,
 		.exit = hantro_vp8_dec_exit,
 	},
+	/* Reached only through rk3026_vpu_dec_fmts. */
+	[HANTRO_MODE_JPEG_DEC] = {
+		.run = hantro_g1_jpeg_dec_run,
+		.reset = rk3066_vpu_dec_reset,
+		.init = hantro_jpeg_dec_init,
+		.exit = hantro_jpeg_dec_exit,
+	},
 };
 
 static const struct hantro_codec_ops rk3288_vpu_codec_ops[] = {
@@ -703,26 +816,29 @@ const struct hantro_variant rk3066_vpu_variant = {
 /*
  * The RK3026 has the RK3066 block with the smaller encoder revision
  * (ID 0x8270): its encoder registers end at 0x200, where the decoder
- * registers start.
+ * registers start. The decoder also takes baseline JPEG, whose headers the
+ * driver parses: the bitstream buffers need a kernel mapping.
  */
 const struct hantro_variant rk3026_vpu_variant = {
 	.enc_offset = 0x0,
 	.enc_fmts = rockchip_vpu_enc_fmts,
 	.num_enc_fmts = ARRAY_SIZE(rockchip_vpu_enc_fmts),
 	.dec_offset = 0x200,
-	.dec_fmts = rk3066_vpu_dec_fmts,
-	.num_dec_fmts = ARRAY_SIZE(rk3066_vpu_dec_fmts),
+	.dec_fmts = rk3026_vpu_dec_fmts,
+	.num_dec_fmts = ARRAY_SIZE(rk3026_vpu_dec_fmts),
 	.postproc_fmts = rockchip_vpu1_postproc_fmts,
 	.num_postproc_fmts = ARRAY_SIZE(rockchip_vpu1_postproc_fmts),
 	.postproc_ops = &hantro_g1_postproc_ops,
 	.codec = HANTRO_JPEG_ENCODER | HANTRO_MPEG2_DECODER |
-		 HANTRO_VP8_DECODER | HANTRO_H264_DECODER,
+		 HANTRO_VP8_DECODER | HANTRO_H264_DECODER |
+		 HANTRO_JPEG_DECODER,
 	.codec_ops = rk3066_vpu_codec_ops,
 	.irqs = rockchip_vpu1_irqs,
 	.num_irqs = ARRAY_SIZE(rockchip_vpu1_irqs),
 	.init = rk3066_vpu_hw_init,
 	.clk_names = rk3066_vpu_clk_names,
-	.num_clocks = ARRAY_SIZE(rk3066_vpu_clk_names)
+	.num_clocks = ARRAY_SIZE(rk3066_vpu_clk_names),
+	.src_needs_kmap = 1,
 };
 
 const struct hantro_variant rk3288_vpu_variant = {

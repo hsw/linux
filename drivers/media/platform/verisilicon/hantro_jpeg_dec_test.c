@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  * KUnit tests for the Hantro JPEG decoder helpers: the header check, the
- * defaults the decoder fills in, the table buffer and the G1 registers of a
- * job. No hardware is touched.
+ * defaults the decoder fills in, the table buffer, the G1 registers of a
+ * job and the variants that enable the decoder. No hardware is touched.
  */
 
 #include <kunit/test.h>
@@ -814,6 +814,77 @@ static void jpeg_dec_grey(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, check(&j, V4L2_PIX_FMT_GREY, 1072, 1456), -EINVAL);
 }
 
+static const struct hantro_fmt *find_fmt(const struct hantro_variant *variant,
+					 u32 fourcc, unsigned int *count)
+{
+	const struct hantro_fmt *found = NULL;
+	unsigned int i;
+
+	*count = 0;
+	for (i = 0; i < variant->num_dec_fmts; i++) {
+		if (variant->dec_fmts[i].fourcc != fourcc)
+			continue;
+		found = &variant->dec_fmts[i];
+		(*count)++;
+	}
+
+	return found;
+}
+
+static void jpeg_dec_rockchip_fmts(struct kunit *test)
+{
+	static const u32 jpeg_only[] = { V4L2_PIX_FMT_NV16, V4L2_PIX_FMT_GREY };
+	const struct hantro_variant *rk3026 = &rk3026_vpu_variant;
+	const struct hantro_fmt *fmt;
+	unsigned int count, i;
+
+	if (!IS_ENABLED(CONFIG_VIDEO_HANTRO_ROCKCHIP))
+		kunit_skip(test, "no Rockchip variants");
+
+	/* RK3036, RK3066 and RK3188 do not decode JPEG. */
+	find_fmt(&rk3036_vpu_variant, V4L2_PIX_FMT_JPEG, &count);
+	KUNIT_EXPECT_EQ(test, count, 0);
+	KUNIT_EXPECT_FALSE(test, rk3036_vpu_variant.codec & HANTRO_JPEG_DECODER);
+	find_fmt(&rk3066_vpu_variant, V4L2_PIX_FMT_JPEG, &count);
+	KUNIT_EXPECT_EQ(test, count, 0);
+	KUNIT_EXPECT_FALSE(test, rk3066_vpu_variant.codec & HANTRO_JPEG_DECODER);
+	KUNIT_EXPECT_FALSE(test, rk3066_vpu_variant.src_needs_kmap);
+	for (i = 0; i < ARRAY_SIZE(jpeg_only); i++) {
+		find_fmt(&rk3066_vpu_variant, jpeg_only[i], &count);
+		KUNIT_EXPECT_EQ(test, count, 0);
+	}
+
+	/* The RK3026 does, with one JPEG entry and the decoder's limits. */
+	fmt = find_fmt(rk3026, V4L2_PIX_FMT_JPEG, &count);
+	KUNIT_ASSERT_EQ(test, count, 1);
+	KUNIT_EXPECT_EQ(test, fmt->codec_mode, HANTRO_MODE_JPEG_DEC);
+	KUNIT_EXPECT_EQ(test, fmt->frmsize.max_width, 8176);
+	KUNIT_EXPECT_EQ(test, fmt->frmsize.max_height, 8176);
+	KUNIT_EXPECT_TRUE(test, rk3026->codec & HANTRO_JPEG_DECODER);
+	KUNIT_EXPECT_TRUE(test, rk3026->src_needs_kmap);
+	KUNIT_EXPECT_TRUE(test, rk3026->codec_ops[HANTRO_MODE_JPEG_DEC].run ==
+			  hantro_g1_jpeg_dec_run);
+	KUNIT_EXPECT_TRUE(test, rk3026->codec_ops[HANTRO_MODE_JPEG_DEC].init ==
+			  hantro_jpeg_dec_init);
+
+	/* NV12 serves every codec, NV16 and GREY only JPEG. */
+	fmt = find_fmt(rk3026, V4L2_PIX_FMT_NV12, &count);
+	KUNIT_ASSERT_EQ(test, count, 1);
+	KUNIT_EXPECT_EQ(test, fmt->codec_modes, 0);
+	KUNIT_EXPECT_EQ(test, fmt->frmsize.max_width, 8176);
+	for (i = 0; i < ARRAY_SIZE(jpeg_only); i++) {
+		fmt = find_fmt(rk3026, jpeg_only[i], &count);
+		KUNIT_ASSERT_EQ(test, count, 1);
+		KUNIT_EXPECT_EQ(test, fmt->codec_modes, BIT(HANTRO_MODE_JPEG_DEC));
+	}
+
+	/* The video formats keep the RK3066 limits. */
+	fmt = find_fmt(rk3026, V4L2_PIX_FMT_H264_SLICE, &count);
+	KUNIT_ASSERT_EQ(test, count, 1);
+	KUNIT_EXPECT_EQ(test, fmt->frmsize.max_width, FMT_FHD_WIDTH);
+	KUNIT_EXPECT_EQ(test, fmt->frmsize.max_height, FMT_FHD_HEIGHT);
+}
+
 static struct kunit_case hantro_jpeg_dec_cases[] = {
 	KUNIT_CASE(jpeg_dec_check_sampling),
 	KUNIT_CASE(jpeg_dec_check_frame),
@@ -833,6 +904,7 @@ static struct kunit_case hantro_jpeg_dec_cases[] = {
 	KUNIT_CASE(jpeg_dec_regs_fill),
 	KUNIT_CASE(jpeg_dec_regs_frame),
 	KUNIT_CASE(jpeg_dec_grey),
+	KUNIT_CASE(jpeg_dec_rockchip_fmts),
 	{ }
 };
 

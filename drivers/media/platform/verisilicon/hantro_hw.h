@@ -10,6 +10,7 @@
 #define HANTRO_HW_H_
 
 #include <linux/interrupt.h>
+#include <linux/sizes.h>
 #include <linux/v4l2-controls.h>
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-vp9.h>
@@ -282,6 +283,11 @@ struct hantro_jpeg_dec_hw_ctx {
 #define HANTRO_G1_JPEG_DEC_MAX_PIXELS	(4672 * 3504)
 /* STREAM_LEN, the bytes of entropy-coded data, is 24 bits wide. */
 #define HANTRO_G1_JPEG_DEC_MAX_STREAM	0xffffff
+/*
+ * A JPEG bitstream buffer large enough for the longest stream the decoder
+ * reads, with 1 MiB for the headers before it.
+ */
+#define HANTRO_JPEG_DEC_MAX_OUTPUT_SIZE	(HANTRO_G1_JPEG_DEC_MAX_STREAM + 1 + SZ_1M)
 
 /**
  * struct hantro_av1_dec_ctrls

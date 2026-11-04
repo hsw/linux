@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  * KUnit tests for the Hantro JPEG decoder helpers: the header check, the
- * defaults the decoder fills in, the table buffer and the G1 registers of a
- * job. No hardware is touched.
+ * defaults the decoder fills in, the table buffer, the G1 registers of a
+ * job and the variants that enable the decoder. No hardware is touched.
  */
 
 #include <kunit/test.h>
@@ -15,6 +15,7 @@
 #include "hantro.h"
 #include "hantro_g1_regs.h"
 #include "hantro_jpeg.h"
+#include "hantro_v4l2.h"
 
 struct test_jpeg {
 	struct v4l2_jpeg_header hdr;
@@ -921,6 +922,112 @@ static void jpeg_dec_grey(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, check(&j, V4L2_PIX_FMT_GREY, 1072, 1456), -EINVAL);
 }
 
+static const struct hantro_fmt *find_fmt(const struct hantro_variant *variant,
+					 u32 fourcc, unsigned int *count)
+{
+	const struct hantro_fmt *found = NULL;
+	unsigned int i;
+
+	*count = 0;
+	for (i = 0; i < variant->num_dec_fmts; i++) {
+		if (variant->dec_fmts[i].fourcc != fourcc)
+			continue;
+		found = &variant->dec_fmts[i];
+		(*count)++;
+	}
+
+	return found;
+}
+
+static void jpeg_dec_rockchip_fmts(struct kunit *test)
+{
+	const struct hantro_variant *rk3026 = &rk3026_vpu_variant;
+	const struct hantro_fmt *fmt;
+	unsigned int count;
+
+	if (!IS_ENABLED(CONFIG_VIDEO_HANTRO_ROCKCHIP))
+		kunit_skip(test, "no Rockchip variants");
+
+	/* RK3036, RK3066 and RK3188 do not decode JPEG. */
+	find_fmt(&rk3036_vpu_variant, V4L2_PIX_FMT_JPEG, &count);
+	KUNIT_EXPECT_EQ(test, count, 0);
+	KUNIT_EXPECT_FALSE(test, rk3036_vpu_variant.codec & HANTRO_JPEG_DECODER);
+	find_fmt(&rk3066_vpu_variant, V4L2_PIX_FMT_JPEG, &count);
+	KUNIT_EXPECT_EQ(test, count, 0);
+	KUNIT_EXPECT_FALSE(test, rk3066_vpu_variant.codec & HANTRO_JPEG_DECODER);
+
+	/* The RK3026 does, with one JPEG entry. */
+	fmt = find_fmt(rk3026, V4L2_PIX_FMT_JPEG, &count);
+	KUNIT_ASSERT_EQ(test, count, 1);
+	KUNIT_EXPECT_EQ(test, fmt->codec_mode, HANTRO_MODE_JPEG_DEC);
+	KUNIT_EXPECT_TRUE(test, rk3026->codec & HANTRO_JPEG_DECODER);
+	KUNIT_EXPECT_TRUE(test, rk3026->codec_ops[HANTRO_MODE_JPEG_DEC].run ==
+			  hantro_g1_jpeg_dec_run);
+}
+
+/*
+ * Which RK3026 CAPTURE formats a decoder context offers for its OUTPUT
+ * format: NV16 and GREY only for JPEG, the post-processed YUYV for every
+ * coded format but JPEG.
+ */
+static void jpeg_dec_raw_fmt_allowed(struct kunit *test)
+{
+	static const u32 raw[] = {
+		V4L2_PIX_FMT_NV12, V4L2_PIX_FMT_NV16, V4L2_PIX_FMT_GREY,
+	};
+	static const struct {
+		u32 src;
+		bool encoder;
+		bool allowed[4];	/* NV12, NV16, GREY, YUYV */
+	} cases[] = {
+		{ V4L2_PIX_FMT_JPEG, false, { true, true, true, false } },
+		{ V4L2_PIX_FMT_H264_SLICE, false, { true, false, false, true } },
+		{ V4L2_PIX_FMT_VP8_FRAME, false, { true, false, false, true } },
+		/* OUTPUT not set yet, or set to a raw format: no filter. */
+		{ 0, false, { true, true, true, true } },
+		{ V4L2_PIX_FMT_NV12, false, { true, true, true, true } },
+		/* An encoder's raw formats are its OUTPUT formats. */
+		{ V4L2_PIX_FMT_JPEG, true, { true, true, true, true } },
+	};
+	const struct hantro_variant *rk3026 = &rk3026_vpu_variant;
+	const struct hantro_fmt *fmts[4];
+	struct hantro_ctx *ctx;
+	struct hantro_dev *dev;
+	unsigned int c, i, count;
+
+	if (!IS_ENABLED(CONFIG_VIDEO_HANTRO_ROCKCHIP))
+		kunit_skip(test, "no Rockchip variants");
+
+	dev = kunit_kzalloc(test, sizeof(*dev), GFP_KERNEL);
+	ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, dev);
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	dev->variant = rk3026;
+	ctx->dev = dev;
+
+	for (i = 0; i < ARRAY_SIZE(raw); i++) {
+		fmts[i] = find_fmt(rk3026, raw[i], &count);
+		KUNIT_ASSERT_EQ(test, count, 1);
+	}
+	KUNIT_ASSERT_EQ(test, rk3026->num_postproc_fmts, 1);
+	fmts[3] = &rk3026->postproc_fmts[0];
+	KUNIT_ASSERT_EQ(test, fmts[3]->fourcc, V4L2_PIX_FMT_YUYV);
+
+	for (c = 0; c < ARRAY_SIZE(cases); c++) {
+		ctx->is_encoder = cases[c].encoder;
+		ctx->vpu_src_fmt = NULL;
+		if (cases[c].src) {
+			ctx->vpu_src_fmt = find_fmt(rk3026, cases[c].src, &count);
+			KUNIT_ASSERT_EQ(test, count, 1);
+		}
+		for (i = 0; i < ARRAY_SIZE(fmts); i++)
+			KUNIT_EXPECT_EQ_MSG(test,
+					    hantro_raw_fmt_allowed(ctx, fmts[i]),
+					    cases[c].allowed[i],
+					    "case %u, %p4cc", c, &fmts[i]->fourcc);
+	}
+}
+
 static struct kunit_case hantro_jpeg_dec_cases[] = {
 	KUNIT_CASE(jpeg_dec_check_sampling),
 	KUNIT_CASE(jpeg_dec_check_frame),
@@ -940,6 +1047,8 @@ static struct kunit_case hantro_jpeg_dec_cases[] = {
 	KUNIT_CASE(jpeg_dec_regs_fill),
 	KUNIT_CASE(jpeg_dec_regs_frame),
 	KUNIT_CASE(jpeg_dec_grey),
+	KUNIT_CASE(jpeg_dec_rockchip_fmts),
+	KUNIT_CASE(jpeg_dec_raw_fmt_allowed),
 	{ }
 };
 

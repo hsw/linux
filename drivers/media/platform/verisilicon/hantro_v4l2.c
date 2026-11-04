@@ -14,6 +14,7 @@
  * Copyright (C) 2010-2011 Samsung Electronics Co., Ltd.
  */
 
+#include <kunit/visibility.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/module.h>
@@ -115,7 +116,7 @@ hantro_check_depth_match(const struct hantro_fmt *fmt, int bit_depth)
  * decoder does not use the post-processor, so the post-processed formats are
  * not offered for a JPEG OUTPUT.
  */
-static bool
+VISIBLE_IF_KUNIT bool
 hantro_raw_fmt_allowed(const struct hantro_ctx *ctx, const struct hantro_fmt *fmt)
 {
 	if (ctx->is_encoder || !ctx->vpu_src_fmt ||
@@ -436,6 +437,16 @@ static int hantro_try_fmt(const struct hantro_ctx *ctx,
 		    (ctx->is_encoder &&
 		     pix_mp->plane_fmt[0].sizeimage > max_size))
 			pix_mp->plane_fmt[0].sizeimage = max_size;
+
+		/*
+		 * The JPEG decoder reads no more than STREAM_LEN bytes of
+		 * entropy-coded data: a larger bitstream buffer, which also
+		 * takes kernel address space for its mapping, is of no use.
+		 */
+		if (fmt->codec_mode == HANTRO_MODE_JPEG_DEC)
+			pix_mp->plane_fmt[0].sizeimage =
+				min_t(u32, pix_mp->plane_fmt[0].sizeimage,
+				      HANTRO_JPEG_DEC_MAX_OUTPUT_SIZE);
 	}
 
 	return 0;

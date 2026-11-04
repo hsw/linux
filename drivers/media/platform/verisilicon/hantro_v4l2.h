@@ -31,4 +31,9 @@ const struct hantro_fmt *
 hantro_get_default_fmt(const struct hantro_ctx *ctx, bool bitstream,
 		       int bit_depth, bool need_postproc);
 
+#if IS_ENABLED(CONFIG_KUNIT)
+bool hantro_raw_fmt_allowed(const struct hantro_ctx *ctx,
+			    const struct hantro_fmt *fmt);
+#endif
+
 #endif /* HANTRO_V4L2_H_ */

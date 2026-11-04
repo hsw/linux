@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * KUnit tests for the Hantro JPEG decoder helpers: the header check, and
- * the defaults the decoder fills in. No hardware is touched.
+ * KUnit tests for the Hantro JPEG decoder helpers: the header check, the
+ * defaults the decoder fills in, the table buffer and the G1 registers of a
+ * job. No hardware is touched.
  */
 
 #include <kunit/test.h>
+#include <linux/slab.h>
 #include <linux/string.h>
+#include <linux/unaligned.h>
 #include <linux/videodev2.h>
 #include <media/v4l2-jpeg.h>
 
 #include "hantro.h"
+#include "hantro_g1_regs.h"
 #include "hantro_jpeg.h"
 
 struct test_jpeg {
@@ -314,6 +318,410 @@ static void jpeg_dec_fourcc(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, hantro_g1_jpeg_dec_fourcc(V4L2_JPEG_CHROMA_SUBSAMPLING_410), 0);
 }
 
+/* The table buffer as bytes, in the order the hardware reads them. */
+static void table_bytes(struct kunit *test, const u8 *buf, u8 *bytes)
+{
+	unsigned int i;
+
+	for (i = 0; i < HANTRO_JPEG_DEC_TABLE_SIZE / 4; i++)
+		put_unaligned_be32(((const u32 *)buf)[i], bytes + 4 * i);
+}
+
+static void natural_order(const u8 *zigzag, u8 *natural)
+{
+	unsigned int i;
+
+	for (i = 0; i < JPEG_QUANT_SIZE; i++)
+		natural[v4l2_jpeg_zigzag_scan_index[i]] = zigzag[i];
+}
+
+/* Expected AC (162 + 162) and DC (12 + 12) value lists after the q tables */
+static void expect_huffman(struct kunit *test, const u8 *bytes, unsigned int nq,
+			   const struct v4l2_jpeg_reference *ac1,
+			   const struct v4l2_jpeg_reference *ac2,
+			   const struct v4l2_jpeg_reference *dc1,
+			   const struct v4l2_jpeg_reference *dc2)
+{
+	const struct v4l2_jpeg_reference *lists[] = { ac1, ac2, dc1, dc2 };
+	const unsigned int sizes[] = {
+		HANTRO_JPEG_DEC_AC_SIZE, HANTRO_JPEG_DEC_AC_SIZE,
+		HANTRO_JPEG_DEC_DC_SIZE, HANTRO_JPEG_DEC_DC_SIZE,
+	};
+	u8 expected[HANTRO_JPEG_DEC_AC_SIZE];
+	const u8 *p = bytes + nq * JPEG_QUANT_SIZE;
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(lists); i++) {
+		memset(expected, 0, sizeof(expected));
+		if (lists[i])
+			memcpy(expected, lists[i]->start + 16, lists[i]->length - 16);
+		KUNIT_EXPECT_MEMEQ_MSG(test, p, expected, sizes[i], "list %u", i);
+		p += sizes[i];
+	}
+	/* The rest of the buffer stays zero. */
+	memset(expected, 0, sizeof(expected));
+	KUNIT_EXPECT_MEMEQ(test, p, expected, bytes + HANTRO_JPEG_DEC_TABLE_SIZE - p);
+}
+
+static void jpeg_dec_table_420(struct kunit *test)
+{
+	u8 *buf = kunit_kzalloc(test, HANTRO_JPEG_DEC_TABLE_SIZE, GFP_KERNEL);
+	u8 *bytes = kunit_kzalloc(test, HANTRO_JPEG_DEC_TABLE_SIZE, GFP_KERNEL);
+	u8 luma[JPEG_QUANT_SIZE], chroma[JPEG_QUANT_SIZE];
+	struct test_jpeg j;
+
+	KUNIT_ASSERT_NOT_NULL(test, buf);
+	KUNIT_ASSERT_NOT_NULL(test, bytes);
+	natural_order(v4l2_jpeg_ref_table_luma_qt, luma);
+	natural_order(v4l2_jpeg_ref_table_chroma_qt, chroma);
+
+	make_jpeg(&j, V4L2_JPEG_CHROMA_SUBSAMPLING_420, 640, 480);
+	KUNIT_ASSERT_EQ(test, hantro_jpeg_prepare_vlc_hw_table(&j.hdr, buf), 0);
+	table_bytes(test, buf, bytes);
+
+	/* The first word: the first four luma quantizers, first in 31:24. */
+	KUNIT_EXPECT_EQ(test, ((u32 *)buf)[0],
+			(u32)luma[0] << 24 | luma[1] << 16 | luma[2] << 8 | luma[3]);
+	KUNIT_EXPECT_MEMEQ(test, bytes, luma, JPEG_QUANT_SIZE);
+	KUNIT_EXPECT_MEMEQ(test, bytes + 64, chroma, JPEG_QUANT_SIZE);
+	KUNIT_EXPECT_MEMEQ(test, bytes + 128, chroma, JPEG_QUANT_SIZE);
+	expect_huffman(test, bytes, 3, &j.ht[2], &j.ht[3], &j.ht[0], &j.ht[1]);
+}
+
+static void jpeg_dec_table_selectors(struct kunit *test)
+{
+	u8 *buf = kunit_kzalloc(test, HANTRO_JPEG_DEC_TABLE_SIZE, GFP_KERNEL);
+	u8 *bytes = kunit_kzalloc(test, HANTRO_JPEG_DEC_TABLE_SIZE, GFP_KERNEL);
+	u8 luma[JPEG_QUANT_SIZE], chroma[JPEG_QUANT_SIZE];
+	struct test_jpeg j;
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, buf);
+	KUNIT_ASSERT_NOT_NULL(test, bytes);
+	natural_order(v4l2_jpeg_ref_table_luma_qt, luma);
+	natural_order(v4l2_jpeg_ref_table_chroma_qt, chroma);
+
+	/* Luma on Huffman tables 1, chroma on tables 0: luma's come first. */
+	make_jpeg(&j, V4L2_JPEG_CHROMA_SUBSAMPLING_420, 640, 480);
+	for (i = 0; i < 3; i++) {
+		j.scan.component[i].dc_entropy_coding_table_selector = !i;
+		j.scan.component[i].ac_entropy_coding_table_selector = !i;
+	}
+	KUNIT_ASSERT_EQ(test, hantro_jpeg_prepare_vlc_hw_table(&j.hdr, buf), 0);
+	table_bytes(test, buf, bytes);
+	expect_huffman(test, bytes, 3, &j.ht[3], &j.ht[2], &j.ht[1], &j.ht[0]);
+
+	/* Each component gets the quantization table it selects. */
+	make_jpeg(&j, V4L2_JPEG_CHROMA_SUBSAMPLING_420, 640, 480);
+	j.hdr.frame.component[0].quantization_table_selector = 1;
+	j.hdr.frame.component[1].quantization_table_selector = 0;
+	j.hdr.frame.component[2].quantization_table_selector = 3;
+	j.qt[3] = j.qt[0];
+	KUNIT_ASSERT_EQ(test, hantro_jpeg_prepare_vlc_hw_table(&j.hdr, buf), 0);
+	table_bytes(test, buf, bytes);
+	KUNIT_EXPECT_MEMEQ(test, bytes, chroma, JPEG_QUANT_SIZE);
+	KUNIT_EXPECT_MEMEQ(test, bytes + 64, luma, JPEG_QUANT_SIZE);
+	KUNIT_EXPECT_MEMEQ(test, bytes + 128, luma, JPEG_QUANT_SIZE);
+
+	/* A missing table, and a 16-bit one. */
+	j.qt[3].start = NULL;
+	KUNIT_EXPECT_EQ(test, hantro_jpeg_prepare_vlc_hw_table(&j.hdr, buf), -EINVAL);
+	j.qt[3] = j.qt[0];
+	j.qt[3].length = 128;
+	KUNIT_EXPECT_EQ(test, hantro_jpeg_prepare_vlc_hw_table(&j.hdr, buf), -EINVAL);
+}
+
+static void jpeg_dec_table_lengths(struct kunit *test)
+{
+	/* An optimised table: two codes of length 2. */
+	static const u8 ac_short[16 + 2] = { 0, 2, [16] = 0x01, 0x11 };
+	static const u8 ac163[16 + 163] = { [8] = 163 };
+	static const u8 dc13[16 + 13] = { 0, 3, 7, 3 };
+	static const u8 dc12[16 + 12] = { 0, 3, 7, 2, [16] = 1, 2, 3, 4, 5, 6,
+					  7, 8, 9, 10, 11, 12 };
+	u8 *buf = kunit_kzalloc(test, HANTRO_JPEG_DEC_TABLE_SIZE, GFP_KERNEL);
+	u8 *bytes = kunit_kzalloc(test, HANTRO_JPEG_DEC_TABLE_SIZE, GFP_KERNEL);
+	struct test_jpeg j;
+
+	KUNIT_ASSERT_NOT_NULL(test, buf);
+	KUNIT_ASSERT_NOT_NULL(test, bytes);
+
+	/* Short value lists are padded with zeros, 12 values fill DC. */
+	make_jpeg(&j, V4L2_JPEG_CHROMA_SUBSAMPLING_420, 640, 480);
+	j.ht[2].start = (u8 *)ac_short;
+	j.ht[2].length = sizeof(ac_short);
+	j.ht[1].start = (u8 *)dc12;
+	j.ht[1].length = sizeof(dc12);
+	memset(buf, 0xff, HANTRO_JPEG_DEC_TABLE_SIZE);
+	KUNIT_ASSERT_EQ(test, hantro_jpeg_prepare_vlc_hw_table(&j.hdr, buf), 0);
+	table_bytes(test, buf, bytes);
+	expect_huffman(test, bytes, 3, &j.ht[2], &j.ht[3], &j.ht[0], &j.ht[1]);
+
+	/* Value lists longer than the buffer holds. */
+	make_jpeg(&j, V4L2_JPEG_CHROMA_SUBSAMPLING_420, 640, 480);
+	j.ht[3].start = (u8 *)ac163;
+	j.ht[3].length = sizeof(ac163);
+	KUNIT_EXPECT_EQ(test, hantro_jpeg_prepare_vlc_hw_table(&j.hdr, buf), -EINVAL);
+
+	make_jpeg(&j, V4L2_JPEG_CHROMA_SUBSAMPLING_420, 640, 480);
+	j.ht[0].start = (u8 *)dc13;
+	j.ht[0].length = sizeof(dc13);
+	KUNIT_EXPECT_EQ(test, hantro_jpeg_prepare_vlc_hw_table(&j.hdr, buf), -EINVAL);
+}
+
+/*
+ * The code count fields of registers 0x040-0x068, written out from the
+ * register map rather than from the driver's macros: { word, shift } of
+ * count L = 1..16 of the AC1, AC2, DC1 and DC2 tables.
+ */
+static const u8 vlc_field[4][16][2] = {
+	{ { 0, 0 }, { 0, 3 }, { 0, 7 }, { 0, 11 }, { 0, 16 }, { 0, 24 },
+	  { 1, 0 }, { 1, 8 }, { 1, 16 }, { 1, 24 },
+	  { 2, 0 }, { 2, 8 }, { 2, 16 }, { 2, 24 }, { 3, 0 }, { 3, 8 } },
+	{ { 3, 16 }, { 3, 19 }, { 3, 23 }, { 3, 27 },
+	  { 4, 0 }, { 4, 8 }, { 4, 16 }, { 4, 24 },
+	  { 5, 0 }, { 5, 8 }, { 5, 16 }, { 5, 24 },
+	  { 6, 0 }, { 6, 8 }, { 6, 16 }, { 6, 24 } },
+	{ { 7, 0 }, { 7, 4 }, { 7, 8 }, { 7, 12 }, { 7, 16 }, { 7, 20 },
+	  { 7, 24 }, { 7, 28 }, { 8, 0 }, { 8, 4 }, { 8, 8 }, { 8, 12 },
+	  { 8, 16 }, { 8, 20 }, { 8, 24 }, { 8, 28 } },
+	{ { 9, 0 }, { 9, 4 }, { 9, 8 }, { 9, 12 }, { 9, 16 }, { 9, 20 },
+	  { 9, 24 }, { 9, 28 }, { 10, 0 }, { 10, 4 }, { 10, 8 }, { 10, 12 },
+	  { 10, 16 }, { 10, 20 }, { 10, 24 }, { 10, 28 } },
+};
+
+static void expect_vlc(struct kunit *test, const u32 *vlc,
+		       const u8 *ac1, const u8 *ac2, const u8 *dc1, const u8 *dc2)
+{
+	const u8 *bits[4] = { ac1, ac2, dc1, dc2 };
+	u32 expected[HANTRO_G1_JPEG_DEC_VLC_REGS] = { };
+	unsigned int t, l;
+
+	for (t = 0; t < 4; t++)
+		for (l = 0; l < 16; l++)
+			if (bits[t])
+				expected[vlc_field[t][l][0]] |=
+					(u32)bits[t][l] << vlc_field[t][l][1];
+
+	KUNIT_EXPECT_MEMEQ(test, vlc, expected, sizeof(expected));
+}
+
+static void jpeg_dec_regs_vlc(struct kunit *test)
+{
+	struct hantro_g1_jpeg_dec_regs regs;
+	struct test_jpeg j;
+	unsigned int i;
+
+	make_jpeg(&j, V4L2_JPEG_CHROMA_SUBSAMPLING_420, 640, 480);
+	hantro_g1_jpeg_dec_regs(&j.hdr, 0x10000000, j.payload, &regs);
+	expect_vlc(test, regs.vlc, v4l2_jpeg_ref_table_luma_ac_ht,
+		   v4l2_jpeg_ref_table_chroma_ac_ht,
+		   v4l2_jpeg_ref_table_luma_dc_ht,
+		   v4l2_jpeg_ref_table_chroma_dc_ht);
+	/* Spot checks: luma AC counts 0, 2, 1, 3, ..., DC chroma 0, 3, 1. */
+	KUNIT_EXPECT_EQ(test, regs.vlc[0],
+			0u << 0 | 2u << 3 | 1u << 7 | 3u << 11 | 3u << 16 | 2u << 24);
+	KUNIT_EXPECT_EQ(test, regs.vlc[9] & 0xfff, 0u << 0 | 3u << 4 | 1u << 8);
+
+	/* Luma on tables 1: its counts go to the AC1/DC1 fields. */
+	for (i = 0; i < 3; i++) {
+		j.scan.component[i].dc_entropy_coding_table_selector = !i;
+		j.scan.component[i].ac_entropy_coding_table_selector = !i;
+	}
+	hantro_g1_jpeg_dec_regs(&j.hdr, 0x10000000, j.payload, &regs);
+	expect_vlc(test, regs.vlc, v4l2_jpeg_ref_table_chroma_ac_ht,
+		   v4l2_jpeg_ref_table_luma_ac_ht,
+		   v4l2_jpeg_ref_table_chroma_dc_ht,
+		   v4l2_jpeg_ref_table_luma_dc_ht);
+}
+
+static u32 ctrl2_selectors(u32 ctrl2)
+{
+	return ctrl2 & (G1_REG_DEC_CTRL2_CB_AC_VLCTABLE |
+			G1_REG_DEC_CTRL2_CB_DC_VLCTABLE |
+			G1_REG_DEC_CTRL2_CR_AC_VLCTABLE |
+			G1_REG_DEC_CTRL2_CR_DC_VLCTABLE |
+			G1_REG_DEC_CTRL2_CB_DC_VLCTABLE3 |
+			G1_REG_DEC_CTRL2_CR_DC_VLCTABLE3);
+}
+
+static u32 selectors(u8 y_dc, u8 y_ac, u8 cb_dc, u8 cb_ac, u8 cr_dc, u8 cr_ac)
+{
+	struct hantro_g1_jpeg_dec_regs regs;
+	struct test_jpeg j;
+
+	make_jpeg(&j, V4L2_JPEG_CHROMA_SUBSAMPLING_420, 640, 480);
+	j.scan.component[0].dc_entropy_coding_table_selector = y_dc;
+	j.scan.component[0].ac_entropy_coding_table_selector = y_ac;
+	j.scan.component[1].dc_entropy_coding_table_selector = cb_dc;
+	j.scan.component[1].ac_entropy_coding_table_selector = cb_ac;
+	j.scan.component[2].dc_entropy_coding_table_selector = cr_dc;
+	j.scan.component[2].ac_entropy_coding_table_selector = cr_ac;
+	hantro_g1_jpeg_dec_regs(&j.hdr, 0x10000000, j.payload, &regs);
+
+	return ctrl2_selectors(regs.ctrl2);
+}
+
+static void jpeg_dec_regs_selectors(struct kunit *test)
+{
+	const u32 all = G1_REG_DEC_CTRL2_CB_AC_VLCTABLE |
+			G1_REG_DEC_CTRL2_CB_DC_VLCTABLE |
+			G1_REG_DEC_CTRL2_CR_AC_VLCTABLE |
+			G1_REG_DEC_CTRL2_CR_DC_VLCTABLE;
+
+	/* Luma on tables 0. */
+	KUNIT_EXPECT_EQ(test, selectors(0, 0, 1, 1, 1, 1), all);
+	KUNIT_EXPECT_EQ(test, selectors(0, 0, 0, 0, 0, 0), 0);
+	KUNIT_EXPECT_EQ(test, selectors(0, 0, 0, 1, 1, 0),
+			G1_REG_DEC_CTRL2_CB_AC_VLCTABLE |
+			G1_REG_DEC_CTRL2_CR_DC_VLCTABLE);
+	/* Luma on tables 1: the selector says "not the luma's table". */
+	KUNIT_EXPECT_EQ(test, selectors(1, 1, 0, 0, 0, 0), all);
+	KUNIT_EXPECT_EQ(test, selectors(1, 1, 1, 1, 1, 1), 0);
+	KUNIT_EXPECT_EQ(test, selectors(1, 0, 1, 1, 0, 0),
+			G1_REG_DEC_CTRL2_CB_AC_VLCTABLE |
+			G1_REG_DEC_CTRL2_CR_DC_VLCTABLE);
+}
+
+static void jpeg_dec_regs_stream(struct kunit *test)
+{
+	static const size_t offsets[] = {
+		2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 623,
+	};
+	const dma_addr_t src = 0x10000000;
+	struct hantro_g1_jpeg_dec_regs regs;
+	struct test_jpeg j;
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(offsets); i++) {
+		size_t ecs = offsets[i];
+
+		make_jpeg(&j, V4L2_JPEG_CHROMA_SUBSAMPLING_420, 640, 480);
+		j.hdr.ecs_offset = ecs;
+		j.payload = 100000;
+		hantro_g1_jpeg_dec_regs(&j.hdr, src, j.payload, &regs);
+
+		KUNIT_EXPECT_EQ_MSG(test, regs.stream, src + (ecs & ~7),
+				    "ecs %zu", ecs);
+		KUNIT_EXPECT_EQ_MSG(test, (regs.ctrl2 >> 26) & 0x3f, 8 * (ecs & 7),
+				    "ecs %zu", ecs);
+		KUNIT_EXPECT_EQ_MSG(test, regs.ctrl3 & 0xffffff,
+				    j.payload - (ecs & ~7), "ecs %zu", ecs);
+		KUNIT_EXPECT_TRUE(test, regs.ctrl2 & G1_REG_DEC_CTRL2_JPEG_STREAM_ALL);
+	}
+}
+
+static void jpeg_dec_regs_restart(struct kunit *test)
+{
+	/* Ri from a DRI segment: none, every MCU, odd ones, the largest. */
+	static const u16 intervals[] = { 0, 1, 7, 67, 0xffff };
+	static const enum v4l2_jpeg_chroma_subsampling sampling[] = {
+		V4L2_JPEG_CHROMA_SUBSAMPLING_420,
+		V4L2_JPEG_CHROMA_SUBSAMPLING_422,
+	};
+	struct hantro_g1_jpeg_dec_regs regs, plain;
+	struct test_jpeg j;
+	unsigned int i, s;
+
+	for (s = 0; s < ARRAY_SIZE(sampling); s++) {
+		make_jpeg(&j, sampling[s], 1072, 1448);
+		hantro_g1_jpeg_dec_regs(&j.hdr, 0x10000000, j.payload, &plain);
+
+		for (i = 0; i < ARRAY_SIZE(intervals); i++) {
+			u16 ri = intervals[i];
+
+			j.hdr.restart_interval = ri;
+			hantro_g1_jpeg_dec_regs(&j.hdr, 0x10000000, j.payload,
+						&regs);
+			/*
+			 * SYNC_MARKER_E is CTRL2 bit 25, PJPEG_REST_FREQ is
+			 * CTRL5 bits 15:0; nothing else changes.
+			 */
+			KUNIT_EXPECT_EQ_MSG(test, regs.ctrl2,
+					    plain.ctrl2 | (ri ? BIT(25) : 0),
+					    "Ri %u", ri);
+			KUNIT_EXPECT_EQ_MSG(test, regs.ctrl5, (u32)ri,
+					    "Ri %u", ri);
+			KUNIT_EXPECT_EQ_MSG(test, regs.ctrl4, plain.ctrl4,
+					    "Ri %u", ri);
+		}
+	}
+}
+
+static u32 fill_bits(enum v4l2_jpeg_chroma_subsampling subsampling,
+		     u16 width, u16 height)
+{
+	struct hantro_g1_jpeg_dec_regs regs;
+	struct test_jpeg j;
+	u32 bits = 0;
+
+	make_jpeg(&j, subsampling, width, height);
+	hantro_g1_jpeg_dec_regs(&j.hdr, 0x10000000, j.payload, &regs);
+	if (regs.ctrl2 & G1_REG_DEC_CTRL2_JPEG_FILRIGHT_E)
+		bits |= 1;
+	if (regs.ctrl4 & G1_REG_DEC_CTRL4_PJPEG_FILDOWN_E)
+		bits |= 2;
+	/* Nothing else in CTRL4 for a baseline picture. */
+	if (regs.ctrl4 & ~G1_REG_DEC_CTRL4_PJPEG_FILDOWN_E)
+		bits |= 4;
+
+	return bits;
+}
+
+static void jpeg_dec_regs_fill(struct kunit *test)
+{
+	/* 1 = FILRIGHT, 2 = FILDOWN */
+	KUNIT_EXPECT_EQ(test, fill_bits(V4L2_JPEG_CHROMA_SUBSAMPLING_420, 1920, 1080), 0);
+	KUNIT_EXPECT_EQ(test, fill_bits(V4L2_JPEG_CHROMA_SUBSAMPLING_420, 1000, 1081), 0);
+	/* 4:2:0 MCUs are whole macroblocks: never a fill, at any size. */
+	KUNIT_EXPECT_EQ(test, fill_bits(V4L2_JPEG_CHROMA_SUBSAMPLING_420, 1000, 750), 0);
+	KUNIT_EXPECT_EQ(test, fill_bits(V4L2_JPEG_CHROMA_SUBSAMPLING_420, 333, 251), 0);
+	KUNIT_EXPECT_EQ(test, fill_bits(V4L2_JPEG_CHROMA_SUBSAMPLING_422, 1920, 1080), 2);
+	KUNIT_EXPECT_EQ(test, fill_bits(V4L2_JPEG_CHROMA_SUBSAMPLING_422, 1920, 1073), 2);
+	KUNIT_EXPECT_EQ(test, fill_bits(V4L2_JPEG_CHROMA_SUBSAMPLING_422, 1920, 1081), 0);
+	KUNIT_EXPECT_EQ(test, fill_bits(V4L2_JPEG_CHROMA_SUBSAMPLING_422, 1000, 1440), 0);
+}
+
+static void jpeg_dec_regs_frame(struct kunit *test)
+{
+	struct hantro_g1_jpeg_dec_regs regs;
+	struct test_jpeg j;
+
+	make_jpeg(&j, V4L2_JPEG_CHROMA_SUBSAMPLING_420, 1072, 1448);
+	hantro_g1_jpeg_dec_regs(&j.hdr, 0x10000000, j.payload, &regs);
+	/* DEC_MODE 3 (JPEG) in 31:28, FILTERING_DIS (bit 14). */
+	KUNIT_EXPECT_EQ(test, regs.ctrl0, 3u << 28 | BIT(14));
+	/* 67 x 91 macroblocks: width in 31:23, height in 18:11, no ext. */
+	KUNIT_EXPECT_EQ(test, regs.ctrl1, 67u << 23 | 91u << 11);
+	/* JPEG_MODE 2 in 10:8, three quantization tables in 12:11. */
+	KUNIT_EXPECT_EQ(test, (regs.ctrl2 >> 8) & 0x7, 2);
+	KUNIT_EXPECT_EQ(test, (regs.ctrl2 >> 11) & 0x3, 3);
+	KUNIT_EXPECT_EQ(test, regs.jpeg_ctrl, 0);
+
+	/* 511 macroblock rows: 8 bits in HEIGHT_P, the ninth in H_EXT. */
+	make_jpeg(&j, V4L2_JPEG_CHROMA_SUBSAMPLING_422, 48, 8176);
+	hantro_g1_jpeg_dec_regs(&j.hdr, 0x10000000, j.payload, &regs);
+	KUNIT_EXPECT_EQ(test, regs.ctrl1, 3u << 23 | 0xffu << 11 | 1u << 0);
+	KUNIT_EXPECT_EQ(test, (regs.ctrl2 >> 8) & 0x7, 3);
+
+	/* 511 macroblock columns fit the 9-bit width field. */
+	make_jpeg(&j, V4L2_JPEG_CHROMA_SUBSAMPLING_420, 8176, 48);
+	hantro_g1_jpeg_dec_regs(&j.hdr, 0x10000000, j.payload, &regs);
+	KUNIT_EXPECT_EQ(test, regs.ctrl1, 511u << 23 | 3u << 11);
+}
+
+static void jpeg_dec_mode(struct kunit *test)
+{
+	KUNIT_EXPECT_EQ(test, hantro_g1_jpeg_dec_mode(V4L2_JPEG_CHROMA_SUBSAMPLING_420), 2);
+	KUNIT_EXPECT_EQ(test, hantro_g1_jpeg_dec_mode(V4L2_JPEG_CHROMA_SUBSAMPLING_422), 3);
+	KUNIT_EXPECT_EQ(test, hantro_g1_jpeg_dec_mode(V4L2_JPEG_CHROMA_SUBSAMPLING_GRAY),
+			-EINVAL);
+	KUNIT_EXPECT_EQ(test, hantro_g1_jpeg_dec_mode(V4L2_JPEG_CHROMA_SUBSAMPLING_444),
+			-EINVAL);
+	KUNIT_EXPECT_EQ(test, hantro_g1_jpeg_dec_mode(V4L2_JPEG_CHROMA_SUBSAMPLING_411),
+			-EINVAL);
+}
+
 static struct kunit_case hantro_jpeg_dec_cases[] = {
 	KUNIT_CASE(jpeg_dec_check_sampling),
 	KUNIT_CASE(jpeg_dec_check_frame),
@@ -322,6 +730,16 @@ static struct kunit_case hantro_jpeg_dec_cases[] = {
 	KUNIT_CASE(jpeg_dec_check_stream),
 	KUNIT_CASE(jpeg_dec_default_huffman),
 	KUNIT_CASE(jpeg_dec_fourcc),
+	KUNIT_CASE(jpeg_dec_mode),
+	KUNIT_CASE(jpeg_dec_table_420),
+	KUNIT_CASE(jpeg_dec_table_selectors),
+	KUNIT_CASE(jpeg_dec_table_lengths),
+	KUNIT_CASE(jpeg_dec_regs_vlc),
+	KUNIT_CASE(jpeg_dec_regs_selectors),
+	KUNIT_CASE(jpeg_dec_regs_stream),
+	KUNIT_CASE(jpeg_dec_regs_restart),
+	KUNIT_CASE(jpeg_dec_regs_fill),
+	KUNIT_CASE(jpeg_dec_regs_frame),
 	{ }
 };
 

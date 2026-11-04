@@ -13,6 +13,7 @@
 #include <linux/build_bug.h>
 #include <linux/kernel.h>
 #include <linux/string.h>
+#include <linux/unaligned.h>
 #include <media/v4l2-jpeg.h>
 #include "hantro_jpeg.h"
 #include "hantro.h"
@@ -278,124 +279,105 @@ void hantro_jpeg_get_default_huffman_tables(struct v4l2_jpeg_reference *huffman_
 	}
 }
 
-#define JPEG_HUFFVAL_OFF 16
-#define JPEG_AC_SIZE HANTRO_JPEG_DEC_AC_SIZE
-#define JPEG_DC_SIZE HANTRO_JPEG_DEC_DC_SIZE
+/* HUFFVAL follows the 16 BITS code counts in a DHT table. */
+#define JPEG_HUFFVAL_OFF	16
 
-/* Decoder VLC hardware table */
-struct hantro_jpeg_vlc_hw_table {
-	u8 qp_tables[3][JPEG_QUANT_SIZE];
-	u8 ac_tables[2][JPEG_AC_SIZE];
-	u8 dc_tables[2][JPEG_DC_SIZE];
-	u8 padding[4];
-};
-
-int hantro_jpeg_prepare_vlc_hw_table(struct v4l2_jpeg_header *header,
-				     u8 *vlc_hw_table)
+static int copy_huffman_values(u8 *dst, const struct v4l2_jpeg_reference *table,
+			       unsigned int max_values)
 {
-	u32 i, j = 0;
-	u8 *huffvals1;
-	u8 *huffvals2;
-	u32 hufflength1, hufflength2;
-	u8 *table;
-	u32 *hw_table_le;
-	struct hantro_jpeg_vlc_hw_table *hw_table =
-		(struct hantro_jpeg_vlc_hw_table *)vlc_hw_table;
-
-	/* Only 3 quantization tables supported */
-	if (header->quantization_tables[3].start)
+	if (!table->start || table->length < JPEG_HUFFVAL_OFF ||
+	    table->length - JPEG_HUFFVAL_OFF > max_values)
 		return -EINVAL;
 
-	/* If chroma table is missing, take the luma */
-	if (!header->quantization_tables[1].start) {
-		header->quantization_tables[1].start =
-			header->quantization_tables[0].start;
-		header->quantization_tables[1].length =
-			header->quantization_tables[0].length;
-	}
+	memcpy(dst, table->start + JPEG_HUFFVAL_OFF,
+	       table->length - JPEG_HUFFVAL_OFF);
 
-	/* If second chroma table is missing, take the first one */
-	if (!header->quantization_tables[2].start) {
-		header->quantization_tables[2].start =
-			header->quantization_tables[1].start;
-		header->quantization_tables[2].length =
-			header->quantization_tables[1].length;
-	}
+	return 0;
+}
 
-	/* QP tables for all components */
-	for (j = 0; j < 3; j++) {
-		table = header->quantization_tables[j].start;
-		if (!table)
-			continue;
+/**
+ * hantro_jpeg_prepare_vlc_hw_table() - build the decoder's table buffer
+ * @header: parsed header, with the default Huffman tables filled in
+ * @vlc_hw_table: HANTRO_JPEG_DEC_TABLE_SIZE bytes, 32-bit aligned
+ *
+ * The buffer is a byte sequence the hardware reads as 32-bit words, the
+ * first byte of each word in bits 31:24:
+ *
+ * - the quantization table each scan component selects, in natural (not
+ *   zigzag) order: one table for a one-component scan, three otherwise;
+ * - the AC Huffman values (HUFFVAL) of the table the first component uses,
+ *   then of the other table, each zero-padded to 162 bytes;
+ * - the DC Huffman values in the same order, each zero-padded to 12 bytes.
+ *
+ * The other table's values stay zero for a one-component scan. The code
+ * counts (BITS) go to registers, see hantro_g1_jpeg_dec_regs().
+ *
+ * Return: 0, or -EINVAL if a table is missing or does not fit.
+ */
+int hantro_jpeg_prepare_vlc_hw_table(const struct v4l2_jpeg_header *header,
+				     u8 *vlc_hw_table)
+{
+	const struct v4l2_jpeg_scan_header *scan = header->scan;
+	const struct v4l2_jpeg_reference *ht = header->huffman_tables;
+	unsigned int ns = scan->num_components;
+	u32 *words = (u32 *)vlc_hw_table;
+	u8 *p = vlc_hw_table;
+	unsigned int i, j;
+	u8 ta, td;
+	int ret;
 
-		if (header->quantization_tables[j].length != JPEG_QUANT_SIZE)
+	memset(vlc_hw_table, 0, HANTRO_JPEG_DEC_TABLE_SIZE);
+
+	if (ns != 1 && ns != 3)
+		return -EINVAL;
+
+	for (j = 0; j < ns; j++) {
+		u8 tq = header->frame.component[j].quantization_table_selector;
+		const struct v4l2_jpeg_reference *qt;
+
+		if (tq >= V4L2_JPEG_MAX_TABLES)
+			return -EINVAL;
+
+		qt = &header->quantization_tables[tq];
+		if (!qt->start || qt->length != JPEG_QUANT_SIZE)
 			return -EINVAL;
 
 		for (i = 0; i < JPEG_QUANT_SIZE; i++)
-			hw_table->qp_tables[j][v4l2_jpeg_zigzag_scan_index[i]] = table[i];
+			p[v4l2_jpeg_zigzag_scan_index[i]] = qt->start[i];
+		p += JPEG_QUANT_SIZE;
 	}
 
-	/* HUFFVAL code values are located after the first 16 bytes BITS code lengths */
-	if (!header->huffman_tables[2].start ||
-	    header->huffman_tables[2].length != JPEG_AC_SIZE + JPEG_HUFFVAL_OFF)
+	/* The first component's tables come first, whatever their number. */
+	ta = scan->component[0].ac_entropy_coding_table_selector;
+	td = scan->component[0].dc_entropy_coding_table_selector;
+	if (ta > 1 || td > 1)
 		return -EINVAL;
 
-	huffvals1 = (u8 *)(header->huffman_tables[2].start + JPEG_HUFFVAL_OFF);
-	hufflength1 = header->huffman_tables[2].length - JPEG_HUFFVAL_OFF;
+	ret = copy_huffman_values(p, &ht[2 + ta], HANTRO_JPEG_DEC_AC_SIZE);
+	if (ret)
+		return ret;
+	p += HANTRO_JPEG_DEC_AC_SIZE;
 
-	if (!header->huffman_tables[3].start ||
-	    header->huffman_tables[3].length != JPEG_AC_SIZE + JPEG_HUFFVAL_OFF)
-		return -EINVAL;
+	if (ns > 1) {
+		ret = copy_huffman_values(p, &ht[2 + !ta], HANTRO_JPEG_DEC_AC_SIZE);
+		if (ret)
+			return ret;
+	}
+	p += HANTRO_JPEG_DEC_AC_SIZE;
 
-	huffvals2 = (u8 *)(header->huffman_tables[3].start + JPEG_HUFFVAL_OFF);
-	hufflength2 = header->huffman_tables[3].length - JPEG_HUFFVAL_OFF;
+	ret = copy_huffman_values(p, &ht[td], HANTRO_JPEG_DEC_DC_SIZE);
+	if (ret)
+		return ret;
+	p += HANTRO_JPEG_DEC_DC_SIZE;
 
-	/* Hardware requires that AC Table 1 is luma table */
-	if (header->scan->component[0].ac_entropy_coding_table_selector == 1) { /* Ta[0] == 1 */
-		swap(huffvals1, huffvals2);
-		swap(hufflength1, hufflength2);
+	if (ns > 1) {
+		ret = copy_huffman_values(p, &ht[!td], HANTRO_JPEG_DEC_DC_SIZE);
+		if (ret)
+			return ret;
 	}
 
-	/* AC table values */
-	memcpy(&hw_table->ac_tables[0], huffvals1,
-	       min(hufflength1, (u32)JPEG_AC_SIZE));
-	memcpy(&hw_table->ac_tables[1], huffvals2,
-	       min(hufflength2, (u32)JPEG_AC_SIZE));
-
-	/* HUFFVAL code values are located after the first 16 bytes BITS code lengths */
-	if (!header->huffman_tables[0].start ||
-	    header->huffman_tables[0].length != JPEG_DC_SIZE + JPEG_HUFFVAL_OFF)
-		return -EINVAL;
-
-	huffvals1 = (u8 *)(header->huffman_tables[0].start + JPEG_HUFFVAL_OFF);
-	hufflength1 = header->huffman_tables[0].length - JPEG_HUFFVAL_OFF;
-
-	if (!header->huffman_tables[1].start ||
-	    header->huffman_tables[1].length != JPEG_DC_SIZE + JPEG_HUFFVAL_OFF)
-		return -EINVAL;
-
-	huffvals2 = (u8 *)(header->huffman_tables[1].start + JPEG_HUFFVAL_OFF);
-	hufflength2 = header->huffman_tables[1].length - JPEG_HUFFVAL_OFF;
-
-	/* Hardware requires that DC Table 1 is luma table */
-	if (header->scan->component[0].dc_entropy_coding_table_selector == 1) { /* Td[0] == 1 */
-		swap(huffvals1, huffvals2);
-		swap(hufflength1, hufflength2);
-	}
-
-	/* DC table values */
-	memcpy(&hw_table->dc_tables[0], huffvals1,
-	       min(hufflength1, (u32)JPEG_DC_SIZE));
-	memcpy(&hw_table->dc_tables[1], huffvals2,
-	       min(hufflength2, (u32)JPEG_DC_SIZE));
-
-	/* Padding of 4 last bytes */
-	memset(hw_table->padding, 0, 4);
-
-	/* Hardware requires 32-bits little-endian ordering */
-	hw_table_le = (u32 *)hw_table;
-	for (i = 0; i < (sizeof(*hw_table) / sizeof(u32)); i++)
-		hw_table_le[i] = __swab32(hw_table_le[i]);
+	for (i = 0; i < HANTRO_JPEG_DEC_TABLE_SIZE / sizeof(u32); i++)
+		words[i] = get_unaligned_be32(&words[i]);
 
 	return 0;
 }
@@ -414,14 +396,13 @@ int hantro_jpeg_dec_init(struct hantro_ctx *ctx)
 	struct hantro_dev *vpu = ctx->dev;
 	struct hantro_jpeg_dec_hw_ctx *jpeg_dec = &ctx->jpeg_dec;
 	struct hantro_aux_buf *priv = &jpeg_dec->priv;
-	struct hantro_jpeg_vlc_hw_table *hw_table;
 
-	priv->cpu = dma_alloc_coherent(vpu->dev, sizeof(*hw_table), &priv->dma,
-				       GFP_KERNEL);
+	priv->cpu = dma_alloc_coherent(vpu->dev, HANTRO_JPEG_DEC_TABLE_SIZE,
+				       &priv->dma, GFP_KERNEL);
 	if (!priv->cpu)
 		return -ENOMEM;
 
-	priv->size = sizeof(*hw_table);
+	priv->size = HANTRO_JPEG_DEC_TABLE_SIZE;
 
 	return 0;
 }

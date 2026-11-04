@@ -20,207 +20,188 @@
 #include "hantro_hw.h"
 #include "hantro_jpeg.h"
 
-static void set_buffers(struct hantro_dev *vpu, struct hantro_ctx *ctx,
-			struct vb2_buffer *src_buf,
-			struct vb2_buffer *dst_buf,
-			struct v4l2_jpeg_header *header)
-{
-	dma_addr_t src_dma, dst_dma;
-
-	/* Source (stream) buffer. */
-	src_dma = vb2_dma_contig_plane_dma_addr(src_buf, 0);
-
-	/* Skip header */
-	src_dma += header->ecs_offset;
-
-	vdpu_write_relaxed(vpu, src_dma, G1_REG_ADDR_STR);
-
-	/* Destination (decoded frame) buffer. */
-	dst_dma = hantro_get_dec_buf_addr(ctx, dst_buf);
-	vdpu_write_relaxed(vpu, dst_dma, G1_REG_ADDR_DST);
-	vdpu_write_relaxed(vpu, dst_dma +
-				ctx->dst_fmt.height * ctx->dst_fmt.width,
-			   G1_REG_ADDR_DST_CHROMA);
-
-	/* Auxiliary buffer prepared in hantro_jpeg_prepare_vlc_hw_table(). */
-	vdpu_write_relaxed(vpu, ctx->jpeg_dec.priv.dma, G1_REG_ADDR_QTABLE);
-}
-
-static int to_jpeg_mode(int subsampling)
+VISIBLE_IF_KUNIT int hantro_g1_jpeg_dec_mode(int subsampling)
 {
 	switch (subsampling) {
-	case V4L2_JPEG_CHROMA_SUBSAMPLING_422:
-		return 3;
 	case V4L2_JPEG_CHROMA_SUBSAMPLING_420:
 		return 2;
-	/*
-	 * Currently unsupported:
-	 * case V4L2_JPEG_CHROMA_SUBSAMPLING_GRAY:
-	 * case V4L2_JPEG_CHROMA_SUBSAMPLING_444:
-	 * case V4L2_JPEG_CHROMA_SUBSAMPLING_411:
-	 */
+	case V4L2_JPEG_CHROMA_SUBSAMPLING_422:
+		return 3;
 	default:
-		return 2;
+		return -EINVAL;
 	}
 }
 
 VISIBLE_IF_KUNIT u32 hantro_g1_jpeg_dec_fourcc(int subsampling)
 {
 	switch (subsampling) {
-	case V4L2_JPEG_CHROMA_SUBSAMPLING_422:
-		return V4L2_PIX_FMT_NV16;
 	case V4L2_JPEG_CHROMA_SUBSAMPLING_420:
 		return V4L2_PIX_FMT_NV12;
-	/*
-	 * Currently unsupported:
-	 * case V4L2_JPEG_CHROMA_SUBSAMPLING_GRAY:
-	 * case V4L2_JPEG_CHROMA_SUBSAMPLING_444:
-	 * case V4L2_JPEG_CHROMA_SUBSAMPLING_411:
-	 */
+	case V4L2_JPEG_CHROMA_SUBSAMPLING_422:
+		return V4L2_PIX_FMT_NV16;
 	default:
 		return 0;
 	}
 }
 
-static int write_vlc_code_lengths(struct hantro_ctx *ctx,
-				  struct v4l2_jpeg_header *header)
+/*
+ * The 16 code counts (BITS) of the two AC and the two DC Huffman tables;
+ * table 1 is the one the first component uses, table 2 the other one.
+ */
+static void vlc_code_counts(const u8 *ac1, const u8 *ac2,
+			    const u8 *dc1, const u8 *dc2, u32 *vlc)
 {
-	struct hantro_dev *vpu = ctx->dev;
-	u32 reg;
-	u8 *bits1;
-	u8 *bits2;
-
-	if (header->huffman_tables[0].length < 16 ||
-	    header->huffman_tables[1].length < 16 ||
-	    header->huffman_tables[2].length < 16 ||
-	    header->huffman_tables[3].length < 16) {
-		dev_err(vpu->dev, "Invalid huffman table size: at least 16 bytes expected");
-		return -EINVAL;
-	}
-
-	/* First 16 bits are BITS code lengths */
-	bits1 = (u8 *)header->huffman_tables[2].start;/* AC luma */
-	bits2 = (u8 *)header->huffman_tables[3].start;/* AC chroma  */
-
-	/* Hardware requires that AC1 registers contains luma table */
-	if (header->scan->component[0].ac_entropy_coding_table_selector == 1) /* Ta[0] == 1 */
-		swap(bits1, bits2);
-
-	/* AC1 table code lengths (luma) */
-	reg = G1_REG_DEC_JPEG_VLC_AC1_CODE1_CNT(bits1[0]) |
-	      G1_REG_DEC_JPEG_VLC_AC1_CODE2_CNT(bits1[1]) |
-	      G1_REG_DEC_JPEG_VLC_AC1_CODE3_CNT(bits1[2]) |
-	      G1_REG_DEC_JPEG_VLC_AC1_CODE4_CNT(bits1[3]) |
-	      G1_REG_DEC_JPEG_VLC_AC1_CODE5_CNT(bits1[4]) |
-	      G1_REG_DEC_JPEG_VLC_AC1_CODE6_CNT(bits1[5]);
-	vdpu_write_relaxed(vpu, reg, G1_REG_DEC_JPEG_VLC_AC_CODE_LENGTHS_A);
-
-	reg = G1_REG_DEC_JPEG_VLC_AC1_CODE7_CNT(bits1[6]) |
-	      G1_REG_DEC_JPEG_VLC_AC1_CODE8_CNT(bits1[7]) |
-	      G1_REG_DEC_JPEG_VLC_AC1_CODE9_CNT(bits1[8]) |
-	      G1_REG_DEC_JPEG_VLC_AC1_CODE10_CNT(bits1[9]);
-	vdpu_write_relaxed(vpu, reg, G1_REG_DEC_JPEG_VLC_AC_CODE_LENGTHS_B);
-
-	reg = G1_REG_DEC_JPEG_VLC_AC1_CODE11_CNT(bits1[10]) |
-	      G1_REG_DEC_JPEG_VLC_AC1_CODE12_CNT(bits1[11]) |
-	      G1_REG_DEC_JPEG_VLC_AC1_CODE13_CNT(bits1[12]) |
-	      G1_REG_DEC_JPEG_VLC_AC1_CODE14_CNT(bits1[13]);
-	vdpu_write_relaxed(vpu, reg, G1_REG_DEC_JPEG_VLC_AC_CODE_LENGTHS_C);
-
-	reg = G1_REG_DEC_JPEG_VLC_AC1_CODE15_CNT(bits1[14]) |
-	      G1_REG_DEC_JPEG_VLC_AC1_CODE16_CNT(bits1[15]) |
-
-	/* AC2 table code lengths (the not-luma) */
-	      G1_REG_DEC_JPEG_VLC_AC2_CODE1_CNT(bits2[0]) |
-	      G1_REG_DEC_JPEG_VLC_AC2_CODE2_CNT(bits2[1]) |
-	      G1_REG_DEC_JPEG_VLC_AC2_CODE3_CNT(bits2[2]) |
-	      G1_REG_DEC_JPEG_VLC_AC2_CODE4_CNT(bits2[3]);
-	vdpu_write_relaxed(vpu, reg, G1_REG_DEC_JPEG_VLC_AC_CODE_LENGTHS_D);
-
-	reg = G1_REG_DEC_JPEG_VLC_AC2_CODE5_CNT(bits2[4]) |
-	      G1_REG_DEC_JPEG_VLC_AC2_CODE6_CNT(bits2[5]) |
-	      G1_REG_DEC_JPEG_VLC_AC2_CODE7_CNT(bits2[6]) |
-	      G1_REG_DEC_JPEG_VLC_AC2_CODE8_CNT(bits2[7]);
-	vdpu_write_relaxed(vpu, reg, G1_REG_DEC_JPEG_VLC_AC_CODE_LENGTHS_E);
-
-	reg = G1_REG_DEC_JPEG_VLC_AC2_CODE9_CNT(bits2[8]) |
-	      G1_REG_DEC_JPEG_VLC_AC2_CODE10_CNT(bits2[9]) |
-	      G1_REG_DEC_JPEG_VLC_AC2_CODE11_CNT(bits2[10]) |
-	      G1_REG_DEC_JPEG_VLC_AC2_CODE12_CNT(bits2[11]);
-	vdpu_write_relaxed(vpu, reg, G1_REG_DEC_JPEG_VLC_AC_CODE_LENGTHS_F);
-
-	reg = G1_REG_DEC_JPEG_VLC_AC2_CODE13_CNT(bits2[12]) |
-	      G1_REG_DEC_JPEG_VLC_AC2_CODE14_CNT(bits2[13]) |
-	      G1_REG_DEC_JPEG_VLC_AC2_CODE15_CNT(bits2[14]) |
-	      G1_REG_DEC_JPEG_VLC_AC2_CODE16_CNT(bits2[15]);
-	vdpu_write_relaxed(vpu, reg, G1_REG_DEC_JPEG_VLC_AC_CODE_LENGTHS_G);
-
-	bits1 = (u8 *)header->huffman_tables[0].start;/* DC luma */
-	bits2 = (u8 *)header->huffman_tables[1].start;/* DC chroma  */
-
-	/* Hardware requires that DC1 registers contains luma table */
-	if (header->scan->component[0].dc_entropy_coding_table_selector == 1) /* Td[0] == 1 */
-		swap(bits1, bits2);
-
-	/* DC1 table code lengths (luma) */
-	reg = G1_REG_DEC_JPEG_VLC_DC1_CODE1_CNT(bits1[0]) |
-	      G1_REG_DEC_JPEG_VLC_DC1_CODE2_CNT(bits1[1]) |
-	      G1_REG_DEC_JPEG_VLC_DC1_CODE3_CNT(bits1[2]) |
-	      G1_REG_DEC_JPEG_VLC_DC1_CODE4_CNT(bits1[3]) |
-	      G1_REG_DEC_JPEG_VLC_DC1_CODE5_CNT(bits1[4]) |
-	      G1_REG_DEC_JPEG_VLC_DC1_CODE6_CNT(bits1[5]) |
-	      G1_REG_DEC_JPEG_VLC_DC1_CODE7_CNT(bits1[6]) |
-	      G1_REG_DEC_JPEG_VLC_DC1_CODE8_CNT(bits1[7]);
-	vdpu_write_relaxed(vpu, reg, G1_REG_DEC_JPEG_VLC_DC_CODE_LENGTHS_A);
-
-	reg = G1_REG_DEC_JPEG_VLC_DC1_CODE9_CNT(bits1[8]) |
-	      G1_REG_DEC_JPEG_VLC_DC1_CODE10_CNT(bits1[9]) |
-	      G1_REG_DEC_JPEG_VLC_DC1_CODE11_CNT(bits1[10]) |
-	      G1_REG_DEC_JPEG_VLC_DC1_CODE12_CNT(bits1[11]) |
-	      G1_REG_DEC_JPEG_VLC_DC1_CODE13_CNT(bits1[12]) |
-	      G1_REG_DEC_JPEG_VLC_DC1_CODE14_CNT(bits1[13]) |
-	      G1_REG_DEC_JPEG_VLC_DC1_CODE15_CNT(bits1[14]) |
-	      G1_REG_DEC_JPEG_VLC_DC1_CODE16_CNT(bits1[15]);
-	vdpu_write_relaxed(vpu, reg, G1_REG_DEC_JPEG_VLC_DC_CODE_LENGTHS_B);
-
-	/* DC2 table code lengths (not-luma) */
-	reg = G1_REG_DEC_JPEG_VLC_DC2_CODE1_CNT(bits2[0]) |
-	      G1_REG_DEC_JPEG_VLC_DC2_CODE2_CNT(bits2[1]) |
-	      G1_REG_DEC_JPEG_VLC_DC2_CODE3_CNT(bits2[2]) |
-	      G1_REG_DEC_JPEG_VLC_DC2_CODE4_CNT(bits2[3]) |
-	      G1_REG_DEC_JPEG_VLC_DC2_CODE5_CNT(bits2[4]) |
-	      G1_REG_DEC_JPEG_VLC_DC2_CODE6_CNT(bits2[5]) |
-	      G1_REG_DEC_JPEG_VLC_DC2_CODE7_CNT(bits2[6]) |
-	      G1_REG_DEC_JPEG_VLC_DC2_CODE8_CNT(bits2[7]);
-	vdpu_write_relaxed(vpu, reg, G1_REG_DEC_JPEG_VLC_DC_CODE_LENGTHS_C);
-
-	reg = G1_REG_DEC_JPEG_VLC_DC2_CODE9_CNT(bits2[8]) |
-	      G1_REG_DEC_JPEG_VLC_DC2_CODE10_CNT(bits2[9]) |
-	      G1_REG_DEC_JPEG_VLC_DC2_CODE11_CNT(bits2[10]) |
-	      G1_REG_DEC_JPEG_VLC_DC2_CODE12_CNT(bits2[11]) |
-	      G1_REG_DEC_JPEG_VLC_DC2_CODE13_CNT(bits2[12]) |
-	      G1_REG_DEC_JPEG_VLC_DC2_CODE14_CNT(bits2[13]) |
-	      G1_REG_DEC_JPEG_VLC_DC2_CODE15_CNT(bits2[14]) |
-	      G1_REG_DEC_JPEG_VLC_DC2_CODE16_CNT(bits2[15]);
-	vdpu_write_relaxed(vpu, reg, G1_REG_DEC_JPEG_VLC_DC_CODE_LENGTHS_D);
-
-	return 0;
+	vlc[0] = G1_REG_DEC_JPEG_VLC_AC1_CODE1_CNT(ac1[0]) |
+		 G1_REG_DEC_JPEG_VLC_AC1_CODE2_CNT(ac1[1]) |
+		 G1_REG_DEC_JPEG_VLC_AC1_CODE3_CNT(ac1[2]) |
+		 G1_REG_DEC_JPEG_VLC_AC1_CODE4_CNT(ac1[3]) |
+		 G1_REG_DEC_JPEG_VLC_AC1_CODE5_CNT(ac1[4]) |
+		 G1_REG_DEC_JPEG_VLC_AC1_CODE6_CNT(ac1[5]);
+	vlc[1] = G1_REG_DEC_JPEG_VLC_AC1_CODE7_CNT(ac1[6]) |
+		 G1_REG_DEC_JPEG_VLC_AC1_CODE8_CNT(ac1[7]) |
+		 G1_REG_DEC_JPEG_VLC_AC1_CODE9_CNT(ac1[8]) |
+		 G1_REG_DEC_JPEG_VLC_AC1_CODE10_CNT(ac1[9]);
+	vlc[2] = G1_REG_DEC_JPEG_VLC_AC1_CODE11_CNT(ac1[10]) |
+		 G1_REG_DEC_JPEG_VLC_AC1_CODE12_CNT(ac1[11]) |
+		 G1_REG_DEC_JPEG_VLC_AC1_CODE13_CNT(ac1[12]) |
+		 G1_REG_DEC_JPEG_VLC_AC1_CODE14_CNT(ac1[13]);
+	vlc[3] = G1_REG_DEC_JPEG_VLC_AC1_CODE15_CNT(ac1[14]) |
+		 G1_REG_DEC_JPEG_VLC_AC1_CODE16_CNT(ac1[15]) |
+		 G1_REG_DEC_JPEG_VLC_AC2_CODE1_CNT(ac2[0]) |
+		 G1_REG_DEC_JPEG_VLC_AC2_CODE2_CNT(ac2[1]) |
+		 G1_REG_DEC_JPEG_VLC_AC2_CODE3_CNT(ac2[2]) |
+		 G1_REG_DEC_JPEG_VLC_AC2_CODE4_CNT(ac2[3]);
+	vlc[4] = G1_REG_DEC_JPEG_VLC_AC2_CODE5_CNT(ac2[4]) |
+		 G1_REG_DEC_JPEG_VLC_AC2_CODE6_CNT(ac2[5]) |
+		 G1_REG_DEC_JPEG_VLC_AC2_CODE7_CNT(ac2[6]) |
+		 G1_REG_DEC_JPEG_VLC_AC2_CODE8_CNT(ac2[7]);
+	vlc[5] = G1_REG_DEC_JPEG_VLC_AC2_CODE9_CNT(ac2[8]) |
+		 G1_REG_DEC_JPEG_VLC_AC2_CODE10_CNT(ac2[9]) |
+		 G1_REG_DEC_JPEG_VLC_AC2_CODE11_CNT(ac2[10]) |
+		 G1_REG_DEC_JPEG_VLC_AC2_CODE12_CNT(ac2[11]);
+	vlc[6] = G1_REG_DEC_JPEG_VLC_AC2_CODE13_CNT(ac2[12]) |
+		 G1_REG_DEC_JPEG_VLC_AC2_CODE14_CNT(ac2[13]) |
+		 G1_REG_DEC_JPEG_VLC_AC2_CODE15_CNT(ac2[14]) |
+		 G1_REG_DEC_JPEG_VLC_AC2_CODE16_CNT(ac2[15]);
+	vlc[7] = G1_REG_DEC_JPEG_VLC_DC1_CODE1_CNT(dc1[0]) |
+		 G1_REG_DEC_JPEG_VLC_DC1_CODE2_CNT(dc1[1]) |
+		 G1_REG_DEC_JPEG_VLC_DC1_CODE3_CNT(dc1[2]) |
+		 G1_REG_DEC_JPEG_VLC_DC1_CODE4_CNT(dc1[3]) |
+		 G1_REG_DEC_JPEG_VLC_DC1_CODE5_CNT(dc1[4]) |
+		 G1_REG_DEC_JPEG_VLC_DC1_CODE6_CNT(dc1[5]) |
+		 G1_REG_DEC_JPEG_VLC_DC1_CODE7_CNT(dc1[6]) |
+		 G1_REG_DEC_JPEG_VLC_DC1_CODE8_CNT(dc1[7]);
+	vlc[8] = G1_REG_DEC_JPEG_VLC_DC1_CODE9_CNT(dc1[8]) |
+		 G1_REG_DEC_JPEG_VLC_DC1_CODE10_CNT(dc1[9]) |
+		 G1_REG_DEC_JPEG_VLC_DC1_CODE11_CNT(dc1[10]) |
+		 G1_REG_DEC_JPEG_VLC_DC1_CODE12_CNT(dc1[11]) |
+		 G1_REG_DEC_JPEG_VLC_DC1_CODE13_CNT(dc1[12]) |
+		 G1_REG_DEC_JPEG_VLC_DC1_CODE14_CNT(dc1[13]) |
+		 G1_REG_DEC_JPEG_VLC_DC1_CODE15_CNT(dc1[14]) |
+		 G1_REG_DEC_JPEG_VLC_DC1_CODE16_CNT(dc1[15]);
+	vlc[9] = G1_REG_DEC_JPEG_VLC_DC2_CODE1_CNT(dc2[0]) |
+		 G1_REG_DEC_JPEG_VLC_DC2_CODE2_CNT(dc2[1]) |
+		 G1_REG_DEC_JPEG_VLC_DC2_CODE3_CNT(dc2[2]) |
+		 G1_REG_DEC_JPEG_VLC_DC2_CODE4_CNT(dc2[3]) |
+		 G1_REG_DEC_JPEG_VLC_DC2_CODE5_CNT(dc2[4]) |
+		 G1_REG_DEC_JPEG_VLC_DC2_CODE6_CNT(dc2[5]) |
+		 G1_REG_DEC_JPEG_VLC_DC2_CODE7_CNT(dc2[6]) |
+		 G1_REG_DEC_JPEG_VLC_DC2_CODE8_CNT(dc2[7]);
+	vlc[10] = G1_REG_DEC_JPEG_VLC_DC2_CODE9_CNT(dc2[8]) |
+		  G1_REG_DEC_JPEG_VLC_DC2_CODE10_CNT(dc2[9]) |
+		  G1_REG_DEC_JPEG_VLC_DC2_CODE11_CNT(dc2[10]) |
+		  G1_REG_DEC_JPEG_VLC_DC2_CODE12_CNT(dc2[11]) |
+		  G1_REG_DEC_JPEG_VLC_DC2_CODE13_CNT(dc2[12]) |
+		  G1_REG_DEC_JPEG_VLC_DC2_CODE14_CNT(dc2[13]) |
+		  G1_REG_DEC_JPEG_VLC_DC2_CODE15_CNT(dc2[14]) |
+		  G1_REG_DEC_JPEG_VLC_DC2_CODE16_CNT(dc2[15]);
 }
 
-static int stream_bit_offset(struct v4l2_jpeg_header *header)
+/* The last macroblock column/row holds 1 to 8 picture columns/rows. */
+static bool fill_needed(unsigned int size)
 {
-	int page_ptr, word_ptr, bit_ptr;
-	u32 ecs_offset = header->ecs_offset;
+	unsigned int rem = size % MB_DIM;
 
-	page_ptr = ecs_offset / 256;
-	word_ptr = (ecs_offset % 256) / 4;
-	if (page_ptr & 1)
-		word_ptr += 64;
-	bit_ptr = (ecs_offset % 4) * 8;
-	if (word_ptr & 1)
-		bit_ptr += 32;
+	return rem && rem <= MB_DIM / 2;
+}
 
-	return bit_ptr;
+/**
+ * hantro_g1_jpeg_dec_regs() - compute the registers of a decoding job
+ * @hdr:	parsed header that passed hantro_g1_jpeg_dec_check()
+ * @src:	bus address of the OUTPUT buffer
+ * @payload:	bytes used in the OUTPUT buffer, from its start
+ * @regs:	the register values
+ */
+VISIBLE_IF_KUNIT void hantro_g1_jpeg_dec_regs(const struct v4l2_jpeg_header *hdr,
+					      dma_addr_t src, size_t payload,
+					      struct hantro_g1_jpeg_dec_regs *regs)
+{
+	const struct v4l2_jpeg_frame_header *frame = &hdr->frame;
+	const struct v4l2_jpeg_scan_header *scan = hdr->scan;
+	const struct v4l2_jpeg_reference *ht = hdr->huffman_tables;
+	u32 mb_width = MB_WIDTH(frame->width);
+	u32 mb_height = MB_HEIGHT(frame->height);
+	u8 ta = scan->component[0].ac_entropy_coding_table_selector;
+	u8 td = scan->component[0].dc_entropy_coding_table_selector;
+	dma_addr_t ecs = src + hdr->ecs_offset;
+
+	memset(regs, 0, sizeof(*regs));
+
+	/* Decoder mode 3: JPEG. */
+	regs->ctrl0 = G1_REG_DEC_CTRL0_DEC_MODE(3) |
+		      G1_REG_DEC_CTRL0_FILTERING_DIS;
+
+	regs->ctrl1 = G1_REG_DEC_CTRL1_PIC_MB_WIDTH(mb_width) |
+		      G1_REG_DEC_CTRL1_PIC_MB_HEIGHT_P(mb_height) |
+		      G1_REG_DEC_CTRL1_PIC_MB_W_EXT(mb_width >> 9) |
+		      G1_REG_DEC_CTRL1_PIC_MB_H_EXT(mb_height >> 8);
+
+	/*
+	 * The stream starts at an 8-byte aligned address; the bit offset of
+	 * the entropy-coded data in that first double word goes to
+	 * STRM_START_BIT, and STREAM_LEN counts from the aligned address.
+	 */
+	regs->stream = ALIGN_DOWN(ecs, 8);
+	regs->ctrl2 = G1_REG_DEC_CTRL2_STRM_START_BIT(8 * (ecs - regs->stream)) |
+		      G1_REG_DEC_CTRL2_JPEG_MODE(hantro_g1_jpeg_dec_mode(frame->subsampling)) |
+		      G1_REG_DEC_CTRL2_JPEG_QTABLES(scan->num_components) |
+		      G1_REG_DEC_CTRL2_JPEG_STREAM_ALL;
+	regs->ctrl3 = G1_REG_DEC_CTRL3_STREAM_LEN(payload - (regs->stream - src));
+
+	/*
+	 * The hardware holds the Huffman tables of the first component as
+	 * table 1 and the other ones as table 2: a chroma component selects
+	 * table 2 when its table is not the first component's.
+	 */
+	if (scan->num_components > 2) {
+		if (scan->component[1].ac_entropy_coding_table_selector != ta)
+			regs->ctrl2 |= G1_REG_DEC_CTRL2_CB_AC_VLCTABLE;
+		if (scan->component[1].dc_entropy_coding_table_selector != td)
+			regs->ctrl2 |= G1_REG_DEC_CTRL2_CB_DC_VLCTABLE;
+		if (scan->component[2].ac_entropy_coding_table_selector != ta)
+			regs->ctrl2 |= G1_REG_DEC_CTRL2_CR_AC_VLCTABLE;
+		if (scan->component[2].dc_entropy_coding_table_selector != td)
+			regs->ctrl2 |= G1_REG_DEC_CTRL2_CR_DC_VLCTABLE;
+	}
+
+	if (hdr->restart_interval)
+		regs->ctrl2 |= G1_REG_DEC_CTRL2_SYNC_MARKER_E;
+	regs->ctrl5 = G1_REG_DEC_CTRL5_PJPEG_REST_FREQ(hdr->restart_interval);
+
+	/*
+	 * A 4:2:2 MCU is 8 rows high: when the last macroblock row holds 8
+	 * picture rows or fewer, the stream has no MCUs for its lower half
+	 * and the decoder must fill it in.
+	 */
+	if (frame->subsampling == V4L2_JPEG_CHROMA_SUBSAMPLING_422 &&
+	    fill_needed(frame->height))
+		regs->ctrl4 |= G1_REG_DEC_CTRL4_PJPEG_FILDOWN_E;
+
+	/* No slice mode: the whole picture in one job. */
+	regs->jpeg_ctrl = G1_REG_JPEG_CTRL_SLICE_H(0);
+
+	vlc_code_counts(ht[2 + ta].start, ht[2 + !ta].start,
+			ht[td].start, ht[!td].start, regs->vlc);
 }
 
 /*
@@ -283,7 +264,7 @@ static int check_huffman_table(const struct v4l2_jpeg_reference *table,
 /**
  * hantro_g1_jpeg_dec_check() - check a parsed header against the hardware
  * @hdr:	parsed header, with the default Huffman tables filled in
- * @payload:	bytes of JPEG data in the OUTPUT buffer
+ * @payload:	bytes used in the OUTPUT buffer, from its start
  * @fourcc:	CAPTURE pixel format
  * @width:	CAPTURE width
  * @height:	CAPTURE height
@@ -389,8 +370,6 @@ static int hantro_g1_jpeg_dec_start(struct hantro_ctx *ctx)
 {
 	struct hantro_dev *vpu = ctx->dev;
 	struct vb2_v4l2_buffer *src_buf, *dst_buf;
-	size_t height = ctx->dst_fmt.height;
-	size_t width = ctx->dst_fmt.width;
 	struct v4l2_jpeg_scan_header scan_header = { };
 	struct v4l2_jpeg_reference quantization_tables[V4L2_JPEG_MAX_TABLES] = { };
 	struct v4l2_jpeg_reference huffman_tables[V4L2_JPEG_MAX_TABLES] = { };
@@ -399,11 +378,11 @@ static int hantro_g1_jpeg_dec_start(struct hantro_ctx *ctx)
 		.quantization_tables = quantization_tables,
 		.huffman_tables = huffman_tables,
 	};
-	u32 mb_width, mb_height;
-	u32 jpeg_size;
-	unsigned int i;
+	struct hantro_g1_jpeg_dec_regs regs;
+	dma_addr_t src_dma, dst_dma;
+	unsigned int offset, i;
+	size_t payload;
 	void *vaddr;
-	u32 reg;
 	int ret;
 
 	src_buf = hantro_get_src_buf(ctx);
@@ -425,13 +404,20 @@ static int hantro_g1_jpeg_dec_start(struct hantro_ctx *ctx)
 	if (!vaddr)
 		return -EFAULT;
 
-	jpeg_size = vb2_get_plane_payload(&src_buf->vb2_buf, 0);
+	/*
+	 * The JPEG data starts data_offset bytes into the plane, which vb2
+	 * keeps below the payload. The stream position counts from the start
+	 * of the buffer, as the payload does.
+	 */
+	offset = src_buf->vb2_buf.planes[0].data_offset;
+	payload = vb2_get_plane_payload(&src_buf->vb2_buf, 0);
 
-	ret = v4l2_jpeg_parse_header(vaddr, jpeg_size, &header);
+	ret = v4l2_jpeg_parse_header(vaddr + offset, payload - offset, &header);
 	if (ret < 0) {
 		vpu_debug(1, "cannot parse the JPEG header: %d\n", ret);
 		return ret;
 	}
+	header.ecs_offset += offset;
 
 	/*
 	 * Userspace can still write to the OUTPUT buffer: the checks and the
@@ -458,86 +444,40 @@ static int hantro_g1_jpeg_dec_start(struct hantro_ctx *ctx)
 	 * as it is while the CAPTURE queue has buffers, and each of them
 	 * holds it (hantro_queue_setup() and hantro_buf_prepare() check).
 	 */
-	ret = hantro_g1_jpeg_dec_check(&header, jpeg_size,
-				       ctx->dst_fmt.pixelformat, width, height);
+	ret = hantro_g1_jpeg_dec_check(&header, payload,
+				       ctx->dst_fmt.pixelformat,
+				       ctx->dst_fmt.width, ctx->dst_fmt.height);
 	if (ret)
 		return ret;
 
-	/* Write VLC table code lengths */
-	ret = write_vlc_code_lengths(ctx, &header);
-	if (ret)
-		return ret;
-
-	/* Prepare VLC QP/AC/DC hardware tables */
 	ret = hantro_jpeg_prepare_vlc_hw_table(&header, ctx->jpeg_dec.priv.cpu);
 	if (ret) {
 		vpu_debug(1, "cannot build the hardware tables: %d\n", ret);
 		return ret;
 	}
 
+	src_dma = vb2_dma_contig_plane_dma_addr(&src_buf->vb2_buf, 0);
+	dst_dma = vb2_dma_contig_plane_dma_addr(&dst_buf->vb2_buf, 0);
+	hantro_g1_jpeg_dec_regs(&header, src_dma, payload, &regs);
+
 	hantro_start_prepare_run(ctx);
 
-	reg = G1_REG_DEC_CTRL0_DEC_MODE(3) |
-	      G1_REG_DEC_CTRL0_FILTERING_DIS;
-	vdpu_write_relaxed(vpu, reg, G1_REG_DEC_CTRL0);
+	vdpu_write_relaxed(vpu, regs.ctrl0, G1_REG_DEC_CTRL0);
+	vdpu_write_relaxed(vpu, regs.ctrl1, G1_REG_DEC_CTRL1);
+	vdpu_write_relaxed(vpu, regs.ctrl2, G1_REG_DEC_CTRL2);
+	vdpu_write_relaxed(vpu, regs.ctrl3, G1_REG_DEC_CTRL3);
+	vdpu_write_relaxed(vpu, regs.ctrl4, G1_REG_DEC_CTRL4);
+	vdpu_write_relaxed(vpu, regs.ctrl5, G1_REG_DEC_CTRL5);
+	vdpu_write_relaxed(vpu, regs.jpeg_ctrl, G1_REG_JPEG_CTRL);
+	for (i = 0; i < ARRAY_SIZE(regs.vlc); i++)
+		vdpu_write_relaxed(vpu, regs.vlc[i],
+				   G1_REG_DEC_JPEG_VLC_AC_CODE_LENGTHS_A + 4 * i);
 
-	/* Frame dimensions */
-	mb_width = MB_WIDTH(width);
-	mb_height = MB_HEIGHT(height);
-	reg = G1_REG_DEC_CTRL1_PIC_MB_WIDTH(mb_width) |
-	      G1_REG_DEC_CTRL1_PIC_MB_HEIGHT_P(mb_height) |
-	      G1_REG_DEC_CTRL1_PIC_MB_W_EXT(mb_width >> 9) |
-	      G1_REG_DEC_CTRL1_PIC_MB_H_EXT(mb_height >> 8);
-	vdpu_write_relaxed(vpu, reg, G1_REG_DEC_CTRL1);
-
-	reg = G1_REG_DEC_CTRL2_JPEG_MODE(to_jpeg_mode(header.frame.subsampling)) |
-	      G1_REG_DEC_CTRL2_JPEG_STREAM_ALL;
-
-	/*
-	 * For luminance the first table is always used
-	 * For chrominance: check jpeg header
-	 */
-	reg |= G1_REG_DEC_CTRL2_JPEG_QTABLES(header.scan->num_components);
-
-	if (header.scan->num_components > 0) {
-		if (header.scan->component[1].dc_entropy_coding_table_selector == 1)/* Td[1]==1 */
-			reg |= G1_REG_DEC_CTRL2_CB_DC_VLCTABLE;
-
-		if (header.scan->component[1].ac_entropy_coding_table_selector == 1)/* Ta[1]==1 */
-			reg |= G1_REG_DEC_CTRL2_CB_AC_VLCTABLE;
-	}
-	if (header.scan->num_components > 1) {
-		if (header.scan->component[2].dc_entropy_coding_table_selector == 1)/* Td[2]==1 */
-			reg |= G1_REG_DEC_CTRL2_CR_DC_VLCTABLE;
-
-		if (header.scan->component[2].ac_entropy_coding_table_selector == 1)/* Ta[2]==1 */
-			reg |= G1_REG_DEC_CTRL2_CR_AC_VLCTABLE;
-	}
-
-	reg |= G1_REG_DEC_CTRL2_STRM_START_BIT(stream_bit_offset(&header));
-
-	if (header.restart_interval) {
-		reg |= G1_REG_DEC_CTRL2_SYNC_MARKER_E;
-		vdpu_write_relaxed(vpu,
-				   G1_REG_DEC_CTRL5_PJPEG_REST_FREQ(header.restart_interval),
-				   G1_REG_DEC_CTRL5);
-	}
-
-	vdpu_write_relaxed(vpu, reg, G1_REG_DEC_CTRL2);
-
-	reg = G1_REG_DEC_CTRL3_STREAM_LEN(jpeg_size);
-	vdpu_write_relaxed(vpu, reg, G1_REG_DEC_CTRL3);
-
-	/* Vertical alignment */
-	reg = IS_ALIGNED(header.frame.height, MB_DIM) ?
-		0 : G1_REG_DEC_CTRL4_PJPEG_FILDOWN_E;
-
-	vdpu_write_relaxed(vpu, reg, G1_REG_DEC_CTRL4);
-
-	/* Disable slice mode */
-	vdpu_write_relaxed(vpu, G1_REG_JPEG_CTRL_SLICE_H(0), G1_REG_JPEG_CTRL);
-
-	set_buffers(vpu, ctx, &src_buf->vb2_buf, &dst_buf->vb2_buf, &header);
+	vdpu_write_relaxed(vpu, regs.stream, G1_REG_ADDR_STR);
+	vdpu_write_relaxed(vpu, dst_dma, G1_REG_ADDR_DST);
+	vdpu_write_relaxed(vpu, dst_dma + ctx->dst_fmt.plane_fmt[0].bytesperline *
+				ctx->dst_fmt.height, G1_REG_ADDR_DST_CHROMA);
+	vdpu_write_relaxed(vpu, ctx->jpeg_dec.priv.dma, G1_REG_ADDR_QTABLE);
 
 	hantro_end_prepare_run(ctx);
 

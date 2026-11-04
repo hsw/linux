@@ -77,6 +77,9 @@ struct hantro_irq {
  * @double_buffer:		core needs double buffering
  * @legacy_regs:		core uses legacy register set
  * @late_postproc:		postproc must be set up at the end of the job
+ * @src_needs_kmap:		the decoder's OUTPUT (bitstream) buffers need a
+ *				kernel mapping, for a stateful decoder that
+ *				parses the bitstream headers in the kernel
  * @shared_devices:		an array of device ids that cannot run concurrently
  */
 struct hantro_variant {
@@ -102,6 +105,7 @@ struct hantro_variant {
 	unsigned int double_buffer : 1;
 	unsigned int legacy_regs : 1;
 	unsigned int late_postproc : 1;
+	unsigned int src_needs_kmap : 1;
 	const struct of_device_id *shared_devices;
 };
 
@@ -115,6 +119,8 @@ struct hantro_variant {
  * @HANTRO_MODE_HEVC_DEC: HEVC decoder.
  * @HANTRO_MODE_VP9_DEC: VP9 decoder.
  * @HANTRO_MODE_AV1_DEC: AV1 decoder
+ * @HANTRO_MODE_JPEG_DEC: JPEG decoder, the only stateful decoder mode: the
+ *			  driver parses the bitstream headers itself.
  */
 enum hantro_codec_mode {
 	HANTRO_MODE_NONE = -1,
@@ -125,6 +131,7 @@ enum hantro_codec_mode {
 	HANTRO_MODE_HEVC_DEC,
 	HANTRO_MODE_VP9_DEC,
 	HANTRO_MODE_AV1_DEC,
+	HANTRO_MODE_JPEG_DEC,
 };
 
 /*

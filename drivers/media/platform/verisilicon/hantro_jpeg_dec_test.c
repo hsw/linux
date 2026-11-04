@@ -116,8 +116,20 @@ static void jpeg_dec_check_sampling(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, check(&j, V4L2_PIX_FMT_NV12, 1072, 1456), -EINVAL);
 
 	make_jpeg(&j, V4L2_JPEG_CHROMA_SUBSAMPLING_GRAY, 1072, 1448);
-	KUNIT_EXPECT_EQ(test, check(&j, V4L2_PIX_FMT_GREY, 1072, 1456), -EINVAL);
+	KUNIT_EXPECT_EQ(test, check(&j, V4L2_PIX_FMT_GREY, 1072, 1456), 0);
 	KUNIT_EXPECT_EQ(test, check(&j, V4L2_PIX_FMT_NV12, 1072, 1456), -EINVAL);
+	/* Any sampling factors: a one-component MCU is one block. */
+	j.hdr.frame.component[0].horizontal_sampling_factor = 2;
+	j.hdr.frame.component[0].vertical_sampling_factor = 2;
+	KUNIT_EXPECT_EQ(test, check(&j, V4L2_PIX_FMT_GREY, 1072, 1456), 0);
+	/* Greyscale needs only the tables its one component uses. */
+	j.ht[1].start = NULL;
+	j.ht[3].start = NULL;
+	j.qt[1].start = NULL;
+	KUNIT_EXPECT_EQ(test, check(&j, V4L2_PIX_FMT_GREY, 1072, 1456), 0);
+
+	make_jpeg(&j, V4L2_JPEG_CHROMA_SUBSAMPLING_420, 1072, 1448);
+	KUNIT_EXPECT_EQ(test, check(&j, V4L2_PIX_FMT_GREY, 1072, 1456), -EINVAL);
 
 	make_jpeg(&j, V4L2_JPEG_CHROMA_SUBSAMPLING_444, 1072, 1448);
 	KUNIT_EXPECT_EQ(test, check(&j, V4L2_PIX_FMT_NV12, 1072, 1456), -EINVAL);
@@ -312,7 +324,8 @@ static void jpeg_dec_fourcc(struct kunit *test)
 			V4L2_PIX_FMT_NV12);
 	KUNIT_EXPECT_EQ(test, hantro_g1_jpeg_dec_fourcc(V4L2_JPEG_CHROMA_SUBSAMPLING_422),
 			V4L2_PIX_FMT_NV16);
-	KUNIT_EXPECT_EQ(test, hantro_g1_jpeg_dec_fourcc(V4L2_JPEG_CHROMA_SUBSAMPLING_GRAY), 0);
+	KUNIT_EXPECT_EQ(test, hantro_g1_jpeg_dec_fourcc(V4L2_JPEG_CHROMA_SUBSAMPLING_GRAY),
+			V4L2_PIX_FMT_GREY);
 	KUNIT_EXPECT_EQ(test, hantro_g1_jpeg_dec_fourcc(V4L2_JPEG_CHROMA_SUBSAMPLING_444), 0);
 	KUNIT_EXPECT_EQ(test, hantro_g1_jpeg_dec_fourcc(V4L2_JPEG_CHROMA_SUBSAMPLING_411), 0);
 	KUNIT_EXPECT_EQ(test, hantro_g1_jpeg_dec_fourcc(V4L2_JPEG_CHROMA_SUBSAMPLING_410), 0);
@@ -680,6 +693,11 @@ static void jpeg_dec_regs_fill(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, fill_bits(V4L2_JPEG_CHROMA_SUBSAMPLING_422, 1920, 1073), 2);
 	KUNIT_EXPECT_EQ(test, fill_bits(V4L2_JPEG_CHROMA_SUBSAMPLING_422, 1920, 1081), 0);
 	KUNIT_EXPECT_EQ(test, fill_bits(V4L2_JPEG_CHROMA_SUBSAMPLING_422, 1000, 1440), 0);
+	KUNIT_EXPECT_EQ(test, fill_bits(V4L2_JPEG_CHROMA_SUBSAMPLING_GRAY, 1000, 1448), 3);
+	KUNIT_EXPECT_EQ(test, fill_bits(V4L2_JPEG_CHROMA_SUBSAMPLING_GRAY, 1072, 1448), 2);
+	KUNIT_EXPECT_EQ(test, fill_bits(V4L2_JPEG_CHROMA_SUBSAMPLING_GRAY, 1000, 1440), 1);
+	KUNIT_EXPECT_EQ(test, fill_bits(V4L2_JPEG_CHROMA_SUBSAMPLING_GRAY, 1001, 1449), 0);
+	KUNIT_EXPECT_EQ(test, fill_bits(V4L2_JPEG_CHROMA_SUBSAMPLING_GRAY, 1440, 1440), 0);
 }
 
 static void jpeg_dec_regs_frame(struct kunit *test)
@@ -714,12 +732,86 @@ static void jpeg_dec_mode(struct kunit *test)
 {
 	KUNIT_EXPECT_EQ(test, hantro_g1_jpeg_dec_mode(V4L2_JPEG_CHROMA_SUBSAMPLING_420), 2);
 	KUNIT_EXPECT_EQ(test, hantro_g1_jpeg_dec_mode(V4L2_JPEG_CHROMA_SUBSAMPLING_422), 3);
-	KUNIT_EXPECT_EQ(test, hantro_g1_jpeg_dec_mode(V4L2_JPEG_CHROMA_SUBSAMPLING_GRAY),
-			-EINVAL);
+	KUNIT_EXPECT_EQ(test, hantro_g1_jpeg_dec_mode(V4L2_JPEG_CHROMA_SUBSAMPLING_GRAY), 0);
 	KUNIT_EXPECT_EQ(test, hantro_g1_jpeg_dec_mode(V4L2_JPEG_CHROMA_SUBSAMPLING_444),
 			-EINVAL);
 	KUNIT_EXPECT_EQ(test, hantro_g1_jpeg_dec_mode(V4L2_JPEG_CHROMA_SUBSAMPLING_411),
 			-EINVAL);
+}
+
+static void jpeg_dec_grey(struct kunit *test)
+{
+	/* Ri from a DRI segment: every MCU, two, odd ones, a row, the largest. */
+	static const u16 intervals[] = { 1, 2, 67, 125, 0xffff };
+	u8 *buf = kunit_kzalloc(test, HANTRO_JPEG_DEC_TABLE_SIZE, GFP_KERNEL);
+	u8 *bytes = kunit_kzalloc(test, HANTRO_JPEG_DEC_TABLE_SIZE, GFP_KERNEL);
+	struct hantro_g1_jpeg_dec_regs regs, plain;
+	unsigned int i;
+	u8 luma[JPEG_QUANT_SIZE];
+	struct test_jpeg j;
+
+	KUNIT_ASSERT_NOT_NULL(test, buf);
+	KUNIT_ASSERT_NOT_NULL(test, bytes);
+	natural_order(v4l2_jpeg_ref_table_luma_qt, luma);
+
+	/* Only table 0 of each kind in the stream. */
+	make_jpeg(&j, V4L2_JPEG_CHROMA_SUBSAMPLING_GRAY, 1072, 1448);
+	j.ht[1].start = NULL;
+	j.ht[3].start = NULL;
+
+	/* One quantization table, AC from offset 64, no second lists. */
+	memset(buf, 0xff, HANTRO_JPEG_DEC_TABLE_SIZE);
+	KUNIT_ASSERT_EQ(test, hantro_jpeg_prepare_vlc_hw_table(&j.hdr, buf), 0);
+	table_bytes(test, buf, bytes);
+	KUNIT_EXPECT_MEMEQ(test, bytes, luma, JPEG_QUANT_SIZE);
+	expect_huffman(test, bytes, 1, &j.ht[2], NULL, &j.ht[0], NULL);
+
+	hantro_g1_jpeg_dec_regs(&j.hdr, 0x10000000, j.payload, &regs);
+	/* JPEG_MODE 0, one quantization table, no chroma table selects. */
+	KUNIT_EXPECT_EQ(test, (regs.ctrl2 >> 8) & 0x7, 0);
+	KUNIT_EXPECT_EQ(test, (regs.ctrl2 >> 11) & 0x3, 1);
+	KUNIT_EXPECT_EQ(test, ctrl2_selectors(regs.ctrl2), 0);
+	expect_vlc(test, regs.vlc, v4l2_jpeg_ref_table_luma_ac_ht, NULL,
+		   v4l2_jpeg_ref_table_luma_dc_ht, NULL);
+
+	/* The same with the luma on tables 1. */
+	make_jpeg(&j, V4L2_JPEG_CHROMA_SUBSAMPLING_GRAY, 1072, 1448);
+	j.scan.component[0].dc_entropy_coding_table_selector = 1;
+	j.scan.component[0].ac_entropy_coding_table_selector = 1;
+	j.ht[0].start = NULL;
+	j.ht[2].start = NULL;
+	KUNIT_ASSERT_EQ(test, check(&j, V4L2_PIX_FMT_GREY, 1072, 1456), 0);
+	KUNIT_ASSERT_EQ(test, hantro_jpeg_prepare_vlc_hw_table(&j.hdr, buf), 0);
+	table_bytes(test, buf, bytes);
+	expect_huffman(test, bytes, 1, &j.ht[3], NULL, &j.ht[1], NULL);
+	hantro_g1_jpeg_dec_regs(&j.hdr, 0x10000000, j.payload, &regs);
+	KUNIT_EXPECT_EQ(test, ctrl2_selectors(regs.ctrl2), 0);
+	expect_vlc(test, regs.vlc, v4l2_jpeg_ref_table_chroma_ac_ht, NULL,
+		   v4l2_jpeg_ref_table_chroma_dc_ht, NULL);
+
+	/*
+	 * A restart interval: SYNC_MARKER_E (CTRL2 bit 25) and Ri - 1 in
+	 * PJPEG_REST_FREQ (CTRL5 bits 15:0).
+	 */
+	make_jpeg(&j, V4L2_JPEG_CHROMA_SUBSAMPLING_GRAY, 1000, 1448);
+	hantro_g1_jpeg_dec_regs(&j.hdr, 0x10000000, j.payload, &plain);
+	KUNIT_EXPECT_EQ(test, plain.ctrl2 & BIT(25), 0);
+	KUNIT_EXPECT_EQ(test, plain.ctrl5, 0);
+	for (i = 0; i < ARRAY_SIZE(intervals); i++) {
+		u16 ri = intervals[i];
+
+		j.hdr.restart_interval = ri;
+		hantro_g1_jpeg_dec_regs(&j.hdr, 0x10000000, j.payload, &regs);
+		KUNIT_EXPECT_EQ_MSG(test, regs.ctrl2, plain.ctrl2 | BIT(25),
+				    "Ri %u", ri);
+		KUNIT_EXPECT_EQ_MSG(test, regs.ctrl5, (u32)ri - 1, "Ri %u", ri);
+		KUNIT_EXPECT_EQ_MSG(test, regs.ctrl4, plain.ctrl4, "Ri %u", ri);
+	}
+
+	/* A greyscale header claiming three components. */
+	make_jpeg(&j, V4L2_JPEG_CHROMA_SUBSAMPLING_420, 1072, 1448);
+	j.hdr.frame.subsampling = V4L2_JPEG_CHROMA_SUBSAMPLING_GRAY;
+	KUNIT_EXPECT_EQ(test, check(&j, V4L2_PIX_FMT_GREY, 1072, 1456), -EINVAL);
 }
 
 static struct kunit_case hantro_jpeg_dec_cases[] = {
@@ -740,6 +832,7 @@ static struct kunit_case hantro_jpeg_dec_cases[] = {
 	KUNIT_CASE(jpeg_dec_regs_restart),
 	KUNIT_CASE(jpeg_dec_regs_fill),
 	KUNIT_CASE(jpeg_dec_regs_frame),
+	KUNIT_CASE(jpeg_dec_grey),
 	{ }
 };
 

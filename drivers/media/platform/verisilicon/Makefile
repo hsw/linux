@@ -22,6 +22,9 @@ hantro-vpu-y += \
 		hantro_vp8.o \
 		hantro_vp9.o
 
+hantro-vpu-$(CONFIG_VIDEO_HANTRO_KUNIT_TEST) += \
+		hantro_jpeg_dec_test.o
+
 hantro-vpu-$(CONFIG_VIDEO_HANTRO_IMX8M) += \
 		imx8m_vpu_hw.o
 

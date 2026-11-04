@@ -21,6 +21,18 @@ config VIDEO_HANTRO
 	  To compile this driver as a module, choose M here: the module
 	  will be called hantro-vpu.
 
+config VIDEO_HANTRO_KUNIT_TEST
+	bool "KUnit tests for the Hantro JPEG decoder" if !KUNIT_ALL_TESTS
+	depends on VIDEO_HANTRO && KUNIT
+	depends on KUNIT=y || VIDEO_HANTRO=m
+	default KUNIT_ALL_TESTS
+	help
+	  Build the KUnit tests of the Hantro JPEG decoder's header checks
+	  into the driver. They need no hardware.
+
+	  This option is only useful for kernel developers working on the
+	  driver. If unsure, say N.
+
 config VIDEO_HANTRO_HEVC_RFC
 	bool "Use reference frame compression for HEVC"
 	depends on VIDEO_HANTRO

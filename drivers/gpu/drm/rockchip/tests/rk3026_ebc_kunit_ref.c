@@ -150,6 +150,16 @@ static u32 ref_bayer8(int x, int y)
 	       (a & 4) >> 1 | (b & 4) >> 2;
 }
 
+/* The 8x8 thresholds 4 b + 1 of the Bayer indices b, row-major. */
+void rk3026_ebc_ref_dither_thr(u8 *thr)
+{
+	int x, y;
+
+	for (y = 0; y < 8; y++)
+		for (x = 0; x < 8; x++)
+			thr[y * 8 + x] = 4 * ref_bayer8(x, y) + 1;
+}
+
 /*
  * The ordered-dither blit as a per-pixel loop: the grey, the luma as in
  * rk3026_ebc_ref_blit_rows() for @cpp 4 or the byte for @cpp 1, the

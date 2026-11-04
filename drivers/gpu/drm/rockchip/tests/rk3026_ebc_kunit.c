@@ -15317,6 +15317,151 @@ static void ebc_test_dither_ramp(struct kunit *test)
 	mutex_unlock(&ebc->image_lock);
 }
 
+#if IS_ENABLED(CONFIG_DRM_RK3026_EBC_NEON)
+/*
+ * rk3026_ebc_blit_rows_dither_neon() in the NEON section it needs, on the
+ * format and steps set for t_dither_rows(), with the thresholds of the
+ * reference.
+ */
+static void t_dither_neon(u8 *dst, const void *src, unsigned int src_pitch,
+			  int x1, int x2, int y1, int y2, unsigned int width)
+{
+	u8 thr[64];
+
+	rk3026_ebc_ref_dither_thr(thr);
+	scoped_ksimd()
+		rk3026_ebc_blit_rows_dither_neon(dst, src, src_pitch, x1, x2,
+						 y1, y2, width, thr,
+						 t_dither_cpp, t_dither_steps);
+}
+
+/*
+ * rk3026_ebc_blit_rows_dither_neon() writes the bytes of
+ * rk3026_ebc_blit_rows_dither(), to 16 levels and to black and white:
+ * every fixture, source set, pitch and clip, XRGB8888 and R8.
+ */
+static void ebc_test_dither_neon_rows(struct kunit *test)
+{
+	unsigned int i;
+
+	if (!t_neon_ready(test))
+		return;
+	for (i = 0; i < ARRAY_SIZE(t_dither_all_steps); i++) {
+		t_dither_steps = t_dither_all_steps[i];
+		t_dither_cpp = 4;
+		t_rows_sets(test, t_dither_neon, t_dither_rows);
+		t_dither_cpp = 1;
+		t_grey_sets(test, t_dither_neon, t_dither_rows);
+	}
+}
+
+/*
+ * The 16-px blocks, from every phase of the threshold row, and every tail
+ * of 0 to 14 px after 0 to 5 of them; odd R8 addresses too.
+ */
+static void ebc_test_dither_neon_tails(struct kunit *test)
+{
+	unsigned int i;
+
+	if (!t_neon_ready(test))
+		return;
+	for (i = 0; i < ARRAY_SIZE(t_dither_all_steps); i++) {
+		t_dither_steps = t_dither_all_steps[i];
+		t_dither_cpp = 4;
+		t_rows_tails(test, t_dither_neon, t_dither_rows);
+		t_dither_cpp = 1;
+		t_grey_tails(test, t_dither_neon, t_dither_rows);
+	}
+}
+#else
+/* No NEON rows: a skip. */
+static void ebc_test_dither_neon_rows(struct kunit *test)
+{
+	t_neon_ready(test);
+}
+
+static void ebc_test_dither_neon_tails(struct kunit *test)
+{
+	t_neon_ready(test);
+}
+#endif
+
+/* rk3026_ebc_blit_dither() as a row function, its answer dropped. */
+static void t_dither_convert(u8 *dst, const void *src, unsigned int src_pitch,
+			     int x1, int x2, int y1, int y2,
+			     unsigned int width)
+{
+	rk3026_ebc_blit_dither(dst, src, src_pitch, t_dither_cpp, x1, x2, y1,
+			       y2, width,
+			       t_dither_steps == 1 ? EBC_DITHER_Y1 :
+			       EBC_DITHER_Y4);
+}
+
+/*
+ * rk3026_ebc_blit_dither() writes the bytes of the reference on the band
+ * edges and below 16 px as ebc_test_blit_convert() checks it, XRGB8888 and
+ * R8, to 16 levels and to black and white, and says which rows ran: NEON
+ * from 16 px where it is built in, never below.
+ */
+static void ebc_test_dither_convert(struct kunit *test)
+{
+	static const struct t_fix f = { "48x200", 48, 200 };
+	static const struct {
+		int x1, x2, y1, y2;
+	} r[] = {
+		{ 0, 48, 0, 200 }, { 2, 46, 1, 130 }, { 0, 48, 63, 65 },
+		{ 4, 38, 5, 69 }, { 0, 48, 0, 64 }, { 0, 48, 0, 65 },
+		{ 0, 48, 64, 128 }, { 16, 32, 199, 200 }, { 0, 16, 0, 200 },
+		{ 2, 16, 0, 200 }, { 6, 8, 60, 70 }, { 6, 30, 3, 9 },
+	};
+	u8 *out = t_fix_img(test, &f);
+	u8 *ref = t_fix_img(test, &f);
+	u8 *xrgb = kunit_kmalloc(test, (size_t)f.w * 4 * f.h, GFP_KERNEL);
+	u8 *r8 = kunit_kmalloc(test, (size_t)(f.w + 1) * f.h, GFP_KERNEL);
+	struct rnd_state rs;
+	unsigned int i, k;
+
+	KUNIT_ASSERT_NOT_NULL(test, xrgb);
+	KUNIT_ASSERT_NOT_NULL(test, r8);
+	if (IS_ENABLED(CONFIG_DRM_RK3026_EBC_NEON) && !t_neon_ready(test))
+		return;
+	t_src_fill(xrgb, f.w * 4, &f, T_SRC_RANDOM, 79);
+	t_grey_fill(r8, f.w + 1, &f, T_GREY_RANDOM, 80);
+	prandom_seed_state(&rs, 7900);
+	for (k = 0; k < ARRAY_SIZE(t_dither_all_steps); k++) {
+		t_dither_steps = t_dither_all_steps[k];
+		for (i = 0; i < ARRAY_SIZE(r); i++) {
+			t_dither_cpp = 4;
+			if (!t_rows_vs_ref(test, &f, t_dither_convert,
+					   t_dither_ref, out, ref, xrgb,
+					   f.w * 4, r[i].x1, r[i].x2, r[i].y1,
+					   r[i].y2, &rs))
+				return;
+			t_dither_cpp = 1;
+			if (!t_rows_vs_ref(test, &f, t_dither_convert,
+					   t_dither_ref, out, ref, r8, f.w + 1,
+					   r[i].x1, r[i].x2, r[i].y1, r[i].y2,
+					   &rs))
+				return;
+		}
+	}
+
+	for (k = 1; k <= 4; k += 3) {
+		const u8 *src = k == 4 ? xrgb : r8;
+		unsigned int pitch = k == 4 ? f.w * 4 : f.w + 1;
+
+		KUNIT_EXPECT_EQ(test,
+				rk3026_ebc_blit_dither(out, src, pitch, k, 0,
+						       16, 0, 2, f.w,
+						       EBC_DITHER_Y4),
+				IS_ENABLED(CONFIG_DRM_RK3026_EBC_NEON));
+		KUNIT_EXPECT_FALSE(test,
+				   rk3026_ebc_blit_dither(out, src, pitch, k,
+							  0, 14, 0, 2, f.w,
+							  EBC_DITHER_Y1));
+	}
+}
+
 #if IS_ENABLED(CONFIG_DRM_RK3026_EBC_MXCFB)
 /*
  * An inverted mxcfb send's target on one source and every clip of @clips:
@@ -15440,6 +15585,9 @@ static struct kunit_case rk3026_ebc_conv_test_cases[] = {
 	KUNIT_CASE(ebc_test_dither_levels),
 	KUNIT_CASE(ebc_test_dither_tiling),
 	KUNIT_CASE(ebc_test_dither_ramp),
+	KUNIT_CASE(ebc_test_dither_neon_rows),
+	KUNIT_CASE(ebc_test_dither_neon_tails),
+	KUNIT_CASE(ebc_test_dither_convert),
 #if IS_ENABLED(CONFIG_DRM_RK3026_EBC_MXCFB)
 	KUNIT_CASE(ebc_test_mxcfb_invert),
 #endif

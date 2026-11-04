@@ -1366,7 +1366,7 @@ void rk3026_ebc_blit_rows_dither(u8 *dst, const void *src,
 				 unsigned int src_pitch, int x1, int x2,
 				 int y1, int y2, unsigned int width,
 				 unsigned int cpp, unsigned int steps);
-void rk3026_ebc_blit_dither(u8 *dst, const void *src, unsigned int src_pitch,
+bool rk3026_ebc_blit_dither(u8 *dst, const void *src, unsigned int src_pitch,
 			    unsigned int cpp, int x1, int x2, int y1, int y2,
 			    unsigned int width, enum rk3026_ebc_dither dither);
 

@@ -31,7 +31,8 @@
  * (rk3026_ebc_blit_dither(), enum rk3026_ebc_dither): the same 8-bit grey,
  * the luma or the R8 byte, spread over the 16 levels or over black and
  * white by an 8x8 threshold pattern. It costs a few operations more per
- * pixel, again the same for every page.
+ * pixel, again the same for every page, and takes NEON rows where the
+ * plain conversion does.
  */
 
 #include <linux/compiler.h>
@@ -190,6 +191,8 @@ typedef void ebc_neon_rows_fn(unsigned char *dst, const void *src,
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_blit_rows_neon);
 /* And the R8 rows of that unit. */
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_blit_r8_rows_neon);
+/* And the dither rows. */
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_blit_rows_dither_neon);
 
 /* The NEON rows are built in and this CPU can run them. */
 static bool ebc_neon_cpu(void)
@@ -505,6 +508,37 @@ void rk3026_ebc_blit_rows_dither(u8 *dst, const void *src,
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_blit_rows_dither);
 
+#if IS_ENABLED(CONFIG_DRM_RK3026_EBC_NEON)
+/* ebc_neon_bands() for the dither rows, @cpp bytes a pixel, @steps steps. */
+static bool ebc_dither_neon(u8 *dst, const void *src, unsigned int src_pitch,
+			    int x1, int x2, int y1, int y2, unsigned int width,
+			    unsigned int cpp, unsigned int steps)
+{
+	int y;
+
+	if (x2 - x1 < 16 || !ebc_neon_cpu() || !may_use_simd())
+		return false;
+
+	for (y = y1; y < y2; y += EBC_NEON_BAND_ROWS) {
+		int end = min(y + EBC_NEON_BAND_ROWS, y2);
+
+		scoped_ksimd()
+			rk3026_ebc_blit_rows_dither_neon(dst, src, src_pitch,
+							 x1, x2, y, end, width,
+							 &ebc_dither_t[0][0],
+							 cpp, steps);
+	}
+	return true;
+}
+#else
+static bool ebc_dither_neon(u8 *dst, const void *src, unsigned int src_pitch,
+			    int x1, int x2, int y1, int y2, unsigned int width,
+			    unsigned int cpp, unsigned int steps)
+{
+	return false;
+}
+#endif
+
 /**
  * rk3026_ebc_blit_dither - convert XRGB8888 or R8 rows with a dither
  * @dst: target image, @width / 2 bytes per row, low nibble first
@@ -519,17 +553,27 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_blit_rows_dither);
  * @dither: EBC_DITHER_Y4 or EBC_DITHER_Y1
  *
  * The dither on 15 steps for EBC_DITHER_Y4 and on one step for
- * EBC_DITHER_Y1 (rk3026_ebc_blit_rows_dither()). EBC_DITHER_NONE is the
- * caller's: it takes the plain conversion of its format.
+ * EBC_DITHER_Y1: rk3026_ebc_blit_rows_dither_neon() under the conditions
+ * of rk3026_ebc_blit_convert(), rk3026_ebc_blit_rows_dither() otherwise.
+ * Both write the same bytes, so the choice only changes the time.
+ * EBC_DITHER_NONE is the caller's: it takes the plain conversion of its
+ * format.
+ *
+ * Returns true if the NEON rows ran. For KUnit, which checks the choice;
+ * a caller needs no answer.
  */
-void rk3026_ebc_blit_dither(u8 *dst, const void *src, unsigned int src_pitch,
+bool rk3026_ebc_blit_dither(u8 *dst, const void *src, unsigned int src_pitch,
 			    unsigned int cpp, int x1, int x2, int y1, int y2,
 			    unsigned int width, enum rk3026_ebc_dither dither)
 {
 	unsigned int steps = dither == EBC_DITHER_Y1 ? 1 : 15;
 
+	if (ebc_dither_neon(dst, src, src_pitch, x1, x2, y1, y2, width, cpp,
+			    steps))
+		return true;
 	rk3026_ebc_blit_rows_dither(dst, src, src_pitch, x1, x2, y1, y2,
 				    width, cpp, steps);
+	return false;
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_blit_dither);
 
@@ -537,7 +581,8 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_blit_dither);
  * rk3026_ebc_blit_impl - the XRGB8888 conversion rk3026_ebc_blit() runs
  *
  * For the probe line and debugfs "timing", so a measured blit time says
- * which loop it is from. R8 takes NEON under the same conditions; C8
+ * which loop it is from. R8 and the dither of either format take NEON
+ * under the same conditions; C8
  * always takes the scalar table rows (rk3026_ebc_blit_c8_rows()),
  * whatever this says.
  *

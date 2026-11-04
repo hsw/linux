@@ -10,6 +10,7 @@
  *
  */
 
+#include <kunit/visibility.h>
 #include <linux/bitfield.h>
 #include <linux/unaligned.h>
 #include <media/v4l2-jpeg.h>
@@ -63,7 +64,7 @@ static int to_jpeg_mode(int subsampling)
 	}
 }
 
-static u32 to_pixelformat(int subsampling)
+VISIBLE_IF_KUNIT u32 hantro_g1_jpeg_dec_fourcc(int subsampling)
 {
 	switch (subsampling) {
 	case V4L2_JPEG_CHROMA_SUBSAMPLING_422:
@@ -222,132 +223,195 @@ static int stream_bit_offset(struct v4l2_jpeg_header *header)
 	return bit_ptr;
 }
 
+/* The decoder needs at least three macroblocks per side. */
+#define G1_JPEG_MIN_MBS		3
+/*
+ * Largest picture the decoder takes in one job, without slice mode: at most
+ * 8176 pixels per side and 4672x3504 pixels in total.
+ */
+#define G1_JPEG_MAX_DIM		8176
+#define G1_JPEG_MAX_PIXELS	(4672 * 3504)
+/* STREAM_LEN is 24 bits wide. */
+#define G1_JPEG_MAX_STREAM_LEN	0xffffff
+
+static int check_huffman_table(const struct v4l2_jpeg_reference *table,
+			       unsigned int max_values)
+{
+	unsigned int i;
+
+	if (!table->start || table->length < 16 + 1 ||
+	    table->length > 16 + max_values)
+		return -EINVAL;
+
+	/*
+	 * The code counts go to register fields as wide as a valid table
+	 * needs: at most 2^L - 1 codes of length L.
+	 */
+	for (i = 0; i < 7; i++)
+		if (table->start[i] >= BIT(i + 1))
+			return -EINVAL;
+
+	return 0;
+}
+
+/**
+ * hantro_g1_jpeg_dec_check() - check a parsed header against the hardware
+ * @hdr:	parsed header, with the default Huffman tables filled in
+ * @payload:	bytes of JPEG data in the OUTPUT buffer
+ * @fourcc:	CAPTURE pixel format
+ * @width:	CAPTURE width
+ * @height:	CAPTURE height
+ *
+ * Return: 0 if the decoder can decode the picture into the CAPTURE format,
+ * -EINVAL otherwise.
+ */
+VISIBLE_IF_KUNIT int hantro_g1_jpeg_dec_check(const struct v4l2_jpeg_header *hdr,
+					      size_t payload, u32 fourcc,
+					      u32 width, u32 height)
+{
+	const struct v4l2_jpeg_frame_header *frame = &hdr->frame;
+	const struct v4l2_jpeg_scan_header *scan = hdr->scan;
+	unsigned int i;
+
+	if (frame->precision != 8) {
+		vpu_debug(1, "unsupported precision %u\n", frame->precision);
+		return -EINVAL;
+	}
+
+	if (MB_WIDTH(frame->width) < G1_JPEG_MIN_MBS ||
+	    MB_HEIGHT(frame->height) < G1_JPEG_MIN_MBS ||
+	    frame->width > G1_JPEG_MAX_DIM || frame->height > G1_JPEG_MAX_DIM ||
+	    frame->width * frame->height > G1_JPEG_MAX_PIXELS) {
+		vpu_debug(1, "unsupported size %ux%u\n",
+			  frame->width, frame->height);
+		return -EINVAL;
+	}
+
+	/*
+	 * The decoder writes whole macroblocks: the CAPTURE size is the
+	 * picture size rounded up to them.
+	 */
+	if (!IS_ALIGNED(width, MB_DIM) || !IS_ALIGNED(height, MB_DIM) ||
+	    MB_WIDTH(frame->width) != MB_WIDTH(width) ||
+	    MB_HEIGHT(frame->height) != MB_HEIGHT(height)) {
+		vpu_debug(1, "size %ux%u does not match the CAPTURE %ux%u\n",
+			  frame->width, frame->height, width, height);
+		return -EINVAL;
+	}
+
+	if (frame->num_components != 3 ||
+	    hantro_g1_jpeg_dec_fourcc(frame->subsampling) != fourcc) {
+		vpu_debug(1, "%u components, subsampling %d: not %p4cc\n",
+			  frame->num_components, frame->subsampling, &fourcc);
+		return -EINVAL;
+	}
+
+	/* One interleaved scan with all the components, in frame order. */
+	if (scan->num_components != frame->num_components) {
+		vpu_debug(1, "non-interleaved scan\n");
+		return -EINVAL;
+	}
+
+	for (i = 0; i < frame->num_components; i++) {
+		const struct v4l2_jpeg_frame_component_spec *fc = &frame->component[i];
+		const struct v4l2_jpeg_scan_component_spec *sc = &scan->component[i];
+		u8 tq = fc->quantization_table_selector;
+		u8 td = sc->dc_entropy_coding_table_selector;
+		u8 ta = sc->ac_entropy_coding_table_selector;
+
+		if (sc->component_selector != fc->component_identifier) {
+			vpu_debug(1, "scan component %u out of order\n", i);
+			return -EINVAL;
+		}
+
+		if (tq >= V4L2_JPEG_MAX_TABLES ||
+		    !hdr->quantization_tables[tq].start ||
+		    hdr->quantization_tables[tq].length != JPEG_QUANT_SIZE) {
+			vpu_debug(1, "component %u: no 8-bit quantization table %u\n",
+				  i, tq);
+			return -EINVAL;
+		}
+
+		if (td > 1 || ta > 1 ||
+		    check_huffman_table(&hdr->huffman_tables[td],
+					HANTRO_JPEG_DEC_DC_SIZE) ||
+		    check_huffman_table(&hdr->huffman_tables[2 + ta],
+					HANTRO_JPEG_DEC_AC_SIZE)) {
+			vpu_debug(1, "component %u: bad Huffman table DC%u/AC%u\n",
+				  i, td, ta);
+			return -EINVAL;
+		}
+	}
+
+	if (hdr->ecs_offset >= payload ||
+	    payload - ALIGN_DOWN(hdr->ecs_offset, 8) > G1_JPEG_MAX_STREAM_LEN) {
+		vpu_debug(1, "entropy-coded data at %zu of %zu bytes\n",
+			  hdr->ecs_offset, payload);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
 int hantro_g1_jpeg_dec_run(struct hantro_ctx *ctx)
 {
 	struct hantro_dev *vpu = ctx->dev;
 	struct vb2_v4l2_buffer *src_buf, *dst_buf;
 	size_t height = ctx->dst_fmt.height;
 	size_t width = ctx->dst_fmt.width;
-	struct v4l2_jpeg_scan_header scan_header;
-	struct v4l2_jpeg_reference quantization_tables[4] = { };
-	struct v4l2_jpeg_reference huffman_tables[4] = { };
-	struct v4l2_jpeg_header header;
+	struct v4l2_jpeg_scan_header scan_header = { };
+	struct v4l2_jpeg_reference quantization_tables[V4L2_JPEG_MAX_TABLES] = { };
+	struct v4l2_jpeg_reference huffman_tables[V4L2_JPEG_MAX_TABLES] = { };
+	struct v4l2_jpeg_header header = {
+		.scan = &scan_header,
+		.quantization_tables = quantization_tables,
+		.huffman_tables = huffman_tables,
+	};
 	u32 mb_width, mb_height;
-	u32 dst_pixelformat;
 	u32 jpeg_size;
+	void *vaddr;
 	u32 reg;
 	int ret;
-	u32 i;
-
-	hantro_start_prepare_run(ctx);
 
 	src_buf = hantro_get_src_buf(ctx);
 	dst_buf = hantro_get_dst_buf(ctx);
 
+	/*
+	 * Everything that can fail is checked before the job is prepared:
+	 * a failing ->run() must not leave the watchdog armed.
+	 */
+	vaddr = vb2_plane_vaddr(&src_buf->vb2_buf, 0);
+	if (!vaddr)
+		return -EFAULT;
+
 	jpeg_size = vb2_get_plane_payload(&src_buf->vb2_buf, 0);
 
-	memset(&header, 0, sizeof(header));
-	header.scan = &scan_header;
-	header.quantization_tables = quantization_tables;
-	header.huffman_tables = huffman_tables;
-
-	ret = v4l2_jpeg_parse_header(vb2_plane_vaddr(&src_buf->vb2_buf, 0),
-				     jpeg_size,
-				     &header);
+	ret = v4l2_jpeg_parse_header(vaddr, jpeg_size, &header);
 	if (ret < 0) {
-		dev_err(vpu->dev, "Error parsing JPEG stream markers\n");
-		hantro_end_prepare_run(ctx);
+		vpu_debug(1, "cannot parse the JPEG header: %d\n", ret);
 		return ret;
 	}
 
-	/* Check JPEG width/height */
-	if (header.frame.width != width ||
-	    MB_HEIGHT(header.frame.height) != MB_HEIGHT(height)) {
-		dev_err(vpu->dev,
-			"Resolution mismatch: %dx%d (JPEG) versus %zux%zu (user)",
-			header.frame.width, header.frame.height, width, height);
-		hantro_end_prepare_run(ctx);
-		return -EINVAL;
-	}
+	hantro_jpeg_get_default_huffman_tables(header.huffman_tables);
 
-	/* Check JPEG number of components */
-	if (header.frame.num_components > V4L2_JPEG_MAX_COMPONENTS) {
-		dev_err(vpu->dev, "JPEG number of components should be <=%d",
-			V4L2_JPEG_MAX_COMPONENTS);
-		hantro_end_prepare_run(ctx);
-		return -EINVAL;
-	}
-
-	/* Check JPEG quantization tables */
-	if (header.quantization_tables[3].start) {
-		dev_err(vpu->dev, "Maximum 3 quantization tables are supported\n");
-		hantro_end_prepare_run(ctx);
-		return -EINVAL;
-	}
-
-	for (i = 0; i < 3; i++) {
-		if (!header.quantization_tables[i].start)
-			continue;
-
-		if (header.quantization_tables[i].length != JPEG_QUANT_SIZE) {
-			dev_err(vpu->dev, "Only 8-bit quantization tables supported\n");
-			hantro_end_prepare_run(ctx);
-			return -EINVAL;
-		}
-	}
-
-	/* Check JPEG huffman tables */
-	if (!header.num_dht)
-		hantro_jpeg_get_default_huffman_tables(header.huffman_tables);
-
-	for (i = 0; i < 4; i++) {
-		if (!header.huffman_tables[i].start) {
-			dev_err(vpu->dev, "Missing Huffman[%d] table\n", i);
-			hantro_end_prepare_run(ctx);
-			return -EINVAL;
-		}
-		/* AC tables should be between 17 -> 178, DC between 17 -> 28 */
-		if (header.huffman_tables[i].length < 17 ||
-		    header.huffman_tables[i].length > 178 ||
-		    ((i & 2) == 0 && header.huffman_tables[i].length > 28)) {
-			dev_err(vpu->dev,
-				"invalid Huffman table %d length: %zu\n",
-				i, header.huffman_tables[i].length);
-			hantro_end_prepare_run(ctx);
-			return -EINVAL;
-		}
-	}
-
-	/* Check destination pixel format match with JPEG subsampling */
-	dst_pixelformat = to_pixelformat(header.frame.subsampling);
-	if (!dst_pixelformat) {
-		dev_err(vpu->dev, "Unsupported JPEG subsampling (%d)\n",
-			header.frame.subsampling);
-		hantro_end_prepare_run(ctx);
-		return -EINVAL;
-	}
-
-	if (dst_pixelformat != ctx->dst_fmt.pixelformat) {
-		dev_err(vpu->dev, "Decoder pixel format mismatch (expected %4.4s but got %4.4s)\n",
-			(char *)&dst_pixelformat, (char *)&ctx->dst_fmt.pixelformat);
-		hantro_end_prepare_run(ctx);
-		return -EINVAL;
-	}
+	ret = hantro_g1_jpeg_dec_check(&header, jpeg_size,
+				       ctx->dst_fmt.pixelformat, width, height);
+	if (ret)
+		return ret;
 
 	/* Write VLC table code lengths */
 	ret = write_vlc_code_lengths(ctx, &header);
-	if (ret) {
-		hantro_end_prepare_run(ctx);
+	if (ret)
 		return ret;
-	}
 
 	/* Prepare VLC QP/AC/DC hardware tables */
 	ret = hantro_jpeg_prepare_vlc_hw_table(&header, ctx->jpeg_dec.priv.cpu);
 	if (ret) {
-		dev_err(vpu->dev, "Error when preparing VLC table");
-		hantro_end_prepare_run(ctx);
+		vpu_debug(1, "cannot build the hardware tables: %d\n", ret);
 		return ret;
 	}
+
+	hantro_start_prepare_run(ctx);
 
 	reg = G1_REG_DEC_CTRL0_DEC_MODE(3) |
 	      G1_REG_DEC_CTRL0_FILTERING_DIS;

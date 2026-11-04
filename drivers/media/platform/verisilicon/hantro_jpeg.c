@@ -246,21 +246,41 @@ void hantro_jpeg_header_assemble(struct hantro_jpeg_ctx *ctx)
 	jpeg_set_quality(ctx);
 }
 
+/**
+ * hantro_jpeg_get_default_huffman_tables() - fill in missing Huffman tables
+ * @huffman_tables: the DC0, DC1, AC0, AC1 tables of a parsed header
+ *
+ * A JPEG stream may omit Huffman tables (Motion JPEG frames usually do);
+ * the tables of ITU-T T.81 Annex K.3 then apply, the luminance ones to
+ * table 0 and the chrominance ones to table 1. Fill every table the stream
+ * did not define.
+ */
 void hantro_jpeg_get_default_huffman_tables(struct v4l2_jpeg_reference *huffman_tables)
 {
-	huffman_tables[0].start = (u8 *)v4l2_jpeg_ref_table_luma_dc_ht;
-	huffman_tables[0].length = V4L2_JPEG_REF_HT_DC_LEN;
-	huffman_tables[1].start = (u8 *)v4l2_jpeg_ref_table_chroma_dc_ht;
-	huffman_tables[1].length = V4L2_JPEG_REF_HT_DC_LEN;
-	huffman_tables[2].start = (u8 *)v4l2_jpeg_ref_table_luma_ac_ht;
-	huffman_tables[2].length = V4L2_JPEG_REF_HT_AC_LEN;
-	huffman_tables[3].start = (u8 *)v4l2_jpeg_ref_table_chroma_ac_ht;
-	huffman_tables[3].length = V4L2_JPEG_REF_HT_AC_LEN;
+	static const struct {
+		const u8 *table;
+		size_t length;
+	} defaults[V4L2_JPEG_MAX_TABLES] = {
+		{ v4l2_jpeg_ref_table_luma_dc_ht, V4L2_JPEG_REF_HT_DC_LEN },
+		{ v4l2_jpeg_ref_table_chroma_dc_ht, V4L2_JPEG_REF_HT_DC_LEN },
+		{ v4l2_jpeg_ref_table_luma_ac_ht, V4L2_JPEG_REF_HT_AC_LEN },
+		{ v4l2_jpeg_ref_table_chroma_ac_ht, V4L2_JPEG_REF_HT_AC_LEN },
+	};
+	unsigned int i;
+
+	for (i = 0; i < V4L2_JPEG_MAX_TABLES; i++) {
+		if (huffman_tables[i].start)
+			continue;
+
+		/* Read only: v4l2_jpeg_reference has no const variant. */
+		huffman_tables[i].start = (u8 *)defaults[i].table;
+		huffman_tables[i].length = defaults[i].length;
+	}
 }
 
 #define JPEG_HUFFVAL_OFF 16
-#define JPEG_AC_SIZE 162
-#define JPEG_DC_SIZE 12
+#define JPEG_AC_SIZE HANTRO_JPEG_DEC_AC_SIZE
+#define JPEG_DC_SIZE HANTRO_JPEG_DEC_DC_SIZE
 
 /* Decoder VLC hardware table */
 struct hantro_jpeg_vlc_hw_table {

@@ -266,10 +266,22 @@ struct hantro_vp9_dec_hw_ctx {
 /**
  * struct hantro_jpeg_dec_hw_ctx
  * @priv:	Quantization and Huffman table buffer for the hardware
+ * @huffman:	the DC0, DC1, AC0 and AC1 Huffman tables (16 code counts and
+ *		up to 162 values) of the current job, copied from the stream
  */
 struct hantro_jpeg_dec_hw_ctx {
 	struct hantro_aux_buf priv;
+	u8 huffman[4][16 + 162];
 };
+
+/*
+ * Largest picture the G1 JPEG decoder takes in one job, without slice mode:
+ * at most 8176 pixels per side and 4672x3504 pixels in total.
+ */
+#define HANTRO_G1_JPEG_DEC_MAX_SIZE	8176
+#define HANTRO_G1_JPEG_DEC_MAX_PIXELS	(4672 * 3504)
+/* STREAM_LEN, the bytes of entropy-coded data, is 24 bits wide. */
+#define HANTRO_G1_JPEG_DEC_MAX_STREAM	0xffffff
 
 /**
  * struct hantro_av1_dec_ctrls

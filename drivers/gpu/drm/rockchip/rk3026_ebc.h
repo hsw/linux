@@ -240,6 +240,19 @@ enum rk3026_ebc_wait_for {
 	EBC_WAIT_TAKE,		/* rk3026_ebc_seq_taken() */
 };
 
+/*
+ * How rk3026_ebc_blit() turns an 8-bit grey into the panel's 16 levels.
+ * NONE is the plain conversion of the source format, as every update had
+ * before the dithered one; Y4 and Y1 dither the grey in an 8x8 ordered
+ * pattern to the 16 levels or to black and white (rk3026_ebc_blit_dither()).
+ * Only an mxcfb send asks for a dither (EPDC_FLAG_USE_DITHERING_Y1 / _Y4).
+ */
+enum rk3026_ebc_dither {
+	EBC_DITHER_NONE,
+	EBC_DITHER_Y4,
+	EBC_DITHER_Y1,
+};
+
 /* What became of one part (the updates one scan takes). */
 enum rk3026_ebc_outcome {
 	EBC_OUTCOME_NONE,	/* nothing taken yet */
@@ -1274,7 +1287,7 @@ static inline struct rk3026_ebc *drm_to_ebc(struct drm_device *drm)
 /* rk3026_ebc.c */
 u32 rk3026_ebc_blit(struct rk3026_ebc *ebc, const void *src,
 		    unsigned int src_pitch, u32 format,
-		    const struct drm_rect *clip);
+		    const struct drm_rect *clip, enum rk3026_ebc_dither dither);
 u32 rk3026_ebc_add_update(struct rk3026_ebc *ebc,
 			  const struct rk3026_ebc_update *upd);
 int rk3026_ebc_wait_marker(struct rk3026_ebc *ebc, u32 marker,
@@ -1348,6 +1361,13 @@ void rk3026_ebc_blit_c8_rows(u8 *dst, const void *src, unsigned int src_pitch,
 			     int x1, int x2, int y1, int y2,
 			     unsigned int width, const u8 *levels);
 u8 rk3026_ebc_palette_level(u16 red, u16 green, u16 blue);
+void rk3026_ebc_blit_rows_dither(u8 *dst, const void *src,
+				 unsigned int src_pitch, int x1, int x2,
+				 int y1, int y2, unsigned int width,
+				 unsigned int cpp, unsigned int steps);
+void rk3026_ebc_blit_dither(u8 *dst, const void *src, unsigned int src_pitch,
+			    unsigned int cpp, int x1, int x2, int y1, int y2,
+			    unsigned int width, enum rk3026_ebc_dither dither);
 
 /**
  * rk3026_ebc_grey_level - the panel level of an 8-bit grey

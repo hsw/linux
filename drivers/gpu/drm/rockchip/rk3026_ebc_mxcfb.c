@@ -286,7 +286,7 @@ VISIBLE_IF_KUNIT int rk3026_ebc_mxcfb_send(struct rk3026_ebc *ebc,
 	/* A RESET discards the pixels: rk3026_ebc_add_update() whitens them. */
 	if (upd.mode != EBC_MODE_RESET) {
 		upd.blit_us = rk3026_ebc_blit(ebc, src, pitch, blit_format,
-					      &clip);
+					      &clip, EBC_DITHER_NONE);
 		if (req->flags & EPDC_FLAG_ENABLE_INVERSION)
 			rk3026_ebc_mxcfb_invert(ebc->next_shadow, &clip,
 						ebc->width, ebc->height);

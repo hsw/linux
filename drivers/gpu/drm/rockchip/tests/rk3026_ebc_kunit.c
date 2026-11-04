@@ -8996,14 +8996,15 @@ static void ebc_test_glue_blit_time(struct kunit *test)
 	KUNIT_EXPECT_STREQ(test, rk3026_ebc_blit_impl(), t_blit_impl());
 
 	mutex_lock(&ebc->image_lock);
-	us = rk3026_ebc_blit(ebc, black, T_W * 4, DRM_FORMAT_XRGB8888, &off);
+	us = rk3026_ebc_blit(ebc, black, T_W * 4, DRM_FORMAT_XRGB8888, &off,
+			     EBC_DITHER_NONE);
 	mutex_unlock(&ebc->image_lock);
 	KUNIT_EXPECT_EQ(test, us, 0);
 	t_expect_white(test, ebc->next_shadow);
 
 	mutex_lock(&ebc->image_lock);
 	us = rk3026_ebc_blit(ebc, black, T_W * 4, DRM_FORMAT_XRGB8888,
-			     &t_panel);
+			     &t_panel, EBC_DITHER_NONE);
 	mutex_unlock(&ebc->image_lock);
 	KUNIT_EXPECT_GE(test, us, 1);
 
@@ -9680,7 +9681,8 @@ static void ebc_test_glue_palette_swap(struct kunit *test)
 	KUNIT_EXPECT_NE(test, started, 0);
 	msleep(20);
 	KUNIT_EXPECT_TRUE(test, work_busy(&w->work) & WORK_BUSY_RUNNING);
-	rk3026_ebc_blit(ebc, fb, T_W, DRM_FORMAT_C8, &t_panel);
+	rk3026_ebc_blit(ebc, fb, T_W, DRM_FORMAT_C8, &t_panel,
+			EBC_DITHER_NONE);
 	mutex_unlock(&ebc->image_lock);
 	t_expect_c8_img(test, ebc->next_shadow, fb, T_W, old_levels);
 
@@ -14056,10 +14058,14 @@ static const struct t_src_set t_xrgb_srcs = {
 	.fill = t_src_fill,
 };
 
-/* A plane format, the per-pixel reference of its conversion. */
+/*
+ * A plane format, the per-pixel reference of its conversion, and the
+ * dither rk3026_ebc_blit() is asked for (none unless set).
+ */
 struct t_blit_fmt {
 	u32 format;
 	t_rows_fn *ref_rows;
+	enum rk3026_ebc_dither dither;
 };
 
 static const struct t_blit_fmt t_blit_xrgb = {
@@ -14100,7 +14106,8 @@ static bool t_ref_blit_src(struct kunit *test, const struct t_fix *f,
 			run->fmt->ref_rows(ref, src, pitch, w.x1, w.x2, w.y1,
 					   w.y2, f->w);
 		mutex_lock(&ebc->image_lock);
-		rk3026_ebc_blit(ebc, src, pitch, run->fmt->format, r);
+		rk3026_ebc_blit(ebc, src, pitch, run->fmt->format, r,
+				run->fmt->dither);
 		mutex_unlock(&ebc->image_lock);
 		diff = t_fix_diff(f, ref, out);
 		if (diff != INT_MAX) {
@@ -14755,6 +14762,355 @@ static void ebc_test_palette_levels(struct kunit *test)
 	}
 }
 
+/*
+ * The dither rows and their reference as t_rows_fn, on the source format
+ * (bytes a pixel) and the steps set here; KUnit runs one case at a time.
+ */
+static unsigned int t_dither_cpp, t_dither_steps;
+
+static void t_dither_rows(u8 *dst, const void *src, unsigned int src_pitch,
+			  int x1, int x2, int y1, int y2, unsigned int width)
+{
+	rk3026_ebc_blit_rows_dither(dst, src, src_pitch, x1, x2, y1, y2,
+				    width, t_dither_cpp, t_dither_steps);
+}
+
+static void t_dither_ref(u8 *dst, const void *src, unsigned int src_pitch,
+			 int x1, int x2, int y1, int y2, unsigned int width)
+{
+	rk3026_ebc_ref_blit_rows_dither(dst, src, src_pitch, x1, x2, y1, y2,
+					width, t_dither_cpp, t_dither_steps);
+}
+
+/* The steps of EBC_DITHER_Y4 and EBC_DITHER_Y1. */
+static const unsigned int t_dither_all_steps[] = { 15, 1 };
+
+/*
+ * rk3026_ebc_blit_rows_dither() writes the bytes of the per-pixel
+ * reference, to 16 levels and to black and white: every fixture, source
+ * set, pitch and clip, XRGB8888 and R8.
+ */
+static void ebc_test_dither_rows(struct kunit *test)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(t_dither_all_steps); i++) {
+		t_dither_steps = t_dither_all_steps[i];
+		t_dither_cpp = 4;
+		t_rows_sets(test, t_dither_rows, t_dither_ref);
+		t_dither_cpp = 1;
+		t_grey_sets(test, t_dither_rows, t_dither_ref);
+	}
+}
+
+/* The dither rows' 4-px stores and 2-px tail from every start. */
+static void ebc_test_dither_rows_tails(struct kunit *test)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(t_dither_all_steps); i++) {
+		t_dither_steps = t_dither_all_steps[i];
+		t_dither_cpp = 4;
+		t_rows_tails(test, t_dither_rows, t_dither_ref);
+		t_dither_cpp = 1;
+		t_grey_tails(test, t_dither_rows, t_dither_ref);
+	}
+}
+
+/*
+ * rk3026_ebc_blit() with EBC_DITHER_Y4 and EBC_DITHER_Y1 widens and clamps
+ * the clip and writes the bytes of the dither's reference, XRGB8888 and R8,
+ * on every fixture, source set, pitch and clip.
+ */
+static void ebc_test_ref_blit_dither(struct kunit *test)
+{
+	static const enum rk3026_ebc_dither d[] = {
+		EBC_DITHER_Y4, EBC_DITHER_Y1,
+	};
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(d); i++) {
+		struct t_blit_fmt xrgb = {
+			DRM_FORMAT_XRGB8888, t_dither_ref, d[i],
+		};
+		struct t_blit_fmt r8 = { DRM_FORMAT_R8, t_dither_ref, d[i] };
+
+		t_dither_steps = d[i] == EBC_DITHER_Y1 ? 1 : 15;
+		t_dither_cpp = 4;
+		t_blit_sets(test, &t_xrgb_srcs, &xrgb);
+		t_dither_cpp = 1;
+		t_blit_sets(test, &t_grey_srcs, &r8);
+	}
+}
+
+/*
+ * A 16x16 image of grey @g, @cpp bytes a pixel, four tiles of the matrix,
+ * dithered on @steps steps: only the two levels around @g * @steps / 255,
+ * every tile alike, the upper one on f * 64 / 255 cells of a tile to within
+ * half a cell, f = @g * @steps mod 255; with f = 0 the bytes of the plain
+ * conversion of the format. False after the first failure.
+ */
+static bool t_dither_flat(struct kunit *test, u8 *src, unsigned int cpp,
+			  unsigned int g, unsigned int steps)
+{
+	static const struct t_fix sq = { "16x16", 16, 16 };
+	unsigned int lo = g * steps / 255, f = g * steps % 255;
+	u8 nlo = lo * (15 / steps), nhi = min(lo + 1, steps) * (15 / steps);
+	unsigned int tile[4] = {}, i;
+	u8 out[16 * 8], plain[16 * 8];
+	int x, y;
+
+	for (i = 0; i < 16 * 16; i++) {
+		if (cpp == 4)
+			put_unaligned_le32((i * 37 & 0xff) << 24 |
+					   g * 0x010101, src + i * 4);
+		else
+			src[i] = g;
+	}
+	rk3026_ebc_blit_rows_dither(out, src, 16 * cpp, 0, 16, 0, 16, 16, cpp,
+				    steps);
+	if (cpp == 4)
+		rk3026_ebc_blit_rows(plain, src, 16 * 4, 0, 16, 0, 16, 16);
+	else
+		rk3026_ebc_blit_r8_rows(plain, src, 16, 0, 16, 0, 16, 16);
+
+	for (y = 0; y < 16; y++) {
+		for (x = 0; x < 16; x++) {
+			u8 n = t_px_w(out, &sq, x, y);
+
+			if (n == nhi && n != nlo) {
+				tile[y / 8 * 2 + x / 8]++;
+			} else if (n != nlo) {
+				KUNIT_FAIL(test, "cpp %u steps %u grey %u (%d, %d): %u, not %u/%u",
+					   cpp, steps, g, x, y, n, nlo, nhi);
+				return false;
+			}
+		}
+	}
+	for (i = 1; i < 4; i++) {
+		if (tile[i] != tile[0]) {
+			KUNIT_FAIL(test, "cpp %u steps %u grey %u: tile %u has %u, tile 0 %u",
+				   cpp, steps, g, i, tile[i], tile[0]);
+			return false;
+		}
+	}
+	if (abs((int)(255 * tile[0]) - (int)(64 * f)) > 127) {
+		KUNIT_FAIL(test, "cpp %u steps %u grey %u: %u upper cells, f %u",
+			   cpp, steps, g, tile[0], f);
+		return false;
+	}
+	if (!f && memcmp(out, plain, sizeof(out))) {
+		KUNIT_FAIL(test, "cpp %u steps %u grey %u: not the plain bytes",
+			   cpp, steps, g);
+		return false;
+	}
+	return true;
+}
+
+/*
+ * Every grey, dithered to the 16 levels and to black and white, from
+ * XRGB8888 and from R8: Y4 draws the two levels around it and Y1 black and
+ * white, in proportions that keep the mean grey, the same in every 8x8
+ * tile; the grey of a level (17 n for Y4, 0 and 255 for Y1) is drawn flat,
+ * as the plain conversion draws it. The X byte plays no part.
+ */
+static void ebc_test_dither_levels(struct kunit *test)
+{
+	u8 *src = kunit_kmalloc(test, 16 * 16 * 4, GFP_KERNEL);
+	unsigned int g, cpp;
+
+	KUNIT_ASSERT_NOT_NULL(test, src);
+	for (cpp = 1; cpp <= 4; cpp += 3)
+		for (g = 0; g < 256; g++)
+			if (!t_dither_flat(test, src, cpp, g, 15) ||
+			    !t_dither_flat(test, src, cpp, g, 1))
+				return;
+}
+
+/* A bare controller for rk3026_ebc_blit() on fixture @f into @img. */
+static struct rk3026_ebc *t_blit_ebc(struct kunit *test,
+				     const struct t_fix *f, u8 *img)
+{
+	struct rk3026_ebc *ebc = kunit_kzalloc(test, sizeof(*ebc), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, ebc);
+	mutex_init(&ebc->image_lock);
+	ebc->width = f->w;
+	ebc->height = f->h;
+	ebc->next_shadow = img;
+	return ebc;
+}
+
+/*
+ * The pattern is anchored to the image: a 64x16 image converted at once
+ * and as a grid of updates with odd edges (each widened to whole bytes,
+ * so neighbours overlap by a column) gives the same bytes, for Y4 and Y1,
+ * from XRGB8888 and from R8.
+ */
+static void ebc_test_dither_tiling(struct kunit *test)
+{
+	static const struct t_fix f = { "64x16", 64, 16 };
+	static const int xs[] = { 0, 3, 13, 30, 47, 64 };
+	static const int ys[] = { 0, 5, 11, 16 };
+	static const struct {
+		u32 format;
+		unsigned int cpp;
+		void (*fill)(u8 *src, unsigned int src_pitch,
+			     const struct t_fix *f, unsigned int kind,
+			     u32 seed);
+		unsigned int kind;
+	} fmt[] = {
+		{ DRM_FORMAT_XRGB8888, 4, t_src_fill, T_SRC_RANDOM },
+		{ DRM_FORMAT_R8, 1, t_grey_fill, T_GREY_RANDOM },
+	};
+	u8 *whole = t_fix_img(test, &f);
+	struct rk3026_ebc *ebc = t_blit_ebc(test, &f, t_fix_img(test, &f));
+	u8 *src = kunit_kmalloc(test, (size_t)f.w * 4 * f.h, GFP_KERNEL);
+	const struct drm_rect all = DRM_RECT_INIT(0, 0, f.w, f.h);
+	unsigned int dither, k, i, j;
+
+	KUNIT_ASSERT_NOT_NULL(test, src);
+	for (k = 0; k < ARRAY_SIZE(fmt); k++) {
+		unsigned int pitch = f.w * fmt[k].cpp;
+
+		fmt[k].fill(src, pitch, &f, fmt[k].kind, 5);
+		for (dither = EBC_DITHER_Y4; dither <= EBC_DITHER_Y1;
+		     dither++) {
+			mutex_lock(&ebc->image_lock);
+			memset(ebc->next_shadow, 0x5a, t_fix_size(&f));
+			rk3026_ebc_blit(ebc, src, pitch, fmt[k].format, &all,
+					dither);
+			memcpy(whole, ebc->next_shadow, t_fix_size(&f));
+			memset(ebc->next_shadow, 0xa5, t_fix_size(&f));
+			for (j = 0; j + 1 < ARRAY_SIZE(ys); j++) {
+				for (i = 0; i + 1 < ARRAY_SIZE(xs); i++) {
+					struct drm_rect r = {
+						.x1 = xs[i], .x2 = xs[i + 1],
+						.y1 = ys[j], .y2 = ys[j + 1],
+					};
+
+					rk3026_ebc_blit(ebc, src, pitch,
+							fmt[k].format, &r,
+							dither);
+				}
+			}
+			mutex_unlock(&ebc->image_lock);
+			KUNIT_EXPECT_EQ_MSG(test,
+					    t_fix_diff(&f, whole,
+						       ebc->next_shadow),
+					    INT_MAX, "cpp %u dither %u",
+					    fmt[k].cpp, dither);
+		}
+	}
+}
+
+/*
+ * The bytes of a 16x8 ramp, grey 16 x + 8 in column x, dithered to the 16
+ * levels (Y4) and to black and white (Y1): worked out by hand from the
+ * 8x8 Bayer matrix, not by the reference, so a change of the matrix or of
+ * the threshold rule shows here even if both the driver and the reference
+ * change.
+ */
+static const u8 t_dither_ramp_y4[8][8] = {
+	{ 0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdb, 0xfd },
+	{ 0x11, 0x33, 0x55, 0x77, 0x98, 0xba, 0xcc, 0xfe },
+	{ 0x20, 0x32, 0x54, 0x76, 0x98, 0xb9, 0xdb, 0xfd },
+	{ 0x11, 0x33, 0x55, 0x76, 0x98, 0xba, 0xdc, 0xee },
+	{ 0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdb, 0xfd },
+	{ 0x11, 0x33, 0x55, 0x77, 0x98, 0xba, 0xcc, 0xee },
+	{ 0x20, 0x32, 0x54, 0x76, 0x98, 0xb9, 0xdb, 0xfd },
+	{ 0x11, 0x33, 0x55, 0x76, 0x98, 0xba, 0xdc, 0xee },
+};
+
+static const u8 t_dither_ramp_y1[8][8] = {
+	{ 0x00, 0x00, 0x00, 0xf0, 0xf0, 0xf0, 0xf0, 0xff },
+	{ 0x00, 0x0f, 0x0f, 0x0f, 0x0f, 0xff, 0xff, 0xff },
+	{ 0x00, 0x00, 0xf0, 0xf0, 0xf0, 0xf0, 0xff, 0xff },
+	{ 0x00, 0x00, 0x0f, 0x0f, 0xff, 0xff, 0xff, 0xff },
+	{ 0x00, 0x00, 0x00, 0xf0, 0xf0, 0xf0, 0xf0, 0xff },
+	{ 0x00, 0x0f, 0x0f, 0x0f, 0x0f, 0xff, 0xff, 0xff },
+	{ 0x00, 0x00, 0xf0, 0xf0, 0xf0, 0xf0, 0xf0, 0xf0 },
+	{ 0x0f, 0x0f, 0x0f, 0x0f, 0xff, 0xff, 0xff, 0xff },
+};
+
+/*
+ * rk3026_ebc_blit() of the ramp, repeated every 16 columns, gives those
+ * bytes from R8 and from XRGB8888 (R = G = B, whose luma is the grey
+ * itself, whatever X), at the image's origin and one ramp and one tile
+ * further, at (16, 8); C8 takes no dither, so a dithered C8 blit writes
+ * the plain one's bytes.
+ */
+static void ebc_test_dither_ramp(struct kunit *test)
+{
+	static const struct t_fix f = { "32x16", 32, 16 };
+	u8 *img = t_fix_img(test, &f);
+	struct rk3026_ebc *ebc = t_blit_ebc(test, &f, img);
+	u8 *r8 = kunit_kzalloc(test, f.w * f.h, GFP_KERNEL);
+	u8 *xrgb = kunit_kzalloc(test, f.w * 4 * f.h, GFP_KERNEL);
+	u8 *plain = t_fix_img(test, &f);
+	const struct drm_rect all = DRM_RECT_INIT(0, 0, f.w, f.h);
+	unsigned int dither, k;
+	int x, y, ox, oy;
+
+	KUNIT_ASSERT_NOT_NULL(test, r8);
+	KUNIT_ASSERT_NOT_NULL(test, xrgb);
+	for (y = 0; y < f.h; y++) {
+		for (x = 0; x < f.w; x++) {
+			u8 g = 16 * (x % 16) + 8;
+
+			r8[y * f.w + x] = g;
+			put_unaligned_le32((x * 59 & 0xff) << 24 |
+					   g * 0x010101,
+					   xrgb + (y * f.w + x) * 4);
+		}
+	}
+	for (dither = EBC_DITHER_Y4; dither <= EBC_DITHER_Y1; dither++) {
+		const u8 (*want)[8] = dither == EBC_DITHER_Y1 ?
+				      t_dither_ramp_y1 : t_dither_ramp_y4;
+
+		for (k = 0; k < 2; k++) {
+			mutex_lock(&ebc->image_lock);
+			memset(img, 0, t_fix_size(&f));
+			if (k)
+				rk3026_ebc_blit(ebc, xrgb, f.w * 4,
+						DRM_FORMAT_XRGB8888, &all,
+						dither);
+			else
+				rk3026_ebc_blit(ebc, r8, f.w, DRM_FORMAT_R8,
+						&all, dither);
+			mutex_unlock(&ebc->image_lock);
+			for (oy = 0; oy <= 8; oy += 8) {
+				ox = 2 * oy;
+				for (y = 0; y < 8; y++) {
+					const u8 *row = img +
+						(oy + y) * t_fix_pitch(&f) +
+						ox / 2;
+
+					KUNIT_EXPECT_MEMEQ_MSG(test, row,
+							       want[y], 8,
+							       "%s dither %u at (%d, %d) row %d",
+							       k ? "XRGB8888" : "R8",
+							       dither, ox, oy,
+							       y);
+				}
+			}
+		}
+	}
+
+	mutex_lock(&ebc->image_lock);
+	for (x = 0; x < EBC_PALETTE_SIZE; x++)
+		ebc->c8_levels[x] = x >> 4;
+	rk3026_ebc_blit(ebc, r8, f.w, DRM_FORMAT_C8, &all, EBC_DITHER_NONE);
+	memcpy(plain, img, t_fix_size(&f));
+	for (dither = EBC_DITHER_Y4; dither <= EBC_DITHER_Y1; dither++) {
+		memset(img, 0, t_fix_size(&f));
+		rk3026_ebc_blit(ebc, r8, f.w, DRM_FORMAT_C8, &all, dither);
+		KUNIT_EXPECT_EQ_MSG(test, t_fix_diff(&f, plain, img), INT_MAX,
+				    "C8 dither %u", dither);
+	}
+	mutex_unlock(&ebc->image_lock);
+}
+
 #if IS_ENABLED(CONFIG_DRM_RK3026_EBC_MXCFB)
 /*
  * An inverted mxcfb send's target on one source and every clip of @clips:
@@ -14872,6 +15228,12 @@ static struct kunit_case rk3026_ebc_conv_test_cases[] = {
 	KUNIT_CASE(ebc_test_c8_rows),
 	KUNIT_CASE(ebc_test_c8_rows_tails),
 	KUNIT_CASE(ebc_test_palette_levels),
+	KUNIT_CASE(ebc_test_dither_rows),
+	KUNIT_CASE(ebc_test_dither_rows_tails),
+	KUNIT_CASE(ebc_test_ref_blit_dither),
+	KUNIT_CASE(ebc_test_dither_levels),
+	KUNIT_CASE(ebc_test_dither_tiling),
+	KUNIT_CASE(ebc_test_dither_ramp),
 #if IS_ENABLED(CONFIG_DRM_RK3026_EBC_MXCFB)
 	KUNIT_CASE(ebc_test_mxcfb_invert),
 #endif

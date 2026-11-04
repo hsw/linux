@@ -505,6 +505,8 @@ static u32 ebc_us_since(ktime_t start)
  * @src_pitch: source stride in bytes
  * @format: source format, one of ebc_plane_formats[]
  * @clip: damaged region, in pixels
+ * @dither: the conversion the sender asks for; EBC_DITHER_NONE for a plane
+ *	update, which has no way to ask
  *
  * The panel is 4bpp with two pixels per byte, low nibble first. The clip is
  * widened to an even pixel boundary so byte writes stay whole, and clamped
@@ -513,6 +515,11 @@ static u32 ebc_us_since(ktime_t start)
  * nearest of the 16 levels; C8 through rk3026_ebc_blit_c8_rows(), a byte
  * lookup in @c8_levels, the levels of the palette. A format with no
  * conversion here is a driver bug: it warns once and writes nothing.
+ *
+ * With @dither other than EBC_DITHER_NONE, XRGB8888 and R8 go through
+ * rk3026_ebc_blit_dither() instead. C8 takes no dither: only the plane,
+ * which never asks for one, blits indices, and an mxcfb send blits a C8
+ * framebuffer as R8.
  *
  * Writes @next_shadow. Called under @image_lock, in the same section that
  * queues the update, so no snapshot sees the pixels without their update.
@@ -523,7 +530,7 @@ static u32 ebc_us_since(ktime_t start)
  */
 u32 rk3026_ebc_blit(struct rk3026_ebc *ebc, const void *src,
 		    unsigned int src_pitch, u32 format,
-		    const struct drm_rect *clip)
+		    const struct drm_rect *clip, enum rk3026_ebc_dither dither)
 {
 	struct drm_rect r = *clip;
 	ktime_t start;
@@ -535,12 +542,24 @@ u32 rk3026_ebc_blit(struct rk3026_ebc *ebc, const void *src,
 	start = ktime_get();
 	switch (format) {
 	case DRM_FORMAT_XRGB8888:
-		rk3026_ebc_blit_convert(ebc->next_shadow, src, src_pitch,
-					r.x1, r.x2, r.y1, r.y2, ebc->width);
+		if (dither != EBC_DITHER_NONE)
+			rk3026_ebc_blit_dither(ebc->next_shadow, src,
+					       src_pitch, 4, r.x1, r.x2, r.y1,
+					       r.y2, ebc->width, dither);
+		else
+			rk3026_ebc_blit_convert(ebc->next_shadow, src,
+						src_pitch, r.x1, r.x2, r.y1,
+						r.y2, ebc->width);
 		break;
 	case DRM_FORMAT_R8:
-		rk3026_ebc_blit_r8_convert(ebc->next_shadow, src, src_pitch,
-					   r.x1, r.x2, r.y1, r.y2, ebc->width);
+		if (dither != EBC_DITHER_NONE)
+			rk3026_ebc_blit_dither(ebc->next_shadow, src,
+					       src_pitch, 1, r.x1, r.x2, r.y1,
+					       r.y2, ebc->width, dither);
+		else
+			rk3026_ebc_blit_r8_convert(ebc->next_shadow, src,
+						   src_pitch, r.x1, r.x2, r.y1,
+						   r.y2, ebc->width);
 		break;
 	case DRM_FORMAT_C8:
 		rk3026_ebc_blit_c8_rows(ebc->next_shadow, src, src_pitch,
@@ -2394,7 +2413,7 @@ VISIBLE_IF_KUNIT bool rk3026_ebc_plane_update(struct rk3026_ebc *ebc,
 			upd.clip = DRM_RECT_INIT(0, 0, ebc->width, ebc->height);
 		ebc->plane_resync = false;
 		upd.blit_us = rk3026_ebc_blit(ebc, src, src_pitch, format,
-					      &upd.clip);
+					      &upd.clip, EBC_DITHER_NONE);
 		WRITE_ONCE(ebc->idle_last_plane, jiffies);
 		WRITE_ONCE(ebc->idle_armed, true);
 		ebc->commit_seq = rk3026_ebc_add_update(ebc, &upd);

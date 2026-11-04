@@ -4,7 +4,7 @@
  *
  * The snapshot and the XRGB8888 blit worked out pixel by pixel, in the
  * byte loops rk3026_ebc_core.c and rk3026_ebc.c had before the word-wide
- * versions, and the 8-bit blit one pixel at a time as well. The tests
+ * versions, and the 8-bit blit and the dither one pixel at a time as well. The tests
  * require the driver's functions to match these bit for bit. They have
  * their own copies of the helpers and share no code with the driver, so a
  * change to the driver cannot change them too.
@@ -133,6 +133,57 @@ void rk3026_ebc_ref_grey_rows(u8 *dst, const void *src,
 			u8 l1 = levels ? levels[s[1]] : (s[1] + 8) / 17;
 
 			*d = l0 | l1 << 4;
+		}
+	}
+}
+
+/*
+ * The 8x8 Bayer index of cell (@x mod 8, @y mod 8): the bits of x ^ y and
+ * of y interleaved, lowest first, which is the recursive matrix
+ * M(2n) = [4 M(n), 4 M(n) + 2; 4 M(n) + 3, 4 M(n) + 1] from M(1) = [0].
+ */
+static u32 ref_bayer8(int x, int y)
+{
+	u32 a = (x ^ y) & 7, b = y & 7;
+
+	return (a & 1) << 5 | (b & 1) << 4 | (a & 2) << 2 | (b & 2) << 1 |
+	       (a & 4) >> 1 | (b & 4) >> 2;
+}
+
+/*
+ * The ordered-dither blit as a per-pixel loop: the grey, the luma as in
+ * rk3026_ebc_ref_blit_rows() for @cpp 4 or the byte for @cpp 1, the
+ * threshold 4 b + 1 of the pixel's Bayer index b, the level
+ * (grey * @steps + threshold) / 255 by a division, and the nibble
+ * 15 / @steps times the level. Same box rules as
+ * rk3026_ebc_ref_blit_rows().
+ */
+void rk3026_ebc_ref_blit_rows_dither(u8 *dst, const void *src,
+				     unsigned int src_pitch, int x1, int x2,
+				     int y1, int y2, unsigned int width,
+				     unsigned int cpp, unsigned int steps)
+{
+	int x, y, i;
+
+	for (y = y1; y < y2; y++) {
+		const u8 *s = (const u8 *)src + (size_t)y * src_pitch +
+			      x1 * cpp;
+		u8 *d = dst + ((size_t)y * width + x1) / 2;
+
+		for (x = x1; x < x2; x += 2, d++) {
+			u8 out = 0;
+
+			for (i = 0; i < 2; i++, s += cpp) {
+				u32 p = cpp == 4 ? get_unaligned_le32(s) : *s;
+				u32 g = cpp == 4 ? (77 * ((p >> 16) & 0xff) +
+						    150 * ((p >> 8) & 0xff) +
+						    29 * (p & 0xff)) / 256 : p;
+				u32 t = 4 * ref_bayer8(x + i, y) + 1;
+				u32 n = (g * steps + t) / 255 * (15 / steps);
+
+				out |= n << (4 * i);
+			}
+			*d = out;
 		}
 	}
 }

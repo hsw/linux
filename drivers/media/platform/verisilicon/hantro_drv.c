@@ -207,9 +207,10 @@ queue_init(void *priv, struct vb2_queue *src_vq, struct vb2_queue *dst_vq)
 	 * Driver does mostly sequential access, so sacrifice TLB efficiency
 	 * for faster allocation. Also, no CPU access on the source queue,
 	 * so no kernel mapping needed, unless a stateful decoder parses the
-	 * bitstream headers.
+	 * bitstream headers. Userspace chooses the buffer sizes: a failed
+	 * allocation is an error for it, not a kernel warning.
 	 */
-	src_vq->dma_attrs = DMA_ATTR_ALLOC_SINGLE_PAGES;
+	src_vq->dma_attrs = DMA_ATTR_ALLOC_SINGLE_PAGES | DMA_ATTR_NO_WARN;
 	if (ctx->is_encoder || !ctx->dev->variant->src_needs_kmap)
 		src_vq->dma_attrs |= DMA_ATTR_NO_KERNEL_MAPPING;
 	src_vq->buf_struct_size = sizeof(struct v4l2_m2m_buffer);
@@ -224,7 +225,7 @@ queue_init(void *priv, struct vb2_queue *src_vq, struct vb2_queue *dst_vq)
 
 	dst_vq->bidirectional = true;
 	dst_vq->mem_ops = &vb2_dma_contig_memops;
-	dst_vq->dma_attrs = DMA_ATTR_ALLOC_SINGLE_PAGES;
+	dst_vq->dma_attrs = DMA_ATTR_ALLOC_SINGLE_PAGES | DMA_ATTR_NO_WARN;
 	/*
 	 * The Kernel needs access to the JPEG destination buffer for the
 	 * JPEG encoder to fill in the JPEG headers.

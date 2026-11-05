@@ -1286,10 +1286,16 @@ static void hantro_remove(struct platform_device *pdev)
 	hantro_remove_enc_func(vpu);
 	media_device_cleanup(&vpu->mdev);
 	v4l2_m2m_put(vpu->m2m_dev);
-	v4l2_device_unregister(&vpu->v4l2_dev);
-	clk_bulk_unprepare(vpu->variant->num_clocks, vpu->clocks);
+	/* Suspend first: v4l2_device_unregister() clears the driver data. */
 	pm_runtime_dont_use_autosuspend(vpu->dev);
 	pm_runtime_disable(vpu->dev);
+	/* Runtime PM forbidden through sysfs: the device is still active. */
+	if (IS_ENABLED(CONFIG_PM) && !pm_runtime_status_suspended(vpu->dev)) {
+		clk_bulk_disable(vpu->variant->num_clocks, vpu->clocks);
+		pm_runtime_set_suspended(vpu->dev);
+	}
+	v4l2_device_unregister(&vpu->v4l2_dev);
+	clk_bulk_unprepare(vpu->variant->num_clocks, vpu->clocks);
 	reset_control_assert(vpu->resets);
 }
 

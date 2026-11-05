@@ -100,7 +100,9 @@ It contains following fields:
   the stop function.
 * reboot_nb: notifier block that is registered for reboot notifications, for
   internal use only. If the driver calls watchdog_stop_on_reboot, watchdog core
-  will stop the watchdog on such notifications.
+  will stop the watchdog on such notifications. With the stop_on_reboot=0
+  parameter, watchdog core instead stops pinging a running watchdog that
+  userspace has not opened.
 * restart_nb: notifier block that is registered for machine restart, for
   internal use only. If a watchdog is capable of restarting the machine, it
   should define ops->restart. Priority can be changed through

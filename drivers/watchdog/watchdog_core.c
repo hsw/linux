@@ -176,6 +176,18 @@ static int watchdog_reboot_notifier(struct notifier_block *nb,
 	return NOTIFY_DONE;
 }
 
+static int watchdog_reboot_keep_notifier(struct notifier_block *nb,
+					 unsigned long code, void *data)
+{
+	struct watchdog_device *wdd;
+
+	wdd = container_of(nb, struct watchdog_device, reboot_nb);
+	if (code == SYS_DOWN || code == SYS_HALT || code == SYS_POWER_OFF)
+		watchdog_dev_reboot(wdd);
+
+	return NOTIFY_DONE;
+}
+
 static int watchdog_restart_notifier(struct notifier_block *nb,
 				     unsigned long action, void *data)
 {
@@ -300,20 +312,28 @@ static int ___watchdog_register_device(struct watchdog_device *wdd)
 			clear_bit(WDOG_STOP_ON_REBOOT, &wdd->status);
 	}
 
+	wdd->reboot_nb.notifier_call = NULL;
 	if (test_bit(WDOG_STOP_ON_REBOOT, &wdd->status)) {
 		if (!wdd->ops->stop)
 			pr_warn("watchdog%d: stop_on_reboot not supported\n", wdd->id);
-		else {
+		else
 			wdd->reboot_nb.notifier_call = watchdog_reboot_notifier;
+	} else if (stop_on_reboot == 0) {
+		/*
+		 * Keep watching: the hardware runs on through the shutdown,
+		 * and the kernel no longer pings it on behalf of user space.
+		 */
+		wdd->reboot_nb.notifier_call = watchdog_reboot_keep_notifier;
+	}
 
-			ret = register_reboot_notifier(&wdd->reboot_nb);
-			if (ret) {
-				pr_err("watchdog%d: Cannot register reboot notifier (%d)\n",
-					wdd->id, ret);
-				watchdog_dev_unregister(wdd);
-				ida_free(&watchdog_ida, id);
-				return ret;
-			}
+	if (wdd->reboot_nb.notifier_call) {
+		ret = register_reboot_notifier(&wdd->reboot_nb);
+		if (ret) {
+			pr_err("watchdog%d: Cannot register reboot notifier (%d)\n",
+			       wdd->id, ret);
+			watchdog_dev_unregister(wdd);
+			ida_free(&watchdog_ida, id);
+			return ret;
 		}
 	}
 
@@ -388,7 +408,7 @@ static void __watchdog_unregister_device(struct watchdog_device *wdd)
 	if (wdd->ops->restart)
 		unregister_restart_handler(&wdd->restart_nb);
 
-	if (test_bit(WDOG_STOP_ON_REBOOT, &wdd->status))
+	if (wdd->reboot_nb.notifier_call)
 		unregister_reboot_notifier(&wdd->reboot_nb);
 
 	if (test_bit(WDOG_NO_PING_ON_SUSPEND, &wdd->status))

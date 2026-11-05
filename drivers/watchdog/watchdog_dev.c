@@ -1179,6 +1179,29 @@ void watchdog_dev_unregister(struct watchdog_device *wdd)
 }
 
 /**
+ * watchdog_dev_reboot - stop the kernel's pings at reboot
+ * @wdd: watchdog device
+ *
+ * Called when the system starts to reboot, halt or power off while the
+ * watchdog is to keep watching (stop_on_reboot=0). End the time for which
+ * the kernel pings a running watchdog that user space has not opened, as an
+ * expired open_timeout does, so that a shutdown which hangs before it
+ * reaches the restart handler is reset by the hardware within its timeout.
+ * A watchdog that user space keeps open is left to it.
+ */
+void watchdog_dev_reboot(struct watchdog_device *wdd)
+{
+	struct watchdog_core_data *wd_data = wdd->wd_data;
+
+	mutex_lock(&wd_data->lock);
+	/* every point in time after boot is past this deadline */
+	wd_data->open_deadline = 0;
+	if (!watchdog_active(wdd))
+		hrtimer_cancel(&wd_data->timer);
+	mutex_unlock(&wd_data->lock);
+}
+
+/**
  * watchdog_set_last_hw_keepalive - set last HW keepalive time for watchdog
  * @wdd:		Watchdog device
  * @last_ping_ms:	Time since last HW heartbeat

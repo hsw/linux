@@ -21,6 +21,14 @@ watchdog core:
 	timeout. Setting this to a non-zero value can be useful to ensure that
 	either userspace comes up properly, or the board gets reset and allows
 	fallback logic in the bootloader to try something else.
+    stop_on_reboot:
+	What happens to a watchdog when the system reboots, halts or powers
+	off. 1 stops every watchdog whose driver can stop it. 0 keeps every
+	watchdog watching: the hardware is not stopped, and the kernel stops
+	pinging a running watchdog that userspace has not opened, so a
+	shutdown that hangs before the restart is reset by the hardware within
+	its timeout. A watchdog that userspace keeps open is left to it. -1
+	(the default) leaves the choice to each driver.
 
 -------------------------------------------------
 

@@ -1278,11 +1278,18 @@ static void hantro_remove(struct platform_device *pdev)
 	hantro_remove_enc_func(vpu);
 	media_device_cleanup(&vpu->mdev);
 	v4l2_m2m_put(vpu->m2m_dev);
+	/*
+	 * Suspend the device while its driver data is still valid: within
+	 * the autosuspend delay of the last job it is still active, and
+	 * v4l2_device_unregister() clears the driver data, which is the
+	 * v4l2_device. The clocks are then disabled before they are
+	 * unprepared.
+	 */
+	pm_runtime_dont_use_autosuspend(vpu->dev);
+	pm_runtime_disable(vpu->dev);
 	v4l2_device_unregister(&vpu->v4l2_dev);
 	clk_bulk_unprepare(vpu->variant->num_clocks, vpu->clocks);
 	reset_control_assert(vpu->resets);
-	pm_runtime_dont_use_autosuspend(vpu->dev);
-	pm_runtime_disable(vpu->dev);
 }
 
 #ifdef CONFIG_PM

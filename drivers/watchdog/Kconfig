@@ -86,6 +86,17 @@ config WATCHDOG_SYSFS
 	  Say Y here if you want to enable watchdog device status read through
 	  sysfs attributes.
 
+config WATCHDOG_CORE_KUNIT_TEST
+	tristate "KUnit test for the watchdog core" if !KUNIT_ALL_TESTS
+	depends on KUNIT && WATCHDOG_CORE
+	default KUNIT_ALL_TESTS
+	help
+	  Build the KUnit test of the watchdog core: the kernel's pings of a
+	  running watchdog nobody has opened end at reboot when the watchdog
+	  is to keep watching (watchdog.stop_on_reboot=0).
+
+	  If unsure, say N.
+
 config WATCHDOG_HRTIMER_PRETIMEOUT
 	bool "Enable watchdog hrtimer-based pretimeouts"
 	help

@@ -189,14 +189,9 @@ VISIBLE_IF_KUNIT void hantro_g1_jpeg_dec_regs(const struct v4l2_jpeg_header *hdr
 			regs->ctrl2 |= G1_REG_DEC_CTRL2_CR_DC_VLCTABLE;
 	}
 
-	/*
-	 * In a single-component scan the decoder reads one MCU more than
-	 * PJPEG_REST_FREQ before it expects a restart marker.
-	 */
 	if (hdr->restart_interval) {
 		regs->ctrl2 |= G1_REG_DEC_CTRL2_SYNC_MARKER_E;
-		regs->ctrl5 = G1_REG_DEC_CTRL5_PJPEG_REST_FREQ(hdr->restart_interval -
-								 grey);
+		regs->ctrl5 = G1_REG_DEC_CTRL5_PJPEG_REST_FREQ(hdr->restart_interval);
 	}
 
 	/*
@@ -306,6 +301,20 @@ VISIBLE_IF_KUNIT int hantro_g1_jpeg_dec_check(const struct v4l2_jpeg_header *hdr
 	/* One interleaved scan with all the components, in frame order. */
 	if (scan->num_components != frame->num_components) {
 		vpu_debug(1, "non-interleaved scan\n");
+		return -EINVAL;
+	}
+
+	/*
+	 * In a one-component scan the decoder does not count the restart
+	 * interval: a restart marker it meets where it expects a block gives
+	 * an empty block and moves the rest of the picture on by one. Only a
+	 * marker at the end of a block row is taken without loss, so every
+	 * restart must fall there.
+	 */
+	if (scan->num_components == 1 &&
+	    hdr->restart_interval % DIV_ROUND_UP(frame->width, 8)) {
+		vpu_debug(1, "one component, restart interval %u: not whole rows\n",
+			  hdr->restart_interval);
 		return -EINVAL;
 	}
 

@@ -743,6 +743,14 @@ static void jpeg_dec_grey(struct kunit *test)
 {
 	/* Ri from a DRI segment: every MCU, two, odd ones, a row, the largest. */
 	static const u16 intervals[] = { 1, 2, 67, 125, 0xffff };
+	static const struct {
+		u16 ri;
+		int ret;
+	} restarts[] = {
+		{ 0, 0 }, { 125, 0 }, { 250, 0 }, { 125 * 524, 0 },
+		{ 1, -EINVAL }, { 2, -EINVAL }, { 67, -EINVAL },
+		{ 124, -EINVAL }, { 126, -EINVAL }, { 0xffff, -EINVAL },
+	};
 	u8 *buf = kunit_kzalloc(test, HANTRO_JPEG_DEC_TABLE_SIZE, GFP_KERNEL);
 	u8 *bytes = kunit_kzalloc(test, HANTRO_JPEG_DEC_TABLE_SIZE, GFP_KERNEL);
 	struct hantro_g1_jpeg_dec_regs regs, plain;
@@ -790,8 +798,8 @@ static void jpeg_dec_grey(struct kunit *test)
 		   v4l2_jpeg_ref_table_chroma_dc_ht, NULL);
 
 	/*
-	 * A restart interval: SYNC_MARKER_E (CTRL2 bit 25) and Ri - 1 in
-	 * PJPEG_REST_FREQ (CTRL5 bits 15:0).
+	 * A restart interval: SYNC_MARKER_E (CTRL2 bit 25) and Ri in
+	 * PJPEG_REST_FREQ (CTRL5 bits 15:0), as for three components.
 	 */
 	make_jpeg(&j, V4L2_JPEG_CHROMA_SUBSAMPLING_GRAY, 1000, 1448);
 	hantro_g1_jpeg_dec_regs(&j.hdr, 0x10000000, j.payload, &plain);
@@ -804,9 +812,26 @@ static void jpeg_dec_grey(struct kunit *test)
 		hantro_g1_jpeg_dec_regs(&j.hdr, 0x10000000, j.payload, &regs);
 		KUNIT_EXPECT_EQ_MSG(test, regs.ctrl2, plain.ctrl2 | BIT(25),
 				    "Ri %u", ri);
-		KUNIT_EXPECT_EQ_MSG(test, regs.ctrl5, (u32)ri - 1, "Ri %u", ri);
+		KUNIT_EXPECT_EQ_MSG(test, regs.ctrl5, (u32)ri, "Ri %u", ri);
 		KUNIT_EXPECT_EQ_MSG(test, regs.ctrl4, plain.ctrl4, "Ri %u", ri);
 	}
+
+	/* Restarts only at the end of a block row: 125 blocks per row. */
+	for (i = 0; i < ARRAY_SIZE(restarts); i++) {
+		j.hdr.restart_interval = restarts[i].ri;
+		KUNIT_EXPECT_EQ_MSG(test, check(&j, V4L2_PIX_FMT_GREY, 1008, 1456),
+				    restarts[i].ret, "Ri %u", restarts[i].ri);
+	}
+	/* 134 blocks per row. */
+	make_jpeg(&j, V4L2_JPEG_CHROMA_SUBSAMPLING_GRAY, 1072, 1448);
+	j.hdr.restart_interval = 134;
+	KUNIT_EXPECT_EQ(test, check(&j, V4L2_PIX_FMT_GREY, 1072, 1456), 0);
+	j.hdr.restart_interval = 125;
+	KUNIT_EXPECT_EQ(test, check(&j, V4L2_PIX_FMT_GREY, 1072, 1456), -EINVAL);
+	/* Three components take any interval. */
+	make_jpeg(&j, V4L2_JPEG_CHROMA_SUBSAMPLING_420, 1000, 1448);
+	j.hdr.restart_interval = 67;
+	KUNIT_EXPECT_EQ(test, check(&j, V4L2_PIX_FMT_NV12, 1008, 1456), 0);
 
 	/* A greyscale header claiming three components. */
 	make_jpeg(&j, V4L2_JPEG_CHROMA_SUBSAMPLING_420, 1072, 1448);

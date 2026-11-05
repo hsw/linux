@@ -1734,6 +1734,32 @@ void arch_teardown_dma_ops(struct device *dev)
 	set_dma_ops(dev, NULL);
 }
 
+/*
+ * dma-direct allocates the DMA_ATTR_NO_KERNEL_MAPPING buffers itself, without
+ * arch_dma_alloc(), and leaves their kernel alias cacheable: write back and
+ * invalidate that alias, as __dma_clear_buffer() does, so that no dirty line
+ * left from the pages' previous use is evicted over what the device writes.
+ */
+void arch_dma_prep_coherent(struct page *page, size_t size)
+{
+	phys_addr_t base = page_to_phys(page);
+	size_t off;
+
+	if (PageHighMem(page)) {
+		for (off = 0; off < size; off += PAGE_SIZE) {
+			void *ptr = kmap_local_page(page + (off >> PAGE_SHIFT));
+
+			dmac_flush_range(ptr, ptr + PAGE_SIZE);
+			kunmap_local(ptr);
+		}
+	} else {
+		void *ptr = page_address(page);
+
+		dmac_flush_range(ptr, ptr + size);
+	}
+	outer_flush_range(base, base + size);
+}
+
 void *arch_dma_alloc(struct device *dev, size_t size, dma_addr_t *dma_handle,
 		gfp_t gfp, unsigned long attrs)
 {

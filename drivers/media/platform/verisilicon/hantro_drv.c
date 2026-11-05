@@ -1292,10 +1292,15 @@ static void hantro_remove(struct platform_device *pdev)
 	 * the autosuspend delay of the last job it is still active, and
 	 * v4l2_device_unregister() clears the driver data, which is the
 	 * v4l2_device. The clocks are then disabled before they are
-	 * unprepared.
+	 * unprepared. If runtime PM is forbidden through sysfs, the device
+	 * stays active, so disable its clocks here.
 	 */
 	pm_runtime_dont_use_autosuspend(vpu->dev);
 	pm_runtime_disable(vpu->dev);
+	if (IS_ENABLED(CONFIG_PM) && !pm_runtime_status_suspended(vpu->dev)) {
+		clk_bulk_disable(vpu->variant->num_clocks, vpu->clocks);
+		pm_runtime_set_suspended(vpu->dev);
+	}
 	v4l2_device_unregister(&vpu->v4l2_dev);
 	clk_bulk_unprepare(vpu->variant->num_clocks, vpu->clocks);
 	reset_control_assert(vpu->resets);

@@ -67,6 +67,19 @@ config WATCHDOG_OPEN_TIMEOUT
 	  value set here can be overridden by the commandline parameter
 	  "watchdog.open_timeout".
 
+config WATCHDOG_KEEP_WATCHING_ON_REBOOT
+	bool "Keep watchdogs watching through reboot and power-off"
+	help
+	  Say Y here to make 0 the default of the "watchdog.stop_on_reboot"
+	  parameter: no watchdog is stopped when the system reboots, halts or
+	  powers off, and the kernel stops pinging a running watchdog that
+	  userspace has not opened. A shutdown that hangs before the restart
+	  is then reset by the hardware within the watchdog's timeout. A
+	  halt, or a power-off that leaves the system running, ends in a
+	  watchdog reset too. If you say N here, each driver decides whether
+	  its watchdog is stopped. The command line parameter overrides this
+	  default either way.
+
 config WATCHDOG_SYSFS
 	bool "Read different watchdog information through sysfs"
 	help

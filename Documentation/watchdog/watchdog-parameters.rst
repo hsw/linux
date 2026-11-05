@@ -28,7 +28,8 @@ watchdog core:
 	pinging a running watchdog that userspace has not opened, so a
 	shutdown that hangs before the restart is reset by the hardware within
 	its timeout. A watchdog that userspace keeps open is left to it. -1
-	(the default) leaves the choice to each driver.
+	leaves the choice to each driver. The default is 0 with
+	CONFIG_WATCHDOG_KEEP_WATCHING_ON_REBOOT, else -1.
 
 -------------------------------------------------
 

@@ -26,6 +26,13 @@
  * C8 sources (one palette index per pixel) take rk3026_ebc_blit_c8_rows():
  * each index goes through a 256-entry table of levels, one
  * rk3026_ebc_palette_level() an entry of the palette.
+ *
+ * An update of XRGB8888 or R8 may ask for an ordered dither instead
+ * (rk3026_ebc_blit_dither(), enum rk3026_ebc_dither): the same 8-bit grey,
+ * the luma or the R8 byte, spread over the 16 levels or over black and
+ * white by an 8x8 threshold pattern. It costs a few operations more per
+ * pixel, again the same for every page, and takes NEON rows where the
+ * plain conversion does.
  */
 
 #include <linux/compiler.h>
@@ -184,6 +191,8 @@ typedef void ebc_neon_rows_fn(unsigned char *dst, const void *src,
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_blit_rows_neon);
 /* And the R8 rows of that unit. */
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_blit_r8_rows_neon);
+/* And the dither rows. */
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_blit_rows_dither_neon);
 
 /* The NEON rows are built in and this CPU can run them. */
 static bool ebc_neon_cpu(void)
@@ -362,11 +371,218 @@ u8 rk3026_ebc_palette_level(u16 red, u16 green, u16 blue)
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_palette_level);
 
+/*
+ * The ordered dither (EBC_DITHER_Y4, EBC_DITHER_Y1).
+ *
+ * The 8-bit grey L of a pixel, the luma of rk3026_ebc_blit_rows() or the
+ * byte of an R8 source, is spread over @steps steps, 15 for the 16 levels
+ * and 1 for black and white: its level is (L * @steps + t) / 255, where t
+ * is the threshold of the pixel's cell in an 8x8 Bayer matrix, 4 b + 1 for
+ * the cell's index b (0 to 63). The thresholds lie evenly between 1 and
+ * 253, so with f = L * @steps mod 255 a flat area of L shows the upper of
+ * its two levels on f * 64 / 255 cells of every 8x8 tile, to within half
+ * a cell: the area keeps its mean grey. The grey of a level itself
+ * (L = 17 n for the 16 levels; 0 and 255 for black and white) is drawn
+ * flat, as the same nibble as the plain conversion's. The nibble is the
+ * level times 15 / @steps. Between the levels the conversions differ on
+ * purpose: the plain XRGB8888 one draws L / 16 rounded down, the dither
+ * keeps the mean L / 17, so a dithered grey can differ by up to about one
+ * level from the same grey drawn plainly: lighter at the dark end, darker
+ * near white, where the plain one draws 240 to 254 as white. R8 rounds to
+ * the nearest level, which the dither's mean matches.
+ *
+ * The matrix is anchored to the image: the cell of pixel (x, y) is
+ * (x mod 8, y mod 8) whatever the clip, so adjacent updates with the same
+ * conversion tile without a seam, and a pixel converted twice from the
+ * same source gets the same nibble. A clip with an odd edge is widened to
+ * whole bytes (rk3026_ebc_widen_clip()), so the pixel next to that edge
+ * takes the conversion of the update that widened over it.
+ */
+#define EBC_DT(b)	(4 * (b) + 1)
+#define EBC_DT_ROW(a, b, c, d, e, f, g, h)				\
+	{ EBC_DT(a), EBC_DT(b), EBC_DT(c), EBC_DT(d),			\
+	  EBC_DT(e), EBC_DT(f), EBC_DT(g), EBC_DT(h) }
+
+static const u8 ebc_dither_t[8][8] = {
+	EBC_DT_ROW(0, 32, 8, 40, 2, 34, 10, 42),
+	EBC_DT_ROW(48, 16, 56, 24, 50, 18, 58, 26),
+	EBC_DT_ROW(12, 44, 4, 36, 14, 46, 6, 38),
+	EBC_DT_ROW(60, 28, 52, 20, 62, 30, 54, 22),
+	EBC_DT_ROW(3, 35, 11, 43, 1, 33, 9, 41),
+	EBC_DT_ROW(51, 19, 59, 27, 49, 17, 57, 25),
+	EBC_DT_ROW(15, 47, 7, 39, 13, 45, 5, 37),
+	EBC_DT_ROW(63, 31, 55, 23, 61, 29, 53, 21),
+};
+
+/*
+ * The 8-bit grey of the pixel at @s: the luma of an XRGB8888 pixel for
+ * @cpp 4, the byte of an R8 one for @cpp 1.
+ */
+static __always_inline u32 ebc_dither_grey(const u8 *s, unsigned int cpp)
+{
+	return cpp == 4 ? ebc_luma(get_unaligned_le32(s)) >> 24 : *s;
+}
+
+/*
+ * The dithered nibble of grey @l with threshold @t on @steps steps. The
+ * sum v = @l * @steps + @t is below 2^16, where v / 255 is
+ * (v + (v >> 8) + 1) >> 8.
+ */
+static __always_inline u32 ebc_dither_nibble(u32 l, u32 t, unsigned int steps)
+{
+	u32 v = l * steps + t;
+
+	return ((v + (v >> 8) + 1) >> 8) * (15 / steps);
+}
+
+/* Two pixels at @s, columns @x and @x + 1 of row thresholds @t, one byte. */
+static __always_inline u32 ebc_dither2(const u8 *s, const u8 *t, int x,
+				       unsigned int cpp, unsigned int steps)
+{
+	return ebc_dither_nibble(ebc_dither_grey(s, cpp), t[x & 7], steps) |
+	       ebc_dither_nibble(ebc_dither_grey(s + cpp, cpp),
+				 t[(x + 1) & 7], steps) << 4;
+}
+
+/* rk3026_ebc_blit_rows_dither() for a constant @cpp and @steps. */
+static __always_inline void ebc_dither_rows(u8 *dst, const void *src,
+					    unsigned int src_pitch, int x1,
+					    int x2, int y1, int y2,
+					    unsigned int width,
+					    unsigned int cpp,
+					    unsigned int steps)
+{
+	int x, y;
+
+	for (y = y1; y < y2; y++) {
+		const u8 *s = (const u8 *)src + (size_t)y * src_pitch +
+			      x1 * cpp;
+		const u8 *t = ebc_dither_t[y & 7];
+		u8 *d = dst + ((size_t)y * width + x1) / 2;
+
+		for (x = x1; x2 - x >= 4; x += 4, s += 4 * cpp, d += 2) {
+			prefetch(s + 128);
+			put_unaligned_le16(ebc_dither2(s, t, x, cpp, steps) |
+					   ebc_dither2(s + 2 * cpp, t, x + 2,
+						       cpp, steps) << 8, d);
+		}
+		if (x < x2)
+			*d = ebc_dither2(s, t, x, cpp, steps);
+	}
+}
+
+/**
+ * rk3026_ebc_blit_rows_dither - convert rows with an ordered dither
+ * @dst: target image, @width / 2 bytes per row, low nibble first
+ * @src: source, top-left of the whole framebuffer
+ * @src_pitch: source stride in bytes
+ * @x1: first column, even
+ * @x2: end column, even, at most @width, above @x1
+ * @y1: first row
+ * @y2: end row, above @y1
+ * @width: image width in pixels
+ * @cpp: bytes per source pixel, 4 for XRGB8888, 1 for R8
+ * @steps: 15 to dither to the 16 levels, 1 to black and white
+ *
+ * Writes bytes @x1 / 2 to @x2 / 2 of rows @y1 to @y2 of @dst, nothing else,
+ * with the grey of each pixel dithered as described above. Four pixels
+ * per 16-bit store, as rk3026_ebc_blit_rows().
+ */
+void rk3026_ebc_blit_rows_dither(u8 *dst, const void *src,
+				 unsigned int src_pitch, int x1, int x2,
+				 int y1, int y2, unsigned int width,
+				 unsigned int cpp, unsigned int steps)
+{
+	if (cpp == 4 && steps == 1)
+		ebc_dither_rows(dst, src, src_pitch, x1, x2, y1, y2, width, 4,
+				1);
+	else if (cpp == 4)
+		ebc_dither_rows(dst, src, src_pitch, x1, x2, y1, y2, width, 4,
+				15);
+	else if (steps == 1)
+		ebc_dither_rows(dst, src, src_pitch, x1, x2, y1, y2, width, 1,
+				1);
+	else
+		ebc_dither_rows(dst, src, src_pitch, x1, x2, y1, y2, width, 1,
+				15);
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_blit_rows_dither);
+
+#if IS_ENABLED(CONFIG_DRM_RK3026_EBC_NEON)
+/* ebc_neon_bands() for the dither rows, @cpp bytes a pixel, @steps steps. */
+static bool ebc_dither_neon(u8 *dst, const void *src, unsigned int src_pitch,
+			    int x1, int x2, int y1, int y2, unsigned int width,
+			    unsigned int cpp, unsigned int steps)
+{
+	int y;
+
+	if (x2 - x1 < 16 || !ebc_neon_cpu() || !may_use_simd())
+		return false;
+
+	for (y = y1; y < y2; y += EBC_NEON_BAND_ROWS) {
+		int end = min(y + EBC_NEON_BAND_ROWS, y2);
+
+		scoped_ksimd()
+			rk3026_ebc_blit_rows_dither_neon(dst, src, src_pitch,
+							 x1, x2, y, end, width,
+							 &ebc_dither_t[0][0],
+							 cpp, steps);
+	}
+	return true;
+}
+#else
+static bool ebc_dither_neon(u8 *dst, const void *src, unsigned int src_pitch,
+			    int x1, int x2, int y1, int y2, unsigned int width,
+			    unsigned int cpp, unsigned int steps)
+{
+	return false;
+}
+#endif
+
+/**
+ * rk3026_ebc_blit_dither - convert XRGB8888 or R8 rows with a dither
+ * @dst: target image, @width / 2 bytes per row, low nibble first
+ * @src: source, top-left of the whole framebuffer
+ * @src_pitch: source stride in bytes
+ * @cpp: bytes per source pixel, 4 for XRGB8888, 1 for R8
+ * @x1: first column, even
+ * @x2: end column, even, at most @width, above @x1
+ * @y1: first row
+ * @y2: end row, above @y1
+ * @width: image width in pixels
+ * @dither: EBC_DITHER_Y4 or EBC_DITHER_Y1
+ *
+ * The dither on 15 steps for EBC_DITHER_Y4 and on one step for
+ * EBC_DITHER_Y1: rk3026_ebc_blit_rows_dither_neon() under the conditions
+ * of rk3026_ebc_blit_convert(), rk3026_ebc_blit_rows_dither() otherwise.
+ * Both write the same bytes, so the choice only changes the time.
+ * EBC_DITHER_NONE is the caller's: it takes the plain conversion of its
+ * format.
+ *
+ * Returns true if the NEON rows ran. For KUnit, which checks the choice;
+ * a caller needs no answer.
+ */
+bool rk3026_ebc_blit_dither(u8 *dst, const void *src, unsigned int src_pitch,
+			    unsigned int cpp, int x1, int x2, int y1, int y2,
+			    unsigned int width, enum rk3026_ebc_dither dither)
+{
+	unsigned int steps = dither == EBC_DITHER_Y1 ? 1 : 15;
+
+	if (ebc_dither_neon(dst, src, src_pitch, x1, x2, y1, y2, width, cpp,
+			    steps))
+		return true;
+	rk3026_ebc_blit_rows_dither(dst, src, src_pitch, x1, x2, y1, y2,
+				    width, cpp, steps);
+	return false;
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_blit_dither);
+
 /**
  * rk3026_ebc_blit_impl - the XRGB8888 conversion rk3026_ebc_blit() runs
  *
  * For the probe line and debugfs "timing", so a measured blit time says
- * which loop it is from. R8 takes NEON under the same conditions; C8
+ * which loop it is from. R8 and the dither of either format take NEON
+ * under the same conditions; C8
  * always takes the scalar table rows (rk3026_ebc_blit_c8_rows()),
  * whatever this says.
  *

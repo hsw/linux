@@ -166,8 +166,11 @@ static void jpeg_dec_check_sampling(struct kunit *test)
 	make_jpeg(&j, V4L2_JPEG_CHROMA_SUBSAMPLING_420, 1072, 1448);
 	KUNIT_EXPECT_EQ(test, check(&j, V4L2_PIX_FMT_NV12, 1072, 1456), 0);
 	KUNIT_EXPECT_EQ(test, check(&j, V4L2_PIX_FMT_NV16, 1072, 1456), -EINVAL);
-	/* A post-processed CAPTURE format is not decoded to. */
-	KUNIT_EXPECT_EQ(test, check(&j, V4L2_PIX_FMT_YUYV, 1072, 1456), -EINVAL);
+	/* The post-processor's formats, at a size it writes. */
+	KUNIT_EXPECT_EQ(test, check(&j, V4L2_PIX_FMT_YUYV, 1072, 1456), 0);
+	KUNIT_EXPECT_EQ(test, check(&j, V4L2_PIX_FMT_XBGR32, 1072, 1448), 0);
+	/* A format neither the decoder nor the post-processor writes. */
+	KUNIT_EXPECT_EQ(test, check(&j, V4L2_PIX_FMT_NV21, 1072, 1456), -EINVAL);
 
 	/* NV12 from 4:2:2 or greyscale is the post-processor's. */
 	make_jpeg(&j, V4L2_JPEG_CHROMA_SUBSAMPLING_422, 1072, 1448);
@@ -1031,30 +1034,37 @@ static void jpeg_dec_rockchip_fmts(struct kunit *test)
 
 /*
  * Which RK3026 CAPTURE formats a decoder context offers for its OUTPUT
- * format: NV16 and GREY only for JPEG, the post-processed YUYV for every
- * coded format but JPEG.
+ * format: NV16, GREY and RGB only for JPEG, the post-processed YUYV for
+ * every coded format.
  */
 static void jpeg_dec_raw_fmt_allowed(struct kunit *test)
 {
 	static const u32 raw[] = {
 		V4L2_PIX_FMT_NV12, V4L2_PIX_FMT_NV16, V4L2_PIX_FMT_GREY,
+		V4L2_PIX_FMT_RGB565, V4L2_PIX_FMT_XBGR32, V4L2_PIX_FMT_XRGB32,
 	};
 	static const struct {
 		u32 src;
 		bool encoder;
-		bool allowed[4];	/* NV12, NV16, GREY, YUYV */
+		/* NV12, NV16, GREY, RGB565, XBGR32, XRGB32, YUYV */
+		bool allowed[7];
 	} cases[] = {
-		{ V4L2_PIX_FMT_JPEG, false, { true, true, true, false } },
-		{ V4L2_PIX_FMT_H264_SLICE, false, { true, false, false, true } },
-		{ V4L2_PIX_FMT_VP8_FRAME, false, { true, false, false, true } },
+		{ V4L2_PIX_FMT_JPEG, false,
+		  { true, true, true, true, true, true, true } },
+		{ V4L2_PIX_FMT_H264_SLICE, false,
+		  { true, false, false, false, false, false, true } },
+		{ V4L2_PIX_FMT_VP8_FRAME, false,
+		  { true, false, false, false, false, false, true } },
 		/* OUTPUT not set yet, or set to a raw format: no filter. */
-		{ 0, false, { true, true, true, true } },
-		{ V4L2_PIX_FMT_NV12, false, { true, true, true, true } },
+		{ 0, false, { true, true, true, true, true, true, true } },
+		{ V4L2_PIX_FMT_NV12, false,
+		  { true, true, true, true, true, true, true } },
 		/* An encoder's raw formats are its OUTPUT formats. */
-		{ V4L2_PIX_FMT_JPEG, true, { true, true, true, true } },
+		{ V4L2_PIX_FMT_JPEG, true,
+		  { true, true, true, true, true, true, true } },
 	};
 	const struct hantro_variant *rk3026 = &rk3026_vpu_variant;
-	const struct hantro_fmt *fmts[4];
+	const struct hantro_fmt *fmts[7];
 	struct hantro_ctx *ctx;
 	struct hantro_dev *dev;
 	unsigned int c, i, count;
@@ -1074,8 +1084,8 @@ static void jpeg_dec_raw_fmt_allowed(struct kunit *test)
 		KUNIT_ASSERT_EQ(test, count, 1);
 	}
 	KUNIT_ASSERT_EQ(test, rk3026->num_postproc_fmts, 1);
-	fmts[3] = &rk3026->postproc_fmts[0];
-	KUNIT_ASSERT_EQ(test, fmts[3]->fourcc, V4L2_PIX_FMT_YUYV);
+	fmts[6] = &rk3026->postproc_fmts[0];
+	KUNIT_ASSERT_EQ(test, fmts[6]->fourcc, V4L2_PIX_FMT_YUYV);
 
 	for (c = 0; c < ARRAY_SIZE(cases); c++) {
 		ctx->is_encoder = cases[c].encoder;
@@ -1567,6 +1577,474 @@ static void jpeg_dec_selection(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, h, 3008);
 }
 
+/* Bits hi:lo of a register value. */
+static u32 reg_field(u32 reg, unsigned int hi, unsigned int lo)
+{
+	return (reg & GENMASK(hi, lo)) >> lo;
+}
+
+/* G1_REG_PP_DEV_CONFIG for RGB: OUT_SWAP32_E 5, burst length 16. */
+#define PP_DEV_CONFIG_RGB	(BIT(5) | 16)
+
+/* The post-processor's output formats, as a job programs them. */
+static const struct {
+	u32 fourcc;
+	u32 out_fmt;		/* PP_OUT_FORMAT, 28:26 */
+	u32 cpp;
+	bool rgb, rgb16;
+	u32 mask_r, mask_g, mask_b;
+	u32 padd_r, padd_g, padd_b;
+} pp_formats[] = {
+	{ V4L2_PIX_FMT_NV12, 5, 1 },
+	{ V4L2_PIX_FMT_YUYV, 3, 2 },
+	{ V4L2_PIX_FMT_RGB565, 0, 2, true, true,
+	  0xf800f800, 0x07e007e0, 0x001f001f, 0, 5, 11 },
+	{ V4L2_PIX_FMT_XBGR32, 0, 4, true, false,
+	  0x00ff0000, 0x0000ff00, 0x000000ff, 8, 16, 24 },
+	{ V4L2_PIX_FMT_XRGB32, 0, 4, true, false,
+	  0x0000ff00, 0x00ff0000, 0xff000000, 16, 8, 0 },
+};
+
+/*
+ * The whole register image of a job, per output format and sampling: the
+ * format field, byte order, conversion, masks and their padding, the
+ * input and scaling, the stride, the position and the chroma plane.
+ */
+static void jpeg_dec_pp_formats(struct kunit *test)
+{
+	static const struct {
+		enum v4l2_jpeg_chroma_subsampling sampling;
+		u32 in_fmt;
+		u16 w, h;			/* the picture */
+		u32 buf_w, buf_h;
+		struct v4l2_rect compose;
+		u32 input_size, scaling1, scaling_inv, crops, orig_width;
+	} jobs[] = {
+		/* 4:2:0, scaled down to 536x400 at (16, 2) */
+		{ V4L2_JPEG_CHROMA_SUBSAMPLING_420, 1, 1000, 744, 1072, 736,
+		  { 16, 2, 536, 400 }, 47 << 9 | 63, PP_MODES_DOWN,
+		  (536u << 16) / 1000 << 16 | ((400u << 16) / 744 + 1),
+		  BIT(1) | BIT(0), 63 },
+		/* 4:2:2 at 1:1, whole macroblocks */
+		{ V4L2_JPEG_CHROMA_SUBSAMPLING_422, 4, 1000, 744, 1008, 752,
+		  { 0, 0, 1000, 744 }, 47 << 9 | 63, 0, 0, 0, 63 },
+		/* greyscale, scaled down to 104x200 */
+		{ V4L2_JPEG_CHROMA_SUBSAMPLING_GRAY, 3, 216, 408, 224, 416,
+		  { 0, 0, 104, 200 }, 26 << 9 | 14, PP_MODES_DOWN,
+		  (104u << 16) / 216 << 16 | ((200u << 16) / 408 + 1),
+		  BIT(1) | BIT(0), 14 },
+	};
+	struct hantro_g1_jpeg_dec_out out;
+	struct hantro_g1_pp_regs pp;
+	struct test_jpeg j;
+	unsigned int f, i;
+	bool use_pp;
+
+	for (i = 0; i < ARRAY_SIZE(jobs); i++) {
+		make_jpeg(&j, jobs[i].sampling, jobs[i].w, jobs[i].h);
+		for (f = 0; f < ARRAY_SIZE(pp_formats); f++) {
+			u32 fourcc = pp_formats[f].fourcc;
+			const struct v4l2_rect *c = &jobs[i].compose;
+			u32 w = c->width, h = c->height;
+			u32 scaling0 = 0, swap16 = 0;
+			u32 chroma = 0;
+
+			/* At 1:1, whole macroblocks: 1008x752. */
+			if (!jobs[i].scaling1) {
+				w = ALIGN(w, 16);
+				h = ALIGN(h, 16);
+			}
+			if (pp_formats[f].rgb)
+				scaling0 = BIT(29) | pp_formats[f].padd_r << 23 |
+					   pp_formats[f].padd_g << 18;
+			if (pp_formats[f].rgb16) {
+				scaling0 |= BIT(28);
+				swap16 = BIT(2);
+			}
+			if (fourcc == V4L2_PIX_FMT_NV12)
+				chroma = jobs[i].buf_w * jobs[i].buf_h +
+					 c->top / 2 * jobs[i].buf_w + c->left;
+
+			out = (struct hantro_g1_jpeg_dec_out){
+				.src_width = jobs[i].w, .src_height = jobs[i].h,
+				.fourcc = fourcc, .width = jobs[i].buf_w,
+				.height = jobs[i].buf_h, .compose = *c,
+				.pp_max_width = TEST_PP_MAX_WIDTH,
+			};
+			KUNIT_ASSERT_EQ_MSG(test, check_out(&j, &out, &pp, &use_pp),
+					    0, "job %u %p4cc", i, &fourcc);
+			KUNIT_EXPECT_TRUE_MSG(test, use_pp, "job %u %p4cc", i,
+					      &fourcc);
+			KUNIT_EXPECT_EQ_MSG(test, pp.dev_config,
+					    pp_formats[f].rgb ? PP_DEV_CONFIG_RGB :
+					    PP_DEV_CONFIG_YUV,
+					    "job %u %p4cc", i, &fourcc);
+			KUNIT_EXPECT_EQ_MSG(test, pp.input_size,
+					    jobs[i].input_size,
+					    "job %u %p4cc", i, &fourcc);
+			KUNIT_EXPECT_EQ_MSG(test, pp.control,
+					    PP_CONTROL(jobs[i].in_fmt,
+						       pp_formats[f].out_fmt, w, h) |
+					    swap16 | jobs[i].crops,
+					    "job %u %p4cc", i, &fourcc);
+			KUNIT_EXPECT_EQ_MSG(test, pp.scaling0, scaling0,
+					    "job %u %p4cc", i, &fourcc);
+			/* SCALING1: RGB_B_PADD 22:18 next to the modes. */
+			KUNIT_EXPECT_EQ_MSG(test, pp.scaling1,
+					    jobs[i].scaling1 |
+					    pp_formats[f].padd_b << 18,
+					    "job %u %p4cc", i, &fourcc);
+			KUNIT_EXPECT_EQ_MSG(test, pp.scaling_inv,
+					    jobs[i].scaling_inv,
+					    "job %u %p4cc", i, &fourcc);
+			KUNIT_EXPECT_EQ_MSG(test, pp.mask_r, pp_formats[f].mask_r,
+					    "job %u %p4cc", i, &fourcc);
+			KUNIT_EXPECT_EQ_MSG(test, pp.mask_g, pp_formats[f].mask_g,
+					    "job %u %p4cc", i, &fourcc);
+			KUNIT_EXPECT_EQ_MSG(test, pp.mask_b, pp_formats[f].mask_b,
+					    "job %u %p4cc", i, &fourcc);
+			/* The conversion for RGB only (its weights below). */
+			KUNIT_EXPECT_EQ_MSG(test, pp.color_conv != 0,
+					    pp_formats[f].rgb,
+					    "job %u %p4cc", i, &fourcc);
+			KUNIT_EXPECT_EQ_MSG(test, pp.orig_width,
+					    jobs[i].orig_width << 23,
+					    "job %u %p4cc", i, &fourcc);
+			KUNIT_EXPECT_EQ_MSG(test, pp.display_width, jobs[i].buf_w,
+					    "job %u %p4cc", i, &fourcc);
+			KUNIT_EXPECT_EQ_MSG(test, pp.luma_offset,
+					    (c->top * jobs[i].buf_w + c->left) *
+					    pp_formats[f].cpp,
+					    "job %u %p4cc", i, &fourcc);
+			KUNIT_EXPECT_EQ_MSG(test, pp.chroma_offset, chroma,
+					    "job %u %p4cc", i, &fourcc);
+		}
+	}
+}
+
+/*
+ * The bytes the post-processor stores for one output word, as the driver
+ * reads the fields: each 8-bit colour value shifted right from the top of
+ * the word by its PADD and masked; for a 16-bit format the first pixel in
+ * the upper half, the second in the lower one (the masks repeat there);
+ * OUT_SWAP16_E swaps the halves; the word goes to memory most significant
+ * byte first with OUT_ENDIAN, least significant byte first without it.
+ * This only checks that the registers give the V4L2 layouts under that
+ * reading; the reading itself is the hardware's to confirm.
+ */
+static void pp_store(const struct hantro_g1_pp_regs *pp, const u8 rgb[2][3],
+		     u8 *bytes)
+{
+	const u32 padd[3] = {
+		reg_field(pp->scaling0, 27, 23),
+		reg_field(pp->scaling0, 22, 18),
+		reg_field(pp->scaling1, 22, 18),
+	};
+	const u32 mask[3] = { pp->mask_r, pp->mask_g, pp->mask_b };
+	bool rgb16 = pp->scaling0 & BIT(28);
+	unsigned int c;
+	u32 word = 0;
+
+	for (c = 0; c < 3; c++) {
+		if (!rgb16) {
+			word |= ((u32)rgb[0][c] << 24 >> padd[c]) & mask[c];
+			continue;
+		}
+		word |= ((u32)rgb[0][c] << 24 >> padd[c]) & mask[c] &
+			GENMASK(31, 16);
+		word |= ((u32)rgb[1][c] << 24 >> (padd[c] + 16)) & mask[c] &
+			GENMASK(15, 0);
+	}
+
+	if (pp->control & BIT(2))
+		word = ror32(word, 16);
+
+	if (pp->dev_config & BIT(6))
+		put_unaligned_be32(word, bytes);
+	else
+		put_unaligned_le32(word, bytes);
+}
+
+/* A 640x480 picture at its own size in a buffer of fourcc. */
+static void pp_regs_640(struct kunit *test, u32 fourcc,
+			struct hantro_g1_pp_regs *pp)
+{
+	struct hantro_g1_jpeg_dec_out out;
+	struct test_jpeg j;
+	bool use_pp;
+
+	make_jpeg(&j, V4L2_JPEG_CHROMA_SUBSAMPLING_420, 640, 480);
+	make_out(&out, 640, 480, fourcc, 640, 480);
+	KUNIT_ASSERT_EQ(test, check_out(&j, &out, pp, &use_pp), 0);
+	KUNIT_ASSERT_TRUE(test, use_pp);
+}
+
+/* The memory layouts the V4L2 RGB formats are defined by. */
+static void jpeg_dec_pp_byte_order(struct kunit *test)
+{
+	static const u8 rgb[2][3] = { { 0xf3, 0x1c, 0xa5 }, { 0x3b, 0xe6, 0x0f } };
+	struct hantro_g1_pp_regs pp;
+	u8 bytes[4];
+	u16 px;
+
+	/* XBGR32: B, G, R, X (DRM XRGB8888). */
+	pp_regs_640(test, V4L2_PIX_FMT_XBGR32, &pp);
+	pp_store(&pp, rgb, bytes);
+	KUNIT_EXPECT_EQ(test, bytes[0], 0xa5);
+	KUNIT_EXPECT_EQ(test, bytes[1], 0x1c);
+	KUNIT_EXPECT_EQ(test, bytes[2], 0xf3);
+
+	/* XRGB32: X, R, G, B (DRM BGRX8888). */
+	pp_regs_640(test, V4L2_PIX_FMT_XRGB32, &pp);
+	pp_store(&pp, rgb, bytes);
+	KUNIT_EXPECT_EQ(test, bytes[1], 0xf3);
+	KUNIT_EXPECT_EQ(test, bytes[2], 0x1c);
+	KUNIT_EXPECT_EQ(test, bytes[3], 0xa5);
+
+	/*
+	 * RGB565: two little-endian 16-bit pixels in order, R in 15:11,
+	 * G in 10:5, B in 4:0 (DRM RGB565).
+	 */
+	pp_regs_640(test, V4L2_PIX_FMT_RGB565, &pp);
+	pp_store(&pp, rgb, bytes);
+	px = (0xf3 >> 3) << 11 | (0x1c >> 2) << 5 | 0xa5 >> 3;
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(bytes), px);
+	px = (0x3b >> 3) << 11 | (0xe6 >> 2) << 5 | 0x0f >> 3;
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(bytes + 2), px);
+
+	/* NV12 and YUYV keep the byte order of the decoder's own output. */
+	pp_regs_640(test, V4L2_PIX_FMT_YUYV, &pp);
+	KUNIT_EXPECT_TRUE(test, pp.dev_config & BIT(6));
+	KUNIT_EXPECT_FALSE(test, pp.control & BIT(2));
+}
+
+/*
+ * The colour conversion: JFIF's coefficients (ITU-T T.871) in the 10-bit
+ * fields with 8 fractional bits, Y at full range, no contrast or
+ * brightness change.
+ */
+static void jpeg_dec_pp_coefficients(struct kunit *test)
+{
+	/* The coefficients in millionths. */
+	static const s64 cr_r = 1402000, cr_g = 714136, cb_g = 344136,
+			 cb_b = 1772000;
+	struct hantro_g1_pp_regs pp;
+	s64 a1, a2, b, c, d, e, f, err_r, err_g, err_b;
+
+	pp_regs_640(test, V4L2_PIX_FMT_XBGR32, &pp);
+
+	/* COEFFA2 27:18, COEFFA1 17:8, CONTRAST_THR2 7:0 */
+	a2 = reg_field(pp.color_conv, 27, 18);
+	a1 = reg_field(pp.color_conv, 17, 8);
+	KUNIT_EXPECT_EQ(test, a1, 256);
+	KUNIT_EXPECT_EQ(test, a2, 256);
+	KUNIT_EXPECT_EQ(test, pp.color_conv & GENMASK(7, 0), 0);
+	/* COEFFD 29:20 (Cb in G), COEFFC 19:10 (Cr in G), COEFFB 9:0 (Cr in R) */
+	d = reg_field(pp.color_conv0, 29, 20);
+	c = reg_field(pp.color_conv0, 19, 10);
+	b = reg_field(pp.color_conv0, 9, 0);
+	/* COEFFF 17:10 (brightness), COEFFE 9:0 (Cb in B) */
+	f = reg_field(pp.color_conv1, 17, 10);
+	e = reg_field(pp.color_conv1, 9, 0);
+	KUNIT_EXPECT_EQ(test, f, 0);
+	/* YCBCR_RANGE 29: full range. */
+	KUNIT_EXPECT_EQ(test, reg_field(pp.scaling0, 29, 29), 1);
+
+	KUNIT_EXPECT_EQ(test, b, 359);
+	KUNIT_EXPECT_EQ(test, c, 183);
+	KUNIT_EXPECT_EQ(test, d, 88);
+	KUNIT_EXPECT_EQ(test, e, 454);
+
+	/*
+	 * At the largest chroma, |Cb - 128| = |Cr - 128| = 128, the rounded
+	 * coefficients move R, G and B by less than a quarter of a level.
+	 */
+	err_r = abs(b * 1000000 / 2 - cr_r * 128);
+	err_g = abs(c * 1000000 / 2 - cr_g * 128) +
+		abs(d * 1000000 / 2 - cb_g * 128);
+	err_b = abs(e * 1000000 / 2 - cb_b * 128);
+	KUNIT_EXPECT_LT(test, err_r, 250000);
+	KUNIT_EXPECT_LT(test, err_g, 250000);
+	KUNIT_EXPECT_LT(test, err_b, 250000);
+
+	/* The same conversion for every RGB format, none for YUV. */
+	pp_regs_640(test, V4L2_PIX_FMT_RGB565, &pp);
+	KUNIT_EXPECT_EQ(test, reg_field(pp.color_conv0, 9, 0), b);
+	KUNIT_EXPECT_EQ(test, pp.color_conv1, e);
+	pp_regs_640(test, V4L2_PIX_FMT_YUYV, &pp);
+	KUNIT_EXPECT_EQ(test, pp.color_conv | pp.color_conv0 | pp.color_conv1 |
+			pp.scaling0 | pp.mask_r | pp.mask_g | pp.mask_b, 0);
+}
+
+/* What the register builder refuses. */
+static void pp_regs_refused(struct kunit *test)
+{
+	const struct hantro_g1_pp_cfg ok = {
+		.in_fmt = 1, .in_width = 640, .in_height = 480,
+		.orig_mb_width = 40, .fourcc = V4L2_PIX_FMT_XBGR32,
+		.width = 320, .height = 240, .stride = 320, .buf_height = 240,
+		.csc = &hantro_g1_pp_csc_bt601_full,
+	};
+	struct hantro_g1_pp_regs pp;
+	struct hantro_g1_pp_cfg cfg;
+
+	KUNIT_EXPECT_EQ(test, hantro_g1_pp_regs(&ok, &pp), 0);
+	KUNIT_EXPECT_TRUE(test, hantro_g1_pp_writes(V4L2_PIX_FMT_RGB565));
+	KUNIT_EXPECT_FALSE(test, hantro_g1_pp_writes(V4L2_PIX_FMT_NV16));
+
+	cfg = ok;
+	cfg.fourcc = V4L2_PIX_FMT_GREY;
+	KUNIT_EXPECT_EQ(test, hantro_g1_pp_regs(&cfg, &pp), -EINVAL);
+	/* RGB needs a conversion, YUV takes none. */
+	cfg = ok;
+	cfg.csc = NULL;
+	KUNIT_EXPECT_EQ(test, hantro_g1_pp_regs(&cfg, &pp), -EINVAL);
+	cfg.fourcc = V4L2_PIX_FMT_YUYV;
+	KUNIT_EXPECT_EQ(test, hantro_g1_pp_regs(&cfg, &pp), 0);
+}
+
+/*
+ * The other formats the post-processor writes: TRY_FMT sizes, the
+ * stepwise sizes, the default compose rectangle, and its position at a
+ * multiple of 8 bytes.
+ */
+static void jpeg_dec_pp_cap(struct kunit *test)
+{
+	static const u32 sizes[][2] = {
+		{ 48, 48 }, { 4088, 8176 }, { 56, 50 }, { 1072, 1448 },
+		{ 1448, 1072 }, { 1008, 752 }, { 1000, 744 }, { 4000, 48 },
+	};
+	struct v4l2_frmsizeenum fsize = { };
+	const struct v4l2_frmsize_stepwise *sw = &fsize.stepwise;
+	struct hantro_g1_jpeg_dec_out out;
+	struct v4l2_rect r;
+	unsigned int i;
+	u32 w, h;
+
+	/* A size of 0: the whole picture, as large as it is written. */
+	make_out(&out, 4000, 3000, V4L2_PIX_FMT_YUYV, 0, 0);
+	w = 0;
+	h = 0;
+	hantro_g1_jpeg_dec_cap_size(&out, &w, &h);
+	KUNIT_EXPECT_EQ(test, w, 1920);
+	KUNIT_EXPECT_EQ(test, h, 1440);
+	make_out(&out, 640, 480, V4L2_PIX_FMT_RGB565, 0, 0);
+	w = 0;
+	h = 0;
+	hantro_g1_jpeg_dec_cap_size(&out, &w, &h);
+	KUNIT_EXPECT_EQ(test, w, 640);
+	KUNIT_EXPECT_EQ(test, h, 480);
+	/* Any other size: a buffer, also one that holds the picture. */
+	w = 1008;
+	h = 752;
+	hantro_g1_jpeg_dec_cap_size(&out, &w, &h);
+	KUNIT_EXPECT_EQ(test, w, 1008);
+	KUNIT_EXPECT_EQ(test, h, 752);
+	w = 1071;
+	h = 1447;
+	hantro_g1_jpeg_dec_cap_size(&out, &w, &h);
+	KUNIT_EXPECT_EQ(test, w, 1072);
+	KUNIT_EXPECT_EQ(test, h, 1448);
+
+	/* Stepwise, every size taken as it is. */
+	make_out(&out, 1000, 744, V4L2_PIX_FMT_YUYV, 0, 0);
+	KUNIT_ASSERT_EQ(test, hantro_g1_jpeg_dec_cap_frmsize(&out, &fsize), 0);
+	KUNIT_EXPECT_EQ(test, fsize.type, V4L2_FRMSIZE_TYPE_STEPWISE);
+	KUNIT_EXPECT_EQ(test, sw->min_width, 48);
+	KUNIT_EXPECT_EQ(test, sw->max_width, 4088);
+	KUNIT_EXPECT_EQ(test, sw->step_width, 8);
+	KUNIT_EXPECT_EQ(test, sw->min_height, 48);
+	KUNIT_EXPECT_EQ(test, sw->max_height, 8176);
+	KUNIT_EXPECT_EQ(test, sw->step_height, 2);
+	for (i = 0; i < ARRAY_SIZE(sizes); i++) {
+		w = sizes[i][0];
+		h = sizes[i][1];
+		KUNIT_EXPECT_EQ(test, (w - sw->min_width) % sw->step_width, 0);
+		KUNIT_EXPECT_EQ(test, (h - sw->min_height) % sw->step_height, 0);
+		hantro_g1_jpeg_dec_cap_size(&out, &w, &h);
+		KUNIT_EXPECT_EQ_MSG(test, w, sizes[i][0], "%ux%u", sizes[i][0],
+				    sizes[i][1]);
+		KUNIT_EXPECT_EQ_MSG(test, h, sizes[i][1], "%ux%u", sizes[i][0],
+				    sizes[i][1]);
+	}
+	fsize.index = 1;
+	KUNIT_EXPECT_EQ(test, hantro_g1_jpeg_dec_cap_frmsize(&out, &fsize),
+			-EINVAL);
+
+	/*
+	 * The default compose rectangle: the crop rectangle where the buffer
+	 * holds it and the post-processor writes it that large, else the
+	 * picture fitted, aspect ratio kept.
+	 */
+	make_out(&out, 1000, 744, V4L2_PIX_FMT_YUYV, 1000, 744);
+	expect_rect(test, &out.compose, 0, 0, 1000, 744, "YUYV picture size");
+	make_out(&out, 640, 480, V4L2_PIX_FMT_XRGB32, 1072, 1448);
+	expect_rect(test, &out.compose, 0, 0, 640, 480, "XRGB32 larger");
+	make_out(&out, 4000, 3000, V4L2_PIX_FMT_YUYV, 4000, 3000);
+	expect_rect(test, &out.compose, 0, 0, 1920, 1440, "YUYV 4000 wide");
+	make_out(&out, 1000, 3000, V4L2_PIX_FMT_RGB565, 1000, 3000);
+	expect_rect(test, &out.compose, 0, 0, 680, 2046, "RGB565 3000 high");
+
+	make_out(&out, 1000, 744, V4L2_PIX_FMT_YUYV, 1072, 736);
+	r = (struct v4l2_rect){ 7, 0, 536, 400 };
+	hantro_g1_jpeg_dec_compose_adjust(&out, &r);
+	KUNIT_EXPECT_EQ(test, r.left, 4);
+	out.fourcc = V4L2_PIX_FMT_XRGB32;
+	r = (struct v4l2_rect){ 7, 0, 536, 400 };
+	hantro_g1_jpeg_dec_compose_adjust(&out, &r);
+	KUNIT_EXPECT_EQ(test, r.left, 6);
+	out.fourcc = V4L2_PIX_FMT_NV12;
+	r = (struct v4l2_rect){ 7, 0, 536, 400 };
+	hantro_g1_jpeg_dec_compose_adjust(&out, &r);
+	KUNIT_EXPECT_EQ(test, r.left, 0);
+}
+
+/*
+ * The JPEG decoder sets the post-processor up for each job itself: no
+ * generic post-processing for its YUYV, unlike the video decoders'.
+ */
+static void jpeg_dec_needs_postproc(struct kunit *test)
+{
+	static const struct {
+		u32 src, dst;
+		bool needs;
+	} cases[] = {
+		{ V4L2_PIX_FMT_JPEG, V4L2_PIX_FMT_YUYV, false },
+		{ V4L2_PIX_FMT_JPEG, V4L2_PIX_FMT_NV12, false },
+		{ V4L2_PIX_FMT_H264_SLICE, V4L2_PIX_FMT_YUYV, true },
+		{ V4L2_PIX_FMT_VP8_FRAME, V4L2_PIX_FMT_YUYV, true },
+		{ V4L2_PIX_FMT_VP8_FRAME, V4L2_PIX_FMT_NV12, false },
+	};
+	const struct hantro_variant *rk3026 = &rk3026_vpu_variant;
+	const struct hantro_fmt *dst;
+	struct hantro_ctx *ctx;
+	struct hantro_dev *dev;
+	unsigned int c, count;
+
+	if (!IS_ENABLED(CONFIG_VIDEO_HANTRO_ROCKCHIP))
+		kunit_skip(test, "no Rockchip variants");
+
+	dev = kunit_kzalloc(test, sizeof(*dev), GFP_KERNEL);
+	ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, dev);
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	dev->variant = rk3026;
+	ctx->dev = dev;
+
+	for (c = 0; c < ARRAY_SIZE(cases); c++) {
+		ctx->vpu_src_fmt = find_fmt(rk3026, cases[c].src, &count);
+		KUNIT_ASSERT_EQ(test, count, 1);
+		if (cases[c].dst == V4L2_PIX_FMT_YUYV) {
+			dst = &rk3026->postproc_fmts[0];
+		} else {
+			dst = find_fmt(rk3026, cases[c].dst, &count);
+			KUNIT_ASSERT_EQ(test, count, 1);
+		}
+		KUNIT_EXPECT_EQ_MSG(test, hantro_needs_postproc(ctx, dst),
+				    cases[c].needs, "case %u", c);
+	}
+}
+
 /* One field of a register file, as the video post-processing wrote them. */
 struct pp_field {
 	unsigned int swreg;
@@ -1707,6 +2185,12 @@ static struct kunit_case hantro_jpeg_dec_cases[] = {
 	KUNIT_CASE(jpeg_dec_compose),
 	KUNIT_CASE(jpeg_dec_job_out),
 	KUNIT_CASE(jpeg_dec_selection),
+	KUNIT_CASE(jpeg_dec_pp_formats),
+	KUNIT_CASE(jpeg_dec_pp_byte_order),
+	KUNIT_CASE(jpeg_dec_pp_coefficients),
+	KUNIT_CASE(pp_regs_refused),
+	KUNIT_CASE(jpeg_dec_pp_cap),
+	KUNIT_CASE(jpeg_dec_needs_postproc),
 	{ }
 };
 

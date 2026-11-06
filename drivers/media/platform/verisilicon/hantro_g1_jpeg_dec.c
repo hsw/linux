@@ -160,10 +160,10 @@ static bool dec_fmt(u32 fourcc)
 	       fourcc == V4L2_PIX_FMT_GREY;
 }
 
-/* A format the post-processor writes for the decoder: NV12. */
+/* A format the post-processor writes. */
 static bool pp_fmt(const struct hantro_g1_jpeg_dec_out *out)
 {
-	return out->pp_max_width && out->fourcc == V4L2_PIX_FMT_NV12;
+	return out->pp_max_width && hantro_g1_pp_writes(out->fourcc);
 }
 
 /* The decoder's own buffer: its format, the picture in macroblocks. */
@@ -266,11 +266,21 @@ static void pp_axis(u32 src, u32 pos, u32 size, u32 buf, u32 max,
  * for the picture's size, also one in the header that is not a multiple
  * of 8, gets all of it, as from the decoder alone. NV12 smaller than that
  * in either direction is a buffer the post-processor writes into, up to
- * its widest stride.
+ * its widest stride. Its other formats
+ * are such buffers at any size; 0 asks for the whole picture as large as
+ * the post-processor writes it.
  */
 VISIBLE_IF_KUNIT void hantro_g1_jpeg_dec_cap_size(const struct hantro_g1_jpeg_dec_out *out,
 						  u32 *width, u32 *height)
 {
+	if (!dec_fmt(out->fourcc)) {
+		if (!*width || !*height)
+			pp_fit(out, out->pp_max_width, HANTRO_G1_PP_MAX_HEIGHT,
+			       width, height);
+		v4l2_apply_frmsize_constraints(width, height, &pp_buf_sizes);
+		return;
+	}
+
 	if (pp_fmt(out) && *width && *height &&
 	    !holds_picture(out, *width, *height)) {
 		v4l2_apply_frmsize_constraints(width, height, &pp_buf_sizes);
@@ -292,7 +302,8 @@ VISIBLE_IF_KUNIT void hantro_g1_jpeg_dec_cap_size(const struct hantro_g1_jpeg_de
  * NV12 size that holds the whole picture. The smaller NV12 buffers the
  * post-processor writes into are not listed: no stepwise range gives the
  * sizes below the picture in either direction without sizes that S_FMT
- * replaces by the decoder's.
+ * replaces by the decoder's. The post-processor's other formats: the
+ * buffers it writes into, stepwise.
  *
  * Return: 0, or -EINVAL for an index other than 0.
  */
@@ -301,6 +312,12 @@ VISIBLE_IF_KUNIT int hantro_g1_jpeg_dec_cap_frmsize(const struct hantro_g1_jpeg_
 {
 	if (fsize->index)
 		return -EINVAL;
+
+	if (!dec_fmt(out->fourcc)) {
+		fsize->type = V4L2_FRMSIZE_TYPE_STEPWISE;
+		fsize->stepwise = pp_buf_sizes;
+		return 0;
+	}
 
 	fsize->type = V4L2_FRMSIZE_TYPE_DISCRETE;
 	fsize->discrete.width = ALIGN(out->src_width, MB_DIM);
@@ -422,6 +439,8 @@ VISIBLE_IF_KUNIT int hantro_g1_jpeg_dec_job_out(const struct hantro_g1_jpeg_dec_
 		.buf_height = out->height,
 		.left = c->left,
 		.top = c->top,
+		/* JFIF: BT.601 at full range. */
+		.csc = &hantro_g1_pp_csc_bt601_full,
 	};
 	struct v4l2_rect r = *c;
 

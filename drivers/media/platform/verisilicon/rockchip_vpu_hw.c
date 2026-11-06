@@ -176,10 +176,11 @@ static const struct hantro_fmt rk3066_vpu_dec_fmts[] = {
 };
 
 /*
- * The RK3066 list plus the JPEG decoder: NV16 and GREY are offered only for
- * a JPEG OUTPUT, and the raw sizes go up to the JPEG limit. The video
- * formats keep their 1920x1088 limit, which bounds the CAPTURE size of
- * their contexts.
+ * The RK3066 list plus the JPEG decoder: NV16, GREY and the RGB formats the
+ * post-processor writes for it are offered only for a JPEG OUTPUT, and the
+ * raw sizes go up to the JPEG limit; the JPEG decoder's codec ops size its
+ * CAPTURE buffers. The video formats keep their 1920x1088 limit, which
+ * bounds the CAPTURE size of their contexts.
  */
 static const struct hantro_fmt rk3026_vpu_dec_fmts[] = {
 	{
@@ -219,6 +220,21 @@ static const struct hantro_fmt rk3026_vpu_dec_fmts[] = {
 			.max_height = HANTRO_G1_JPEG_DEC_MAX_SIZE,
 			.step_height = MB_DIM,
 		},
+	},
+	{
+		.fourcc = V4L2_PIX_FMT_RGB565,
+		.codec_mode = HANTRO_MODE_NONE,
+		.codec_modes = BIT(HANTRO_MODE_JPEG_DEC),
+	},
+	{
+		.fourcc = V4L2_PIX_FMT_XBGR32,
+		.codec_mode = HANTRO_MODE_NONE,
+		.codec_modes = BIT(HANTRO_MODE_JPEG_DEC),
+	},
+	{
+		.fourcc = V4L2_PIX_FMT_XRGB32,
+		.codec_mode = HANTRO_MODE_NONE,
+		.codec_modes = BIT(HANTRO_MODE_JPEG_DEC),
 	},
 	{
 		.fourcc = V4L2_PIX_FMT_H264_SLICE,

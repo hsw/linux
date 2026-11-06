@@ -112,19 +112,28 @@ hantro_check_depth_match(const struct hantro_fmt *fmt, int bit_depth)
 
 /*
  * A raw decoder format may be limited to some coded formats (codec_modes):
- * it is offered only while the OUTPUT queue holds one of them. The JPEG
- * decoder does not use the post-processor, so the post-processed formats are
- * not offered for a JPEG OUTPUT.
+ * it is offered only while the OUTPUT queue holds one of them. A mode that
+ * writes its CAPTURE buffers through the post-processor itself offers the
+ * post-processed formats it writes; the JPEG decoder does not use the
+ * post-processor otherwise.
  */
 VISIBLE_IF_KUNIT bool
 hantro_raw_fmt_allowed(const struct hantro_ctx *ctx, const struct hantro_fmt *fmt)
 {
+	const struct hantro_codec_ops *ops;
+	u32 width = 0, height = 0;
+
 	if (ctx->is_encoder || !ctx->vpu_src_fmt ||
 	    ctx->vpu_src_fmt->codec_mode == HANTRO_MODE_NONE)
 		return true;
 
-	if (fmt->postprocessed)
+	if (fmt->postprocessed) {
+		ops = hantro_dec_cap_ops(ctx);
+		if (ops)
+			return !ops->cap_try_fmt(ctx, fmt->fourcc, &width,
+						 &height);
 		return ctx->vpu_src_fmt->codec_mode != HANTRO_MODE_JPEG_DEC;
+	}
 
 	return !fmt->codec_modes ||
 	       fmt->codec_modes & BIT(ctx->vpu_src_fmt->codec_mode);
@@ -142,7 +151,7 @@ static bool hantro_is_stateful_dec(const struct hantro_ctx *ctx)
  * mode that writes its CAPTURE buffers through the post-processor itself
  * (cap_try_fmt) size them and its compose rectangle.
  */
-static const struct hantro_codec_ops *
+const struct hantro_codec_ops *
 hantro_dec_cap_ops(const struct hantro_ctx *ctx)
 {
 	const struct hantro_codec_ops *ops;

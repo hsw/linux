@@ -407,6 +407,28 @@ struct hantro_postproc_ops {
 #define HANTRO_G1_PP_STEP_HEIGHT	2
 
 /**
+ * struct hantro_g1_pp_csc - YCbCr to RGB conversion of the G1 post-processor
+ * @full_range:	Y and CbCr at full range; else Y is offset by 16
+ * @y:		weight of Y
+ * @cr_r:	weight of Cr - 128 in R
+ * @cr_g:	weight of Cr - 128 in G, subtracted
+ * @cb_g:	weight of Cb - 128 in G, subtracted
+ * @cb_b:	weight of Cb - 128 in B
+ *
+ * The weights have 8 fractional bits and are at most 1023.
+ */
+struct hantro_g1_pp_csc {
+	bool full_range;
+	u16 y;
+	u16 cr_r;
+	u16 cr_g;
+	u16 cb_g;
+	u16 cb_b;
+};
+
+extern const struct hantro_g1_pp_csc hantro_g1_pp_csc_bt601_full;
+
+/**
  * struct hantro_g1_pp_cfg - a picture the G1 post-processor writes, in
  *			     pipeline with the decoder
  * @in_fmt:		G1_REG_PP_CONTROL_IN_FMT() value of the decoded picture
@@ -423,6 +445,7 @@ struct hantro_postproc_ops {
  *			follows its luma plane
  * @left:		position of the output in the buffer
  * @top:		likewise
+ * @csc:		conversion to an RGB output format
  */
 struct hantro_g1_pp_cfg {
 	u32 in_fmt;
@@ -436,14 +459,22 @@ struct hantro_g1_pp_cfg {
 	u32 buf_height;
 	u32 left;
 	u32 top;
+	const struct hantro_g1_pp_csc *csc;
 };
 
 /**
  * struct hantro_g1_pp_regs - G1 post-processor registers of one picture
  * @dev_config:		G1_REG_PP_DEV_CONFIG
+ * @color_conv:		G1_REG_PP_COLOR_CONVERSION
+ * @color_conv0:	G1_REG_PP_COLOR_CONVERSION0
+ * @color_conv1:	G1_REG_PP_COLOR_CONVERSION1
  * @input_size:		G1_REG_PP_INPUT_SIZE
+ * @scaling0:		G1_REG_PP_SCALING0
  * @scaling1:		G1_REG_PP_SCALING1
  * @scaling_inv:	G1_REG_PP_SCALING_INV
+ * @mask_r:		G1_REG_PP_MASK_R
+ * @mask_g:		G1_REG_PP_MASK_G
+ * @mask_b:		G1_REG_PP_MASK_B
  * @control:		G1_REG_PP_CONTROL
  * @orig_width:		G1_REG_PP_MASK1_ORIG_WIDTH
  * @display_width:	G1_REG_PP_DISPLAY_WIDTH_IN_EXT
@@ -453,9 +484,16 @@ struct hantro_g1_pp_cfg {
  */
 struct hantro_g1_pp_regs {
 	u32 dev_config;
+	u32 color_conv;
+	u32 color_conv0;
+	u32 color_conv1;
 	u32 input_size;
+	u32 scaling0;
 	u32 scaling1;
 	u32 scaling_inv;
+	u32 mask_r;
+	u32 mask_g;
+	u32 mask_b;
 	u32 control;
 	u32 orig_width;
 	u32 display_width;
@@ -701,6 +739,7 @@ void hantro_g2_check_idle(struct hantro_dev *vpu);
 void hantro_g2_reset(struct hantro_ctx *ctx);
 irqreturn_t hantro_g2_irq(int irq, void *dev_id);
 
+bool hantro_g1_pp_writes(u32 fourcc);
 int hantro_g1_pp_regs(const struct hantro_g1_pp_cfg *cfg,
 		      struct hantro_g1_pp_regs *regs);
 void hantro_g1_pp_write(struct hantro_dev *vpu,

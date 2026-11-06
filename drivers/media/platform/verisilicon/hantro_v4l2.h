@@ -27,6 +27,8 @@ extern const struct vb2_ops hantro_queue_ops;
 int hantro_reset_raw_fmt(struct hantro_ctx *ctx, int bit_depth, bool need_postproc);
 void hantro_reset_fmts(struct hantro_ctx *ctx);
 int hantro_get_format_depth(u32 fourcc);
+const struct hantro_codec_ops *
+hantro_dec_cap_ops(const struct hantro_ctx *ctx);
 const struct hantro_fmt *
 hantro_get_default_fmt(const struct hantro_ctx *ctx, bool bitstream,
 		       int bit_depth, bool need_postproc);

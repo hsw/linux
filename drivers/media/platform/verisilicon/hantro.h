@@ -39,6 +39,7 @@ struct hantro_postproc_ops;
 #define HANTRO_HEVC_DECODER	BIT(19)
 #define HANTRO_VP9_DECODER	BIT(20)
 #define HANTRO_AV1_DECODER	BIT(21)
+#define HANTRO_JPEG_DECODER	BIT(22)
 #define HANTRO_DECODERS		0xffff0000
 
 /**
@@ -77,6 +78,9 @@ struct hantro_irq {
  * @double_buffer:		core needs double buffering
  * @legacy_regs:		core uses legacy register set
  * @late_postproc:		postproc must be set up at the end of the job
+ * @pp_max_width:		widest output of the G1 post-processor, for a
+ *				decoder mode that sets it up itself (the
+ *				JPEG decoder); 0 if none does
  * @shared_devices:		an array of device ids that cannot run concurrently
  */
 struct hantro_variant {
@@ -102,6 +106,7 @@ struct hantro_variant {
 	unsigned int double_buffer : 1;
 	unsigned int legacy_regs : 1;
 	unsigned int late_postproc : 1;
+	unsigned int pp_max_width;
 	const struct of_device_id *shared_devices;
 };
 
@@ -115,6 +120,8 @@ struct hantro_variant {
  * @HANTRO_MODE_HEVC_DEC: HEVC decoder.
  * @HANTRO_MODE_VP9_DEC: VP9 decoder.
  * @HANTRO_MODE_AV1_DEC: AV1 decoder
+ * @HANTRO_MODE_JPEG_DEC: JPEG decoder, the only stateful decoder mode: the
+ *			  driver parses the bitstream headers itself.
  */
 enum hantro_codec_mode {
 	HANTRO_MODE_NONE = -1,
@@ -125,6 +132,7 @@ enum hantro_codec_mode {
 	HANTRO_MODE_HEVC_DEC,
 	HANTRO_MODE_VP9_DEC,
 	HANTRO_MODE_AV1_DEC,
+	HANTRO_MODE_JPEG_DEC,
 };
 
 /*
@@ -239,12 +247,15 @@ struct hantro_dev {
  *
  * @codec_ops:		Set of operations related to codec mode.
  * @postproc:		Post-processing context.
+ * @compose:		CAPTURE compose rectangle of a decoder mode with
+ *			hantro_codec_ops.cap_selection
  * @h264_dec:		H.264-decoding context.
  * @mpeg2_dec:		MPEG-2-decoding context.
  * @vp8_dec:		VP8-decoding context.
  * @hevc_dec:		HEVC-decoding context.
  * @vp9_dec:		VP9-decoding context.
  * @av1_dec:		AV1-decoding context.
+ * @jpeg_dec:		JPEG-decoding context.
  */
 struct hantro_ctx {
 	struct hantro_dev *dev;
@@ -266,6 +277,7 @@ struct hantro_ctx {
 
 	const struct hantro_codec_ops *codec_ops;
 	struct hantro_postproc_ctx postproc;
+	struct v4l2_rect compose;
 	bool need_postproc;
 
 	/* Specific for particular codec modes. */
@@ -276,6 +288,7 @@ struct hantro_ctx {
 		struct hantro_hevc_dec_hw_ctx hevc_dec;
 		struct hantro_vp9_dec_hw_ctx vp9_dec;
 		struct hantro_av1_dec_hw_ctx av1_dec;
+		struct hantro_jpeg_dec_hw_ctx jpeg_dec;
 	};
 };
 
@@ -291,6 +304,9 @@ struct hantro_ctx {
  * @frmsize:	Supported range of frame sizes (only for bitstream formats).
  * @postprocessed: Indicates if this format needs the post-processor.
  * @match_depth: Indicates if format bit depth must match video bit depth
+ * @codec_modes: Raw decoder formats only: mask of BIT(HANTRO_MODE_*) of the
+ *		coded formats this format can be decoded to. 0 means all of
+ *		them.
  */
 struct hantro_fmt {
 	char *name;
@@ -302,31 +318,13 @@ struct hantro_fmt {
 	struct v4l2_frmsize_stepwise frmsize;
 	bool postprocessed;
 	bool match_depth;
+	unsigned int codec_modes;
 };
 
 struct hantro_reg {
 	u32 base;
 	u32 shift;
 	u32 mask;
-};
-
-struct hantro_postproc_regs {
-	struct hantro_reg pipeline_en;
-	struct hantro_reg max_burst;
-	struct hantro_reg clk_gate;
-	struct hantro_reg out_swap32;
-	struct hantro_reg out_endian;
-	struct hantro_reg out_luma_base;
-	struct hantro_reg input_width;
-	struct hantro_reg input_height;
-	struct hantro_reg output_width;
-	struct hantro_reg output_height;
-	struct hantro_reg input_fmt;
-	struct hantro_reg output_fmt;
-	struct hantro_reg orig_width;
-	struct hantro_reg display_width;
-	struct hantro_reg input_width_ext;
-	struct hantro_reg input_height_ext;
 };
 
 struct hantro_vp9_decoded_buffer_info {

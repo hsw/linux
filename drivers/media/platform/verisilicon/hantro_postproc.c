@@ -5,7 +5,9 @@
  * Copyright (C) 2019 Collabora, Ltd.
  */
 
+#include <kunit/visibility.h>
 #include <linux/dma-mapping.h>
+#include <linux/math64.h>
 #include <linux/types.h>
 
 #include "hantro.h"
@@ -14,50 +16,319 @@
 #include "hantro_g2_regs.h"
 #include "hantro_v4l2.h"
 
-#define HANTRO_PP_REG_WRITE(vpu, reg_name, val) \
-{ \
-	hantro_reg_write(vpu, \
-			 &hantro_g1_postproc_regs.reg_name, \
-			 val); \
-}
-
-#define HANTRO_PP_REG_WRITE_RELAXED(vpu, reg_name, val) \
-{ \
-	hantro_reg_write_relaxed(vpu, \
-				 &hantro_g1_postproc_regs.reg_name, \
-				 val); \
-}
-
 #define VPU_PP_IN_YUYV			0x0
 #define VPU_PP_IN_NV12			0x1
 #define VPU_PP_IN_YUV420		0x2
 #define VPU_PP_IN_YUV240_TILED		0x5
 #define VPU_PP_OUT_RGB			0x0
 #define VPU_PP_OUT_YUYV			0x3
+#define VPU_PP_OUT_NV12			0x5
 
-static const struct hantro_postproc_regs hantro_g1_postproc_regs = {
-	.pipeline_en = {G1_REG_PP_INTERRUPT, 1, 0x1},
-	.max_burst = {G1_REG_PP_DEV_CONFIG, 0, 0x1f},
-	.clk_gate = {G1_REG_PP_DEV_CONFIG, 1, 0x1},
-	.out_swap32 = {G1_REG_PP_DEV_CONFIG, 5, 0x1},
-	.out_endian = {G1_REG_PP_DEV_CONFIG, 6, 0x1},
-	.out_luma_base = {G1_REG_PP_OUT_LUMA_BASE, 0, 0xffffffff},
-	.input_width = {G1_REG_PP_INPUT_SIZE, 0, 0x1ff},
-	.input_height = {G1_REG_PP_INPUT_SIZE, 9, 0x1ff},
-	.output_width = {G1_REG_PP_CONTROL, 4, 0x7ff},
-	.output_height = {G1_REG_PP_CONTROL, 15, 0x7ff},
-	.input_fmt = {G1_REG_PP_CONTROL, 29, 0x7},
-	.output_fmt = {G1_REG_PP_CONTROL, 26, 0x7},
-	.orig_width = {G1_REG_PP_MASK1_ORIG_WIDTH, 23, 0x1ff},
-	.display_width = {G1_REG_PP_DISPLAY_WIDTH_IN_EXT, 0, 0xfff},
-	.input_width_ext = {G1_REG_PP_DISPLAY_WIDTH_IN_EXT, 26, 0x7},
-	.input_height_ext = {G1_REG_PP_DISPLAY_WIDTH_IN_EXT, 29, 0x7},
+/* G1_REG_PP_SCALING1 scaling mode */
+#define VPU_PP_SCALE_DOWN		2
+
+/* A colour conversion weight with 8 fractional bits: num / den, rounded. */
+#define VPU_PP_COEF(num, den)		(((num) * 512ULL / (den) + 1) / 2)
+#define VPU_PP_COEF_MAX			1023
+
+/*
+ * BT.601 YCbCr to RGB at full range, as JFIF (ITU-T T.871) defines it:
+ *
+ *   R = Y + 1.402 (Cr - 128)
+ *   G = Y - 0.344136 (Cb - 128) - 0.714136 (Cr - 128)
+ *   B = Y + 1.772 (Cb - 128)
+ */
+const struct hantro_g1_pp_csc hantro_g1_pp_csc_bt601_full = {
+	.full_range = true,
+	.y = VPU_PP_COEF(1, 1),
+	.cr_r = VPU_PP_COEF(1402, 1000),
+	.cr_g = VPU_PP_COEF(714136, 1000000),
+	.cb_g = VPU_PP_COEF(344136, 1000000),
+	.cb_b = VPU_PP_COEF(1772, 1000),
 };
+
+/* The largest weight fits the 10-bit fields. */
+static_assert(VPU_PP_COEF(1772, 1000) <= VPU_PP_COEF_MAX);
+
+/**
+ * struct hantro_g1_pp_fmt - an output format of the G1 post-processor
+ * @fourcc:	V4L2 pixel format
+ * @out_fmt:	G1_REG_PP_CONTROL_OUT_FMT() value
+ * @cpp:	bytes per pixel of the first plane
+ * @rgb16:	RGB with two 16-bit pixels in a 32-bit word
+ * @mask_r:	bits of R in a pixel, 0 for a YUV format
+ * @mask_g:	bits of G in a pixel
+ * @mask_b:	bits of B in a pixel
+ */
+struct hantro_g1_pp_fmt {
+	u32 fourcc;
+	u32 out_fmt;
+	u8 cpp;
+	bool rgb16;
+	u32 mask_r;
+	u32 mask_g;
+	u32 mask_b;
+};
+
+/*
+ * The RGB layouts as the fields read: the post-processor builds 32-bit
+ * output words, shifting each 8-bit colour value right from the top of the
+ * word by the channel's RGB_*_PADD and keeping the bits of the channel's
+ * mask; two 16-bit pixels share a word, the first in the upper half, the
+ * masks repeated for the second in the lower half. OUT_ENDIAN sets the
+ * byte order of a word in memory: set, as for the decoder's own output, it
+ * stores 8-bit YUV samples in order; clear for RGB, so that a mask is the
+ * layout of a pixel as a little-endian word, which is how these formats are
+ * defined. OUT_SWAP16_E then puts the first of two 16-bit pixels first.
+ */
+static const struct hantro_g1_pp_fmt hantro_g1_pp_fmts[] = {
+	{
+		/* CbCr after the luma plane, at the same stride */
+		.fourcc = V4L2_PIX_FMT_NV12,
+		.out_fmt = VPU_PP_OUT_NV12,
+		.cpp = 1,
+	},
+	{
+		.fourcc = V4L2_PIX_FMT_YUYV,
+		.out_fmt = VPU_PP_OUT_YUYV,
+		.cpp = 2,
+	},
+	{
+		/* R in 15:11, G in 10:5, B in 4:0 */
+		.fourcc = V4L2_PIX_FMT_RGB565,
+		.out_fmt = VPU_PP_OUT_RGB,
+		.cpp = 2,
+		.rgb16 = true,
+		.mask_r = 0xf800,
+		.mask_g = 0x07e0,
+		.mask_b = 0x001f,
+	},
+	{
+		/* B, G, R, X in memory */
+		.fourcc = V4L2_PIX_FMT_XBGR32,
+		.out_fmt = VPU_PP_OUT_RGB,
+		.cpp = 4,
+		.mask_r = 0x00ff0000,
+		.mask_g = 0x0000ff00,
+		.mask_b = 0x000000ff,
+	},
+	{
+		/* X, R, G, B in memory */
+		.fourcc = V4L2_PIX_FMT_XRGB32,
+		.out_fmt = VPU_PP_OUT_RGB,
+		.cpp = 4,
+		.mask_r = 0x0000ff00,
+		.mask_g = 0x00ff0000,
+		.mask_b = 0xff000000,
+	},
+};
+
+static const struct hantro_g1_pp_fmt *hantro_g1_pp_find(u32 fourcc)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(hantro_g1_pp_fmts); i++)
+		if (hantro_g1_pp_fmts[i].fourcc == fourcc)
+			return &hantro_g1_pp_fmts[i];
+
+	return NULL;
+}
+
+/**
+ * hantro_g1_pp_writes() - does the G1 post-processor write a format
+ * @fourcc:	V4L2 pixel format
+ *
+ * Return: true if hantro_g1_pp_regs() takes it as the output format.
+ */
+bool hantro_g1_pp_writes(u32 fourcc)
+{
+	return hantro_g1_pp_find(fourcc);
+}
+
+/* An inverse scaling ratio, out / in with 16 fractional bits, below 1. */
+static u32 hantro_g1_pp_inv_ratio(u32 out, u32 in)
+{
+	return div_u64((u64)out << 16, in);
+}
+
+/**
+ * hantro_g1_pp_regs() - compute the G1 post-processor registers of a
+ *			 picture
+ * @cfg:	the decoded picture and the output
+ * @regs:	the register values
+ *
+ * The post-processor reads @cfg->in_width x @cfg->in_height pixels of the
+ * picture the decoder writes, scales them down to the output size in each
+ * direction where that is smaller, and stores them in the output format at
+ * @cfg->left, @cfg->top of the buffer: YUV as it is, RGB converted by
+ * @cfg->csc, without dithering. The device configuration is the one the
+ * video post-processing has always used, OUT_ENDIAN and OUT_SWAP32_E set
+ * and bursts of 16, with OUT_ENDIAN clear for RGB.
+ *
+ * The caller keeps the sizes and the position within the post-processor's
+ * limits (HANTRO_G1_PP_*): the output no larger than the input, the input
+ * a multiple of 8, the output width and the stride in steps of 8 pixels,
+ * @cfg->left at a multiple of 8 bytes, the output height and @cfg->top
+ * even.
+ *
+ * Return: 0, or -EINVAL for a format the post-processor does not write, or
+ * an RGB format without a conversion.
+ */
+int hantro_g1_pp_regs(const struct hantro_g1_pp_cfg *cfg,
+		      struct hantro_g1_pp_regs *regs)
+{
+	const struct hantro_g1_pp_fmt *fmt = hantro_g1_pp_find(cfg->fourcc);
+	const struct hantro_g1_pp_csc *csc = cfg->csc;
+	u32 in_mb_width = DIV_ROUND_UP(cfg->in_width, MB_DIM);
+	u32 in_mb_height = DIV_ROUND_UP(cfg->in_height, MB_DIM);
+	bool rgb;
+
+	memset(regs, 0, sizeof(*regs));
+	if (!fmt)
+		return -EINVAL;
+
+	rgb = fmt->out_fmt == VPU_PP_OUT_RGB;
+	if (rgb && !csc)
+		return -EINVAL;
+
+	regs->dev_config = G1_REG_PP_OUT_ENDIAN(!rgb) |
+			   G1_REG_PP_OUTSWAP32_E(1) |
+			   G1_REG_PP_MAX_BURST(16);
+	regs->input_size = G1_REG_PP_INPUT_SIZE_WIDTH(in_mb_width) |
+			   G1_REG_PP_INPUT_SIZE_HEIGHT(in_mb_height);
+	regs->control = G1_REG_PP_CONTROL_IN_FMT(cfg->in_fmt) |
+			G1_REG_PP_CONTROL_OUT_FMT(fmt->out_fmt) |
+			G1_REG_PP_CONTROL_OUT_HEIGHT(cfg->height) |
+			G1_REG_PP_CONTROL_OUT_WIDTH(cfg->width);
+	/*
+	 * The input fields count macroblocks, the last one included where
+	 * the input ends in its middle; a crop bit drops the last 8 columns
+	 * (rows) of that macroblock from what is read.
+	 */
+	if (cfg->in_width % MB_DIM)
+		regs->control |= G1_REG_PP_CONTROL_CROP8_R_E;
+	if (cfg->in_height % MB_DIM)
+		regs->control |= G1_REG_PP_CONTROL_CROP8_D_E;
+	if (fmt->rgb16)
+		regs->control |= G1_REG_PP_CONTROL_OUT_SWAP16_E;
+	regs->orig_width = G1_REG_PP_ORIG_WIDTH(cfg->orig_mb_width);
+	regs->display_width = G1_REG_PP_DISPLAY_WIDTH(cfg->stride) |
+			      G1_REG_PP_IN_W_EXT(in_mb_width >> 9) |
+			      G1_REG_PP_IN_H_EXT(in_mb_height >> 8);
+
+	/*
+	 * A direction scaled down takes the inverse ratio, out / in. The
+	 * vertical one is programmed a unit above the truncated quotient,
+	 * the horizontal one is not; why the vertical scaler needs it is
+	 * not documented.
+	 */
+	if (cfg->width < cfg->in_width) {
+		regs->scaling1 |= G1_REG_PP_HOR_SCALE_MODE(VPU_PP_SCALE_DOWN);
+		regs->scaling_inv |=
+			G1_REG_PP_WSCALE_INVRA(hantro_g1_pp_inv_ratio(cfg->width,
+								      cfg->in_width));
+	}
+	if (cfg->height < cfg->in_height) {
+		regs->scaling1 |= G1_REG_PP_VER_SCALE_MODE(VPU_PP_SCALE_DOWN);
+		regs->scaling_inv |=
+			G1_REG_PP_HSCALE_INVRA(hantro_g1_pp_inv_ratio(cfg->height,
+								      cfg->in_height) + 1);
+	}
+
+	if (rgb) {
+		u32 mask_r = fmt->mask_r;
+		u32 mask_g = fmt->mask_g;
+		u32 mask_b = fmt->mask_b;
+
+		if (fmt->rgb16) {
+			mask_r |= mask_r << 16;
+			mask_g |= mask_g << 16;
+			mask_b |= mask_b << 16;
+		}
+
+		/*
+		 * COEFFA1 and COEFFA2 weigh Y below and above the contrast
+		 * thresholds, COEFFB Cr in R, COEFFC Cr in G, COEFFD Cb in G
+		 * and COEFFE Cb in B. Y has the same weight on both sides of
+		 * the thresholds and the contrast offsets are 0: no contrast
+		 * change. Brightness (COEFFF) is 0. YCBCR_RANGE takes Y at
+		 * full range; clear, Y is offset by 16.
+		 */
+		regs->color_conv = G1_REG_PP_COLOR_COEFFA2(csc->y) |
+				   G1_REG_PP_COLOR_COEFFA1(csc->y);
+		regs->color_conv0 = G1_REG_PP_COLOR_COEFFD(csc->cb_g) |
+				    G1_REG_PP_COLOR_COEFFC(csc->cr_g) |
+				    G1_REG_PP_COLOR_COEFFB(csc->cr_r);
+		regs->color_conv1 = G1_REG_PP_COLOR_COEFFE(csc->cb_b);
+
+		/* A channel's PADD: the bits above it in the word. */
+		regs->scaling0 = G1_REG_PP_YCBCR_RANGE(csc->full_range) |
+				 G1_REG_PP_RGB_16(fmt->rgb16) |
+				 G1_REG_PP_PADD_R(32 - fls(mask_r)) |
+				 G1_REG_PP_PADD_G(32 - fls(mask_g));
+		regs->scaling1 |= G1_REG_PP_PADD_B(32 - fls(mask_b));
+		regs->mask_r = mask_r;
+		regs->mask_g = mask_g;
+		regs->mask_b = mask_b;
+	}
+
+	regs->luma_offset = (cfg->top * cfg->stride + cfg->left) * fmt->cpp;
+	/* NV12: two CbCr bytes for every two pixels of every second line. */
+	if (fmt->out_fmt == VPU_PP_OUT_NV12)
+		regs->chroma_offset = cfg->stride * cfg->buf_height +
+				      cfg->top / 2 * cfg->stride + cfg->left;
+
+	return 0;
+}
+
+/**
+ * hantro_g1_pp_write() - set the G1 post-processor up for the next job
+ * @vpu:	the device
+ * @regs:	registers from hantro_g1_pp_regs()
+ * @dst:	bus address of the output buffer
+ *
+ * Pipeline mode goes on first, with the post-processor's own interrupt
+ * masked: the decoder's interrupt ends the job. The other registers are
+ * written whole, those the output does not use as 0, so nothing is left
+ * over from a job with another set-up.
+ */
+void hantro_g1_pp_write(struct hantro_dev *vpu,
+			const struct hantro_g1_pp_regs *regs, dma_addr_t dst)
+{
+	vdpu_write(vpu, G1_REG_PP_PIPELINE_EN | G1_REG_PP_IRQ_DIS,
+		   G1_REG_PP_INTERRUPT);
+	vdpu_write_relaxed(vpu, regs->dev_config, G1_REG_PP_DEV_CONFIG);
+	vdpu_write_relaxed(vpu, dst + regs->luma_offset,
+			   G1_REG_PP_OUT_LUMA_BASE);
+	vdpu_write_relaxed(vpu, regs->chroma_offset ?
+			   dst + regs->chroma_offset : 0,
+			   G1_REG_PP_OUT_CHROMA_BASE);
+	/* Contrast thresholds and offsets: 0. */
+	vdpu_write_relaxed(vpu, 0, G1_REG_PP_CONTRAST_ADJUST);
+	vdpu_write_relaxed(vpu, regs->color_conv, G1_REG_PP_COLOR_CONVERSION);
+	vdpu_write_relaxed(vpu, regs->color_conv0, G1_REG_PP_COLOR_CONVERSION0);
+	vdpu_write_relaxed(vpu, regs->color_conv1, G1_REG_PP_COLOR_CONVERSION1);
+	vdpu_write_relaxed(vpu, regs->input_size, G1_REG_PP_INPUT_SIZE);
+	vdpu_write_relaxed(vpu, regs->scaling0, G1_REG_PP_SCALING0);
+	vdpu_write_relaxed(vpu, regs->scaling1, G1_REG_PP_SCALING1);
+	vdpu_write_relaxed(vpu, regs->scaling_inv, G1_REG_PP_SCALING_INV);
+	vdpu_write_relaxed(vpu, regs->mask_r, G1_REG_PP_MASK_R);
+	vdpu_write_relaxed(vpu, regs->mask_g, G1_REG_PP_MASK_G);
+	vdpu_write_relaxed(vpu, regs->mask_b, G1_REG_PP_MASK_B);
+	vdpu_write_relaxed(vpu, regs->control, G1_REG_PP_CONTROL);
+	vdpu_write_relaxed(vpu, regs->orig_width, G1_REG_PP_MASK1_ORIG_WIDTH);
+	vdpu_write_relaxed(vpu, regs->display_width,
+			   G1_REG_PP_DISPLAY_WIDTH_IN_EXT);
+}
 
 bool hantro_needs_postproc(const struct hantro_ctx *ctx,
 			   const struct hantro_fmt *fmt)
 {
 	if (ctx->is_encoder)
+		return false;
+
+	/* A mode that sets the post-processor up for each job itself. */
+	if (hantro_dec_cap_ops(ctx))
 		return false;
 
 	if (ctx->need_postproc)
@@ -66,47 +337,46 @@ bool hantro_needs_postproc(const struct hantro_ctx *ctx,
 	return fmt->postprocessed;
 }
 
+/*
+ * A video decoder's picture at its own size, whole macroblocks, as the
+ * CAPTURE format: the post-processor converts NV12 to it.
+ */
+VISIBLE_IF_KUNIT int hantro_g1_pp_video_regs(u32 fourcc, u32 width, u32 height,
+					     struct hantro_g1_pp_regs *regs)
+{
+	struct hantro_g1_pp_cfg cfg = {
+		.in_fmt = VPU_PP_IN_NV12,
+		.in_width = MB_WIDTH(width) * MB_DIM,
+		.in_height = MB_HEIGHT(height) * MB_DIM,
+		.orig_mb_width = MB_WIDTH(width),
+		.fourcc = fourcc,
+		.width = width,
+		.height = height,
+		.stride = width,
+		.buf_height = height,
+	};
+
+	return hantro_g1_pp_regs(&cfg, regs);
+}
+
 static void hantro_postproc_g1_enable(struct hantro_ctx *ctx)
 {
 	struct hantro_dev *vpu = ctx->dev;
 	struct vb2_v4l2_buffer *dst_buf;
-	u32 src_pp_fmt, dst_pp_fmt;
+	struct hantro_g1_pp_regs regs;
 	dma_addr_t dst_dma;
 
-	/* Turn on pipeline mode. Must be done first. */
-	HANTRO_PP_REG_WRITE(vpu, pipeline_en, 0x1);
-
-	src_pp_fmt = VPU_PP_IN_NV12;
-
-	switch (ctx->vpu_dst_fmt->fourcc) {
-	case V4L2_PIX_FMT_YUYV:
-		dst_pp_fmt = VPU_PP_OUT_YUYV;
-		break;
-	default:
-		WARN(1, "output format %d not supported by the post-processor, this wasn't expected.",
-		     ctx->vpu_dst_fmt->fourcc);
-		dst_pp_fmt = 0;
-		break;
+	if (hantro_g1_pp_video_regs(ctx->vpu_dst_fmt->fourcc,
+				    ctx->dst_fmt.width, ctx->dst_fmt.height,
+				    &regs)) {
+		WARN(1, "output format %p4cc not supported by the post-processor, this wasn't expected.",
+		     &ctx->vpu_dst_fmt->fourcc);
+		return;
 	}
 
 	dst_buf = v4l2_m2m_next_dst_buf(ctx->fh.m2m_ctx);
 	dst_dma = vb2_dma_contig_plane_dma_addr(&dst_buf->vb2_buf, 0);
-
-	HANTRO_PP_REG_WRITE(vpu, clk_gate, 0x1);
-	HANTRO_PP_REG_WRITE(vpu, out_endian, 0x1);
-	HANTRO_PP_REG_WRITE(vpu, out_swap32, 0x1);
-	HANTRO_PP_REG_WRITE(vpu, max_burst, 16);
-	HANTRO_PP_REG_WRITE(vpu, out_luma_base, dst_dma);
-	HANTRO_PP_REG_WRITE(vpu, input_width, MB_WIDTH(ctx->dst_fmt.width));
-	HANTRO_PP_REG_WRITE(vpu, input_height, MB_HEIGHT(ctx->dst_fmt.height));
-	HANTRO_PP_REG_WRITE(vpu, input_fmt, src_pp_fmt);
-	HANTRO_PP_REG_WRITE(vpu, output_fmt, dst_pp_fmt);
-	HANTRO_PP_REG_WRITE(vpu, output_width, ctx->dst_fmt.width);
-	HANTRO_PP_REG_WRITE(vpu, output_height, ctx->dst_fmt.height);
-	HANTRO_PP_REG_WRITE(vpu, orig_width, MB_WIDTH(ctx->dst_fmt.width));
-	HANTRO_PP_REG_WRITE(vpu, display_width, ctx->dst_fmt.width);
-	HANTRO_PP_REG_WRITE(vpu, input_width_ext, MB_WIDTH(ctx->dst_fmt.width) >> 9);
-	HANTRO_PP_REG_WRITE(vpu, input_height_ext, MB_HEIGHT(ctx->dst_fmt.height) >> 8);
+	hantro_g1_pp_write(vpu, &regs, dst_dma);
 }
 
 static int down_scale_factor(struct hantro_ctx *ctx)
@@ -293,9 +563,11 @@ hantro_postproc_get_dec_buf_addr(struct hantro_ctx *ctx, int index)
 
 static void hantro_postproc_g1_disable(struct hantro_ctx *ctx)
 {
-	struct hantro_dev *vpu = ctx->dev;
+	static const struct hantro_reg pipeline_en = {
+		G1_REG_PP_INTERRUPT, 1, 0x1
+	};
 
-	HANTRO_PP_REG_WRITE(vpu, pipeline_en, 0x0);
+	hantro_reg_write(ctx->dev, &pipeline_en, 0);
 }
 
 static void hantro_postproc_g2_disable(struct hantro_ctx *ctx)

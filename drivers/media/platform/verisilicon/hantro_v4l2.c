@@ -14,6 +14,7 @@
  * Copyright (C) 2010-2011 Samsung Electronics Co., Ltd.
  */
 
+#include <kunit/visibility.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/module.h>
@@ -109,6 +110,60 @@ hantro_check_depth_match(const struct hantro_fmt *fmt, int bit_depth)
 	return fmt_depth == bit_depth;
 }
 
+/*
+ * A raw decoder format may be limited to some coded formats (codec_modes):
+ * it is offered only while the OUTPUT queue holds one of them. A mode that
+ * writes its CAPTURE buffers through the post-processor itself offers the
+ * post-processed formats it writes; the JPEG decoder does not use the
+ * post-processor otherwise.
+ */
+VISIBLE_IF_KUNIT bool
+hantro_raw_fmt_allowed(const struct hantro_ctx *ctx, const struct hantro_fmt *fmt)
+{
+	const struct hantro_codec_ops *ops;
+	u32 width = 0, height = 0;
+
+	if (ctx->is_encoder || !ctx->vpu_src_fmt ||
+	    ctx->vpu_src_fmt->codec_mode == HANTRO_MODE_NONE)
+		return true;
+
+	if (fmt->postprocessed) {
+		ops = hantro_dec_cap_ops(ctx);
+		if (ops)
+			return !ops->cap_try_fmt(ctx, fmt->fourcc, &width,
+						 &height);
+		return ctx->vpu_src_fmt->codec_mode != HANTRO_MODE_JPEG_DEC;
+	}
+
+	return !fmt->codec_modes ||
+	       fmt->codec_modes & BIT(ctx->vpu_src_fmt->codec_mode);
+}
+
+/* The JPEG decoder is the one stateful mode: the driver parses the headers. */
+static bool hantro_is_stateful_dec(const struct hantro_ctx *ctx)
+{
+	return !ctx->is_encoder &&
+	       ctx->vpu_src_fmt->codec_mode == HANTRO_MODE_JPEG_DEC;
+}
+
+/*
+ * The codec ops of a decoder's OUTPUT format, before it streams: those of a
+ * mode that writes its CAPTURE buffers through the post-processor itself
+ * (cap_try_fmt) size them and its compose rectangle.
+ */
+const struct hantro_codec_ops *
+hantro_dec_cap_ops(const struct hantro_ctx *ctx)
+{
+	const struct hantro_codec_ops *ops;
+
+	if (ctx->is_encoder || !ctx->vpu_src_fmt ||
+	    ctx->vpu_src_fmt->codec_mode == HANTRO_MODE_NONE)
+		return NULL;
+
+	ops = &ctx->dev->variant->codec_ops[ctx->vpu_src_fmt->codec_mode];
+	return ops->cap_try_fmt ? ops : NULL;
+}
+
 static const struct hantro_fmt *
 hantro_find_format(const struct hantro_ctx *ctx, u32 fourcc)
 {
@@ -117,12 +172,14 @@ hantro_find_format(const struct hantro_ctx *ctx, u32 fourcc)
 
 	formats = hantro_get_formats(ctx, &num_fmts, HANTRO_AUTO_POSTPROC);
 	for (i = 0; i < num_fmts; i++)
-		if (formats[i].fourcc == fourcc)
+		if (formats[i].fourcc == fourcc &&
+		    hantro_raw_fmt_allowed(ctx, &formats[i]))
 			return &formats[i];
 
 	formats = hantro_get_postproc_formats(ctx, &num_fmts);
 	for (i = 0; i < num_fmts; i++)
-		if (formats[i].fourcc == fourcc)
+		if (formats[i].fourcc == fourcc &&
+		    hantro_raw_fmt_allowed(ctx, &formats[i]))
 			return &formats[i];
 	return NULL;
 }
@@ -156,7 +213,8 @@ hantro_get_default_fmt(const struct hantro_ctx *ctx, bool bitstream,
 	for (i = 0; i < num_fmts; i++) {
 		if (bitstream == (formats[i].codec_mode !=
 				  HANTRO_MODE_NONE) &&
-		    hantro_check_depth_match(&formats[i], bit_depth))
+		    hantro_check_depth_match(&formats[i], bit_depth) &&
+		    hantro_raw_fmt_allowed(ctx, &formats[i]))
 			return &formats[i];
 	}
 
@@ -164,7 +222,8 @@ hantro_get_default_fmt(const struct hantro_ctx *ctx, bool bitstream,
 	for (i = 0; i < num_fmts; i++) {
 		if (bitstream == (formats[i].codec_mode !=
 				  HANTRO_MODE_NONE) &&
-		    hantro_check_depth_match(&formats[i], bit_depth))
+		    hantro_check_depth_match(&formats[i], bit_depth) &&
+		    hantro_raw_fmt_allowed(ctx, &formats[i]))
 			return &formats[i];
 	}
 
@@ -197,6 +256,10 @@ static int vidioc_enum_framesizes(struct file *file, void *priv,
 
 	/* For non-coded formats check if postprocessing scaling is possible */
 	if (fmt->codec_mode == HANTRO_MODE_NONE) {
+		const struct hantro_codec_ops *ops = hantro_dec_cap_ops(ctx);
+
+		if (ops)
+			return ops->cap_enum_framesizes(ctx, fsize);
 		if (hantro_needs_postproc(ctx, fmt))
 			return hanto_postproc_enum_framesizes(ctx, fsize);
 		else
@@ -255,6 +318,8 @@ static int vidioc_enum_fmt(struct file *file, void *priv,
 			continue;
 		if (!hantro_check_depth_match(fmt, ctx->bit_depth) && !enum_all_formats)
 			continue;
+		if (!hantro_raw_fmt_allowed(ctx, fmt) && !enum_all_formats)
+			continue;
 		if (j == index) {
 			f->pixelformat = fmt->fourcc;
 			return 0;
@@ -274,6 +339,8 @@ static int vidioc_enum_fmt(struct file *file, void *priv,
 		fmt = &formats[i];
 
 		if (!hantro_check_depth_match(fmt, ctx->bit_depth) && !enum_all_formats)
+			continue;
+		if (!hantro_raw_fmt_allowed(ctx, fmt) && !enum_all_formats)
 			continue;
 		if (j == index) {
 			f->pixelformat = fmt->fourcc;
@@ -323,10 +390,11 @@ static int vidioc_g_fmt_cap_mplane(struct file *file, void *priv,
 	return 0;
 }
 
-static int hantro_try_fmt(const struct hantro_ctx *ctx,
-			  struct v4l2_pix_format_mplane *pix_mp,
-			  enum v4l2_buf_type type)
+VISIBLE_IF_KUNIT int hantro_try_fmt(const struct hantro_ctx *ctx,
+				    struct v4l2_pix_format_mplane *pix_mp,
+				    enum v4l2_buf_type type)
 {
+	const struct hantro_codec_ops *ops = hantro_dec_cap_ops(ctx);
 	const struct hantro_fmt *fmt;
 	const struct hantro_fmt *vpu_fmt;
 	bool capture = V4L2_TYPE_IS_CAPTURE(type);
@@ -347,6 +415,10 @@ static int hantro_try_fmt(const struct hantro_ctx *ctx,
 		vpu_fmt = fmt;
 	} else if (ctx->is_encoder) {
 		vpu_fmt = hantro_find_format(ctx, ctx->dst_fmt.pixelformat);
+	} else if (ops && !ops->cap_try_fmt(ctx, fmt->fourcc, &pix_mp->width,
+					   &pix_mp->height)) {
+		/* The size of a buffer the mode writes. */
+		vpu_fmt = NULL;
 	} else {
 		/*
 		 * Width/height on the CAPTURE end of a decoder are ignored and
@@ -359,8 +431,21 @@ static int hantro_try_fmt(const struct hantro_ctx *ctx,
 
 	pix_mp->field = V4L2_FIELD_NONE;
 
-	v4l2_apply_frmsize_constraints(&pix_mp->width, &pix_mp->height,
-				       &vpu_fmt->frmsize);
+	/*
+	 * The JPEG decoder takes JFIF pictures: sRGB, BT.601 YCbCr at full
+	 * range, what the JPEG colorspace stands for. Its raw formats keep
+	 * that, the RGB ones converted from it.
+	 */
+	if (!coded && hantro_is_stateful_dec(ctx)) {
+		pix_mp->colorspace = V4L2_COLORSPACE_SRGB;
+		pix_mp->xfer_func = V4L2_XFER_FUNC_SRGB;
+		pix_mp->ycbcr_enc = V4L2_YCBCR_ENC_601;
+		pix_mp->quantization = V4L2_QUANTIZATION_FULL_RANGE;
+	}
+
+	if (vpu_fmt)
+		v4l2_apply_frmsize_constraints(&pix_mp->width, &pix_mp->height,
+					       &vpu_fmt->frmsize);
 
 	if (!coded) {
 		/* Fill remaining fields */
@@ -401,6 +486,16 @@ static int hantro_try_fmt(const struct hantro_ctx *ctx,
 		    (ctx->is_encoder &&
 		     pix_mp->plane_fmt[0].sizeimage > max_size))
 			pix_mp->plane_fmt[0].sizeimage = max_size;
+
+		/*
+		 * The JPEG decoder reads no more than STREAM_LEN bytes of
+		 * entropy-coded data: a larger bitstream buffer, which also
+		 * takes kernel address space for its mapping, is of no use.
+		 */
+		if (fmt->codec_mode == HANTRO_MODE_JPEG_DEC)
+			pix_mp->plane_fmt[0].sizeimage =
+				min_t(u32, pix_mp->plane_fmt[0].sizeimage,
+				      HANTRO_JPEG_DEC_MAX_OUTPUT_SIZE);
 	}
 
 	return 0;
@@ -470,8 +565,11 @@ hantro_reset_raw_fmt(struct hantro_ctx *ctx, int bit_depth, bool need_postproc)
 	}
 
 	hantro_reset_fmt(&raw_fmt, raw_vpu_fmt);
-	raw_fmt.width = encoded_fmt->width;
-	raw_fmt.height = encoded_fmt->height;
+	/* A mode that sizes its CAPTURE buffers picks the default size. */
+	if (!hantro_dec_cap_ops(ctx)) {
+		raw_fmt.width = encoded_fmt->width;
+		raw_fmt.height = encoded_fmt->height;
+	}
 	if (ctx->is_encoder)
 		ret = hantro_set_fmt_out(ctx, &raw_fmt, need_postproc);
 	else
@@ -569,6 +667,17 @@ static int hantro_set_fmt_out(struct hantro_ctx *ctx,
 	ctx->src_fmt = *pix_mp;
 
 	/*
+	 * Only a decoder that parses the headers reads its bitstream
+	 * buffers; the attribute applies to the buffers allocated next.
+	 */
+	if (!ctx->is_encoder && !vb2_is_busy(vq)) {
+		if (hantro_is_stateful_dec(ctx))
+			vq->dma_attrs &= ~DMA_ATTR_NO_KERNEL_MAPPING;
+		else
+			vq->dma_attrs |= DMA_ATTR_NO_KERNEL_MAPPING;
+	}
+
+	/*
 	 * Current raw format might have become invalid with newly
 	 * selected codec, so reset it to default just to be safe and
 	 * keep internal driver state sane. User is mandated to set
@@ -582,11 +691,16 @@ static int hantro_set_fmt_out(struct hantro_ctx *ctx,
 				     hantro_get_format_depth(pix_mp->pixelformat),
 				     need_postproc);
 
-	/* Colorimetry information are always propagated. */
-	ctx->dst_fmt.colorspace = pix_mp->colorspace;
-	ctx->dst_fmt.ycbcr_enc = pix_mp->ycbcr_enc;
-	ctx->dst_fmt.xfer_func = pix_mp->xfer_func;
-	ctx->dst_fmt.quantization = pix_mp->quantization;
+	/*
+	 * Colorimetry information are always propagated, except for the JPEG
+	 * decoder, which sets the CAPTURE one itself.
+	 */
+	if (!hantro_is_stateful_dec(ctx)) {
+		ctx->dst_fmt.colorspace = pix_mp->colorspace;
+		ctx->dst_fmt.ycbcr_enc = pix_mp->ycbcr_enc;
+		ctx->dst_fmt.xfer_func = pix_mp->xfer_func;
+		ctx->dst_fmt.quantization = pix_mp->quantization;
+	}
 
 	hantro_update_requires_request(ctx, pix_mp->pixelformat);
 	hantro_update_requires_hold_capture_buf(ctx, pix_mp->pixelformat);
@@ -600,6 +714,7 @@ static int hantro_set_fmt_out(struct hantro_ctx *ctx,
 static int hantro_set_fmt_cap(struct hantro_ctx *ctx,
 			      struct v4l2_pix_format_mplane *pix_mp)
 {
+	const struct hantro_codec_ops *ops = hantro_dec_cap_ops(ctx);
 	int ret;
 
 	if (ctx->is_encoder) {
@@ -629,6 +744,17 @@ static int hantro_set_fmt_cap(struct hantro_ctx *ctx,
 	if (ret)
 		return ret;
 
+	/* A new CAPTURE format sets the compose rectangle to its default. */
+	if (ops) {
+		struct v4l2_selection sel = {
+			.type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+			.target = V4L2_SEL_TGT_COMPOSE_DEFAULT,
+		};
+
+		ops->cap_selection(ctx, &sel, false);
+		ctx->compose = sel.r;
+	}
+
 	/*
 	 * Current raw format might have become invalid with newly
 	 * selected codec, so reset it to default just to be safe and
@@ -656,22 +782,83 @@ static int hantro_set_fmt_cap(struct hantro_ctx *ctx,
 	return 0;
 }
 
+/*
+ * The stateful mode's job reads the CAPTURE format without the ioctl lock:
+ * it also starts from the mem2mem worker when the previous job ends. So the
+ * format stays as it is while the CAPTURE queue has buffers, as the stateful
+ * decoder interface asks anyway. An OUTPUT S_FMT sets the CAPTURE format
+ * back to its default, so it is refused then too, also when it enters or
+ * leaves that mode. The stateless modes are not affected.
+ */
+static bool hantro_cap_fmt_busy(struct hantro_ctx *ctx, u32 out_fourcc)
+{
+	const struct hantro_fmt *fmt;
+
+	if (ctx->is_encoder ||
+	    !vb2_is_busy(v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx)))
+		return false;
+
+	if (hantro_is_stateful_dec(ctx))
+		return true;
+
+	fmt = out_fourcc ? hantro_find_format(ctx, out_fourcc) : NULL;
+	return fmt && fmt->codec_mode == HANTRO_MODE_JPEG_DEC;
+}
+
 static int
 vidioc_s_fmt_out_mplane(struct file *file, void *priv, struct v4l2_format *f)
 {
-	return hantro_set_fmt_out(file_to_ctx(file), &f->fmt.pix_mp, HANTRO_AUTO_POSTPROC);
+	struct hantro_ctx *ctx = file_to_ctx(file);
+
+	if (hantro_cap_fmt_busy(ctx, f->fmt.pix_mp.pixelformat))
+		return -EBUSY;
+
+	return hantro_set_fmt_out(ctx, &f->fmt.pix_mp, HANTRO_AUTO_POSTPROC);
 }
 
 static int
 vidioc_s_fmt_cap_mplane(struct file *file, void *priv, struct v4l2_format *f)
 {
-	return hantro_set_fmt_cap(file_to_ctx(file), &f->fmt.pix_mp);
+	struct hantro_ctx *ctx = file_to_ctx(file);
+
+	if (hantro_cap_fmt_busy(ctx, 0))
+		return -EBUSY;
+
+	return hantro_set_fmt_cap(ctx, &f->fmt.pix_mp);
+}
+
+/*
+ * A decoder has CAPTURE selection targets in a mode that writes its CAPTURE
+ * buffers itself, as the stateful decoder interface describes them. In
+ * other modes it has none: -EINVAL, as for a target it does not know.
+ */
+static int hantro_dec_selection(struct hantro_ctx *ctx,
+				struct v4l2_selection *sel, bool set)
+{
+	const struct hantro_codec_ops *ops = hantro_dec_cap_ops(ctx);
+	int ret;
+
+	if (sel->type != V4L2_BUF_TYPE_VIDEO_CAPTURE || !ops)
+		return -EINVAL;
+
+	if (set && sel->target == V4L2_SEL_TGT_COMPOSE &&
+	    vb2_is_busy(v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx)))
+		return -EBUSY;
+
+	ret = ops->cap_selection(ctx, sel, set);
+	if (!ret && set)
+		ctx->compose = sel->r;
+
+	return ret;
 }
 
 static int vidioc_g_selection(struct file *file, void *priv,
 			      struct v4l2_selection *sel)
 {
 	struct hantro_ctx *ctx = file_to_ctx(file);
+
+	if (!ctx->is_encoder)
+		return hantro_dec_selection(ctx, sel, false);
 
 	/* Crop only supported on source. */
 	if (sel->type != V4L2_BUF_TYPE_VIDEO_OUTPUT)
@@ -704,6 +891,9 @@ static int vidioc_s_selection(struct file *file, void *priv,
 	struct hantro_ctx *ctx = file_to_ctx(file);
 	struct v4l2_rect *rect = &sel->r;
 	struct vb2_queue *vq;
+
+	if (!ctx->is_encoder)
+		return hantro_dec_selection(ctx, sel, true);
 
 	/* Crop only supported on source. */
 	if (sel->type != V4L2_BUF_TYPE_VIDEO_OUTPUT)
@@ -772,6 +962,58 @@ static int vidioc_encoder_cmd(struct file *file, void *priv,
 	return 0;
 }
 
+static int vidioc_try_decoder_cmd(struct file *file, void *priv,
+				  struct v4l2_decoder_cmd *dc)
+{
+	struct hantro_ctx *ctx = file_to_ctx(file);
+
+	if (!hantro_is_stateful_dec(ctx))
+		return v4l2_m2m_ioctl_stateless_try_decoder_cmd(file, priv, dc);
+
+	return v4l2_m2m_ioctl_try_decoder_cmd(file, priv, dc);
+}
+
+static int vidioc_decoder_cmd(struct file *file, void *priv,
+			      struct v4l2_decoder_cmd *dc)
+{
+	struct hantro_ctx *ctx = file_to_ctx(file);
+	int ret;
+
+	if (!hantro_is_stateful_dec(ctx))
+		return v4l2_m2m_ioctl_stateless_decoder_cmd(file, priv, dc);
+
+	ret = v4l2_m2m_ioctl_try_decoder_cmd(file, priv, dc);
+	if (ret < 0)
+		return ret;
+
+	if (!vb2_is_streaming(v4l2_m2m_get_src_vq(ctx->fh.m2m_ctx)))
+		return 0;
+
+	ret = v4l2_m2m_ioctl_decoder_cmd(file, priv, dc);
+	if (ret < 0)
+		return ret;
+
+	if (dc->cmd == V4L2_DEC_CMD_STOP &&
+	    v4l2_m2m_has_stopped(ctx->fh.m2m_ctx))
+		v4l2_event_queue_fh(&ctx->fh, &hantro_eos_event);
+
+	if (dc->cmd == V4L2_DEC_CMD_START)
+		vb2_clear_last_buffer_dequeued(&ctx->fh.m2m_ctx->cap_q_ctx.q);
+
+	return 0;
+}
+
+static int hantro_subscribe_event(struct v4l2_fh *fh,
+				  const struct v4l2_event_subscription *sub)
+{
+	switch (sub->type) {
+	case V4L2_EVENT_EOS:
+		return v4l2_event_subscribe(fh, sub, 0, NULL);
+	default:
+		return v4l2_ctrl_subscribe_event(fh, sub);
+	}
+}
+
 const struct v4l2_ioctl_ops hantro_ioctl_ops = {
 	.vidioc_querycap = vidioc_querycap,
 	.vidioc_enum_framesizes = vidioc_enum_framesizes,
@@ -794,7 +1036,7 @@ const struct v4l2_ioctl_ops hantro_ioctl_ops = {
 	.vidioc_remove_bufs = v4l2_m2m_ioctl_remove_bufs,
 	.vidioc_expbuf = v4l2_m2m_ioctl_expbuf,
 
-	.vidioc_subscribe_event = v4l2_ctrl_subscribe_event,
+	.vidioc_subscribe_event = hantro_subscribe_event,
 	.vidioc_unsubscribe_event = v4l2_event_unsubscribe,
 
 	.vidioc_streamon = v4l2_m2m_ioctl_streamon,
@@ -803,8 +1045,8 @@ const struct v4l2_ioctl_ops hantro_ioctl_ops = {
 	.vidioc_g_selection = vidioc_g_selection,
 	.vidioc_s_selection = vidioc_s_selection,
 
-	.vidioc_decoder_cmd = v4l2_m2m_ioctl_stateless_decoder_cmd,
-	.vidioc_try_decoder_cmd = v4l2_m2m_ioctl_stateless_try_decoder_cmd,
+	.vidioc_decoder_cmd = vidioc_decoder_cmd,
+	.vidioc_try_decoder_cmd = vidioc_try_decoder_cmd,
 
 	.vidioc_try_encoder_cmd = v4l2_m2m_ioctl_try_encoder_cmd,
 	.vidioc_encoder_cmd = vidioc_encoder_cmd,

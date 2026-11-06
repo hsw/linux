@@ -125,12 +125,9 @@ static void __dma_clear_buffer(struct page *page, size_t size, int coherent_flag
 		if (coherent_flag != COHERENT)
 			outer_flush_range(base, end);
 	} else {
-		void *ptr = page_address(page);
-		memset(ptr, 0, size);
-		if (coherent_flag != COHERENT) {
-			dmac_flush_range(ptr, ptr + size);
-			outer_flush_range(__pa(ptr), __pa(ptr) + size);
-		}
+		memset(page_address(page), 0, size);
+		if (coherent_flag != COHERENT)
+			arch_dma_prep_coherent(page, size);
 	}
 }
 
@@ -1732,6 +1729,34 @@ void arch_teardown_dma_ops(struct device *dev)
 	arm_teardown_iommu_dma_ops(dev);
 	/* Let arch_setup_dma_ops() start again from scratch upon re-probe */
 	set_dma_ops(dev, NULL);
+}
+
+/*
+ * Write back and invalidate the cacheable kernel alias of the pages, so that
+ * no dirty line left from their previous use is evicted over what a device
+ * writes. dma-direct calls this for the DMA_ATTR_NO_KERNEL_MAPPING buffers it
+ * allocates without arch_dma_alloc(), and for a dma-coherent device's buffer
+ * that came from highmem, before remapping it. A highmem page may have no
+ * kernel mapping, so it is mapped one page at a time.
+ */
+void arch_dma_prep_coherent(struct page *page, size_t size)
+{
+	phys_addr_t base = page_to_phys(page);
+	size_t off;
+
+	if (PageHighMem(page)) {
+		for (off = 0; off < size; off += PAGE_SIZE) {
+			void *ptr = kmap_local_page(page + (off >> PAGE_SHIFT));
+
+			dmac_flush_range(ptr, ptr + PAGE_SIZE);
+			kunmap_local(ptr);
+		}
+	} else {
+		void *ptr = page_address(page);
+
+		dmac_flush_range(ptr, ptr + size);
+	}
+	outer_flush_range(base, base + size);
 }
 
 void *arch_dma_alloc(struct device *dev, size_t size, dma_addr_t *dma_handle,

@@ -7,11 +7,13 @@
  */
 
 #include <kunit/test.h>
+#include <linux/dma-mapping.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/unaligned.h>
 #include <linux/videodev2.h>
 #include <media/v4l2-jpeg.h>
+#include <media/v4l2-mem2mem.h>
 
 #include "hantro.h"
 #include "hantro_g1_regs.h"
@@ -2244,6 +2246,110 @@ static void pp_video_regs(struct kunit *test)
 						      640, 480, &regs), -EINVAL);
 }
 
+/*
+ * The kernel mapping of a decoder's buffers: both queues of the JPEG decoder
+ * map theirs, so that an importer can vmap an exported CAPTURE buffer, and
+ * the video decoders map neither. The attribute follows the codec selected
+ * when a queue gets its first buffers: a queue with buffers keeps the
+ * attribute they were allocated with, and the encoder's queues are left as
+ * they are.
+ */
+static void jpeg_dec_kernel_mapping(struct kunit *test)
+{
+	static const struct {
+		u32 fourcc;
+		bool map;
+	} cases[] = {
+		{ V4L2_PIX_FMT_JPEG, true },
+		{ V4L2_PIX_FMT_VP8_FRAME, false },
+		{ V4L2_PIX_FMT_H264_SLICE, false },
+		{ V4L2_PIX_FMT_MPEG2_SLICE, false },
+		{ V4L2_PIX_FMT_JPEG, true },
+	};
+	const unsigned long base = DMA_ATTR_ALLOC_SINGLE_PAGES |
+				   DMA_ATTR_NO_WARN;
+	const unsigned long nomap = base | DMA_ATTR_NO_KERNEL_MAPPING;
+	const struct hantro_variant *rk3026 = &rk3026_vpu_variant;
+	struct vb2_queue *src_vq, *dst_vq;
+	unsigned long *bufs_bitmap;
+	struct hantro_ctx *ctx;
+	struct hantro_dev *dev;
+	unsigned int c, count;
+	unsigned long want;
+
+	if (!IS_ENABLED(CONFIG_VIDEO_HANTRO_ROCKCHIP))
+		kunit_skip(test, "no Rockchip variants");
+
+	dev = kunit_kzalloc(test, sizeof(*dev), GFP_KERNEL);
+	ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	bufs_bitmap = kunit_kzalloc(test, BITS_TO_LONGS(8) * sizeof(long),
+				    GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, dev);
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	KUNIT_ASSERT_NOT_NULL(test, bufs_bitmap);
+	ctx->fh.m2m_ctx = kunit_kzalloc(test, sizeof(*ctx->fh.m2m_ctx),
+					GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ctx->fh.m2m_ctx);
+	dev->variant = rk3026;
+	ctx->dev = dev;
+	src_vq = v4l2_m2m_get_src_vq(ctx->fh.m2m_ctx);
+	dst_vq = v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx);
+
+	/* As the decoder's queues are set up, both empty. */
+	src_vq->dma_attrs = nomap;
+	dst_vq->dma_attrs = nomap;
+	for (c = 0; c < ARRAY_SIZE(cases); c++) {
+		ctx->vpu_src_fmt = find_fmt(rk3026, cases[c].fourcc, &count);
+		KUNIT_ASSERT_EQ(test, count, 1);
+		hantro_update_dec_kernel_mapping(ctx, src_vq);
+		hantro_update_dec_kernel_mapping(ctx, dst_vq);
+		want = nomap;
+		if (cases[c].map)
+			want = base;
+		KUNIT_EXPECT_EQ_MSG(test, src_vq->dma_attrs, want, "case %u", c);
+		KUNIT_EXPECT_EQ_MSG(test, dst_vq->dma_attrs, want, "case %u", c);
+	}
+
+	/*
+	 * The JPEG decoder's CAPTURE buffers stay while the codec changes to
+	 * VP8 and back: a queue with buffers keeps its attribute.
+	 */
+	dst_vq->max_num_buffers = 8;
+	dst_vq->bufs_bitmap = bufs_bitmap;
+	__set_bit(0, bufs_bitmap);
+	ctx->vpu_src_fmt = find_fmt(rk3026, V4L2_PIX_FMT_VP8_FRAME, &count);
+	hantro_update_dec_kernel_mapping(ctx, src_vq);
+	hantro_update_dec_kernel_mapping(ctx, dst_vq);
+	KUNIT_EXPECT_EQ(test, src_vq->dma_attrs, nomap);
+	KUNIT_EXPECT_EQ(test, dst_vq->dma_attrs, base);
+
+	/* The VP8 decoder allocates its CAPTURE buffers anew. */
+	__clear_bit(0, bufs_bitmap);
+	hantro_update_dec_kernel_mapping(ctx, dst_vq);
+	KUNIT_EXPECT_EQ(test, dst_vq->dma_attrs, nomap);
+
+	/*
+	 * The codec changes to JPEG while CAPTURE has the video buffers; the
+	 * client frees them and allocates new ones without another S_FMT.
+	 */
+	__set_bit(0, bufs_bitmap);
+	ctx->vpu_src_fmt = find_fmt(rk3026, V4L2_PIX_FMT_JPEG, &count);
+	hantro_update_dec_kernel_mapping(ctx, dst_vq);
+	KUNIT_EXPECT_EQ(test, dst_vq->dma_attrs, nomap);
+	__clear_bit(0, bufs_bitmap);
+	hantro_update_dec_kernel_mapping(ctx, dst_vq);
+	KUNIT_EXPECT_EQ(test, dst_vq->dma_attrs, base);
+
+	/* The encoder: a mapped CAPTURE queue, an unmapped OUTPUT one. */
+	src_vq->dma_attrs = nomap;
+	dst_vq->dma_attrs = base;
+	ctx->is_encoder = true;
+	hantro_update_dec_kernel_mapping(ctx, src_vq);
+	hantro_update_dec_kernel_mapping(ctx, dst_vq);
+	KUNIT_EXPECT_EQ(test, src_vq->dma_attrs, nomap);
+	KUNIT_EXPECT_EQ(test, dst_vq->dma_attrs, base);
+}
+
 static struct kunit_case hantro_jpeg_dec_cases[] = {
 	KUNIT_CASE(jpeg_dec_check_sampling),
 	KUNIT_CASE(jpeg_dec_check_frame),
@@ -2278,6 +2384,7 @@ static struct kunit_case hantro_jpeg_dec_cases[] = {
 	KUNIT_CASE(jpeg_dec_pp_cap),
 	KUNIT_CASE(jpeg_dec_needs_postproc),
 	KUNIT_CASE(jpeg_dec_try_fmt),
+	KUNIT_CASE(jpeg_dec_kernel_mapping),
 	{ }
 };
 

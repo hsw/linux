@@ -632,6 +632,28 @@ hantro_update_requires_hold_capture_buf(struct hantro_ctx *ctx, u32 fourcc)
 	}
 }
 
+/*
+ * Only a decoder that parses the headers reads its bitstream buffers. Its
+ * CAPTURE buffers, which hold still pictures, get a kernel mapping too: an
+ * importer of an exported one that reads it with the CPU, such as a DRM
+ * driver with a shadow plane, needs dma_buf_vmap() to work on it. The video
+ * decoders map neither. The attribute is set when a queue gets its first
+ * buffers, from the codec selected then, as the codec may change while a
+ * queue has buffers; a queue with buffers keeps the attribute they were
+ * allocated with.
+ */
+VISIBLE_IF_KUNIT void hantro_update_dec_kernel_mapping(struct hantro_ctx *ctx,
+						       struct vb2_queue *vq)
+{
+	if (ctx->is_encoder || vb2_get_num_buffers(vq))
+		return;
+
+	if (hantro_is_stateful_dec(ctx))
+		vq->dma_attrs &= ~DMA_ATTR_NO_KERNEL_MAPPING;
+	else
+		vq->dma_attrs |= DMA_ATTR_NO_KERNEL_MAPPING;
+}
+
 static int hantro_set_fmt_out(struct hantro_ctx *ctx,
 			      struct v4l2_pix_format_mplane *pix_mp,
 			      bool need_postproc)
@@ -665,17 +687,6 @@ static int hantro_set_fmt_out(struct hantro_ctx *ctx,
 
 	ctx->vpu_src_fmt = hantro_find_format(ctx, pix_mp->pixelformat);
 	ctx->src_fmt = *pix_mp;
-
-	/*
-	 * Only a decoder that parses the headers reads its bitstream
-	 * buffers; the attribute applies to the buffers allocated next.
-	 */
-	if (!ctx->is_encoder && !vb2_is_busy(vq)) {
-		if (hantro_is_stateful_dec(ctx))
-			vq->dma_attrs &= ~DMA_ATTR_NO_KERNEL_MAPPING;
-		else
-			vq->dma_attrs |= DMA_ATTR_NO_KERNEL_MAPPING;
-	}
 
 	/*
 	 * Current raw format might have become invalid with newly
@@ -1072,6 +1083,8 @@ hantro_queue_setup(struct vb2_queue *vq, unsigned int *num_buffers,
 		vpu_err("invalid queue type: %d\n", vq->type);
 		return -EINVAL;
 	}
+
+	hantro_update_dec_kernel_mapping(ctx, vq);
 
 	if (*num_planes) {
 		if (*num_planes != pixfmt->num_planes)

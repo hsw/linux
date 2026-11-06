@@ -2045,6 +2045,92 @@ static void jpeg_dec_needs_postproc(struct kunit *test)
 	}
 }
 
+/*
+ * TRY_FMT on a JPEG decoder's CAPTURE queue: the buffer sizes and line
+ * lengths, and the JFIF colorimetry for every raw format; a video
+ * decoder's CAPTURE keeps the colorimetry it is given.
+ */
+static void jpeg_dec_try_fmt(struct kunit *test)
+{
+	static const struct {
+		u32 fourcc, w, h;
+		u32 want_w, want_h, bpl, sizeimage;
+	} cases[] = {
+		{ V4L2_PIX_FMT_NV12, 0, 0, 1008, 752, 1008, 1008 * 752 * 3 / 2 },
+		{ V4L2_PIX_FMT_NV12, 1000, 744, 1008, 752, 1008, 1008 * 752 * 3 / 2 },
+		{ V4L2_PIX_FMT_NV12, 536, 400, 536, 400, 536, 536 * 400 * 3 / 2 },
+		{ V4L2_PIX_FMT_NV16, 0, 0, 1008, 752, 1008, 1008 * 752 * 2 },
+		{ V4L2_PIX_FMT_GREY, 640, 480, 1008, 752, 1008, 1008 * 752 },
+		{ V4L2_PIX_FMT_YUYV, 1072, 1448, 1072, 1448, 2144, 2144 * 1448 },
+		{ V4L2_PIX_FMT_RGB565, 536, 400, 536, 400, 1072, 1072 * 400 },
+		{ V4L2_PIX_FMT_XBGR32, 0, 0, 1000, 744, 4000, 4000 * 744 },
+		{ V4L2_PIX_FMT_XRGB32, 536, 401, 536, 402, 2144, 2144 * 402 },
+	};
+	const struct hantro_variant *rk3026 = &rk3026_vpu_variant;
+	struct v4l2_pix_format_mplane pix;
+	struct hantro_ctx *ctx;
+	struct hantro_dev *dev;
+	unsigned int i, count;
+
+	if (!IS_ENABLED(CONFIG_VIDEO_HANTRO_ROCKCHIP))
+		kunit_skip(test, "no Rockchip variants");
+
+	dev = kunit_kzalloc(test, sizeof(*dev), GFP_KERNEL);
+	ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, dev);
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	dev->variant = rk3026;
+	ctx->dev = dev;
+	ctx->vpu_src_fmt = find_fmt(rk3026, V4L2_PIX_FMT_JPEG, &count);
+	KUNIT_ASSERT_EQ(test, count, 1);
+	ctx->src_fmt.pixelformat = V4L2_PIX_FMT_JPEG;
+	ctx->src_fmt.width = 1000;
+	ctx->src_fmt.height = 744;
+
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		memset(&pix, 0, sizeof(pix));
+		pix.pixelformat = cases[i].fourcc;
+		pix.width = cases[i].w;
+		pix.height = cases[i].h;
+		pix.colorspace = V4L2_COLORSPACE_JPEG;
+		KUNIT_ASSERT_EQ(test, hantro_try_fmt(ctx, &pix,
+						     V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE),
+				0);
+		KUNIT_EXPECT_EQ_MSG(test, pix.pixelformat, cases[i].fourcc,
+				    "case %u", i);
+		KUNIT_EXPECT_EQ_MSG(test, pix.width, cases[i].want_w, "case %u", i);
+		KUNIT_EXPECT_EQ_MSG(test, pix.height, cases[i].want_h,
+				    "case %u", i);
+		KUNIT_EXPECT_EQ_MSG(test, pix.plane_fmt[0].bytesperline,
+				    cases[i].bpl, "case %u", i);
+		KUNIT_EXPECT_EQ_MSG(test, pix.plane_fmt[0].sizeimage,
+				    cases[i].sizeimage, "case %u", i);
+		KUNIT_EXPECT_EQ_MSG(test, pix.colorspace, V4L2_COLORSPACE_SRGB,
+				    "case %u", i);
+		KUNIT_EXPECT_EQ_MSG(test, pix.xfer_func, V4L2_XFER_FUNC_SRGB,
+				    "case %u", i);
+		KUNIT_EXPECT_EQ_MSG(test, pix.ycbcr_enc, V4L2_YCBCR_ENC_601,
+				    "case %u", i);
+		KUNIT_EXPECT_EQ_MSG(test, pix.quantization,
+				    V4L2_QUANTIZATION_FULL_RANGE, "case %u", i);
+	}
+
+	/* A video decoder's CAPTURE: the colorimetry as given. */
+	ctx->vpu_src_fmt = find_fmt(rk3026, V4L2_PIX_FMT_VP8_FRAME, &count);
+	KUNIT_ASSERT_EQ(test, count, 1);
+	ctx->src_fmt.pixelformat = V4L2_PIX_FMT_VP8_FRAME;
+	ctx->src_fmt.width = 640;
+	ctx->src_fmt.height = 480;
+	memset(&pix, 0, sizeof(pix));
+	pix.pixelformat = V4L2_PIX_FMT_NV12;
+	pix.colorspace = V4L2_COLORSPACE_REC709;
+	KUNIT_ASSERT_EQ(test, hantro_try_fmt(ctx, &pix,
+					     V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE), 0);
+	KUNIT_EXPECT_EQ(test, pix.width, 640);
+	KUNIT_EXPECT_EQ(test, pix.colorspace, V4L2_COLORSPACE_REC709);
+	KUNIT_EXPECT_EQ(test, pix.quantization, V4L2_QUANTIZATION_DEFAULT);
+}
+
 /* One field of a register file, as the video post-processing wrote them. */
 struct pp_field {
 	unsigned int swreg;
@@ -2191,6 +2277,7 @@ static struct kunit_case hantro_jpeg_dec_cases[] = {
 	KUNIT_CASE(pp_regs_refused),
 	KUNIT_CASE(jpeg_dec_pp_cap),
 	KUNIT_CASE(jpeg_dec_needs_postproc),
+	KUNIT_CASE(jpeg_dec_try_fmt),
 	{ }
 };
 

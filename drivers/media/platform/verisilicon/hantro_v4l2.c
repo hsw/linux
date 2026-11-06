@@ -390,9 +390,9 @@ static int vidioc_g_fmt_cap_mplane(struct file *file, void *priv,
 	return 0;
 }
 
-static int hantro_try_fmt(const struct hantro_ctx *ctx,
-			  struct v4l2_pix_format_mplane *pix_mp,
-			  enum v4l2_buf_type type)
+VISIBLE_IF_KUNIT int hantro_try_fmt(const struct hantro_ctx *ctx,
+				    struct v4l2_pix_format_mplane *pix_mp,
+				    enum v4l2_buf_type type)
 {
 	const struct hantro_codec_ops *ops = hantro_dec_cap_ops(ctx);
 	const struct hantro_fmt *fmt;
@@ -430,6 +430,18 @@ static int hantro_try_fmt(const struct hantro_ctx *ctx,
 	}
 
 	pix_mp->field = V4L2_FIELD_NONE;
+
+	/*
+	 * The JPEG decoder takes JFIF pictures: sRGB, BT.601 YCbCr at full
+	 * range, what the JPEG colorspace stands for. Its raw formats keep
+	 * that, the RGB ones converted from it.
+	 */
+	if (!coded && hantro_is_stateful_dec(ctx)) {
+		pix_mp->colorspace = V4L2_COLORSPACE_SRGB;
+		pix_mp->xfer_func = V4L2_XFER_FUNC_SRGB;
+		pix_mp->ycbcr_enc = V4L2_YCBCR_ENC_601;
+		pix_mp->quantization = V4L2_QUANTIZATION_FULL_RANGE;
+	}
 
 	if (vpu_fmt)
 		v4l2_apply_frmsize_constraints(&pix_mp->width, &pix_mp->height,
@@ -679,11 +691,16 @@ static int hantro_set_fmt_out(struct hantro_ctx *ctx,
 				     hantro_get_format_depth(pix_mp->pixelformat),
 				     need_postproc);
 
-	/* Colorimetry information are always propagated. */
-	ctx->dst_fmt.colorspace = pix_mp->colorspace;
-	ctx->dst_fmt.ycbcr_enc = pix_mp->ycbcr_enc;
-	ctx->dst_fmt.xfer_func = pix_mp->xfer_func;
-	ctx->dst_fmt.quantization = pix_mp->quantization;
+	/*
+	 * Colorimetry information are always propagated, except for the JPEG
+	 * decoder, which sets the CAPTURE one itself.
+	 */
+	if (!hantro_is_stateful_dec(ctx)) {
+		ctx->dst_fmt.colorspace = pix_mp->colorspace;
+		ctx->dst_fmt.ycbcr_enc = pix_mp->ycbcr_enc;
+		ctx->dst_fmt.xfer_func = pix_mp->xfer_func;
+		ctx->dst_fmt.quantization = pix_mp->quantization;
+	}
 
 	hantro_update_requires_request(ctx, pix_mp->pixelformat);
 	hantro_update_requires_hold_capture_buf(ctx, pix_mp->pixelformat);

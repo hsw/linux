@@ -430,6 +430,9 @@
 #define G1_REG_PP_MASK1_ORIG_WIDTH	G1_SWREG(88)
 #define     G1_REG_PP_ORIG_WIDTH(v)	(((v) << 23) & GENMASK(31, 23))
 #define G1_REG_PP_DISPLAY_WIDTH_IN_EXT	G1_SWREG(92)
+#define     G1_REG_PP_IN_H_EXT(v)	(((v) << 29) & GENMASK(31, 29))
+#define     G1_REG_PP_IN_W_EXT(v)	(((v) << 26) & GENMASK(28, 26))
+#define     G1_REG_PP_DISPLAY_WIDTH(v)	(((v) << 0) & GENMASK(11, 0))
 #define G1_REG_PP_FUSE			G1_SWREG(99)
 
 #endif /* HANTRO_G1_REGS_H_ */

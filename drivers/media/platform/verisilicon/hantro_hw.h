@@ -392,6 +392,45 @@ struct hantro_postproc_ops {
 };
 
 /**
+ * struct hantro_g1_pp_cfg - a picture the G1 post-processor writes, in
+ *			     pipeline with the decoder
+ * @in_fmt:		G1_REG_PP_CONTROL_IN_FMT() value of the decoded picture
+ * @in_width:		width it reads, whole macroblocks
+ * @in_height:		height it reads, likewise
+ * @orig_mb_width:	width of the decoded picture in macroblocks
+ * @fourcc:		output format
+ * @width:		output width
+ * @height:		output height
+ * @stride:		width of the output buffer, in pixels
+ */
+struct hantro_g1_pp_cfg {
+	u32 in_fmt;
+	u32 in_width;
+	u32 in_height;
+	u32 orig_mb_width;
+	u32 fourcc;
+	u32 width;
+	u32 height;
+	u32 stride;
+};
+
+/**
+ * struct hantro_g1_pp_regs - G1 post-processor registers of one picture
+ * @dev_config:		G1_REG_PP_DEV_CONFIG
+ * @input_size:		G1_REG_PP_INPUT_SIZE
+ * @control:		G1_REG_PP_CONTROL
+ * @orig_width:		G1_REG_PP_MASK1_ORIG_WIDTH
+ * @display_width:	G1_REG_PP_DISPLAY_WIDTH_IN_EXT
+ */
+struct hantro_g1_pp_regs {
+	u32 dev_config;
+	u32 input_size;
+	u32 control;
+	u32 orig_width;
+	u32 display_width;
+};
+
+/**
  * struct hantro_codec_ops - codec mode specific operations
  *
  * @init:	If needed, can be used for initialization.
@@ -612,6 +651,15 @@ void hantro_vp9_dec_exit(struct hantro_ctx *ctx);
 void hantro_g2_check_idle(struct hantro_dev *vpu);
 void hantro_g2_reset(struct hantro_ctx *ctx);
 irqreturn_t hantro_g2_irq(int irq, void *dev_id);
+
+int hantro_g1_pp_regs(const struct hantro_g1_pp_cfg *cfg,
+		      struct hantro_g1_pp_regs *regs);
+void hantro_g1_pp_write(struct hantro_dev *vpu,
+			const struct hantro_g1_pp_regs *regs, dma_addr_t dst);
+#if IS_ENABLED(CONFIG_KUNIT)
+int hantro_g1_pp_video_regs(u32 fourcc, u32 width, u32 height,
+			    struct hantro_g1_pp_regs *regs);
+#endif
 
 int hantro_g1_jpeg_dec_run(struct hantro_ctx *ctx);
 int hantro_jpeg_dec_init(struct hantro_ctx *ctx);

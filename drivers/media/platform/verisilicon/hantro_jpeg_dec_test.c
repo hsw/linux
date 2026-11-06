@@ -2,7 +2,8 @@
 /*
  * KUnit tests for the Hantro JPEG decoder helpers: the header check, the
  * defaults the decoder fills in, the table buffer, the G1 registers of a
- * job and the variants that enable the decoder. No hardware is touched.
+ * job and the variants that enable the decoder; and for the G1
+ * post-processor's register builder. No hardware is touched.
  */
 
 #include <kunit/test.h>
@@ -14,6 +15,7 @@
 
 #include "hantro.h"
 #include "hantro_g1_regs.h"
+#include "hantro_hw.h"
 #include "hantro_jpeg.h"
 #include "hantro_v4l2.h"
 
@@ -1028,6 +1030,114 @@ static void jpeg_dec_raw_fmt_allowed(struct kunit *test)
 	}
 }
 
+/* One field of a register file, as the video post-processing wrote them. */
+struct pp_field {
+	unsigned int swreg;
+	unsigned int shift;
+	u32 mask;
+};
+
+static void pp_field_write(u32 *swreg, const struct pp_field *f, u32 val)
+{
+	swreg[f->swreg] &= ~(f->mask << f->shift);
+	swreg[f->swreg] |= (val & f->mask) << f->shift;
+}
+
+/*
+ * The G1 video post-processing set-up as it was programmed field by field
+ * (read-modify-write) before the register builder, applied to registers
+ * that hold 0: the picture at its own size, NV12 to YUYV.
+ */
+static void old_video_pp(u32 *swreg, u32 width, u32 height, u32 dst)
+{
+	static const struct pp_field pipeline_en = { 60, 1, 0x1 };
+	static const struct pp_field max_burst = { 61, 0, 0x1f };
+	static const struct pp_field clk_gate = { 61, 1, 0x1 };
+	static const struct pp_field out_swap32 = { 61, 5, 0x1 };
+	static const struct pp_field out_endian = { 61, 6, 0x1 };
+	static const struct pp_field out_luma_base = { 66, 0, 0xffffffff };
+	static const struct pp_field input_width = { 72, 0, 0x1ff };
+	static const struct pp_field input_height = { 72, 9, 0x1ff };
+	static const struct pp_field output_width = { 85, 4, 0x7ff };
+	static const struct pp_field output_height = { 85, 15, 0x7ff };
+	static const struct pp_field input_fmt = { 85, 29, 0x7 };
+	static const struct pp_field output_fmt = { 85, 26, 0x7 };
+	static const struct pp_field orig_width = { 88, 23, 0x1ff };
+	static const struct pp_field display_width = { 92, 0, 0xfff };
+	static const struct pp_field input_width_ext = { 92, 26, 0x7 };
+	static const struct pp_field input_height_ext = { 92, 29, 0x7 };
+
+	pp_field_write(swreg, &pipeline_en, 1);
+	pp_field_write(swreg, &clk_gate, 1);
+	pp_field_write(swreg, &out_endian, 1);
+	pp_field_write(swreg, &out_swap32, 1);
+	pp_field_write(swreg, &max_burst, 16);
+	pp_field_write(swreg, &out_luma_base, dst);
+	pp_field_write(swreg, &input_width, MB_WIDTH(width));
+	pp_field_write(swreg, &input_height, MB_HEIGHT(height));
+	pp_field_write(swreg, &input_fmt, 1);	/* NV12 */
+	pp_field_write(swreg, &output_fmt, 3);	/* YUYV */
+	pp_field_write(swreg, &output_width, width);
+	pp_field_write(swreg, &output_height, height);
+	pp_field_write(swreg, &orig_width, MB_WIDTH(width));
+	pp_field_write(swreg, &display_width, width);
+	pp_field_write(swreg, &input_width_ext, MB_WIDTH(width) >> 9);
+	pp_field_write(swreg, &input_height_ext, MB_HEIGHT(height) >> 8);
+}
+
+/*
+ * The video post-processing set-up from the register builder gives the
+ * registers the field-by-field set-up gave, for the sizes the video
+ * formats take (up to 4K), and 0 in the registers it did not write. The
+ * one difference is in the pipeline word: the builder's write also masks
+ * the post-processor's interrupt.
+ */
+static void pp_video_regs(struct kunit *test)
+{
+	static const struct {
+		u32 width, height;
+	} sizes[] = {
+		{ 48, 48 }, { 176, 144 }, { 640, 480 }, { 1280, 720 },
+		{ 1920, 1088 }, { 3840, 2160 }, { 4096, 2304 },
+	};
+	const u32 dst = 0x12345600;
+	struct hantro_g1_pp_regs regs;
+	unsigned int i, r;
+	u32 swreg[101];
+
+	for (i = 0; i < ARRAY_SIZE(sizes); i++) {
+		u32 w = sizes[i].width, h = sizes[i].height;
+
+		memset(swreg, 0, sizeof(swreg));
+		old_video_pp(swreg, w, h, dst);
+		KUNIT_ASSERT_EQ(test, hantro_g1_pp_video_regs(V4L2_PIX_FMT_YUYV,
+							      w, h, &regs), 0);
+
+		KUNIT_EXPECT_EQ_MSG(test, swreg[60], G1_REG_PP_PIPELINE_EN,
+				    "%ux%u", w, h);
+		/* CLK_GATE_E as written was cleared by the burst length. */
+		KUNIT_EXPECT_EQ_MSG(test, regs.dev_config, swreg[61],
+				    "%ux%u", w, h);
+		KUNIT_EXPECT_EQ_MSG(test, swreg[66], dst, "%ux%u", w, h);
+		KUNIT_EXPECT_EQ_MSG(test, regs.input_size, swreg[72],
+				    "%ux%u", w, h);
+		KUNIT_EXPECT_EQ_MSG(test, regs.control, swreg[85], "%ux%u", w, h);
+		KUNIT_EXPECT_EQ_MSG(test, regs.orig_width, swreg[88],
+				    "%ux%u", w, h);
+		KUNIT_EXPECT_EQ_MSG(test, regs.display_width, swreg[92],
+				    "%ux%u", w, h);
+		/* Chroma base, colour conversion, scaling, masks: 0. */
+		for (r = 67; r <= 84; r++)
+			if (r != 72)
+				KUNIT_EXPECT_EQ_MSG(test, swreg[r], 0,
+						    "%ux%u swreg%u", w, h, r);
+	}
+
+	/* The only format the video post-processing writes. */
+	KUNIT_EXPECT_EQ(test, hantro_g1_pp_video_regs(V4L2_PIX_FMT_NV16,
+						      640, 480, &regs), -EINVAL);
+}
+
 static struct kunit_case hantro_jpeg_dec_cases[] = {
 	KUNIT_CASE(jpeg_dec_check_sampling),
 	KUNIT_CASE(jpeg_dec_check_frame),
@@ -1049,6 +1159,7 @@ static struct kunit_case hantro_jpeg_dec_cases[] = {
 	KUNIT_CASE(jpeg_dec_grey),
 	KUNIT_CASE(jpeg_dec_rockchip_fmts),
 	KUNIT_CASE(jpeg_dec_raw_fmt_allowed),
+	KUNIT_CASE(pp_video_regs),
 	{ }
 };
 

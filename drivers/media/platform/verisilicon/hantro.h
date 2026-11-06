@@ -320,25 +320,6 @@ struct hantro_reg {
 	u32 mask;
 };
 
-struct hantro_postproc_regs {
-	struct hantro_reg pipeline_en;
-	struct hantro_reg max_burst;
-	struct hantro_reg clk_gate;
-	struct hantro_reg out_swap32;
-	struct hantro_reg out_endian;
-	struct hantro_reg out_luma_base;
-	struct hantro_reg input_width;
-	struct hantro_reg input_height;
-	struct hantro_reg output_width;
-	struct hantro_reg output_height;
-	struct hantro_reg input_fmt;
-	struct hantro_reg output_fmt;
-	struct hantro_reg orig_width;
-	struct hantro_reg display_width;
-	struct hantro_reg input_width_ext;
-	struct hantro_reg input_height_ext;
-};
-
 struct hantro_vp9_decoded_buffer_info {
 	/* Info needed when the decoded frame serves as a reference frame. */
 	unsigned short width;

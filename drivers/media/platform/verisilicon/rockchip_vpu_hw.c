@@ -571,6 +571,13 @@ static void rk3066_vpu_dec_reset(struct hantro_ctx *ctx)
 	vdpu_write(vpu, G1_REG_CONFIG_DEC_CLK_GATE_E, G1_REG_CONFIG);
 }
 
+static void rk3026_vpu_jpeg_dec_reset(struct hantro_ctx *ctx)
+{
+	/* A job that timed out may have left the post-processor on. */
+	hantro_g1_jpeg_dec_done(ctx);
+	rk3066_vpu_dec_reset(ctx);
+}
+
 static void rockchip_vpu1_enc_reset(struct hantro_ctx *ctx)
 {
 	struct hantro_dev *vpu = ctx->dev;
@@ -675,9 +682,13 @@ static const struct hantro_codec_ops rk3026_vpu_codec_ops[] = {
 	},
 	[HANTRO_MODE_JPEG_DEC] = {
 		.run = hantro_g1_jpeg_dec_run,
-		.reset = rk3066_vpu_dec_reset,
+		.reset = rk3026_vpu_jpeg_dec_reset,
+		.done = hantro_g1_jpeg_dec_done,
 		.init = hantro_jpeg_dec_init,
 		.exit = hantro_jpeg_dec_exit,
+		.cap_try_fmt = hantro_g1_jpeg_dec_try_cap,
+		.cap_enum_framesizes = hantro_g1_jpeg_dec_enum_cap,
+		.cap_selection = hantro_g1_jpeg_dec_cap_selection,
 	},
 };
 
@@ -855,6 +866,11 @@ const struct hantro_variant rk3026_vpu_variant = {
 		 HANTRO_VP8_DECODER | HANTRO_H264_DECODER |
 		 HANTRO_JPEG_DECODER,
 	.codec_ops = rk3026_vpu_codec_ops,
+	/*
+	 * Bits 10:0 of the post-processor's synthesis configuration
+	 * (swreg100) report it: 1920.
+	 */
+	.pp_max_width = 1920,
 	.irqs = rockchip_vpu1_irqs,
 	.num_irqs = ARRAY_SIZE(rockchip_vpu1_irqs),
 	.init = rk3066_vpu_hw_init,

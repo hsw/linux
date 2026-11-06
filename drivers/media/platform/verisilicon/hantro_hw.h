@@ -391,17 +391,38 @@ struct hantro_postproc_ops {
 	int (*enum_framesizes)(struct hantro_ctx *ctx, struct v4l2_frmsizeenum *fsize);
 };
 
+/*
+ * What the G1 post-processor writes in pipeline with the decoder: its
+ * output width and height fields are 11 bits wide, the height even for a
+ * 4:2:0 output; DISPLAY_WIDTH, the stride in pixels, is 12 bits wide. The
+ * output width, the stride and the position of the output in a line go in
+ * steps of 8 pixels, the height and the line in steps of 2. The widest
+ * output is the variant's (hantro_variant.pp_max_width). The smallest is
+ * the smallest raw format.
+ */
+#define HANTRO_G1_PP_MIN_SIZE		FMT_MIN_WIDTH
+#define HANTRO_G1_PP_MAX_HEIGHT		2046
+#define HANTRO_G1_PP_MAX_STRIDE		4088
+#define HANTRO_G1_PP_STEP_WIDTH		8
+#define HANTRO_G1_PP_STEP_HEIGHT	2
+
 /**
  * struct hantro_g1_pp_cfg - a picture the G1 post-processor writes, in
  *			     pipeline with the decoder
  * @in_fmt:		G1_REG_PP_CONTROL_IN_FMT() value of the decoded picture
- * @in_width:		width it reads, whole macroblocks
+ * @in_width:		width it reads, a multiple of 8: whole macroblocks,
+ *			and the first half of the next one when it is not a
+ *			multiple of 16
  * @in_height:		height it reads, likewise
  * @orig_mb_width:	width of the decoded picture in macroblocks
  * @fourcc:		output format
- * @width:		output width
- * @height:		output height
+ * @width:		output width, at most @in_width: it scales down only
+ * @height:		output height, at most @in_height
  * @stride:		width of the output buffer, in pixels
+ * @buf_height:		height of the output buffer: the CbCr plane of NV12
+ *			follows its luma plane
+ * @left:		position of the output in the buffer
+ * @top:		likewise
  */
 struct hantro_g1_pp_cfg {
 	u32 in_fmt;
@@ -412,22 +433,34 @@ struct hantro_g1_pp_cfg {
 	u32 width;
 	u32 height;
 	u32 stride;
+	u32 buf_height;
+	u32 left;
+	u32 top;
 };
 
 /**
  * struct hantro_g1_pp_regs - G1 post-processor registers of one picture
  * @dev_config:		G1_REG_PP_DEV_CONFIG
  * @input_size:		G1_REG_PP_INPUT_SIZE
+ * @scaling1:		G1_REG_PP_SCALING1
+ * @scaling_inv:	G1_REG_PP_SCALING_INV
  * @control:		G1_REG_PP_CONTROL
  * @orig_width:		G1_REG_PP_MASK1_ORIG_WIDTH
  * @display_width:	G1_REG_PP_DISPLAY_WIDTH_IN_EXT
+ * @luma_offset:	offset of the output in the buffer
+ * @chroma_offset:	offset of its CbCr samples in the buffer, 0 for a
+ *			format with one plane
  */
 struct hantro_g1_pp_regs {
 	u32 dev_config;
 	u32 input_size;
+	u32 scaling1;
+	u32 scaling_inv;
 	u32 control;
 	u32 orig_width;
 	u32 display_width;
+	u32 luma_offset;
+	u32 chroma_offset;
 };
 
 /**
@@ -443,6 +476,16 @@ struct hantro_g1_pp_regs {
  *		negative value in error cases.
  * @done:	Read back processing results and additional data from hardware.
  * @reset:	Reset the hardware in case of a timeout.
+ * @cap_try_fmt: Optional, for a decoder mode that writes its CAPTURE
+ *		buffers through the post-processor itself: adjust a CAPTURE
+ *		size to one of a raw format it writes, a size of 0 to its
+ *		default. Returns -EINVAL for a format it does not write.
+ * @cap_enum_framesizes: The CAPTURE sizes of a raw format, with
+ *		@cap_try_fmt.
+ * @cap_selection: Get a CAPTURE selection target, or adjust a compose
+ *		rectangle to one the mode writes when @set, with
+ *		@cap_try_fmt. Returns -EINVAL for another target, -ERANGE
+ *		for a rectangle the selection flags do not let it adjust.
  */
 struct hantro_codec_ops {
 	int (*init)(struct hantro_ctx *ctx);
@@ -450,6 +493,12 @@ struct hantro_codec_ops {
 	int (*run)(struct hantro_ctx *ctx);
 	void (*done)(struct hantro_ctx *ctx);
 	void (*reset)(struct hantro_ctx *ctx);
+	int (*cap_try_fmt)(const struct hantro_ctx *ctx, u32 fourcc,
+			   u32 *width, u32 *height);
+	int (*cap_enum_framesizes)(const struct hantro_ctx *ctx,
+				   struct v4l2_frmsizeenum *fsize);
+	int (*cap_selection)(const struct hantro_ctx *ctx,
+			     struct v4l2_selection *sel, bool set);
 };
 
 /**
@@ -662,6 +711,13 @@ int hantro_g1_pp_video_regs(u32 fourcc, u32 width, u32 height,
 #endif
 
 int hantro_g1_jpeg_dec_run(struct hantro_ctx *ctx);
+void hantro_g1_jpeg_dec_done(struct hantro_ctx *ctx);
+int hantro_g1_jpeg_dec_try_cap(const struct hantro_ctx *ctx, u32 fourcc,
+			       u32 *width, u32 *height);
+int hantro_g1_jpeg_dec_enum_cap(const struct hantro_ctx *ctx,
+				struct v4l2_frmsizeenum *fsize);
+int hantro_g1_jpeg_dec_cap_selection(const struct hantro_ctx *ctx,
+				     struct v4l2_selection *sel, bool set);
 int hantro_jpeg_dec_init(struct hantro_ctx *ctx);
 void hantro_jpeg_dec_exit(struct hantro_ctx *ctx);
 

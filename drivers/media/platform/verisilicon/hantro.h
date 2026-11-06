@@ -78,6 +78,9 @@ struct hantro_irq {
  * @double_buffer:		core needs double buffering
  * @legacy_regs:		core uses legacy register set
  * @late_postproc:		postproc must be set up at the end of the job
+ * @pp_max_width:		widest output of the G1 post-processor, for a
+ *				decoder mode that sets it up itself (the
+ *				JPEG decoder); 0 if none does
  * @shared_devices:		an array of device ids that cannot run concurrently
  */
 struct hantro_variant {
@@ -103,6 +106,7 @@ struct hantro_variant {
 	unsigned int double_buffer : 1;
 	unsigned int legacy_regs : 1;
 	unsigned int late_postproc : 1;
+	unsigned int pp_max_width;
 	const struct of_device_id *shared_devices;
 };
 
@@ -243,6 +247,8 @@ struct hantro_dev {
  *
  * @codec_ops:		Set of operations related to codec mode.
  * @postproc:		Post-processing context.
+ * @compose:		CAPTURE compose rectangle of a decoder mode with
+ *			hantro_codec_ops.cap_selection
  * @h264_dec:		H.264-decoding context.
  * @mpeg2_dec:		MPEG-2-decoding context.
  * @vp8_dec:		VP8-decoding context.
@@ -271,6 +277,7 @@ struct hantro_ctx {
 
 	const struct hantro_codec_ops *codec_ops;
 	struct hantro_postproc_ctx postproc;
+	struct v4l2_rect compose;
 	bool need_postproc;
 
 	/* Specific for particular codec modes. */

@@ -7,6 +7,7 @@
 
 #include <kunit/visibility.h>
 #include <linux/dma-mapping.h>
+#include <linux/math64.h>
 #include <linux/types.h>
 
 #include "hantro.h"
@@ -21,21 +22,34 @@
 #define VPU_PP_IN_YUV240_TILED		0x5
 #define VPU_PP_OUT_RGB			0x0
 #define VPU_PP_OUT_YUYV			0x3
+#define VPU_PP_OUT_NV12			0x5
+
+/* G1_REG_PP_SCALING1 scaling mode */
+#define VPU_PP_SCALE_DOWN		2
 
 /**
  * struct hantro_g1_pp_fmt - an output format of the G1 post-processor
  * @fourcc:	V4L2 pixel format
  * @out_fmt:	G1_REG_PP_CONTROL_OUT_FMT() value
+ * @cpp:	bytes per pixel of the first plane
  */
 struct hantro_g1_pp_fmt {
 	u32 fourcc;
 	u32 out_fmt;
+	u8 cpp;
 };
 
 static const struct hantro_g1_pp_fmt hantro_g1_pp_fmts[] = {
 	{
+		/* CbCr after the luma plane, at the same stride */
+		.fourcc = V4L2_PIX_FMT_NV12,
+		.out_fmt = VPU_PP_OUT_NV12,
+		.cpp = 1,
+	},
+	{
 		.fourcc = V4L2_PIX_FMT_YUYV,
 		.out_fmt = VPU_PP_OUT_YUYV,
+		.cpp = 2,
 	},
 };
 
@@ -50,6 +64,12 @@ static const struct hantro_g1_pp_fmt *hantro_g1_pp_find(u32 fourcc)
 	return NULL;
 }
 
+/* An inverse scaling ratio, out / in with 16 fractional bits, below 1. */
+static u32 hantro_g1_pp_inv_ratio(u32 out, u32 in)
+{
+	return div_u64((u64)out << 16, in);
+}
+
 /**
  * hantro_g1_pp_regs() - compute the G1 post-processor registers of a
  *			 picture
@@ -57,10 +77,17 @@ static const struct hantro_g1_pp_fmt *hantro_g1_pp_find(u32 fourcc)
  * @regs:	the register values
  *
  * The post-processor reads @cfg->in_width x @cfg->in_height pixels of the
- * picture the decoder writes and stores them in the output format. The
- * device configuration is the one the video post-processing has always
- * used: OUT_ENDIAN and OUT_SWAP32_E set, which store YUYV in its memory
- * order, and bursts of 16.
+ * picture the decoder writes, scales them down to the output size in each
+ * direction where that is smaller, and stores them in the output format at
+ * @cfg->left, @cfg->top of the buffer. The device configuration is the one
+ * the video post-processing has always used: OUT_ENDIAN and OUT_SWAP32_E
+ * set, which store YUYV in its memory order, and bursts of 16.
+ *
+ * The caller keeps the sizes and the position within the post-processor's
+ * limits (HANTRO_G1_PP_*): the output no larger than the input, the input
+ * a multiple of 8, the output width and the stride in steps of 8 pixels,
+ * @cfg->left at a multiple of 8 bytes, the output height and @cfg->top
+ * even.
  *
  * Return: 0, or -EINVAL for a format the post-processor does not write.
  */
@@ -68,8 +95,8 @@ int hantro_g1_pp_regs(const struct hantro_g1_pp_cfg *cfg,
 		      struct hantro_g1_pp_regs *regs)
 {
 	const struct hantro_g1_pp_fmt *fmt = hantro_g1_pp_find(cfg->fourcc);
-	u32 in_mb_width = cfg->in_width / MB_DIM;
-	u32 in_mb_height = cfg->in_height / MB_DIM;
+	u32 in_mb_width = DIV_ROUND_UP(cfg->in_width, MB_DIM);
+	u32 in_mb_height = DIV_ROUND_UP(cfg->in_height, MB_DIM);
 
 	memset(regs, 0, sizeof(*regs));
 	if (!fmt)
@@ -84,10 +111,44 @@ int hantro_g1_pp_regs(const struct hantro_g1_pp_cfg *cfg,
 			G1_REG_PP_CONTROL_OUT_FMT(fmt->out_fmt) |
 			G1_REG_PP_CONTROL_OUT_HEIGHT(cfg->height) |
 			G1_REG_PP_CONTROL_OUT_WIDTH(cfg->width);
+	/*
+	 * The input fields count macroblocks, the last one included where
+	 * the input ends in its middle; a crop bit drops the last 8 columns
+	 * (rows) of that macroblock from what is read.
+	 */
+	if (cfg->in_width % MB_DIM)
+		regs->control |= G1_REG_PP_CONTROL_CROP8_R_E;
+	if (cfg->in_height % MB_DIM)
+		regs->control |= G1_REG_PP_CONTROL_CROP8_D_E;
 	regs->orig_width = G1_REG_PP_ORIG_WIDTH(cfg->orig_mb_width);
 	regs->display_width = G1_REG_PP_DISPLAY_WIDTH(cfg->stride) |
 			      G1_REG_PP_IN_W_EXT(in_mb_width >> 9) |
 			      G1_REG_PP_IN_H_EXT(in_mb_height >> 8);
+
+	/*
+	 * A direction scaled down takes the inverse ratio, out / in. The
+	 * vertical one is programmed a unit above the truncated quotient,
+	 * the horizontal one is not; why the vertical scaler needs it is
+	 * not documented.
+	 */
+	if (cfg->width < cfg->in_width) {
+		regs->scaling1 |= G1_REG_PP_HOR_SCALE_MODE(VPU_PP_SCALE_DOWN);
+		regs->scaling_inv |=
+			G1_REG_PP_WSCALE_INVRA(hantro_g1_pp_inv_ratio(cfg->width,
+								      cfg->in_width));
+	}
+	if (cfg->height < cfg->in_height) {
+		regs->scaling1 |= G1_REG_PP_VER_SCALE_MODE(VPU_PP_SCALE_DOWN);
+		regs->scaling_inv |=
+			G1_REG_PP_HSCALE_INVRA(hantro_g1_pp_inv_ratio(cfg->height,
+								      cfg->in_height) + 1);
+	}
+
+	regs->luma_offset = (cfg->top * cfg->stride + cfg->left) * fmt->cpp;
+	/* NV12: two CbCr bytes for every two pixels of every second line. */
+	if (fmt->out_fmt == VPU_PP_OUT_NV12)
+		regs->chroma_offset = cfg->stride * cfg->buf_height +
+				      cfg->top / 2 * cfg->stride + cfg->left;
 
 	return 0;
 }
@@ -109,16 +170,20 @@ void hantro_g1_pp_write(struct hantro_dev *vpu,
 	vdpu_write(vpu, G1_REG_PP_PIPELINE_EN | G1_REG_PP_IRQ_DIS,
 		   G1_REG_PP_INTERRUPT);
 	vdpu_write_relaxed(vpu, regs->dev_config, G1_REG_PP_DEV_CONFIG);
-	vdpu_write_relaxed(vpu, dst, G1_REG_PP_OUT_LUMA_BASE);
-	vdpu_write_relaxed(vpu, 0, G1_REG_PP_OUT_CHROMA_BASE);
-	/* No contrast, colour conversion, scaling or masks. */
+	vdpu_write_relaxed(vpu, dst + regs->luma_offset,
+			   G1_REG_PP_OUT_LUMA_BASE);
+	vdpu_write_relaxed(vpu, regs->chroma_offset ?
+			   dst + regs->chroma_offset : 0,
+			   G1_REG_PP_OUT_CHROMA_BASE);
+	/* No contrast, colour conversion or masks. */
 	vdpu_write_relaxed(vpu, 0, G1_REG_PP_CONTRAST_ADJUST);
 	vdpu_write_relaxed(vpu, 0, G1_REG_PP_COLOR_CONVERSION);
 	vdpu_write_relaxed(vpu, 0, G1_REG_PP_COLOR_CONVERSION0);
 	vdpu_write_relaxed(vpu, 0, G1_REG_PP_COLOR_CONVERSION1);
 	vdpu_write_relaxed(vpu, regs->input_size, G1_REG_PP_INPUT_SIZE);
 	vdpu_write_relaxed(vpu, 0, G1_REG_PP_SCALING0);
-	vdpu_write_relaxed(vpu, 0, G1_REG_PP_SCALING1);
+	vdpu_write_relaxed(vpu, regs->scaling1, G1_REG_PP_SCALING1);
+	vdpu_write_relaxed(vpu, regs->scaling_inv, G1_REG_PP_SCALING_INV);
 	vdpu_write_relaxed(vpu, 0, G1_REG_PP_MASK_R);
 	vdpu_write_relaxed(vpu, 0, G1_REG_PP_MASK_G);
 	vdpu_write_relaxed(vpu, 0, G1_REG_PP_MASK_B);
@@ -156,6 +221,7 @@ VISIBLE_IF_KUNIT int hantro_g1_pp_video_regs(u32 fourcc, u32 width, u32 height,
 		.width = width,
 		.height = height,
 		.stride = width,
+		.buf_height = height,
 	};
 
 	return hantro_g1_pp_regs(&cfg, regs);

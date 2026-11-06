@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0+ */
 
+#include <linux/videodev2.h>
 #include <media/v4l2-jpeg.h>
 
 #define JPEG_HEADER_SIZE	624
@@ -52,6 +53,29 @@ struct hantro_g1_jpeg_dec_regs {
 	dma_addr_t stream;
 };
 
+/**
+ * struct hantro_g1_jpeg_dec_out - what a JPEG decoding context writes
+ * @src_width:		OUTPUT width: the picture as the client set it up,
+ *			the crop rectangle
+ * @src_height:		OUTPUT height
+ * @fourcc:		CAPTURE format
+ * @width:		CAPTURE width: the buffer
+ * @height:		CAPTURE height
+ * @compose:		where the picture goes in the buffer
+ * @pp_max_width:	widest post-processor output, 0 without one
+ */
+struct hantro_g1_jpeg_dec_out {
+	u32 src_width;
+	u32 src_height;
+	u32 fourcc;
+	u32 width;
+	u32 height;
+	struct v4l2_rect compose;
+	u32 pp_max_width;
+};
+
+struct hantro_g1_pp_regs;
+
 void hantro_jpeg_get_default_huffman_tables(struct v4l2_jpeg_reference *huffman_tables);
 int hantro_jpeg_prepare_vlc_hw_table(const struct v4l2_jpeg_header *header,
 				     u8 *vlc_hw_table);
@@ -63,5 +87,18 @@ void hantro_g1_jpeg_dec_regs(const struct v4l2_jpeg_header *hdr,
 			     dma_addr_t src, size_t payload,
 			     struct hantro_g1_jpeg_dec_regs *regs);
 int hantro_g1_jpeg_dec_check(const struct v4l2_jpeg_header *hdr,
-			     size_t payload, u32 fourcc, u32 width, u32 height);
+			     size_t payload, u32 src_width, u32 src_height);
+void hantro_g1_jpeg_dec_cap_size(const struct hantro_g1_jpeg_dec_out *out,
+				 u32 *width, u32 *height);
+int hantro_g1_jpeg_dec_cap_frmsize(const struct hantro_g1_jpeg_dec_out *out,
+				   struct v4l2_frmsizeenum *fsize);
+void hantro_g1_jpeg_dec_compose_default(const struct hantro_g1_jpeg_dec_out *out,
+					struct v4l2_rect *r);
+void hantro_g1_jpeg_dec_compose_adjust(const struct hantro_g1_jpeg_dec_out *out,
+				       struct v4l2_rect *r);
+void hantro_g1_jpeg_dec_compose_padded(const struct hantro_g1_jpeg_dec_out *out,
+				       struct v4l2_rect *r);
+int hantro_g1_jpeg_dec_job_out(const struct hantro_g1_jpeg_dec_out *out,
+			       int subsampling, struct hantro_g1_pp_regs *pp,
+			       bool *use_pp);
 #endif

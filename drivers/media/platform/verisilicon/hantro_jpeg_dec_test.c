@@ -90,19 +90,73 @@ static void make_jpeg(struct test_jpeg *j,
 	j->payload = 4096;
 }
 
-static int check(const struct test_jpeg *j, u32 fourcc, u32 width, u32 height)
+/* The RK3026's widest post-processor output. */
+#define TEST_PP_MAX_WIDTH	1920
+
+/*
+ * A context with an OUTPUT format of src_w x src_h and a CAPTURE format of
+ * fourcc at width x height, the compose rectangle at its default.
+ */
+static void make_out(struct hantro_g1_jpeg_dec_out *out, u32 src_w, u32 src_h,
+		     u32 fourcc, u32 width, u32 height)
 {
-	return hantro_g1_jpeg_dec_check(&j->hdr, j->payload, fourcc,
-					width, height);
+	memset(out, 0, sizeof(*out));
+	out->src_width = src_w;
+	out->src_height = src_h;
+	out->fourcc = fourcc;
+	out->width = width;
+	out->height = height;
+	out->pp_max_width = TEST_PP_MAX_WIDTH;
+	hantro_g1_jpeg_dec_compose_default(out, &out->compose);
 }
 
-static int check_size(u16 w, u16 h, u32 cap_w, u32 cap_h)
+/* The checks of a job, and how it writes the CAPTURE buffer. */
+static int check_out(const struct test_jpeg *j,
+		     const struct hantro_g1_jpeg_dec_out *out,
+		     struct hantro_g1_pp_regs *pp, bool *use_pp)
 {
+	int ret;
+
+	ret = hantro_g1_jpeg_dec_check(&j->hdr, j->payload, out->src_width,
+				       out->src_height);
+	if (ret)
+		return ret;
+
+	return hantro_g1_jpeg_dec_job_out(out, j->hdr.frame.subsampling, pp,
+					  use_pp);
+}
+
+/*
+ * A job with the OUTPUT format of the picture's size, rounded up to 8 as
+ * TRY_FMT does, and the CAPTURE format and size given.
+ */
+static int check(const struct test_jpeg *j, u32 fourcc, u32 width, u32 height)
+{
+	struct hantro_g1_jpeg_dec_out out;
+	struct hantro_g1_pp_regs pp;
+	bool use_pp;
+
+	make_out(&out, ALIGN(j->hdr.frame.width, 8),
+		 ALIGN(j->hdr.frame.height, 8), fourcc, width, height);
+	return check_out(j, &out, &pp, &use_pp);
+}
+
+/*
+ * A 4:2:0 picture of w x h with the OUTPUT format at src_w x src_h, into
+ * the decoder's own NV12 buffer.
+ */
+static int check_size(u16 w, u16 h, u32 src_w, u32 src_h)
+{
+	struct hantro_g1_jpeg_dec_out out;
+	struct hantro_g1_pp_regs pp;
 	struct test_jpeg j;
+	bool use_pp;
 
 	make_jpeg(&j, V4L2_JPEG_CHROMA_SUBSAMPLING_420, w, h);
 	j.payload = 64 * 1024;
-	return check(&j, V4L2_PIX_FMT_NV12, cap_w, cap_h);
+	make_out(&out, src_w, src_h, V4L2_PIX_FMT_NV12, ALIGN(src_w, 16),
+		 ALIGN(src_h, 16));
+	return check_out(&j, &out, &pp, &use_pp);
 }
 
 static void jpeg_dec_check_sampling(struct kunit *test)
@@ -115,13 +169,16 @@ static void jpeg_dec_check_sampling(struct kunit *test)
 	/* A post-processed CAPTURE format is not decoded to. */
 	KUNIT_EXPECT_EQ(test, check(&j, V4L2_PIX_FMT_YUYV, 1072, 1456), -EINVAL);
 
+	/* NV12 from 4:2:2 or greyscale is the post-processor's. */
 	make_jpeg(&j, V4L2_JPEG_CHROMA_SUBSAMPLING_422, 1072, 1448);
 	KUNIT_EXPECT_EQ(test, check(&j, V4L2_PIX_FMT_NV16, 1072, 1456), 0);
-	KUNIT_EXPECT_EQ(test, check(&j, V4L2_PIX_FMT_NV12, 1072, 1456), -EINVAL);
+	KUNIT_EXPECT_EQ(test, check(&j, V4L2_PIX_FMT_NV12, 1072, 1456), 0);
+	KUNIT_EXPECT_EQ(test, check(&j, V4L2_PIX_FMT_GREY, 1072, 1456), -EINVAL);
 
 	make_jpeg(&j, V4L2_JPEG_CHROMA_SUBSAMPLING_GRAY, 1072, 1448);
 	KUNIT_EXPECT_EQ(test, check(&j, V4L2_PIX_FMT_GREY, 1072, 1456), 0);
-	KUNIT_EXPECT_EQ(test, check(&j, V4L2_PIX_FMT_NV12, 1072, 1456), -EINVAL);
+	KUNIT_EXPECT_EQ(test, check(&j, V4L2_PIX_FMT_NV12, 1072, 1456), 0);
+	KUNIT_EXPECT_EQ(test, check(&j, V4L2_PIX_FMT_NV16, 1072, 1456), -EINVAL);
 	/* Any sampling factors: a one-component MCU is one block. */
 	j.hdr.frame.component[0].horizontal_sampling_factor = 2;
 	j.hdr.frame.component[0].vertical_sampling_factor = 2;
@@ -218,32 +275,37 @@ static void jpeg_dec_check_size(struct kunit *test)
 {
 	/* At most 8176 pixels per side. */
 	KUNIT_EXPECT_EQ(test, check_size(8176, 48, 8176, 48), 0);
-	KUNIT_EXPECT_EQ(test, check_size(8177, 48, 8192, 48), -EINVAL);
+	KUNIT_EXPECT_EQ(test, check_size(8177, 48, 8176, 48), -EINVAL);
 	KUNIT_EXPECT_EQ(test, check_size(48, 8176, 48, 8176), 0);
-	KUNIT_EXPECT_EQ(test, check_size(48, 8177, 48, 8192), -EINVAL);
+	KUNIT_EXPECT_EQ(test, check_size(48, 8177, 48, 8176), -EINVAL);
 
 	/* At most 4672x3504 pixels in total. */
 	KUNIT_EXPECT_EQ(test, check_size(4672, 3504, 4672, 3504), 0);
-	KUNIT_EXPECT_EQ(test, check_size(4673, 3504, 4688, 3504), -EINVAL);
-	KUNIT_EXPECT_EQ(test, check_size(4672, 3505, 4672, 3520), -EINVAL);
+	KUNIT_EXPECT_EQ(test, check_size(4673, 3504, 4680, 3504), -EINVAL);
+	KUNIT_EXPECT_EQ(test, check_size(4672, 3505, 4672, 3512), -EINVAL);
 
 	/* At least three macroblocks per side. */
 	KUNIT_EXPECT_EQ(test, check_size(33, 33, 48, 48), 0);
 	KUNIT_EXPECT_EQ(test, check_size(32, 33, 48, 48), -EINVAL);
 	KUNIT_EXPECT_EQ(test, check_size(33, 32, 48, 48), -EINVAL);
-	KUNIT_EXPECT_EQ(test, check_size(32, 32, 32, 32), -EINVAL);
+	KUNIT_EXPECT_EQ(test, check_size(32, 32, 48, 48), -EINVAL);
 
-	/* The CAPTURE is the picture rounded up to macroblocks. */
+	/* The picture has the OUTPUT format's size in macroblocks. */
+	KUNIT_EXPECT_EQ(test, check_size(1000, 1448, 1000, 1448), 0);
 	KUNIT_EXPECT_EQ(test, check_size(1000, 1448, 1008, 1456), 0);
-	KUNIT_EXPECT_EQ(test, check_size(1000, 1448, 1000, 1448), -EINVAL);
 	KUNIT_EXPECT_EQ(test, check_size(1000, 1448, 1024, 1456), -EINVAL);
 	KUNIT_EXPECT_EQ(test, check_size(1000, 1448, 992, 1456), -EINVAL);
-	KUNIT_EXPECT_EQ(test, check_size(1000, 1457, 1008, 1456), -EINVAL);
-	KUNIT_EXPECT_EQ(test, check_size(1000, 1441, 1008, 1456), 0);
-	/* A CAPTURE format left larger than the picture is refused. */
+	KUNIT_EXPECT_EQ(test, check_size(1000, 1457, 1000, 1456), -EINVAL);
+	KUNIT_EXPECT_EQ(test, check_size(1000, 1441, 1000, 1448), 0);
+	/*
+	 * An OUTPUT format left at another picture's size, or at the
+	 * smallest one, is refused: the CAPTURE buffer and the compose
+	 * rectangle are set up for it.
+	 */
 	KUNIT_EXPECT_EQ(test, check_size(333, 251, 336, 256), 0);
-	KUNIT_EXPECT_EQ(test, check_size(333, 251, 1072, 1456), -EINVAL);
-	KUNIT_EXPECT_EQ(test, check_size(333, 251, 336, 1456), -EINVAL);
+	KUNIT_EXPECT_EQ(test, check_size(333, 251, 1072, 1448), -EINVAL);
+	KUNIT_EXPECT_EQ(test, check_size(333, 251, 336, 1448), -EINVAL);
+	KUNIT_EXPECT_EQ(test, check_size(640, 480, 48, 48), -EINVAL);
 }
 
 static void jpeg_dec_check_huffman(struct kunit *test)
@@ -1030,6 +1092,481 @@ static void jpeg_dec_raw_fmt_allowed(struct kunit *test)
 	}
 }
 
+/* NV12 and the decoder's formats: the buffer sizes TRY_FMT gives. */
+static void jpeg_dec_cap_size(struct kunit *test)
+{
+	static const struct {
+		u32 src_w, src_h;	/* the picture */
+		u32 fourcc;
+		u32 w, h;		/* asked for */
+		u32 want_w, want_h;
+	} cases[] = {
+		/* The decoder's formats: its own buffer, whatever the size. */
+		{ 1000, 744, V4L2_PIX_FMT_NV16, 0, 0, 1008, 752 },
+		{ 1000, 744, V4L2_PIX_FMT_NV16, 640, 480, 1008, 752 },
+		{ 1000, 744, V4L2_PIX_FMT_GREY, 4000, 4000, 1008, 752 },
+		/* NV12: its own buffer for 0 or a size that holds the picture. */
+		{ 1000, 744, V4L2_PIX_FMT_NV12, 0, 0, 1008, 752 },
+		{ 1000, 744, V4L2_PIX_FMT_NV12, 0, 480, 1008, 752 },
+		{ 1000, 744, V4L2_PIX_FMT_NV12, 1008, 752, 1008, 752 },
+		{ 1000, 744, V4L2_PIX_FMT_NV12, 1000, 744, 1008, 752 },
+		{ 1000, 744, V4L2_PIX_FMT_NV12, 1072, 1448, 1008, 752 },
+		{ 4000, 3000, V4L2_PIX_FMT_NV12, 4000, 3000, 4000, 3008 },
+		{ 4000, 3000, V4L2_PIX_FMT_NV12, 5000, 3000, 4000, 3008 },
+		{ 5000, 3000, V4L2_PIX_FMT_NV12, 5000, 3000, 5008, 3008 },
+		{ 8176, 48, V4L2_PIX_FMT_NV12, 8176, 48, 8176, 48 },
+		/* ... each direction rounded up to 8: the size in the header. */
+		{ 1000, 744, V4L2_PIX_FMT_NV12, 993, 737, 1008, 752 },
+		{ 336, 256, V4L2_PIX_FMT_NV12, 333, 251, 336, 256 },
+		{ 1000, 752, V4L2_PIX_FMT_NV12, 1000, 750, 1008, 752 },
+		{ 208, 400, V4L2_PIX_FMT_NV12, 203, 397, 208, 400 },
+		{ 1008, 752, V4L2_PIX_FMT_NV12, 1004, 750, 1008, 752 },
+		/* ... also once the steps round it up to the picture's size. */
+		{ 32, 32, V4L2_PIX_FMT_NV12, 16, 16, 32, 32 },
+		/* Smaller in either direction: the post-processor's buffer. */
+		{ 1000, 744, V4L2_PIX_FMT_NV12, 992, 744, 992, 744 },
+		{ 1000, 744, V4L2_PIX_FMT_NV12, 1000, 736, 1000, 736 },
+		{ 1000, 744, V4L2_PIX_FMT_NV12, 1072, 736, 1072, 736 },
+		{ 1000, 752, V4L2_PIX_FMT_NV12, 1000, 744, 1000, 744 },
+		{ 1000, 744, V4L2_PIX_FMT_NV12, 641, 481, 648, 482 },
+		{ 1000, 744, V4L2_PIX_FMT_NV12, 20, 20, 48, 48 },
+		{ 4000, 3000, V4L2_PIX_FMT_NV12, 1072, 1448, 1072, 1448 },
+		{ 4000, 3000, V4L2_PIX_FMT_NV12, 4000, 2992, 4000, 2992 },
+		{ 5000, 3000, V4L2_PIX_FMT_NV12, 4992, 3000, 4088, 3000 },
+		{ 8176, 48, V4L2_PIX_FMT_NV12, 8000, 48, 4088, 48 },
+	};
+	struct hantro_g1_jpeg_dec_out out;
+	unsigned int i;
+	u32 w, h;
+
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		make_out(&out, cases[i].src_w, cases[i].src_h, cases[i].fourcc,
+			 0, 0);
+		w = cases[i].w;
+		h = cases[i].h;
+		hantro_g1_jpeg_dec_cap_size(&out, &w, &h);
+		KUNIT_EXPECT_EQ_MSG(test, w, cases[i].want_w, "case %u", i);
+		KUNIT_EXPECT_EQ_MSG(test, h, cases[i].want_h, "case %u", i);
+		/* Applied again, it keeps the size. */
+		hantro_g1_jpeg_dec_cap_size(&out, &w, &h);
+		KUNIT_EXPECT_EQ_MSG(test, w, cases[i].want_w, "case %u", i);
+		KUNIT_EXPECT_EQ_MSG(test, h, cases[i].want_h, "case %u", i);
+	}
+
+	/* Without a post-processor, NV12 is the decoder's alone. */
+	make_out(&out, 1000, 744, V4L2_PIX_FMT_NV12, 0, 0);
+	out.pp_max_width = 0;
+	w = 640;
+	h = 480;
+	hantro_g1_jpeg_dec_cap_size(&out, &w, &h);
+	KUNIT_EXPECT_EQ(test, w, 1008);
+	KUNIT_EXPECT_EQ(test, h, 752);
+}
+
+/*
+ * ENUM_FRAMESIZES of NV12, NV16 and GREY: the decoder's own buffer, taken
+ * by TRY_FMT as it is, also where it is wider than the widest stride.
+ */
+static void jpeg_dec_cap_frmsize(struct kunit *test)
+{
+	static const u32 fourccs[] = {
+		V4L2_PIX_FMT_NV12, V4L2_PIX_FMT_NV16, V4L2_PIX_FMT_GREY,
+	};
+	static const u32 pics[][2] = {
+		{ 1000, 744 }, { 4000, 3000 }, { 8176, 48 }, { 48, 8176 },
+	};
+	struct v4l2_frmsizeenum fsize = { };
+	struct hantro_g1_jpeg_dec_out out;
+	unsigned int f, i;
+	u32 w, h;
+
+	for (i = 0; i < ARRAY_SIZE(pics); i++) {
+		for (f = 0; f < ARRAY_SIZE(fourccs); f++) {
+			make_out(&out, pics[i][0], pics[i][1], fourccs[f], 0, 0);
+			fsize.index = 0;
+			KUNIT_ASSERT_EQ(test,
+					hantro_g1_jpeg_dec_cap_frmsize(&out, &fsize),
+					0);
+			KUNIT_EXPECT_EQ(test, fsize.type,
+					V4L2_FRMSIZE_TYPE_DISCRETE);
+			KUNIT_EXPECT_EQ(test, fsize.discrete.width,
+					ALIGN(pics[i][0], 16));
+			KUNIT_EXPECT_EQ(test, fsize.discrete.height,
+					ALIGN(pics[i][1], 16));
+			w = fsize.discrete.width;
+			h = fsize.discrete.height;
+			hantro_g1_jpeg_dec_cap_size(&out, &w, &h);
+			KUNIT_EXPECT_EQ_MSG(test, w, fsize.discrete.width,
+					    "%ux%u %p4cc", pics[i][0], pics[i][1],
+					    &fourccs[f]);
+			KUNIT_EXPECT_EQ_MSG(test, h, fsize.discrete.height,
+					    "%ux%u %p4cc", pics[i][0], pics[i][1],
+					    &fourccs[f]);
+			fsize.index = 1;
+			KUNIT_EXPECT_EQ(test,
+					hantro_g1_jpeg_dec_cap_frmsize(&out, &fsize),
+					-EINVAL);
+		}
+	}
+
+	/* NV12 without a post-processor. */
+	make_out(&out, 1000, 744, V4L2_PIX_FMT_NV12, 0, 0);
+	out.pp_max_width = 0;
+	fsize.index = 0;
+	KUNIT_ASSERT_EQ(test, hantro_g1_jpeg_dec_cap_frmsize(&out, &fsize), 0);
+	KUNIT_EXPECT_EQ(test, fsize.type, V4L2_FRMSIZE_TYPE_DISCRETE);
+	KUNIT_EXPECT_EQ(test, fsize.discrete.width, 1008);
+	KUNIT_EXPECT_EQ(test, fsize.discrete.height, 752);
+}
+
+static void expect_rect(struct kunit *test, const struct v4l2_rect *r,
+			s32 left, s32 top, u32 width, u32 height,
+			const char *what)
+{
+	KUNIT_EXPECT_EQ_MSG(test, r->left, left, "%s", what);
+	KUNIT_EXPECT_EQ_MSG(test, r->top, top, "%s", what);
+	KUNIT_EXPECT_EQ_MSG(test, r->width, width, "%s", what);
+	KUNIT_EXPECT_EQ_MSG(test, r->height, height, "%s", what);
+}
+
+/* The default compose rectangle and the one S_SELECTION gives. */
+static void jpeg_dec_compose(struct kunit *test)
+{
+	struct hantro_g1_jpeg_dec_out out;
+	struct v4l2_rect r;
+
+	/* The decoder's own buffer: the whole picture. */
+	make_out(&out, 1000, 744, V4L2_PIX_FMT_NV12, 1008, 752);
+	expect_rect(test, &out.compose, 0, 0, 1000, 744, "dec");
+
+	/* A smaller buffer: the picture fitted, aspect ratio kept. */
+	make_out(&out, 4000, 3000, V4L2_PIX_FMT_NV12, 1072, 1448);
+	expect_rect(test, &out.compose, 0, 0, 1072, 804, "fit width");
+	make_out(&out, 3000, 4000, V4L2_PIX_FMT_NV12, 1072, 1072);
+	expect_rect(test, &out.compose, 0, 0, 800, 1072, "fit height");
+	/* ... and the widest output. */
+	make_out(&out, 4000, 3000, V4L2_PIX_FMT_NV12, 4088, 2048);
+	expect_rect(test, &out.compose, 0, 0, 1920, 1440, "fit 1920");
+
+	/*
+	 * Set: inside the buffer, no larger than the picture, the width in
+	 * steps of 8, the height in steps of 2, at a multiple of 8 bytes in
+	 * an even line.
+	 */
+	make_out(&out, 4000, 3000, V4L2_PIX_FMT_NV12, 1072, 1448);
+	r = (struct v4l2_rect){ 13, 7, 536, 403 };
+	hantro_g1_jpeg_dec_compose_adjust(&out, &r);
+	expect_rect(test, &r, 8, 6, 536, 402, "steps");
+	r = (struct v4l2_rect){ 100, 51, 2000, 2000 };
+	hantro_g1_jpeg_dec_compose_adjust(&out, &r);
+	expect_rect(test, &r, 0, 0, 1072, 1448, "buffer");
+	r = (struct v4l2_rect){ -8, -2, 10, 10 };
+	hantro_g1_jpeg_dec_compose_adjust(&out, &r);
+	expect_rect(test, &r, 0, 0, 48, 48, "smallest");
+	r = (struct v4l2_rect){ 1072, 1448, 536, 400 };
+	hantro_g1_jpeg_dec_compose_adjust(&out, &r);
+	expect_rect(test, &r, 536, 1048, 536, 400, "bottom right");
+	make_out(&out, 640, 480, V4L2_PIX_FMT_NV12, 1072, 472);
+	r = (struct v4l2_rect){ 216, 484, 1000, 1000 };
+	hantro_g1_jpeg_dec_compose_adjust(&out, &r);
+	expect_rect(test, &r, 216, 0, 640, 472, "no up-scaling");
+	make_out(&out, 4000, 3000, V4L2_PIX_FMT_NV12, 4088, 2048);
+	r = (struct v4l2_rect){ 0, 0, 4000, 3000 };
+	hantro_g1_jpeg_dec_compose_adjust(&out, &r);
+	expect_rect(test, &r, 0, 0, 1920, 2046, "widest");
+
+	/* The decoder's formats, and buffers wider than the stride: fixed. */
+	make_out(&out, 1000, 744, V4L2_PIX_FMT_NV16, 1008, 752);
+	r = (struct v4l2_rect){ 0, 0, 536, 400 };
+	hantro_g1_jpeg_dec_compose_adjust(&out, &r);
+	expect_rect(test, &r, 0, 0, 1000, 744, "NV16");
+	make_out(&out, 8176, 48, V4L2_PIX_FMT_NV12, 8176, 48);
+	r = (struct v4l2_rect){ 0, 0, 48, 48 };
+	hantro_g1_jpeg_dec_compose_adjust(&out, &r);
+	expect_rect(test, &r, 0, 0, 8176, 48, "8176 wide");
+
+	/* What the hardware writes: whole macroblocks where it is 1:1. */
+	make_out(&out, 1000, 744, V4L2_PIX_FMT_NV12, 1008, 752);
+	hantro_g1_jpeg_dec_compose_padded(&out, &r);
+	expect_rect(test, &r, 0, 0, 1008, 752, "padded dec");
+	make_out(&out, 1000, 744, V4L2_PIX_FMT_NV12, 1072, 736);
+	out.compose = (struct v4l2_rect){ 8, 0, 1000, 736 };
+	hantro_g1_jpeg_dec_compose_padded(&out, &r);
+	expect_rect(test, &r, 8, 0, 1008, 736, "padded 1:1");
+	out.compose = (struct v4l2_rect){ 72, 0, 1000, 736 };
+	hantro_g1_jpeg_dec_compose_padded(&out, &r);
+	expect_rect(test, &r, 72, 0, 1000, 736, "padded no room");
+	make_out(&out, 1000, 744, V4L2_PIX_FMT_NV12, 992, 1448);
+	out.compose = (struct v4l2_rect){ 0, 0, 536, 744 };
+	hantro_g1_jpeg_dec_compose_padded(&out, &r);
+	expect_rect(test, &r, 0, 0, 536, 752, "padded scaled");
+}
+
+/* G1_REG_PP_DEV_CONFIG: OUT_ENDIAN 6, OUT_SWAP32_E 5, burst length 16. */
+#define PP_DEV_CONFIG_YUV	(BIT(6) | BIT(5) | 16)
+
+struct pp_image {
+	u32 input_size;		/* swreg72 */
+	u32 scaling1;		/* swreg80 */
+	u32 scaling_inv;	/* swreg81 */
+	u32 control;		/* swreg85 */
+	u32 orig_width;		/* swreg88 */
+	u32 display_width;	/* swreg92 */
+	u32 luma_offset;
+	u32 chroma_offset;
+};
+
+static void expect_pp(struct kunit *test, const struct hantro_g1_pp_regs *pp,
+		      const struct pp_image *want, const char *what)
+{
+	KUNIT_EXPECT_EQ_MSG(test, pp->dev_config, PP_DEV_CONFIG_YUV, "%s", what);
+	KUNIT_EXPECT_EQ_MSG(test, pp->input_size, want->input_size, "%s", what);
+	KUNIT_EXPECT_EQ_MSG(test, pp->scaling1, want->scaling1, "%s", what);
+	KUNIT_EXPECT_EQ_MSG(test, pp->scaling_inv, want->scaling_inv, "%s", what);
+	KUNIT_EXPECT_EQ_MSG(test, pp->control, want->control, "%s", what);
+	KUNIT_EXPECT_EQ_MSG(test, pp->orig_width, want->orig_width, "%s", what);
+	KUNIT_EXPECT_EQ_MSG(test, pp->display_width, want->display_width,
+			    "%s", what);
+	KUNIT_EXPECT_EQ_MSG(test, pp->luma_offset, want->luma_offset,
+			    "%s", what);
+	KUNIT_EXPECT_EQ_MSG(test, pp->chroma_offset, want->chroma_offset,
+			    "%s", what);
+}
+
+/*
+ * Register fields: INPUT_SIZE height 16:9, width 8:0 (macroblocks);
+ * SCALING1 HOR_SCALE_MODE 26:25, VER_SCALE_MODE 24:23 (2: down);
+ * SCALING_INV WSCALE_INVRA 31:16, HSCALE_INVRA 15:0; CONTROL IN_FMT 31:29
+ * (1: 4:2:0, 4: 4:2:2, 3: 4:0:0), OUT_FMT 28:26 (5: NV12), OUT_HEIGHT
+ * 25:15, OUT_WIDTH 14:4, CROP8_R_E 1, CROP8_D_E 0; ORIG_WIDTH 31:23;
+ * DISPLAY_WIDTH 11:0, IN_W_EXT 28:26, IN_H_EXT 31:29.
+ */
+#define PP_MODES_DOWN		(2u << 25 | 2u << 23)
+#define PP_CONTROL(in, out, w, h) \
+	((u32)(in) << 29 | (u32)(out) << 26 | (u32)(h) << 15 | (u32)(w) << 4)
+
+/* How a job writes the CAPTURE buffer: the decoder, or the PP's registers. */
+static void jpeg_dec_job_out(struct kunit *test)
+{
+	struct hantro_g1_jpeg_dec_out out;
+	struct hantro_g1_pp_regs pp;
+	struct test_jpeg j;
+	bool use_pp;
+
+	/* The decoder's own buffer and format, the whole picture. */
+	make_jpeg(&j, V4L2_JPEG_CHROMA_SUBSAMPLING_420, 1000, 744);
+	make_out(&out, 1000, 744, V4L2_PIX_FMT_NV12, 1008, 752);
+	KUNIT_ASSERT_EQ(test, check_out(&j, &out, &pp, &use_pp), 0);
+	KUNIT_EXPECT_FALSE(test, use_pp);
+
+	/*
+	 * Scaled down into a wider, lower buffer at (8, 2): the picture
+	 * rounded up to 8, 63x47 macroblocks less the 8-pixel crops of the
+	 * last ones, both directions down; 536 / 1000 and 400 / 744 (the
+	 * vertical one a unit up).
+	 */
+	out = (struct hantro_g1_jpeg_dec_out){
+		.src_width = 1000, .src_height = 744,
+		.fourcc = V4L2_PIX_FMT_NV12, .width = 1072, .height = 736,
+		.compose = { 8, 2, 536, 400 }, .pp_max_width = 1920,
+	};
+	KUNIT_ASSERT_EQ(test, check_out(&j, &out, &pp, &use_pp), 0);
+	KUNIT_EXPECT_TRUE(test, use_pp);
+	expect_pp(test, &pp, &(struct pp_image){
+		.input_size = 47 << 9 | 63,
+		.scaling1 = PP_MODES_DOWN,
+		.scaling_inv = (536u << 16) / 1000 << 16 | ((400u << 16) / 744 + 1),
+		.control = PP_CONTROL(1, 5, 536, 400) | BIT(1) | BIT(0),
+		.orig_width = 63u << 23,
+		.display_width = 1072,
+		.luma_offset = 2 * 1072 + 8,
+		.chroma_offset = 1072 * 736 + 1072 + 8,
+	}, "420 scaled");
+
+	/*
+	 * NV12 of a 4:2:2 or greyscale picture in the decoder's buffer: the
+	 * post-processor reads and writes whole macroblocks, 1:1.
+	 */
+	make_jpeg(&j, V4L2_JPEG_CHROMA_SUBSAMPLING_422, 1000, 744);
+	make_out(&out, 1000, 744, V4L2_PIX_FMT_NV12, 1008, 752);
+	KUNIT_ASSERT_EQ(test, check_out(&j, &out, &pp, &use_pp), 0);
+	KUNIT_EXPECT_TRUE(test, use_pp);
+	expect_pp(test, &pp, &(struct pp_image){
+		.input_size = 47 << 9 | 63,
+		.control = PP_CONTROL(4, 5, 1008, 752),
+		.orig_width = 63u << 23,
+		.display_width = 1008,
+		.chroma_offset = 1008 * 752,
+	}, "422 1:1");
+	make_jpeg(&j, V4L2_JPEG_CHROMA_SUBSAMPLING_GRAY, 216, 408);
+	make_out(&out, 216, 408, V4L2_PIX_FMT_NV12, 224, 416);
+	KUNIT_ASSERT_EQ(test, check_out(&j, &out, &pp, &use_pp), 0);
+	expect_pp(test, &pp, &(struct pp_image){
+		.input_size = 26 << 9 | 14,
+		.control = PP_CONTROL(3, 5, 224, 416),
+		.orig_width = 14u << 23,
+		.display_width = 224,
+		.chroma_offset = 224 * 416,
+	}, "grey 1:1");
+	/* Scaled in one direction: the other one reads whole macroblocks. */
+	out.width = 224;
+	out.height = 208;
+	hantro_g1_jpeg_dec_compose_default(&out, &out.compose);
+	expect_rect(test, &out.compose, 0, 0, 104, 208, "grey fit");
+	out.compose.width = 216;
+	KUNIT_ASSERT_EQ(test, check_out(&j, &out, &pp, &use_pp), 0);
+	expect_pp(test, &pp, &(struct pp_image){
+		.input_size = 26 << 9 | 14,
+		.scaling1 = 2u << 23,
+		.scaling_inv = (208u << 16) / 408 + 1,
+		.control = PP_CONTROL(3, 5, 224, 208) | BIT(0),
+		.orig_width = 14u << 23,
+		.display_width = 224,
+		.chroma_offset = 224 * 208,
+	}, "grey height only");
+
+	/* 8176 to 48 (about 1/170), and 8176 lines (IN_H_EXT) to 2046. */
+	make_jpeg(&j, V4L2_JPEG_CHROMA_SUBSAMPLING_420, 8176, 48);
+	make_out(&out, 8176, 48, V4L2_PIX_FMT_NV12, 48, 48);
+	KUNIT_ASSERT_EQ(test, check_out(&j, &out, &pp, &use_pp), 0);
+	expect_pp(test, &pp, &(struct pp_image){
+		.input_size = 3 << 9 | (511 & 0x1ff),
+		.scaling1 = 2u << 25,
+		.scaling_inv = 384u << 16,
+		.control = PP_CONTROL(1, 5, 48, 48),
+		.orig_width = 511u << 23,
+		.display_width = 48,
+		.chroma_offset = 48 * 48,
+	}, "8176 wide");
+	make_jpeg(&j, V4L2_JPEG_CHROMA_SUBSAMPLING_420, 48, 8176);
+	make_out(&out, 48, 8176, V4L2_PIX_FMT_NV12, 48, 2046);
+	KUNIT_ASSERT_EQ(test, check_out(&j, &out, &pp, &use_pp), 0);
+	expect_pp(test, &pp, &(struct pp_image){
+		.input_size = (511 & 0xff) << 9 | 3,
+		.scaling1 = 2u << 23,
+		.scaling_inv = (2046u << 16) / 8176 + 1,
+		.control = PP_CONTROL(1, 5, 48, 2046),
+		.orig_width = 3u << 23,
+		.display_width = 48 | 1u << 29,
+		.chroma_offset = 48 * 2046,
+	}, "8176 high");
+
+	/* Refused: no format or compose rectangle that either writes. */
+	make_jpeg(&j, V4L2_JPEG_CHROMA_SUBSAMPLING_422, 4000, 3000);
+	make_out(&out, 4000, 3000, V4L2_PIX_FMT_NV12, 4000, 3008);
+	KUNIT_EXPECT_EQ(test, check_out(&j, &out, &pp, &use_pp), -EINVAL);
+	make_jpeg(&j, V4L2_JPEG_CHROMA_SUBSAMPLING_420, 1000, 744);
+	make_out(&out, 1000, 744, V4L2_PIX_FMT_NV12, 1072, 736);
+	out.compose.width = 532;
+	KUNIT_EXPECT_EQ(test, check_out(&j, &out, &pp, &use_pp), -EINVAL);
+	out.compose = (struct v4l2_rect){ 4, 0, 536, 400 };
+	KUNIT_EXPECT_EQ(test, check_out(&j, &out, &pp, &use_pp), -EINVAL);
+	out.compose = (struct v4l2_rect){ 536, 0, 544, 400 };
+	KUNIT_EXPECT_EQ(test, check_out(&j, &out, &pp, &use_pp), -EINVAL);
+	out.compose = (struct v4l2_rect){ 0, 0, 536, 400 };
+	out.pp_max_width = 0;
+	KUNIT_EXPECT_EQ(test, check_out(&j, &out, &pp, &use_pp), -EINVAL);
+}
+
+/* The JPEG decoder's selection targets, through the codec ops. */
+static void jpeg_dec_selection(struct kunit *test)
+{
+	const struct hantro_variant *rk3026 = &rk3026_vpu_variant;
+	const struct hantro_codec_ops *ops;
+	struct v4l2_selection sel = { .type = V4L2_BUF_TYPE_VIDEO_CAPTURE };
+	struct hantro_ctx *ctx;
+	struct hantro_dev *dev;
+	u32 w = 0, h = 0;
+
+	if (!IS_ENABLED(CONFIG_VIDEO_HANTRO_ROCKCHIP))
+		kunit_skip(test, "no Rockchip variants");
+
+	dev = kunit_kzalloc(test, sizeof(*dev), GFP_KERNEL);
+	ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, dev);
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	dev->variant = rk3026;
+	ctx->dev = dev;
+	ops = &rk3026->codec_ops[HANTRO_MODE_JPEG_DEC];
+	KUNIT_ASSERT_TRUE(test, ops->cap_try_fmt && ops->cap_enum_framesizes &&
+			  ops->cap_selection);
+
+	ctx->src_fmt.width = 4000;
+	ctx->src_fmt.height = 3000;
+	ctx->dst_fmt.pixelformat = V4L2_PIX_FMT_NV12;
+	ctx->dst_fmt.width = 1072;
+	ctx->dst_fmt.height = 1448;
+	ctx->compose = (struct v4l2_rect){ 0, 322, 1072, 804 };
+
+	sel.target = V4L2_SEL_TGT_CROP;
+	KUNIT_ASSERT_EQ(test, ops->cap_selection(ctx, &sel, false), 0);
+	expect_rect(test, &sel.r, 0, 0, 4000, 3000, "crop");
+	sel.target = V4L2_SEL_TGT_CROP_BOUNDS;
+	KUNIT_ASSERT_EQ(test, ops->cap_selection(ctx, &sel, false), 0);
+	expect_rect(test, &sel.r, 0, 0, 4000, 3000, "crop bounds");
+	sel.target = V4L2_SEL_TGT_COMPOSE;
+	KUNIT_ASSERT_EQ(test, ops->cap_selection(ctx, &sel, false), 0);
+	expect_rect(test, &sel.r, 0, 322, 1072, 804, "compose");
+	sel.target = V4L2_SEL_TGT_COMPOSE_DEFAULT;
+	KUNIT_ASSERT_EQ(test, ops->cap_selection(ctx, &sel, false), 0);
+	expect_rect(test, &sel.r, 0, 0, 1072, 804, "compose default");
+	sel.target = V4L2_SEL_TGT_COMPOSE_BOUNDS;
+	KUNIT_ASSERT_EQ(test, ops->cap_selection(ctx, &sel, false), 0);
+	expect_rect(test, &sel.r, 0, 0, 1072, 1448, "compose bounds");
+	sel.target = V4L2_SEL_TGT_COMPOSE_PADDED;
+	KUNIT_ASSERT_EQ(test, ops->cap_selection(ctx, &sel, false), 0);
+	expect_rect(test, &sel.r, 0, 322, 1072, 804, "compose padded");
+	sel.target = 0xffff;
+	KUNIT_EXPECT_EQ(test, ops->cap_selection(ctx, &sel, false), -EINVAL);
+
+	/* Only the compose rectangle can be set. */
+	sel.target = V4L2_SEL_TGT_COMPOSE;
+	sel.r = (struct v4l2_rect){ 12, 3, 540, 401 };
+	KUNIT_ASSERT_EQ(test, ops->cap_selection(ctx, &sel, true), 0);
+	expect_rect(test, &sel.r, 8, 2, 536, 400, "set compose");
+	sel.target = V4L2_SEL_TGT_CROP;
+	KUNIT_EXPECT_EQ(test, ops->cap_selection(ctx, &sel, true), -EINVAL);
+	sel.target = V4L2_SEL_TGT_COMPOSE_DEFAULT;
+	KUNIT_EXPECT_EQ(test, ops->cap_selection(ctx, &sel, true), -EINVAL);
+
+	/* The flags: -ERANGE where the adjusted rectangle breaks them. */
+	sel.target = V4L2_SEL_TGT_COMPOSE;
+	sel.flags = V4L2_SEL_FLAG_LE;
+	sel.r = (struct v4l2_rect){ 8, 2, 540, 401 };
+	KUNIT_ASSERT_EQ(test, ops->cap_selection(ctx, &sel, true), 0);
+	expect_rect(test, &sel.r, 8, 2, 536, 400, "LE");
+	sel.flags = V4L2_SEL_FLAG_GE;
+	sel.r = (struct v4l2_rect){ 8, 2, 540, 401 };
+	KUNIT_EXPECT_EQ(test, ops->cap_selection(ctx, &sel, true), -ERANGE);
+	sel.r = (struct v4l2_rect){ 12, 2, 536, 400 };
+	KUNIT_EXPECT_EQ(test, ops->cap_selection(ctx, &sel, true), -ERANGE);
+	sel.flags = V4L2_SEL_FLAG_GE | V4L2_SEL_FLAG_LE;
+	sel.r = (struct v4l2_rect){ 8, 2, 536, 400 };
+	KUNIT_ASSERT_EQ(test, ops->cap_selection(ctx, &sel, true), 0);
+	expect_rect(test, &sel.r, 8, 2, 536, 400, "GE | LE");
+
+	/* The decoder's own buffer: the compose rectangle stays the picture. */
+	ctx->dst_fmt.pixelformat = V4L2_PIX_FMT_NV16;
+	ctx->dst_fmt.width = 4000;
+	ctx->dst_fmt.height = 3008;
+	sel.flags = 0;
+	sel.r = (struct v4l2_rect){ 0, 0, 536, 400 };
+	KUNIT_ASSERT_EQ(test, ops->cap_selection(ctx, &sel, true), 0);
+	expect_rect(test, &sel.r, 0, 0, 4000, 3000, "NV16");
+	sel.flags = V4L2_SEL_FLAG_LE;
+	sel.r = (struct v4l2_rect){ 0, 0, 536, 400 };
+	KUNIT_EXPECT_EQ(test, ops->cap_selection(ctx, &sel, true), -ERANGE);
+	ctx->dst_fmt.pixelformat = V4L2_PIX_FMT_NV12;
+
+	/* TRY_FMT: a format the decoder neither writes nor post-processes. */
+	KUNIT_EXPECT_EQ(test, ops->cap_try_fmt(ctx, V4L2_PIX_FMT_NV21, &w, &h),
+			-EINVAL);
+	KUNIT_EXPECT_EQ(test, ops->cap_try_fmt(ctx, V4L2_PIX_FMT_NV12, &w, &h),
+			0);
+	KUNIT_EXPECT_EQ(test, w, 4000);
+	KUNIT_EXPECT_EQ(test, h, 3008);
+}
+
 /* One field of a register file, as the video post-processing wrote them. */
 struct pp_field {
 	unsigned int swreg;
@@ -1126,6 +1663,11 @@ static void pp_video_regs(struct kunit *test)
 				    "%ux%u", w, h);
 		KUNIT_EXPECT_EQ_MSG(test, regs.display_width, swreg[92],
 				    "%ux%u", w, h);
+		/* No scaling, at the start of the buffer, one plane. */
+		KUNIT_EXPECT_EQ_MSG(test, regs.scaling1, 0, "%ux%u", w, h);
+		KUNIT_EXPECT_EQ_MSG(test, regs.scaling_inv, 0, "%ux%u", w, h);
+		KUNIT_EXPECT_EQ_MSG(test, regs.luma_offset, 0, "%ux%u", w, h);
+		KUNIT_EXPECT_EQ_MSG(test, regs.chroma_offset, 0, "%ux%u", w, h);
 		/* Chroma base, colour conversion, scaling, masks: 0. */
 		for (r = 67; r <= 84; r++)
 			if (r != 72)
@@ -1160,6 +1702,11 @@ static struct kunit_case hantro_jpeg_dec_cases[] = {
 	KUNIT_CASE(jpeg_dec_rockchip_fmts),
 	KUNIT_CASE(jpeg_dec_raw_fmt_allowed),
 	KUNIT_CASE(pp_video_regs),
+	KUNIT_CASE(jpeg_dec_cap_size),
+	KUNIT_CASE(jpeg_dec_cap_frmsize),
+	KUNIT_CASE(jpeg_dec_compose),
+	KUNIT_CASE(jpeg_dec_job_out),
+	KUNIT_CASE(jpeg_dec_selection),
 	{ }
 };
 

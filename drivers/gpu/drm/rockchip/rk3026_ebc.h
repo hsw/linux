@@ -1389,6 +1389,8 @@ int rk3026_ebc_wait_marker(struct rk3026_ebc *ebc, u32 marker,
 #if IS_ENABLED(CONFIG_KUNIT)
 void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc, struct rk3026_ebc_last *last);
 void rk3026_ebc_set_image_addr(struct rk3026_ebc *ebc, u32 x, u32 y);
+void rk3026_ebc_frame_kick(struct rk3026_ebc *ebc, const u8 *lut, u32 chunk,
+			   u32 frames, bool last);
 int rk3026_ebc_drive(struct rk3026_ebc *ebc, const u8 *lut, u32 frames,
 		     u32 mode, u32 lut_mode, struct rk3026_ebc_last *last);
 int rk3026_ebc_wait_seq(struct rk3026_ebc *ebc, u32 seq,

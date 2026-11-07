@@ -5587,6 +5587,11 @@ static void t_mst_set(struct rk3026_ebc *ebc, u32 mst0, u32 mst1)
  * and from then on it reads back. Nothing in the fake reads back a pair
  * written and not latched; a drive that never starts a scan restores the
  * pair it found, and a stop that resets the block clears it (0/0).
+ *
+ * The write here stands in for the one the real rk3026_ebc_drive() makes
+ * itself, once before its first chunk is kicked: the stubs of the drive
+ * call this, so no glue case sees where the real drive writes the pair.
+ * ebc_test_glue_drive_pair() runs the real drive for that.
  */
 static void t_frame_start(struct rk3026_ebc *ebc)
 {
@@ -7427,6 +7432,93 @@ static void t_expect_mst(struct kunit *test, const struct rk3026_ebc *ebc,
 {
 	KUNIT_EXPECT_EQ(test, mst[0], lower_32_bits(ebc->half_phys[prev]));
 	KUNIT_EXPECT_EQ(test, mst[1], lower_32_bits(ebc->half_phys[next]));
+}
+
+/*
+ * What the stub of rk3026_ebc_frame_kick() saw (t_kick()): its calls, and
+ * at each the WIN_MST pair the fake registers held and the chunk kicked.
+ */
+struct t_kicks {
+	unsigned int	n;
+	u32		mst[4][2];
+	u32		chunk[4];
+};
+
+/* An address of neither half, left in WIN_MST0/1 by each kick (t_kick()). */
+#define T_MST_KICKED	0xdead0000u
+
+/*
+ * rk3026_ebc_frame_kick() without the controller: the pair the fake
+ * registers hold at the kick is noted, then overwritten with T_MST_KICKED,
+ * so a later kick sees a pair only if the drive wrote one after this kick,
+ * and the chunk ends at once, as its interrupt would end it.
+ */
+static void t_kick(struct rk3026_ebc *ebc, const u8 *lut, u32 chunk,
+		   u32 frames, bool last)
+{
+	struct t_kicks *k = kunit_get_current_test()->priv;
+
+	if (k->n < ARRAY_SIZE(k->mst)) {
+		t_mst_get(ebc, k->mst[k->n]);
+		k->chunk[k->n] = chunk;
+	}
+	k->n++;
+	t_mst_set(ebc, T_MST_KICKED, T_MST_KICKED);
+	complete(&ebc->frame_done);
+}
+
+/*
+ * The real rk3026_ebc_drive(), its kicks stubbed (t_kick()): each drive
+ * writes the pair of @roles once, before its first chunk's FRAME_START,
+ * and not again between its chunks or after the last one. The glue cases
+ * stub the whole drive (t_frame_start()), so this is the case that sees
+ * where the drive writes the pair.
+ */
+static void ebc_test_glue_drive_pair(struct kunit *test)
+{
+	struct rk3026_ebc *ebc = t_ebc_alloc(test);
+	u32 frames = 2 * EBC_LUT_MAX_FRAMES + 1;
+	struct rk3026_ebc_last last = {};
+	struct t_kicks k = {};
+	unsigned int i;
+	u32 mst[2];
+	u8 *lut;
+
+	lut = kunit_kzalloc(test, frames * EBC_LUT_FRAME_BYTES, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, lut);
+	init_completion(&ebc->frame_done);
+	ebc->epd_on = true;
+	ebc->vcom_on = true;
+	test->priv = &k;
+	kunit_activate_static_stub(test, rk3026_ebc_frame_kick, t_kick);
+
+	/* Three chunks, the high half as prev: written before the first. */
+	ebc->roles = (struct rk3026_ebc_roles){ EBC_HALF_HIGH, EBC_HALF_LOW };
+	t_mst_set(ebc, 0, 0);
+	KUNIT_ASSERT_EQ(test, rk3026_ebc_drive(ebc, lut, frames, EBC_MODE_FULL,
+					       EBC_MODE_FULL, &last), 0);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_EXPECT_EQ(test, last.driven, frames);
+	KUNIT_ASSERT_EQ(test, k.n, 3);
+	t_expect_mst(test, ebc, k.mst[0], EBC_HALF_HIGH, EBC_HALF_LOW);
+	for (i = 1; i < 3; i++) {
+		KUNIT_EXPECT_EQ(test, k.chunk[i], i);
+		KUNIT_EXPECT_EQ(test, k.mst[i][0], T_MST_KICKED);
+		KUNIT_EXPECT_EQ(test, k.mst[i][1], T_MST_KICKED);
+	}
+	t_mst_get(ebc, mst);
+	KUNIT_EXPECT_EQ(test, mst[0], T_MST_KICKED);
+	KUNIT_EXPECT_EQ(test, mst[1], T_MST_KICKED);
+
+	/* The next drive, one chunk, the roles swapped: written again. */
+	ebc->roles = (struct rk3026_ebc_roles){ EBC_HALF_LOW, EBC_HALF_HIGH };
+	KUNIT_ASSERT_EQ(test, rk3026_ebc_drive(ebc, lut, 1, EBC_MODE_FULL,
+					       EBC_MODE_FULL, &last), 0);
+	KUNIT_ASSERT_EQ(test, k.n, 4);
+	t_expect_mst(test, ebc, k.mst[3], EBC_HALF_LOW, EBC_HALF_HIGH);
+	t_mst_get(ebc, mst);
+	KUNIT_EXPECT_EQ(test, mst[0], T_MST_KICKED);
+	KUNIT_EXPECT_EQ(test, mst[1], T_MST_KICKED);
 }
 
 /*
@@ -13726,6 +13818,7 @@ out:
 static struct kunit_case rk3026_ebc_glue_test_cases[] = {
 	KUNIT_CASE(ebc_test_glue_add_update),
 	KUNIT_CASE(ebc_test_glue_crtc_off),
+	KUNIT_CASE(ebc_test_glue_drive_pair),
 	KUNIT_CASE(ebc_test_glue_no_waveform),
 	KUNIT_CASE(ebc_test_glue_skipped),
 	KUNIT_CASE(ebc_test_glue_reset_keeps_pre),

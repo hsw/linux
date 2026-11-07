@@ -417,13 +417,20 @@ static struct rk3026_ebc_roles ebc_take_roles(struct rk3026_ebc *ebc)
  * Everything up to CONFIG_DONE is a register group latched by that write, and
  * FRAME_START is only asserted afterwards. VCOM_MODE stays set while further
  * chunks follow so the rails are not dropped mid-waveform.
+ *
+ * KUnit replaces it with a static stub, so that rk3026_ebc_drive() can be
+ * run without the controller and its register writes seen at each kick.
  */
-static void ebc_frame_kick(struct rk3026_ebc *ebc, const u8 *lut,
-			   u32 chunk, u32 frames, bool last)
+VISIBLE_IF_KUNIT void rk3026_ebc_frame_kick(struct rk3026_ebc *ebc,
+					    const u8 *lut, u32 chunk,
+					    u32 frames, bool last)
 {
 	const u8 *src = lut + chunk * EBC_LUT_MAX_FRAMES * EBC_LUT_FRAME_BYTES;
 	u32 size = EBC_HALVES(ebc->width, ebc->height);
 	const struct display_timing *t = &ebc->timing;
+
+	KUNIT_STATIC_STUB_REDIRECT(rk3026_ebc_frame_kick, ebc, lut, chunk,
+				   frames, last);
 
 	/*
 	 * Word copies need a word-aligned source: @lut is the waveform's
@@ -462,6 +469,7 @@ static void ebc_frame_kick(struct rk3026_ebc *ebc, const u8 *lut,
 	ebc->dsp_start |= DSP_FRAME_START;
 	writel(ebc->dsp_start, ebc->regs + EBC_DSP_START);
 }
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_frame_kick);
 
 static irqreturn_t ebc_irq(int irq, void *data)
 {
@@ -749,7 +757,7 @@ VISIBLE_IF_KUNIT int rk3026_ebc_drive(struct rk3026_ebc *ebc, const u8 *lut,
 			budget = 1;
 
 		reinit_completion(&ebc->frame_done);
-		ebc_frame_kick(ebc, lut, chunk, n, done + n >= frames);
+		rk3026_ebc_frame_kick(ebc, lut, chunk, n, done + n >= frames);
 		ok = wait_for_completion_timeout(&ebc->frame_done,
 						msecs_to_jiffies(budget));
 		if (!ok) {

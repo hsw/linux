@@ -4668,10 +4668,28 @@ static void t_flip_wd_none(struct work_struct *work)
 {
 }
 
-/* The driver state of the glue tests on @ebc, zeroed, of device @dev. */
+/*
+ * The setting of the scanned images' roles the glue tests run with
+ * (&rk3026_ebc.rotate): fixed in rk3026_ebc_glue, rotated in
+ * rk3026_ebc_glue_rotate, which runs the same cases (t_glue_rotate_init()).
+ */
+static bool t_rotate;
+
+/* The address of the low half in the fake registers; the high one follows. */
+#define T_PHYS		0x60000000u
+
+/*
+ * The driver state of the glue tests on @ebc, zeroed, of device @dev. The
+ * registers are a fake file in memory: what is written reads back, and
+ * nothing else touches it (t_frame_start()).
+ */
 static void t_ebc_init(struct kunit *test, struct rk3026_ebc *ebc,
 		       struct device *dev)
 {
+	void *regs = kunit_kzalloc(test, EBC_CONFIG_DONE + 4, GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, regs);
+	ebc->regs = (__force void __iomem *)regs;
 	ebc->dev = dev;
 	mutex_init(&ebc->image_lock);
 	mutex_init(&ebc->rails_lock);
@@ -4691,7 +4709,14 @@ static void t_ebc_init(struct kunit *test, struct rk3026_ebc *ebc,
 	ebc->shadows.scan = t_img_alloc(test, 15);
 	ebc->shadows.pitch = T_PITCH;
 	ebc->shadows.height = T_H;
-	ebc->prev_virt = t_img_alloc(test, 15);
+	ebc->half_virt[EBC_HALF_LOW] = t_img_alloc(test, 15);
+	ebc->half_virt[EBC_HALF_HIGH] = t_img_alloc(test, 15);
+	ebc->half_phys[EBC_HALF_LOW] = T_PHYS;
+	ebc->half_phys[EBC_HALF_HIGH] = T_PHYS + T_SIZE;
+	ebc->roles = (struct rk3026_ebc_roles){ EBC_HALF_LOW, EBC_HALF_HIGH };
+	ebc->rotate = t_rotate;
+	/* As probe leaves it (ebc_hw_setup()). */
+	ebc->mst_explicit = true;
 	ebc->crtc_on = true;
 	/* As probe sets them: one panel's area, half of it, four panels. */
 	ebc->du_cleanup_area = T_W * T_H;
@@ -4891,7 +4916,6 @@ static void ebc_test_glue_reset_keeps_pre(struct kunit *test)
 	int x, y;
 
 	ebc->waveform = t_rkf_wf(test, ebc->dev, &seg, 1, 0);
-	ebc->next_virt = t_img_alloc(test, 15);
 	ebc->epd_on = true;
 	ebc->vcom_on = true;
 
@@ -5257,7 +5281,6 @@ static struct rk3026_ebc *t_policy_ebc(struct kunit *test)
 	struct rk3026_ebc *ebc = t_ebc_alloc(test);
 
 	ebc->waveform = t_rkf_wf(test, ebc->dev, &seg, 1, 0);
-	ebc->next_virt = t_img_alloc(test, 15);
 	ebc->epd_on = true;
 	ebc->vcom_on = true;
 	return ebc;
@@ -5509,6 +5532,8 @@ struct t_drives {
 	u32		mode[8];
 	u32		seq[8];
 	u32		setup_us[8];
+	/* The WIN_MST pair each drive's scan read (t_frame_start()). */
+	u32		mst[8][2];
 	unsigned int	rails;
 	int		rails_ret;
 	const u32	*rails_fb;
@@ -5543,6 +5568,36 @@ struct t_drives {
 	int		trace_err;
 };
 
+/* The WIN_MST pair the fake registers hold (t_ebc_init()). */
+static void t_mst_get(const struct rk3026_ebc *ebc, u32 *mst)
+{
+	mst[0] = readl_relaxed(ebc->regs + EBC_WIN_MST0);
+	mst[1] = readl_relaxed(ebc->regs + EBC_WIN_MST1);
+}
+
+static void t_mst_set(struct rk3026_ebc *ebc, u32 mst0, u32 mst1)
+{
+	writel_relaxed(mst0, ebc->regs + EBC_WIN_MST0);
+	writel_relaxed(mst1, ebc->regs + EBC_WIN_MST1);
+}
+
+/*
+ * A drive's first FRAME_START in the fake registers: the driver writes the
+ * pair (rk3026_ebc_set_image_addr()), the scan latches it at FRAME_START,
+ * and from then on it reads back. Nothing in the fake reads back a pair
+ * written and not latched; a drive that never starts a scan restores the
+ * pair it found, and a stop that resets the block clears it (0/0).
+ *
+ * The write here stands in for the one the real rk3026_ebc_drive() makes
+ * itself, once before its first chunk is kicked: the stubs of the drive
+ * call this, so no glue case sees where the real drive writes the pair.
+ * ebc_test_glue_drive_pair() runs the real drive for that.
+ */
+static void t_frame_start(struct rk3026_ebc *ebc)
+{
+	rk3026_ebc_set_image_addr(ebc, 0, 0);
+}
+
 /*
  * rk3026_ebc_drive() without the controller: every frame driven, as the
  * real one records it, and the mode noted in the test's struct t_drives,
@@ -5557,7 +5612,9 @@ static int t_drive_ok(struct rk3026_ebc *ebc, const u8 *lut, u32 frames,
 	bool unknown = READ_ONCE(ebc->shadows.prev_unknown);
 	struct t_drives *d = kunit_get_current_test()->priv;
 
+	t_frame_start(ebc);
 	if (d->n < ARRAY_SIZE(d->mode)) {
+		t_mst_get(ebc, d->mst[d->n]);
 		d->mode[d->n] = mode;
 		d->seq[d->n] = last->seq;
 		d->setup_us[d->n] = rk3026_ebc_setup_us(ebc, last);
@@ -5576,13 +5633,19 @@ static int t_drive_ok(struct rk3026_ebc *ebc, const u8 *lut, u32 frames,
 
 /*
  * rk3026_ebc_drive() cut short in its first chunk, as the real one ends on
- * a frame timeout: nothing driven, the mark set, the mode noted.
+ * a frame timeout: nothing driven, the mark set, the mode noted, and the
+ * block reset (ebc_stop_scan()), which clears the image pair.
  */
 static int t_drive_timeout(struct rk3026_ebc *ebc, const u8 *lut,
 			   u32 frames, u32 mode, u32 lut_mode,
 			   struct rk3026_ebc_last *last)
 {
 	struct t_drives *d = kunit_get_current_test()->priv;
+
+	t_frame_start(ebc);
+	if (d->n < ARRAY_SIZE(d->mode))
+		t_mst_get(ebc, d->mst[d->n]);
+	t_mst_set(ebc, 0, 0);
 
 	if (d->n < ARRAY_SIZE(d->mode)) {
 		d->mode[d->n] = mode;
@@ -6824,16 +6887,28 @@ enum t_rows_drive {
  * next image holds the snapshot, the prev image what the glass shows
  * (@shadows.prev, or white after a repair RESET that ran to its end in
  * this part), and the snapshot is the reference one, built from
- * @shadows.prev and the part's @target over its box. @how is what drive k
- * of the part does; @repaired is set by a repair RESET that ran to its
- * end. @bad is the first failure's step.
+ * @shadows.prev and the part's @target over its box. The images are the
+ * halves the pair in the fake registers names when the drive's scan
+ * starts (t_frame_start()), and that pair must be @want, the part's: the
+ * swap of the pair the last scan latched with &rk3026_ebc.rotate, else,
+ * and after a start of the block, a block reset or a pair of no halves,
+ * the low half as prev and the high one as next (t_rows_want()). @how is
+ * what drive k of the part does; a timeout with @rst resets the block, an
+ * abandon without @started ends before the first FRAME_START. @kind counts
+ * the parts driven by what their readback named. @repaired is set by a
+ * repair RESET that ran to its end. @bad is the first failure's step.
  */
 struct t_rows_model {
 	struct t_drives		d;	/* first: t_rails()'s and t_clock()'s priv */
 	u8			*ref;
 	u8			*ref_tl;
 	const u8		*target;
+	struct rk3026_ebc_roles	want;
+	enum rk3026_ebc_mst	read;
+	unsigned int		kind[EBC_MST_FOREIGN + 1];
 	enum t_rows_drive	how[2];
+	bool			rst[2];
+	bool			started[2];
 	unsigned int		calls;
 	bool			repaired;
 	bool			repair_failed;
@@ -6852,6 +6927,44 @@ static void t_rows_fail(struct kunit *test, struct t_rows_model *m,
 	m->bad = m->step;
 }
 
+/* The half at @addr in the fake registers, or -1. */
+static int t_half_at(const struct rk3026_ebc *ebc, u32 addr)
+{
+	int i;
+
+	for (i = 0; i < EBC_HALVES; i++)
+		if (lower_32_bits(ebc->half_phys[i]) == addr)
+			return i;
+	return -1;
+}
+
+/*
+ * The pair the next part's scans must read (struct t_rows_model), from the
+ * fake registers before the part, and what they name.
+ */
+static struct rk3026_ebc_roles t_rows_want(const struct rk3026_ebc *ebc,
+					   enum rk3026_ebc_mst *read)
+{
+	struct rk3026_ebc_roles fixed = { EBC_HALF_LOW, EBC_HALF_HIGH };
+	u32 mst[2];
+	int h0, h1;
+
+	t_mst_get(ebc, mst);
+	h0 = t_half_at(ebc, mst[0]);
+	h1 = t_half_at(ebc, mst[1]);
+	if (ebc->mst_explicit)
+		*read = EBC_MST_UNSET;
+	else if (!mst[0] && !mst[1])
+		*read = EBC_MST_CLEARED;
+	else if (h0 < 0 || h1 < 0 || h0 == h1)
+		*read = EBC_MST_FOREIGN;
+	else
+		*read = EBC_MST_LATCHED;
+	if (!ebc->rotate || *read != EBC_MST_LATCHED)
+		return fixed;
+	return (struct rk3026_ebc_roles){ h1, h0 };
+}
+
 /*
  * rk3026_ebc_drive() without the controller, checking the images it would
  * read (struct t_rows_model), then ending as @how says for this call.
@@ -6865,17 +6978,36 @@ static int t_drive_rows(struct rk3026_ebc *ebc, const u8 *lut, u32 frames,
 	struct rk3026_ebc_shadows ref = *sh;
 	bool unknown = READ_ONCE(sh->prev_unknown);
 	bool repair = !m->calls && last->repaired;
-	enum t_rows_drive how = m->how[min(m->calls, 1u)];
+	unsigned int k = min(m->calls, 1u);
+	enum t_rows_drive how = m->how[k];
 	u32 m_plain = EBC_MODE_PART, m_tl = EBC_MODE_BLACK_WHITE;
-	int i;
+	const u8 *prev, *next;
+	u32 was[2], mst[2];
+	int i, hp, hn;
 
 	m->drives++;
-	if (memcmp(ebc->next_virt, sh->scan, T_SIZE))
+	if (!m->calls)
+		m->kind[m->read]++;
+	t_mst_get(ebc, was);
+	t_frame_start(ebc);
+	t_mst_get(ebc, mst);
+	hp = t_half_at(ebc, mst[0]);
+	hn = t_half_at(ebc, mst[1]);
+	if (hp < 0 || hn < 0 || hp == hn) {
+		t_rows_fail(test, m, "the scan reads no pair of halves");
+		hp = EBC_HALF_LOW;
+		hn = EBC_HALF_HIGH;
+	} else if (hp != m->want.prev || hn != m->want.next) {
+		t_rows_fail(test, m, "the scan reads another pair");
+	}
+	prev = ebc->half_virt[hp];
+	next = ebc->half_virt[hn];
+	if (memcmp(next, sh->scan, T_SIZE))
 		t_rows_fail(test, m, "next image is not the snapshot");
 	for (i = 0; i < T_SIZE; i++) {
 		u8 want = m->repaired ? 0xff : sh->prev[i];
 
-		if (((u8 *)ebc->prev_virt)[i] != want) {
+		if (prev[i] != want) {
 			t_rows_fail(test, m, m->repaired ?
 				    "prev image not white after the repair" :
 				    "prev image is not prev");
@@ -6906,27 +7038,33 @@ static int t_drive_rows(struct rk3026_ebc *ebc, const u8 *lut, u32 frames,
 	WRITE_ONCE(sh->prev_unknown, true);
 	m->repair_failed |= repair;
 	if (how == T_ROWS_TIMEOUT) {
+		if (m->rst[k])
+			t_mst_set(ebc, 0, 0);
 		last->timeouts++;
 		last->outcome = EBC_OUTCOME_TIMEOUT;
 		return -ETIMEDOUT;
 	}
+	if (!m->started[k])
+		t_mst_set(ebc, was[0], was[1]);
 	last->outcome = EBC_OUTCOME_ABANDONED;
 	return -EIO;
 }
 
 /*
- * After a part: the prev image holds prev, as after every part of the
- * whole-copy model, and each range of struct rk3026_ebc_shadows covers
- * every row where its two images differ.
+ * After a part: in fixed roles the prev image holds prev, as after every
+ * part of the whole-copy model, and each range of struct
+ * rk3026_ebc_shadows covers every row where its two images differ.
  */
 static void t_rows_after(struct kunit *test, struct t_rows_model *m,
 			 struct rk3026_ebc *ebc)
 {
 	const struct rk3026_ebc_shadows *sh = &ebc->shadows;
-	const u8 *half[EBC_HALVES] = { ebc->prev_virt, ebc->next_virt };
+	const u8 *half[EBC_HALVES] = {
+		ebc->half_virt[EBC_HALF_LOW], ebc->half_virt[EBC_HALF_HIGH],
+	};
 	unsigned int i;
 
-	if (memcmp(ebc->prev_virt, sh->prev, T_SIZE))
+	if (!ebc->rotate && memcmp(half[EBC_HALF_LOW], sh->prev, T_SIZE))
 		t_rows_fail(test, m, "prev image is not prev after the part");
 	if (t_rows_outside_diff(sh->scan, sh->prev, T_PITCH, T_H,
 				&sh->scan_rows) >= 0)
@@ -6965,12 +7103,16 @@ static void t_rows_paint(u8 *img, const struct drm_rect *box,
  * waveform, a waveform with the RESET alone (no LUT for the part) or
  * without it (the repair is a FULL), rails that do not come up, drives and
  * repair RESETs that run to their end, time out or are abandoned, parts
- * skipped as identical, and the carries all this makes. At every drive the
+ * skipped as identical, and the carries all this makes; a timeout resets
+ * the block or not, an abandon comes before the first scan or after it,
+ * and now and then the block starts again (a CRTC enable, a resume) or
+ * the registers hold a pair of no halves. At every drive the
  * next image is the snapshot, the prev image prev (white after a repair),
- * and the snapshot the one a full copy builds (t_drive_rows()); after
- * every part the prev image is prev and the ranges cover the rows that
- * differ (t_rows_after()). Every outcome, both repair results and a
- * driven RESET part occur.
+ * both the halves the pair the part must write names, and the snapshot
+ * the one a full copy builds (t_drive_rows()); after every part the
+ * ranges cover the rows that differ, and in fixed roles the prev image is
+ * prev (t_rows_after()). Every outcome, both repair results and a driven
+ * RESET part occur, and with &rk3026_ebc.rotate every kind of readback.
  */
 static void ebc_test_glue_rows_model(struct kunit *test)
 {
@@ -7051,7 +7193,18 @@ static void ebc_test_glue_rows_model(struct kunit *test)
 			m->how[i] = r < 72 ? T_ROWS_OK :
 				    r < 88 ? T_ROWS_TIMEOUT :
 					     T_ROWS_ABANDONED;
+			m->rst[i] = prandom_u32_state(&rs) & 1;
+			m->started[i] = prandom_u32_state(&rs) & 1;
 		}
+		/* The block starts again, or its pair names no halves. */
+		r = prandom_u32_state(&rs) % 100;
+		if (r < 3)
+			ebc->mst_explicit = true;
+		else if (r < 4)
+			t_mst_set(ebc, T_PHYS, T_PHYS);
+		else if (r < 5)
+			t_mst_set(ebc, T_PHYS + T_SIZE, T_PHYS + 2 * T_SIZE);
+		m->want = t_rows_want(ebc, &m->read);
 		m->d.now = ktime_add_ms(m->d.now, 700);
 
 		m->target = ebc->pre_split ? ebc->pre_shadow :
@@ -7069,15 +7222,18 @@ static void ebc_test_glue_rows_model(struct kunit *test)
 		}
 		/*
 		 * Not only covered but tight: the image that held the snapshot
-		 * holds prev after a swap, and the prev image was just copied.
+		 * holds prev after a swap, and in fixed roles the prev image
+		 * was just copied. With rotation the next part's pair names
+		 * the first as prev: it needs no copy.
 		 */
 		swapped = (last.outcome == EBC_OUTCOME_DRIVEN ||
 			   last.outcome == EBC_OUTCOME_TIMEOUT ||
 			   last.outcome == EBC_OUTCOME_ABANDONED) &&
 			  last.asked_mode != EBC_MODE_RESET && !m->repair_failed;
-		if (!rk3026_ebc_rows_empty(&sh->half[EBC_HALF_LOW].prev) ||
+		if ((!ebc->rotate &&
+		     !rk3026_ebc_rows_empty(&sh->half[EBC_HALF_LOW].prev)) ||
 		    (swapped &&
-		     !rk3026_ebc_rows_empty(&sh->half[EBC_HALF_HIGH].prev)))
+		     !rk3026_ebc_rows_empty(&sh->half[m->want.next].prev)))
 			t_rows_fail(test, m, "a scanned image left stale");
 		if (m->bad >= 0)
 			return;
@@ -7088,12 +7244,16 @@ static void ebc_test_glue_rows_model(struct kunit *test)
 		resets += last.asked_mode == EBC_MODE_RESET &&
 			  last.outcome == EBC_OUTCOME_DRIVEN;
 	}
-	t_expect_guard(test, ebc->prev_virt);
-	t_expect_guard(test, ebc->next_virt);
-	kunit_info(test, "drives %u repaired %u failed %u resets %u\n",
-		   m->drives, repaired, repair_failed, resets);
+	t_expect_guard(test, ebc->half_virt[EBC_HALF_LOW]);
+	t_expect_guard(test, ebc->half_virt[EBC_HALF_HIGH]);
+	kunit_info(test, "drives %u repaired %u failed %u resets %u read %u %u %u %u\n",
+		   m->drives, repaired, repair_failed, resets,
+		   m->kind[EBC_MST_LATCHED], m->kind[EBC_MST_UNSET],
+		   m->kind[EBC_MST_CLEARED], m->kind[EBC_MST_FOREIGN]);
 	for (i = EBC_OUTCOME_DRIVEN; i <= EBC_OUTCOME_ABANDONED; i++)
 		KUNIT_EXPECT_GT_MSG(test, seen[i], 0, "outcome %u", i);
+	for (i = EBC_MST_LATCHED; ebc->rotate && i <= EBC_MST_FOREIGN; i++)
+		KUNIT_EXPECT_GT_MSG(test, m->kind[i], 0, "readback %u", i);
 	KUNIT_EXPECT_GT(test, repaired, 0);
 	KUNIT_EXPECT_GT(test, repair_failed, 0);
 	KUNIT_EXPECT_GT(test, resets, 0);
@@ -7139,9 +7299,9 @@ static void t_expect_rows(struct kunit *test, struct rk3026_ebc *ebc,
 }
 
 /*
- * After a whole-panel part, a one-row change writes that row alone into
- * each scanned image, and a part identical to the glass writes none: a
- * canary in every other byte stays.
+ * In fixed roles, after a whole-panel part, a one-row change writes that
+ * row alone into each scanned image, and a part identical to the glass
+ * writes none: a canary in every other byte stays.
  */
 static void ebc_test_glue_rows_partial(struct kunit *test)
 {
@@ -7150,11 +7310,12 @@ static void ebc_test_glue_rows_partial(struct kunit *test)
 	struct t_drives d;
 	struct rk3026_ebc *ebc = t_driven_ebc(test, &d, true);
 	struct drm_rect line = DRM_RECT_INIT(0, 3, T_W, 1);
-	u8 *lo = ebc->prev_virt, *hi = ebc->next_virt;
+	u8 *lo = ebc->half_virt[EBC_HALF_LOW], *hi = ebc->half_virt[EBC_HALF_HIGH];
 	u8 *lo_was = t_img_alloc(test, 0), *hi_was = t_img_alloc(test, 0);
 	struct rk3026_ebc_last last;
 	int y;
 
+	ebc->rotate = false;
 	t_img_fill(ebc->next_shadow, 8);
 	t_send(ebc, &t_panel, EBC_MODE_FULL, 1, EBC_SOURCE_MXCFB);
 	rk3026_ebc_do_refresh(ebc, &last);
@@ -7201,6 +7362,7 @@ static void ebc_test_glue_rows_partial(struct kunit *test)
  * with no LUT for the part after it leaves prev white: the prev image is
  * white already, the snapshot and the next image stale in every row, and
  * the next part writes the next image whole. A RESET part leaves the same.
+ * In fixed roles.
  */
 static void ebc_test_glue_repair_marks_full(struct kunit *test)
 {
@@ -7211,9 +7373,10 @@ static void ebc_test_glue_repair_marks_full(struct kunit *test)
 	struct rk3026_ebc *ebc = t_driven_ebc(test, &d, true);
 	struct ebc_waveform *wf = ebc->waveform;
 	struct drm_rect r = DRM_RECT_INIT(4, 2, 2, 1);
-	u8 *lo = ebc->prev_virt, *hi = ebc->next_virt;
+	u8 *lo = ebc->half_virt[EBC_HALF_LOW], *hi = ebc->half_virt[EBC_HALF_HIGH];
 	struct rk3026_ebc_last last;
 
+	ebc->rotate = false;
 	t_img_fill(ebc->next_shadow, 8);
 	t_send(ebc, &t_panel, EBC_MODE_FULL, 1, EBC_SOURCE_MXCFB);
 	rk3026_ebc_do_refresh(ebc, &last);
@@ -7260,6 +7423,316 @@ static void ebc_test_glue_repair_marks_full(struct kunit *test)
 	t_expect_rows(test, ebc, white);
 	t_expect_guard(test, lo);
 	t_expect_guard(test, hi);
+}
+
+/* The pair @mst is @prev as MST0 and @next as MST1. */
+static void t_expect_mst(struct kunit *test, const struct rk3026_ebc *ebc,
+			 const u32 *mst, enum rk3026_ebc_half prev,
+			 enum rk3026_ebc_half next)
+{
+	KUNIT_EXPECT_EQ(test, mst[0], lower_32_bits(ebc->half_phys[prev]));
+	KUNIT_EXPECT_EQ(test, mst[1], lower_32_bits(ebc->half_phys[next]));
+}
+
+/*
+ * What the stub of rk3026_ebc_frame_kick() saw (t_kick()): its calls, and
+ * at each the WIN_MST pair the fake registers held and the chunk kicked.
+ */
+struct t_kicks {
+	unsigned int	n;
+	u32		mst[4][2];
+	u32		chunk[4];
+};
+
+/* An address of neither half, left in WIN_MST0/1 by each kick (t_kick()). */
+#define T_MST_KICKED	0xdead0000u
+
+/*
+ * rk3026_ebc_frame_kick() without the controller: the pair the fake
+ * registers hold at the kick is noted, then overwritten with T_MST_KICKED,
+ * so a later kick sees a pair only if the drive wrote one after this kick,
+ * and the chunk ends at once, as its interrupt would end it.
+ */
+static void t_kick(struct rk3026_ebc *ebc, const u8 *lut, u32 chunk,
+		   u32 frames, bool last)
+{
+	struct t_kicks *k = kunit_get_current_test()->priv;
+
+	if (k->n < ARRAY_SIZE(k->mst)) {
+		t_mst_get(ebc, k->mst[k->n]);
+		k->chunk[k->n] = chunk;
+	}
+	k->n++;
+	t_mst_set(ebc, T_MST_KICKED, T_MST_KICKED);
+	complete(&ebc->frame_done);
+}
+
+/*
+ * The real rk3026_ebc_drive(), its kicks stubbed (t_kick()): each drive
+ * writes the pair of @roles once, before its first chunk's FRAME_START,
+ * and not again between its chunks or after the last one. The glue cases
+ * stub the whole drive (t_frame_start()), so this is the case that sees
+ * where the drive writes the pair.
+ */
+static void ebc_test_glue_drive_pair(struct kunit *test)
+{
+	struct rk3026_ebc *ebc = t_ebc_alloc(test);
+	u32 frames = 2 * EBC_LUT_MAX_FRAMES + 1;
+	struct rk3026_ebc_last last = {};
+	struct t_kicks k = {};
+	unsigned int i;
+	u32 mst[2];
+	u8 *lut;
+
+	lut = kunit_kzalloc(test, frames * EBC_LUT_FRAME_BYTES, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, lut);
+	init_completion(&ebc->frame_done);
+	ebc->epd_on = true;
+	ebc->vcom_on = true;
+	test->priv = &k;
+	kunit_activate_static_stub(test, rk3026_ebc_frame_kick, t_kick);
+
+	/* Three chunks, the high half as prev: written before the first. */
+	ebc->roles = (struct rk3026_ebc_roles){ EBC_HALF_HIGH, EBC_HALF_LOW };
+	t_mst_set(ebc, 0, 0);
+	KUNIT_ASSERT_EQ(test, rk3026_ebc_drive(ebc, lut, frames, EBC_MODE_FULL,
+					       EBC_MODE_FULL, &last), 0);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_EXPECT_EQ(test, last.driven, frames);
+	KUNIT_ASSERT_EQ(test, k.n, 3);
+	t_expect_mst(test, ebc, k.mst[0], EBC_HALF_HIGH, EBC_HALF_LOW);
+	for (i = 1; i < 3; i++) {
+		KUNIT_EXPECT_EQ(test, k.chunk[i], i);
+		KUNIT_EXPECT_EQ(test, k.mst[i][0], T_MST_KICKED);
+		KUNIT_EXPECT_EQ(test, k.mst[i][1], T_MST_KICKED);
+	}
+	t_mst_get(ebc, mst);
+	KUNIT_EXPECT_EQ(test, mst[0], T_MST_KICKED);
+	KUNIT_EXPECT_EQ(test, mst[1], T_MST_KICKED);
+
+	/* The next drive, one chunk, the roles swapped: written again. */
+	ebc->roles = (struct rk3026_ebc_roles){ EBC_HALF_LOW, EBC_HALF_HIGH };
+	KUNIT_ASSERT_EQ(test, rk3026_ebc_drive(ebc, lut, 1, EBC_MODE_FULL,
+					       EBC_MODE_FULL, &last), 0);
+	KUNIT_ASSERT_EQ(test, k.n, 4);
+	t_expect_mst(test, ebc, k.mst[3], EBC_HALF_LOW, EBC_HALF_HIGH);
+	t_mst_get(ebc, mst);
+	KUNIT_EXPECT_EQ(test, mst[0], T_MST_KICKED);
+	KUNIT_EXPECT_EQ(test, mst[1], T_MST_KICKED);
+}
+
+/*
+ * With the roles rotating, the first part after the block started writes
+ * the pair explicitly, the low half as prev and the high one as next, and
+ * both halves whole, whatever pair the block held. Each part after it is
+ * drawn into the half the last scan read as prev, and reads the other as
+ * prev: the pair swapped. The snapshot goes into the rows it or the part
+ * before changed, and nothing into the prev half: after a one-row part
+ * over a one-row part a canary stays in all of the prev half, and in the
+ * target outside the two rows. A part identical to the glass writes
+ * nothing and leaves the pair.
+ */
+static void ebc_test_glue_rotate_rows(struct kunit *test)
+{
+	static const u32 two_rows[] = { 5, 6, 5, 6, 0, 0, 0, 0, 5, 6 };
+	static const u32 skipped[] = { 0, 0, 5, 6, 5, 6, 0, 0, 0, 0 };
+	struct t_drives d;
+	struct rk3026_ebc *ebc = t_driven_ebc(test, &d, true);
+	struct drm_rect line3 = DRM_RECT_INIT(0, 3, T_W, 1);
+	struct drm_rect line5 = DRM_RECT_INIT(0, 5, T_W, 1);
+	u8 *lo = ebc->half_virt[EBC_HALF_LOW], *hi = ebc->half_virt[EBC_HALF_HIGH];
+	u8 *was = t_img_alloc(test, 0);
+	struct rk3026_ebc_last last;
+	u32 mst[2];
+	int y;
+
+	ebc->rotate = true;
+	memset(lo, 0x5a, T_SIZE);
+	memset(hi, 0x5a, T_SIZE);
+	t_mst_set(ebc, T_PHYS, T_PHYS + T_SIZE);
+	t_img_fill(ebc->next_shadow, 8);
+	t_send(ebc, &t_panel, EBC_MODE_FULL, 1, EBC_SOURCE_MXCFB);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_ASSERT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	t_expect_mst(test, ebc, d.mst[0], EBC_HALF_LOW, EBC_HALF_HIGH);
+	t_expect_white(test, lo);
+	KUNIT_EXPECT_MEMEQ(test, hi, ebc->shadows.prev, T_SIZE);
+
+	/* Into the low half, whole: a whole-panel part is behind it. */
+	memcpy(was, hi, T_SIZE);
+	t_px_set(ebc->next_shadow, 5, 3, 0);
+	t_send(ebc, &line3, EBC_MODE_PART, 2, EBC_SOURCE_MXCFB);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_ASSERT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	t_expect_mst(test, ebc, d.mst[1], EBC_HALF_HIGH, EBC_HALF_LOW);
+	KUNIT_EXPECT_MEMEQ(test, lo, ebc->shadows.prev, T_SIZE);
+	KUNIT_EXPECT_MEMEQ(test, hi, was, T_SIZE);
+
+	/* Into the high half, rows 3 to 5; nothing into the low one. */
+	memset(lo, 0x5a, T_SIZE);
+	memset(hi, 0x5a, T_SIZE);
+	t_px_set(ebc->next_shadow, 7, 5, 0);
+	t_send(ebc, &line5, EBC_MODE_PART, 3, EBC_SOURCE_MXCFB);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_ASSERT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	t_expect_mst(test, ebc, d.mst[2], EBC_HALF_LOW, EBC_HALF_HIGH);
+	for (y = 0; y < T_H; y++) {
+		const u8 *p = ebc->shadows.prev + y * T_PITCH;
+		int x;
+
+		for (x = 0; x < T_PITCH; x++) {
+			KUNIT_EXPECT_EQ_MSG(test, lo[y * T_PITCH + x], 0x5a,
+					    "row %d", y);
+			KUNIT_EXPECT_EQ_MSG(test, hi[y * T_PITCH + x],
+					    y >= 3 && y <= 5 ? p[x] : 0x5a,
+					    "row %d", y);
+		}
+	}
+	t_expect_rows(test, ebc, two_rows);
+
+	/* Identical: nothing written, the pair as the last scan left it. */
+	memcpy(was, hi, T_SIZE);
+	t_send(ebc, &line5, EBC_MODE_PART, 4, EBC_SOURCE_MXCFB);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_ASSERT_EQ(test, last.outcome, EBC_OUTCOME_SKIPPED);
+	KUNIT_EXPECT_EQ(test, d.n, 3);
+	for (y = 0; y < T_SIZE; y++)
+		KUNIT_EXPECT_EQ(test, lo[y], 0x5a);
+	KUNIT_EXPECT_MEMEQ(test, hi, was, T_SIZE);
+	t_mst_get(ebc, mst);
+	t_expect_mst(test, ebc, mst, EBC_HALF_LOW, EBC_HALF_HIGH);
+	t_expect_rows(test, ebc, skipped);
+	t_expect_guard(test, lo);
+	t_expect_guard(test, hi);
+}
+
+/*
+ * With the roles rotating, a repair whitens the half the pair names as
+ * prev, the one the last scan drew into, and both scans of the part, the
+ * RESET and the part's own, read the same pair, swapped once. The half
+ * whitened is stale in every row after it; the next part is drawn into
+ * it, whole, and copies nothing into the other.
+ */
+static void ebc_test_glue_rotate_repair(struct kunit *test)
+{
+	static const u32 boxed[] = { 2, 3, 0, 0, 2, 3, 0, T_H, 0, T_H };
+	struct t_drives d;
+	struct rk3026_ebc *ebc = t_driven_ebc(test, &d, true);
+	struct drm_rect r = DRM_RECT_INIT(4, 2, 2, 1);
+	struct drm_rect dot = DRM_RECT_INIT(9, 4, 1, 1);
+	u8 *lo = ebc->half_virt[EBC_HALF_LOW], *hi = ebc->half_virt[EBC_HALF_HIGH];
+	u8 *was = t_img_alloc(test, 0);
+	struct rk3026_ebc_last last;
+
+	ebc->rotate = true;
+	t_img_fill(ebc->next_shadow, 8);
+	t_send(ebc, &t_panel, EBC_MODE_FULL, 1, EBC_SOURCE_MXCFB);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_ASSERT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+
+	ebc->shadows.prev_unknown = true;
+	t_px_set(ebc->next_shadow, 4, 2, 0);
+	t_send(ebc, &r, EBC_MODE_PART, 2, EBC_SOURCE_MXCFB);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_TRUE(test, last.repaired);
+	KUNIT_ASSERT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_ASSERT_EQ(test, d.n, 3);
+	KUNIT_EXPECT_EQ(test, d.mode[1], EBC_MODE_RESET);
+	t_expect_mst(test, ebc, d.mst[1], EBC_HALF_HIGH, EBC_HALF_LOW);
+	t_expect_mst(test, ebc, d.mst[2], EBC_HALF_HIGH, EBC_HALF_LOW);
+	t_expect_white(test, hi);
+	KUNIT_EXPECT_EQ(test, lo[0], 0x88);
+	KUNIT_EXPECT_MEMEQ(test, lo, ebc->shadows.prev, T_SIZE);
+	t_expect_rows(test, ebc, boxed);
+
+	memcpy(was, lo, T_SIZE);
+	t_px_set(ebc->next_shadow, 9, 4, 0);
+	t_send(ebc, &dot, EBC_MODE_PART, 3, EBC_SOURCE_MXCFB);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_ASSERT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_ASSERT_EQ(test, d.n, 4);
+	t_expect_mst(test, ebc, d.mst[3], EBC_HALF_LOW, EBC_HALF_HIGH);
+	KUNIT_EXPECT_MEMEQ(test, hi, ebc->shadows.prev, T_SIZE);
+	KUNIT_EXPECT_MEMEQ(test, lo, was, T_SIZE);
+}
+
+/*
+ * With the roles rotating, the pair is written explicitly, the low half as
+ * prev and the high one as next, and both halves whole: after a stop that
+ * reset the block (the pair reads 0/0; the repair the stop calls for then
+ * whitens the low half), when the pair read back does not name both
+ * halves, and on the first part after the block started again (a CRTC
+ * enable, a resume), whatever pair it holds. The swap goes on from there.
+ */
+static void ebc_test_glue_rotate_stop(struct kunit *test)
+{
+	static const u32 other[][2] = {
+		{ T_PHYS, T_PHYS }, { T_PHYS + T_SIZE, 0x1000 },
+	};
+	struct t_drives d;
+	struct rk3026_ebc *ebc = t_driven_ebc(test, &d, true);
+	struct drm_rect r = DRM_RECT_INIT(4, 2, 2, 1);
+	u8 *lo = ebc->half_virt[EBC_HALF_LOW], *hi = ebc->half_virt[EBC_HALF_HIGH];
+	u8 *old = t_img_alloc(test, 0);
+	struct rk3026_ebc_last last;
+	unsigned int i;
+	u32 mst[2];
+
+	ebc->rotate = true;
+	t_img_fill(ebc->next_shadow, 8);
+	t_send(ebc, &t_panel, EBC_MODE_FULL, 1, EBC_SOURCE_MXCFB);
+	rk3026_ebc_do_refresh(ebc, &last);
+	t_px_set(ebc->next_shadow, 4, 2, 0);
+	t_send(ebc, &r, EBC_MODE_PART, 2, EBC_SOURCE_MXCFB);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_ASSERT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	t_expect_mst(test, ebc, d.mst[1], EBC_HALF_HIGH, EBC_HALF_LOW);
+
+	/* Cut short: the block reset clears the pair. */
+	kunit_activate_static_stub(test, rk3026_ebc_drive, t_drive_timeout);
+	t_px_set(ebc->next_shadow, 4, 2, 15);
+	t_send(ebc, &r, EBC_MODE_PART, 3, EBC_SOURCE_MXCFB);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_ASSERT_EQ(test, last.outcome, EBC_OUTCOME_TIMEOUT);
+	t_expect_mst(test, ebc, d.mst[2], EBC_HALF_LOW, EBC_HALF_HIGH);
+	t_mst_get(ebc, mst);
+	KUNIT_EXPECT_EQ(test, mst[0], 0);
+	KUNIT_EXPECT_EQ(test, mst[1], 0);
+
+	kunit_activate_static_stub(test, rk3026_ebc_drive, t_drive_ok);
+	memset(lo, 0x5a, T_SIZE);
+	memset(hi, 0x5a, T_SIZE);
+	t_px_set(ebc->next_shadow, 4, 2, 0);
+	t_send(ebc, &r, EBC_MODE_PART, 4, EBC_SOURCE_MXCFB);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_TRUE(test, last.repaired);
+	KUNIT_ASSERT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_ASSERT_EQ(test, d.n, 5);
+	t_expect_mst(test, ebc, d.mst[3], EBC_HALF_LOW, EBC_HALF_HIGH);
+	t_expect_mst(test, ebc, d.mst[4], EBC_HALF_LOW, EBC_HALF_HIGH);
+	t_expect_white(test, lo);
+	KUNIT_EXPECT_MEMEQ(test, hi, ebc->shadows.prev, T_SIZE);
+
+	/* A pair of no two halves, then a start of the block. */
+	for (i = 0; i <= ARRAY_SIZE(other); i++) {
+		if (i < ARRAY_SIZE(other))
+			t_mst_set(ebc, other[i][0], other[i][1]);
+		else
+			ebc->mst_explicit = true;
+		memset(lo, 0x5a, T_SIZE);
+		memset(hi, 0x5a, T_SIZE);
+		memcpy(old, ebc->shadows.prev, T_SIZE);
+		t_px_set(ebc->next_shadow, 4, 2, i & 1 ? 0 : 15);
+		t_send(ebc, &r, EBC_MODE_PART, 5 + i, EBC_SOURCE_MXCFB);
+		rk3026_ebc_do_refresh(ebc, &last);
+		KUNIT_ASSERT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+		KUNIT_ASSERT_EQ(test, d.n, 6 + i);
+		t_expect_mst(test, ebc, d.mst[5 + i], EBC_HALF_LOW,
+			     EBC_HALF_HIGH);
+		KUNIT_EXPECT_MEMEQ(test, lo, old, T_SIZE);
+		KUNIT_EXPECT_MEMEQ(test, hi, ebc->shadows.prev, T_SIZE);
+	}
+	KUNIT_EXPECT_FALSE(test, ebc->mst_explicit);
 }
 
 /*
@@ -13345,6 +13818,7 @@ out:
 static struct kunit_case rk3026_ebc_glue_test_cases[] = {
 	KUNIT_CASE(ebc_test_glue_add_update),
 	KUNIT_CASE(ebc_test_glue_crtc_off),
+	KUNIT_CASE(ebc_test_glue_drive_pair),
 	KUNIT_CASE(ebc_test_glue_no_waveform),
 	KUNIT_CASE(ebc_test_glue_skipped),
 	KUNIT_CASE(ebc_test_glue_reset_keeps_pre),
@@ -13399,6 +13873,9 @@ static struct kunit_case rk3026_ebc_glue_test_cases[] = {
 	KUNIT_CASE(ebc_test_glue_rows_model),
 	KUNIT_CASE(ebc_test_glue_rows_partial),
 	KUNIT_CASE(ebc_test_glue_repair_marks_full),
+	KUNIT_CASE(ebc_test_glue_rotate_rows),
+	KUNIT_CASE(ebc_test_glue_rotate_repair),
+	KUNIT_CASE(ebc_test_glue_rotate_stop),
 	KUNIT_CASE(ebc_test_glue_repair_sensor),
 	KUNIT_CASE(ebc_test_glue_repair_no_full),
 	KUNIT_CASE(ebc_test_glue_retry_temp),
@@ -13495,6 +13972,27 @@ static struct kunit_suite rk3026_ebc_glue_test_suite = {
 };
 
 kunit_test_suite(rk3026_ebc_glue_test_suite);
+
+/* The glue cases again, the scanned images' roles rotating (t_rotate). */
+static int t_glue_rotate_init(struct kunit *test)
+{
+	t_rotate = true;
+	return 0;
+}
+
+static void t_glue_rotate_exit(struct kunit *test)
+{
+	t_rotate = false;
+}
+
+static struct kunit_suite rk3026_ebc_glue_rotate_test_suite = {
+	.name = "rk3026_ebc_glue_rotate",
+	.init = t_glue_rotate_init,
+	.exit = t_glue_rotate_exit,
+	.test_cases = rk3026_ebc_glue_test_cases,
+};
+
+kunit_test_suite(rk3026_ebc_glue_rotate_test_suite);
 
 #if IS_ENABLED(CONFIG_DRM_FBDEV_EMULATION)
 
@@ -14873,6 +15371,104 @@ static void ebc_test_rows_bookkeeping(struct kunit *test)
 	KUNIT_EXPECT_GT(test, w->partial, 0);
 	for (i = 0; i < ARRAY_SIZE(w->changes); i++)
 		KUNIT_EXPECT_GT(test, w->changes[i], 0);
+}
+
+/* Each range of @sh is @want, in struct rk3026_ebc_shadows order. */
+static void t_expect_ranges(struct kunit *test,
+			    const struct rk3026_ebc_shadows *sh,
+			    const struct rk3026_ebc_rows *want)
+{
+	const struct rk3026_ebc_rows *got[] = {
+		&sh->scan_rows,
+		&sh->half[EBC_HALF_LOW].prev, &sh->half[EBC_HALF_LOW].scan,
+		&sh->half[EBC_HALF_HIGH].prev, &sh->half[EBC_HALF_HIGH].scan,
+	};
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(got); i++) {
+		KUNIT_EXPECT_EQ_MSG(test, got[i]->y1, want[i].y1, "range %u", i);
+		KUNIT_EXPECT_EQ_MSG(test, got[i]->y2, want[i].y2, "range %u", i);
+	}
+}
+
+static void t_ranges_set(struct rk3026_ebc_shadows *sh,
+			 const struct rk3026_ebc_rows *r)
+{
+	sh->scan_rows = r[0];
+	sh->half[EBC_HALF_LOW].prev = r[1];
+	sh->half[EBC_HALF_LOW].scan = r[2];
+	sh->half[EBC_HALF_HIGH].prev = r[3];
+	sh->half[EBC_HALF_HIGH].scan = r[4];
+}
+
+/*
+ * The halves a scan reads with the roles rotating
+ * (rk3026_ebc_rotate_roles()). A readback naming the two halves gives the
+ * half read back as MST1 as prev and the one read back as MST0 as next,
+ * the target: the pair written is the readback swapped, and the ranges
+ * stay. A scan latching it hands the next part the halves the other way
+ * round, so the target alternates. No pair written since the block
+ * started, a cleared pair (0/0) and a pair that does not name both halves
+ * give the low half as prev and the high one as next, both halves stale in
+ * every row, and the snapshot's rows as they were.
+ */
+static void ebc_test_rotate_roles(struct kunit *test)
+{
+	static const u32 base[EBC_HALVES] = { T_PHYS, T_PHYS + T_SIZE };
+	static const u32 other[][2] = {
+		{ 0, 0 },
+		{ T_PHYS, T_PHYS },
+		{ T_PHYS + T_SIZE, T_PHYS + T_SIZE },
+		{ T_PHYS + 2, T_PHYS + T_SIZE },
+		{ T_PHYS, 0 },
+		{ 0, T_PHYS + T_SIZE },
+		{ T_PHYS + T_SIZE, T_PHYS + 2 * T_SIZE },
+		{ 0xdeadbeef, 0x12345678 },
+	};
+	static const struct rk3026_ebc_rows some[] = {
+		{ 1, 2 }, { 2, 4 }, { 0, 1 }, { 3, 5 }, { 4, 6 },
+	};
+	const struct rk3026_ebc_rows full[] = {
+		some[0], { 0, T_H }, { 0, T_H }, { 0, T_H }, { 0, T_H },
+	};
+	struct rk3026_ebc_shadows sh = { .height = T_H };
+	struct rk3026_ebc_roles roles;
+	u32 mst[2] = { base[EBC_HALF_LOW], base[EBC_HALF_HIGH] };
+	enum rk3026_ebc_mst got;
+	unsigned int i;
+
+	t_ranges_set(&sh, some);
+	for (i = 0; i < 4; i++) {
+		roles = (struct rk3026_ebc_roles){ EBC_HALF_LOW, EBC_HALF_LOW };
+		got = rk3026_ebc_rotate_roles(&sh, mst, base, &roles);
+		KUNIT_EXPECT_EQ_MSG(test, got, EBC_MST_LATCHED, "scan %u", i);
+		KUNIT_EXPECT_EQ_MSG(test, base[roles.next], mst[0], "scan %u", i);
+		KUNIT_EXPECT_EQ_MSG(test, base[roles.prev], mst[1], "scan %u", i);
+		KUNIT_EXPECT_EQ_MSG(test, roles.next,
+				    i & 1 ? EBC_HALF_HIGH : EBC_HALF_LOW,
+				    "scan %u", i);
+		t_expect_ranges(test, &sh, some);
+		/* What the scan latches: the pair written. */
+		mst[0] = base[roles.prev];
+		mst[1] = base[roles.next];
+	}
+
+	for (i = 0; i <= ARRAY_SIZE(other); i++) {
+		const u32 *read = i ? other[i - 1] : NULL;
+
+		t_ranges_set(&sh, some);
+		roles = (struct rk3026_ebc_roles){ EBC_HALF_HIGH, EBC_HALF_LOW };
+		got = rk3026_ebc_rotate_roles(&sh, read, base, &roles);
+		KUNIT_EXPECT_EQ_MSG(test, got,
+				    !i ? EBC_MST_UNSET :
+				    i == 1 ? EBC_MST_CLEARED : EBC_MST_FOREIGN,
+				    "readback %u", i);
+		KUNIT_EXPECT_EQ_MSG(test, roles.prev, EBC_HALF_LOW,
+				    "readback %u", i);
+		KUNIT_EXPECT_EQ_MSG(test, roles.next, EBC_HALF_HIGH,
+				    "readback %u", i);
+		t_expect_ranges(test, &sh, full);
+	}
 }
 
 /*
@@ -16476,6 +17072,7 @@ static struct kunit_case rk3026_ebc_conv_test_cases[] = {
 	KUNIT_CASE(ebc_test_snapshot_stale_rows),
 	KUNIT_CASE(ebc_test_skip_writes_nothing),
 	KUNIT_CASE(ebc_test_rows_bookkeeping),
+	KUNIT_CASE(ebc_test_rotate_roles),
 	KUNIT_CASE(ebc_test_snapshot_a2_guard_positions),
 	KUNIT_CASE(ebc_test_snapshot_two_level_result),
 	KUNIT_CASE(ebc_test_snapshot_two_level_positions),

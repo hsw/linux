@@ -376,6 +376,15 @@ static irqreturn_t rockchip_vpu1_vepu_irq(int irq, void *dev_id)
 	state = (status & H1_REG_INTERRUPT_FRAME_RDY) ?
 		VB2_BUF_STATE_DONE : VB2_BUF_STATE_ERROR;
 
+	/*
+	 * An interrupt without FRAME_RDY does not end the frame: after a
+	 * buffer full the encoder pauses with its enable bit still set,
+	 * waiting for more output space. Stop it, so that the next job is
+	 * not programmed into a paused encoder.
+	 */
+	if (!(status & H1_REG_INTERRUPT_FRAME_RDY))
+		vepu_write(vpu, 0, H1_REG_ENC_CTRL);
+
 	vepu_write(vpu, 0, H1_REG_INTERRUPT);
 	vepu_write(vpu, 0, H1_REG_AXI_CTRL);
 

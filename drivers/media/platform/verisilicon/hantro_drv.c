@@ -229,7 +229,8 @@ queue_init(void *priv, struct vb2_queue *src_vq, struct vb2_queue *dst_vq)
 	dst_vq->dma_attrs = DMA_ATTR_ALLOC_SINGLE_PAGES | DMA_ATTR_NO_WARN;
 	/*
 	 * The Kernel needs access to the JPEG destination buffer for the
-	 * JPEG encoder to fill in the JPEG headers.
+	 * JPEG encoder to fill in the JPEG headers. A decoder maps them only
+	 * in the JPEG mode, which S_FMT on the OUTPUT queue selects.
 	 */
 	if (!ctx->is_encoder) {
 		dst_vq->dma_attrs |= DMA_ATTR_NO_KERNEL_MAPPING;

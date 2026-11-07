@@ -39,6 +39,8 @@ bool hantro_raw_fmt_allowed(const struct hantro_ctx *ctx,
 int hantro_try_fmt(const struct hantro_ctx *ctx,
 		   struct v4l2_pix_format_mplane *pix_mp,
 		   enum v4l2_buf_type type);
+void hantro_update_dec_kernel_mapping(struct hantro_ctx *ctx,
+				      struct vb2_queue *vq);
 #endif
 
 #endif /* HANTRO_V4L2_H_ */

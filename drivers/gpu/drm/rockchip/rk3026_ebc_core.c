@@ -644,6 +644,15 @@ static enum rk3026_ebc_half ebc_half_at(const u32 *base, u32 addr)
  * not write. The pair is then programmed explicitly, the low half as prev
  * and the high one as next, and both are taken as stale in every row
  * (rk3026_ebc_rows_whiten()): the copies before the scan write them whole.
+ * So does a NULL @mst.
+ *
+ * Taking both halves as stale there is a deliberate defensive choice, not
+ * something the readback shows: a block reset leaves memory alone, and
+ * neither a stop nor a resume or a CRTC enable has to have changed what
+ * the halves hold. Written whole, after any of these events the pair
+ * programmed next reads two images the driver itself wrote, whatever the
+ * halves held before, at the cost of a full write of each half on those
+ * rare events.
  *
  * Return: what the readback named (enum rk3026_ebc_mst).
  */

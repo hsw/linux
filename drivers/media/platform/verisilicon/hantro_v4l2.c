@@ -400,10 +400,18 @@ static int hantro_try_fmt(const struct hantro_ctx *ctx,
 		 * stream in bursts, one of them even when the stream limit
 		 * is 0. Leave room for both; a burst is 64 bytes on the
 		 * RK3026 VEPU1.
+		 *
+		 * Clamp a larger request. This driver only encodes 4:2:0
+		 * (see the SOF in hantro_jpeg.c), which libjpeg-turbo's
+		 * tj3JPEGBufSize() sizes for the worst case at 3 bytes per
+		 * pixel. On the VEPU1 a frame that still does not fit ends
+		 * with an error.
 		 */
 		pix_mp->plane_fmt[0].sizeimage =
-			max_t(u32, pix_mp->plane_fmt[0].sizeimage,
-			      fmt->header_size + 64);
+			clamp_t(u32, pix_mp->plane_fmt[0].sizeimage,
+				fmt->header_size + 64,
+				fmt->header_size +
+				pix_mp->width * pix_mp->height * 3);
 	}
 
 	return 0;

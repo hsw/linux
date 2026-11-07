@@ -464,8 +464,10 @@ DEFINE_SHOW_ATTRIBUTE(rk3026_ebc_palette);
  * half<N>_prev and half<N>_scan where scanned image N (enum
  * rk3026_ebc_half: 0 the lower address, 1 the higher) may differ from the
  * on-panel image and from the snapshot image. The scanned images are
- * written outside @image_lock: the next one before the part's finish
- * accounts for it, the prev one just after.
+ * written outside @image_lock: the next one before the drive, so before
+ * the part's finish accounts for it; the prev one with @rotate before the
+ * drive as well (rk3026_ebc_do_refresh(), step 3), in fixed roles just
+ * after the finish.
  */
 VISIBLE_IF_KUNIT int rk3026_ebc_rows_show(struct seq_file *m, void *unused)
 {

@@ -400,6 +400,9 @@ static __always_inline void ebc_snap_rows(u8 *dst, const u8 *prev,
  * @sh: the shadow images; the snapshot is built into @sh->scan
  * @next: the target image the senders write, laid out like the shadows
  * @box: the part's bounding box, in pixels
+ * @rows: the rows where @sh->scan may differ from @sh->prev (every row
+ *	when nothing is known of it); returns those where the snapshot may
+ *	differ from @sh->prev
  * @mode: the scan's mode (rk3026_ebc_scan_mode()); returns the mode that
  *	draws the snapshot
  * @two_level: returns true if some pixel changes and every changed pixel
@@ -419,7 +422,11 @@ static __always_inline void ebc_snap_rows(u8 *dst, const u8 *prev,
  *
  * The box rows are worked eight pixels per 32-bit word (ebc_snap_word()),
  * without a branch per pixel, and every byte of the box is written once;
- * only what lies outside the box is copied from @prev.
+ * only what lies outside the box is copied from @prev, and of that only
+ * what lies in @rows: elsewhere @sh->scan holds @prev's bytes already, so
+ * a part that changes a few rows copies a few rows. On return @rows is the
+ * rows of the widened box when the snapshot differs from @prev, else empty:
+ * the snapshot is then @prev byte for byte.
  *
  * The A2 waveform drives only black <-> white: from a grey it does not
  * move a pixel at all (the A2 table of the panel's waveform), so the glass
@@ -441,7 +448,8 @@ static __always_inline void ebc_snap_rows(u8 *dst, const u8 *prev,
  */
 bool rk3026_ebc_build_snapshot(const struct rk3026_ebc_shadows *sh,
 			       const u8 *next, const struct drm_rect *box,
-			       u32 *mode, bool *two_level, bool *over_grey,
+			       struct rk3026_ebc_rows *rows, u32 *mode,
+			       bool *two_level, bool *over_grey,
 			       u32 *changed_px)
 {
 	const u8 *prev = sh->prev;
@@ -449,22 +457,29 @@ bool rk3026_ebc_build_snapshot(const struct rk3026_ebc_shadows *sh,
 	u8 *dst = sh->scan;
 	u32 tl = ebc_mode_two_level(*mode) ? ~0u : 0;
 	struct ebc_snap_acc acc = { 0 };
+	struct rk3026_ebc_rows in = *rows, part;
 	struct drm_rect r = *box;
-	int y;
+	u32 y;
 
 	*two_level = false;
 	*over_grey = false;
 	*changed_px = 0;
+	*rows = (struct rk3026_ebc_rows){ 0 };
+	in.y2 = min(in.y2, height);
 	if (!rk3026_ebc_widen_clip(&r, pitch * 2, height)) {
-		memcpy(dst, prev, (size_t)pitch * height);
+		rk3026_ebc_rows_copy(dst, prev, pitch, &in);
 		return false;
 	}
 
-	memcpy(dst, prev, (size_t)pitch * r.y1);
-	memcpy(dst + (size_t)pitch * r.y2, prev + (size_t)pitch * r.y2,
-	       (size_t)pitch * (height - r.y2));
+	/* The rows of @in above the box, then those below it. */
+	part = (struct rk3026_ebc_rows){ in.y1, min_t(u32, in.y2, r.y1) };
+	rk3026_ebc_rows_copy(dst, prev, pitch, &part);
+	part = (struct rk3026_ebc_rows){ max_t(u32, in.y1, r.y2), in.y2 };
+	rk3026_ebc_rows_copy(dst, prev, pitch, &part);
 	if (r.x1 > 0 || r.x2 < (int)(pitch * 2)) {
-		for (y = r.y1; y < r.y2; y++) {
+		u32 y2 = min_t(u32, in.y2, r.y2);
+
+		for (y = max_t(u32, in.y1, r.y1); y < y2; y++) {
 			size_t row = (size_t)y * pitch;
 
 			memcpy(dst + row, prev + row, r.x1 / 2);
@@ -479,9 +494,118 @@ bool rk3026_ebc_build_snapshot(const struct rk3026_ebc_shadows *sh,
 	*two_level = acc.count && !acc.grey_new;
 	*over_grey = acc.over_grey != 0;
 	*changed_px = acc.count;
+	if (acc.moves)
+		*rows = (struct rk3026_ebc_rows){ r.y1, r.y2 };
 	return acc.moves != 0;
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_build_snapshot);
+
+/**
+ * rk3026_ebc_rows_copy - copy some rows of one image into another
+ * @dst: the image written
+ * @src: the image read, laid out like @dst
+ * @pitch: bytes per row of either
+ * @rows: the rows copied; none when empty
+ */
+void rk3026_ebc_rows_copy(u8 *dst, const u8 *src, u32 pitch,
+			  const struct rk3026_ebc_rows *rows)
+{
+	size_t off = (size_t)rows->y1 * pitch;
+
+	if (!rk3026_ebc_rows_empty(rows))
+		memcpy(dst + off, src + off,
+		       (size_t)(rows->y2 - rows->y1) * pitch);
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_rows_copy);
+
+/* The rows of @a and of @b, and those between: one range covers both. */
+static struct rk3026_ebc_rows ebc_rows_hull(struct rk3026_ebc_rows a,
+					    struct rk3026_ebc_rows b)
+{
+	if (rk3026_ebc_rows_empty(&a))
+		return b;
+	if (rk3026_ebc_rows_empty(&b))
+		return a;
+	return (struct rk3026_ebc_rows){ min(a.y1, b.y1), max(a.y2, b.y2) };
+}
+
+/**
+ * rk3026_ebc_rows_snapshot - account for a snapshot built into @sh->scan
+ * @sh: the shadow images
+ * @rows: the rows where the snapshot may differ from @sh->prev, as
+ *	rk3026_ebc_build_snapshot() returned them
+ *
+ * A scanned image differs from the new snapshot at most where it differs
+ * from @sh->prev, or @sh->prev from the snapshot.
+ */
+void rk3026_ebc_rows_snapshot(struct rk3026_ebc_shadows *sh,
+			      const struct rk3026_ebc_rows *rows)
+{
+	unsigned int i;
+
+	sh->scan_rows = *rows;
+	for (i = 0; i < EBC_HALVES; i++)
+		sh->half[i].scan = ebc_rows_hull(sh->half[i].prev, *rows);
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_rows_snapshot);
+
+/**
+ * rk3026_ebc_rows_put_scan - a scanned image made to hold @sh->scan
+ * @sh: the shadow images
+ * @half: the scanned image
+ *
+ * Copying @sh->scan into @half over the rows returned makes it hold
+ * @sh->scan byte for byte; it is accounted for here as copied.
+ *
+ * Return: the rows to copy, empty if none.
+ */
+struct rk3026_ebc_rows rk3026_ebc_rows_put_scan(struct rk3026_ebc_shadows *sh,
+						enum rk3026_ebc_half half)
+{
+	struct rk3026_ebc_half_rows *h = &sh->half[half];
+	struct rk3026_ebc_rows rows = h->scan;
+
+	h->scan = (struct rk3026_ebc_rows){ 0 };
+	h->prev = sh->scan_rows;
+	return rows;
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_rows_put_scan);
+
+/**
+ * rk3026_ebc_rows_put_prev - a scanned image made to hold @sh->prev
+ * @sh: the shadow images
+ * @half: the scanned image
+ *
+ * As rk3026_ebc_rows_put_scan(), from @sh->prev.
+ *
+ * Return: the rows to copy, empty if none.
+ */
+struct rk3026_ebc_rows rk3026_ebc_rows_put_prev(struct rk3026_ebc_shadows *sh,
+						enum rk3026_ebc_half half)
+{
+	struct rk3026_ebc_half_rows *h = &sh->half[half];
+	struct rk3026_ebc_rows rows = h->prev;
+
+	h->prev = (struct rk3026_ebc_rows){ 0 };
+	h->scan = sh->scan_rows;
+	return rows;
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_rows_put_prev);
+
+/**
+ * rk3026_ebc_rows_whiten - a scanned image filled with white
+ * @sh: the shadow images
+ * @half: the scanned image
+ *
+ * Every row of @half may differ from both CPU-side images now.
+ */
+void rk3026_ebc_rows_whiten(struct rk3026_ebc_shadows *sh,
+			    enum rk3026_ebc_half half)
+{
+	sh->half[half].prev = rk3026_ebc_rows_all(sh->height);
+	sh->half[half].scan = rk3026_ebc_rows_all(sh->height);
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_rows_whiten);
 
 /**
  * rk3026_ebc_target_differs - whether a part's target differs from the glass
@@ -1257,6 +1381,28 @@ static enum rk3026_ebc_gave_up ebc_retry_settle(struct rk3026_ebc_pending *p,
 	return gave_up;
 }
 
+/* The snapshot becomes @prev, and @prev the image the next one is built in. */
+static void ebc_shadows_swap(struct rk3026_ebc_shadows *sh)
+{
+	unsigned int i;
+
+	swap(sh->prev, sh->scan);
+	for (i = 0; i < EBC_HALVES; i++)
+		swap(sh->half[i].prev, sh->half[i].scan);
+}
+
+/* @prev white, what a RESET ends on. */
+static void ebc_shadows_whiten(struct rk3026_ebc_shadows *sh)
+{
+	struct rk3026_ebc_rows all = rk3026_ebc_rows_all(sh->height);
+	unsigned int i;
+
+	memset(sh->prev, 0xff, (size_t)sh->pitch * sh->height);
+	sh->scan_rows = all;
+	for (i = 0; i < EBC_HALVES; i++)
+		sh->half[i].prev = all;
+}
+
 /**
  * rk3026_ebc_scan_finish - account for one part after its scan
  * @sh: the shadow images
@@ -1304,18 +1450,25 @@ static enum rk3026_ebc_gave_up ebc_retry_settle(struct rk3026_ebc_pending *p,
  * when the RESET was sent), as a RESET sent drops one: it whitens the glass
  * the carry would draw, and its finish ends the carry's waits.
  *
- * Returns true if @prev changed, so the scanned prev image must follow it.
+ * The row ranges of @sh follow the images: a swap swaps what each
+ * scanned image may differ in from @prev and from @scan, and leaves
+ * @scan_rows, which is symmetric; a white @prev may differ from everything
+ * in every row.
+ *
+ * Returns what became of @prev (enum rk3026_ebc_prev_change): unless
+ * EBC_PREV_KEPT, the scanned prev image must follow it.
  */
-bool rk3026_ebc_scan_finish(struct rk3026_ebc_shadows *sh,
-			    struct rk3026_ebc_pending *p,
-			    const struct rk3026_ebc_set *part,
-			    enum rk3026_ebc_outcome outcome,
-			    enum rk3026_ebc_repair repair, ktime_t now,
-			    enum rk3026_ebc_gave_up *gave_up)
+enum rk3026_ebc_prev_change
+rk3026_ebc_scan_finish(struct rk3026_ebc_shadows *sh,
+		       struct rk3026_ebc_pending *p,
+		       const struct rk3026_ebc_set *part,
+		       enum rk3026_ebc_outcome outcome,
+		       enum rk3026_ebc_repair repair, ktime_t now,
+		       enum rk3026_ebc_gave_up *gave_up)
 {
-	size_t size = (size_t)sh->pitch * sh->height;
+	enum rk3026_ebc_prev_change change = EBC_PREV_KEPT;
 	bool reset = part->mode == EBC_MODE_RESET;
-	bool carried = false, changed = false, lost = false;
+	bool carried = false, lost = false;
 	enum rk3026_ebc_gave_up end;
 	struct rk3026_ebc_set whole;
 
@@ -1334,11 +1487,7 @@ bool rk3026_ebc_scan_finish(struct rk3026_ebc_shadows *sh,
 	case EBC_OUTCOME_ABANDONED:
 		if (outcome != EBC_OUTCOME_DRIVEN)
 			sh->prev_unknown = true;
-		if (!reset)
-			swap(sh->prev, sh->scan);
-		else
-			memset(sh->prev, 0xff, size);
-		changed = true;
+		change = reset ? EBC_PREV_WHITE : EBC_PREV_SWAPPED;
 		break;
 
 	case EBC_OUTCOME_NO_RAILS:
@@ -1358,18 +1507,21 @@ bool rk3026_ebc_scan_finish(struct rk3026_ebc_shadows *sh,
 		whole.mode = ebc_mode_max(part->mode, EBC_MODE_PART);
 		whole.cleanup_idle = false;
 		carried = ebc_carry(p, &whole);
-		memset(sh->prev, 0xff, size);
-		changed = true;
+		change = EBC_PREV_WHITE;
 		break;
 
 	default:
 		break;
 	}
 
+	if (change == EBC_PREV_SWAPPED)
+		ebc_shadows_swap(sh);
+	else if (change == EBC_PREV_WHITE)
+		ebc_shadows_whiten(sh);
 settle:
 	end = ebc_retry_settle(p, part, carried, outcome, now);
 	*gave_up = lost ? EBC_GAVE_UP : end;
-	return changed;
+	return change;
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_scan_finish);
 

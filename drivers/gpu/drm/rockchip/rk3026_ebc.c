@@ -1363,6 +1363,7 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 	struct rk3026_ebc_a2 a2 = { 0 };
 	enum rk3026_ebc_gave_up gave_up;
 	struct rk3026_ebc_set part;
+	struct rk3026_ebc_rows rows;
 	bool identical, prev_changed, two_level, prepared = false;
 	u32 frames, mode, scan_mode, resolved, lut_mode, tries;
 	u32 changed_px = 0;
@@ -1499,7 +1500,8 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 
 	/* An A2 scan over a grey of the glass comes back as DU. */
 	snap_start = ktime_get();
-	identical = !rk3026_ebc_build_snapshot(sh, target, &part.box,
+	rows = rk3026_ebc_rows_all(sh->height);
+	identical = !rk3026_ebc_build_snapshot(sh, target, &part.box, &rows,
 					       &scan_mode, &two_level,
 					       &a2.over_grey, &changed_px);
 	last->snap_us = ebc_us_since(snap_start);
@@ -1675,7 +1677,8 @@ finish:
 	 */
 	prev_changed = rk3026_ebc_scan_finish(sh, &ebc->pending, &part,
 					      last->outcome, repair_result,
-					      rk3026_ebc_clock(ebc), &gave_up);
+					      rk3026_ebc_clock(ebc),
+					      &gave_up) != EBC_PREV_KEPT;
 	last->gave_up = gave_up != EBC_GAVE_UP_NONE;
 	if (last->gave_up) {
 		ebc->stats.carry_failed++;

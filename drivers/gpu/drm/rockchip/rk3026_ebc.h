@@ -719,10 +719,70 @@ struct rk3026_ebc_pending {
 };
 
 /*
+ * Rows of an image, half-open: @y1 up to, not including, @y2. Empty when
+ * @y1 >= @y2 (rk3026_ebc_rows_empty()); the zeroed range is empty.
+ */
+struct rk3026_ebc_rows {
+	u32		y1;
+	u32		y2;
+};
+
+static inline bool rk3026_ebc_rows_empty(const struct rk3026_ebc_rows *r)
+{
+	return r->y1 >= r->y2;
+}
+
+/* Every row of an image @height lines high. */
+static inline struct rk3026_ebc_rows rk3026_ebc_rows_all(u32 height)
+{
+	return (struct rk3026_ebc_rows){ .y1 = 0, .y2 = height };
+}
+
+/*
+ * The two images the controller scans, by their place in the one DMA
+ * allocation: the low one first. Which of them a scan reads as prev and
+ * which as next is a matter of the WIN_MST0/1 registers, not of the place.
+ */
+enum rk3026_ebc_half {
+	EBC_HALF_LOW,
+	EBC_HALF_HIGH,
+	EBC_HALVES,
+};
+
+/*
+ * What one scanned image may differ in from the CPU-side ones: outside
+ * @prev its rows hold the bytes of &rk3026_ebc_shadows.prev, outside @scan
+ * those of &rk3026_ebc_shadows.scan.
+ */
+struct rk3026_ebc_half_rows {
+	struct rk3026_ebc_rows	prev;
+	struct rk3026_ebc_rows	scan;
+};
+
+/*
+ * What rk3026_ebc_scan_finish() did to the CPU-side images.
+ */
+enum rk3026_ebc_prev_change {
+	EBC_PREV_KEPT,		/* @prev as it was */
+	EBC_PREV_SWAPPED,	/* @prev and @scan swapped: @prev is the snapshot */
+	EBC_PREV_WHITE,		/* @prev white, @scan as it was */
+};
+
+/*
  * The CPU-side images, packed 4bpp like the scanned ones (@pitch bytes per
  * line, @height lines): what the glass shows, and the snapshot a scan drives.
  * @prev_unknown says @prev is not evidence: a waveform did not end, and no
  * RESET or FULL has run to its end since (rk3026_ebc_drive_knows_glass()).
+ *
+ * The rows each image may differ in from another, so that a copy between
+ * them covers those rows alone: @scan_rows those where @scan may differ
+ * from @prev, @half those where each scanned image may differ from @prev
+ * and from @scan (struct rk3026_ebc_half_rows). Each range covers every
+ * row that differs, and may cover more. Zeroed, as at probe, every range
+ * is empty: all the images are white then. The refresh thread alone
+ * writes them, under @image_lock (rk3026_ebc_rows_snapshot(),
+ * rk3026_ebc_rows_put_scan(), rk3026_ebc_rows_put_prev(),
+ * rk3026_ebc_rows_whiten(), rk3026_ebc_scan_finish()).
  */
 struct rk3026_ebc_shadows {
 	u8		*prev;
@@ -730,6 +790,8 @@ struct rk3026_ebc_shadows {
 	u32		pitch;
 	u32		height;
 	bool		prev_unknown;
+	struct rk3026_ebc_rows	scan_rows;
+	struct rk3026_ebc_half_rows half[EBC_HALVES];
 };
 
 /*
@@ -1400,8 +1462,19 @@ bool rk3026_ebc_pending_take(struct rk3026_ebc_pending *p,
 			     struct rk3026_ebc_set *part);
 bool rk3026_ebc_build_snapshot(const struct rk3026_ebc_shadows *sh,
 			       const u8 *next, const struct drm_rect *box,
-			       u32 *mode, bool *two_level, bool *over_grey,
+			       struct rk3026_ebc_rows *rows, u32 *mode,
+			       bool *two_level, bool *over_grey,
 			       u32 *changed_px);
+void rk3026_ebc_rows_copy(u8 *dst, const u8 *src, u32 pitch,
+			  const struct rk3026_ebc_rows *rows);
+void rk3026_ebc_rows_snapshot(struct rk3026_ebc_shadows *sh,
+			      const struct rk3026_ebc_rows *rows);
+struct rk3026_ebc_rows rk3026_ebc_rows_put_scan(struct rk3026_ebc_shadows *sh,
+						enum rk3026_ebc_half half);
+struct rk3026_ebc_rows rk3026_ebc_rows_put_prev(struct rk3026_ebc_shadows *sh,
+						enum rk3026_ebc_half half);
+void rk3026_ebc_rows_whiten(struct rk3026_ebc_shadows *sh,
+			    enum rk3026_ebc_half half);
 bool rk3026_ebc_target_differs(const struct rk3026_ebc_shadows *sh,
 			       const u8 *next, const struct drm_rect *box);
 bool rk3026_ebc_should_skip(const struct rk3026_ebc_set *part,
@@ -1435,12 +1508,13 @@ u32 rk3026_ebc_du_account(u32 du_area, const struct rk3026_ebc_set *part,
 bool rk3026_ebc_retry_next(ktime_t first, ktime_t now, ktime_t *at);
 void rk3026_ebc_retry_ready(struct rk3026_ebc_pending *p, ktime_t now,
 			    bool crtc_on);
-bool rk3026_ebc_scan_finish(struct rk3026_ebc_shadows *sh,
-			    struct rk3026_ebc_pending *p,
-			    const struct rk3026_ebc_set *part,
-			    enum rk3026_ebc_outcome outcome,
-			    enum rk3026_ebc_repair repair, ktime_t now,
-			    enum rk3026_ebc_gave_up *gave_up);
+enum rk3026_ebc_prev_change
+rk3026_ebc_scan_finish(struct rk3026_ebc_shadows *sh,
+		       struct rk3026_ebc_pending *p,
+		       const struct rk3026_ebc_set *part,
+		       enum rk3026_ebc_outcome outcome,
+		       enum rk3026_ebc_repair repair, ktime_t now,
+		       enum rk3026_ebc_gave_up *gave_up);
 void rk3026_ebc_marker_seq_record(struct rk3026_ebc_marker_ring *ring,
 				  u32 marker, u32 seq);
 bool rk3026_ebc_marker_seq_lookup(const struct rk3026_ebc_marker_ring *ring,

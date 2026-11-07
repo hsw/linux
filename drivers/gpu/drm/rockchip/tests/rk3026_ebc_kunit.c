@@ -127,6 +127,57 @@ static bool t_in_rect(const struct drm_rect *r, int x, int y)
 	return x >= r->x1 && x < r->x2 && y >= r->y1 && y < r->y2;
 }
 
+/* Row @y of @r. */
+static bool t_rows_has(const struct rk3026_ebc_rows *r, u32 y)
+{
+	return y >= r->y1 && y < r->y2;
+}
+
+static bool t_rows_eq(const struct rk3026_ebc_rows *a,
+		      const struct rk3026_ebc_rows *b)
+{
+	if (rk3026_ebc_rows_empty(a) || rk3026_ebc_rows_empty(b))
+		return rk3026_ebc_rows_empty(a) && rk3026_ebc_rows_empty(b);
+	return a->y1 == b->y1 && a->y2 == b->y2;
+}
+
+/*
+ * A random range of an image @h rows high: empty, inverted, every row, one
+ * past the last, or any.
+ */
+static struct rk3026_ebc_rows t_rows_random(struct rnd_state *rs, u32 h)
+{
+	u32 a = prandom_u32_state(rs) % (h + 2);
+	u32 b = prandom_u32_state(rs) % (h + 2);
+
+	switch (prandom_u32_state(rs) % 8) {
+	case 0:
+		return (struct rk3026_ebc_rows){ 0 };
+	case 1:
+		return rk3026_ebc_rows_all(h);
+	case 2:
+		return (struct rk3026_ebc_rows){ max(a, b), min(a, b) };
+	default:
+		return (struct rk3026_ebc_rows){ min(a, b), max(a, b) };
+	}
+}
+
+/*
+ * The first row of @a, @pitch bytes per row and @h rows, that differs from
+ * @b outside @rows; -1 if none.
+ */
+static int t_rows_outside_diff(const u8 *a, const u8 *b, u32 pitch, u32 h,
+			       const struct rk3026_ebc_rows *rows)
+{
+	u32 y;
+
+	for (y = 0; y < h; y++)
+		if (!t_rows_has(rows, y) &&
+		    memcmp(a + (size_t)y * pitch, b + (size_t)y * pitch, pitch))
+			return y;
+	return -1;
+}
+
 static struct rk3026_ebc_update t_upd(const struct drm_rect *clip, u32 mode,
 				      u32 marker, enum rk3026_ebc_source source)
 {
@@ -462,11 +513,12 @@ static bool t_snapshot(u8 *dst, u8 *prev, const u8 *next,
 	const struct rk3026_ebc_shadows sh = {
 		.prev = prev, .scan = dst, .pitch = T_PITCH, .height = T_H,
 	};
+	struct rk3026_ebc_rows rows = rk3026_ebc_rows_all(T_H);
 	bool two_level, over_grey;
 	u32 changed;
 
-	return rk3026_ebc_build_snapshot(&sh, next, box, &mode, &two_level,
-					 &over_grey, &changed);
+	return rk3026_ebc_build_snapshot(&sh, next, box, &rows, &mode,
+					 &two_level, &over_grey, &changed);
 }
 
 static void ebc_test_snapshot_outside_box(struct kunit *test)
@@ -665,6 +717,7 @@ static void ebc_test_snapshot_a2_over_grey(struct kunit *test)
 	const struct rk3026_ebc_shadows sh = {
 		.prev = prev, .scan = dst, .pitch = T_PITCH, .height = T_H,
 	};
+	struct rk3026_ebc_rows rows;
 	unsigned int i;
 	bool two_level, over_grey;
 	u32 mode, changed;
@@ -679,8 +732,10 @@ static void ebc_test_snapshot_a2_over_grey(struct kunit *test)
 	t_px_set(prev, 5, 1, 7);
 	t_px_set(next, 5, 1, 7);
 	mode = EBC_MODE_A2;
+	rows = rk3026_ebc_rows_all(T_H);
 	KUNIT_EXPECT_TRUE(test, rk3026_ebc_build_snapshot(&sh, next, &box,
-							  &mode, &two_level,
+							  &rows, &mode,
+							  &two_level,
 							  &over_grey,
 							  &changed));
 	KUNIT_EXPECT_EQ(test, mode, EBC_MODE_A2);
@@ -692,8 +747,10 @@ static void ebc_test_snapshot_a2_over_grey(struct kunit *test)
 	/* One laid-over pixel on a grey, a grey target too: DU. */
 	t_px_set(prev, 2, 2, 6);
 	t_px_set(next, 2, 2, 12);
+	rows = rk3026_ebc_rows_all(T_H);
 	KUNIT_EXPECT_TRUE(test, rk3026_ebc_build_snapshot(&sh, next, &box,
-							  &mode, &two_level,
+							  &rows, &mode,
+							  &two_level,
 							  &over_grey,
 							  &changed));
 	KUNIT_EXPECT_EQ(test, mode, EBC_MODE_BLACK_WHITE);
@@ -708,8 +765,9 @@ static void ebc_test_snapshot_a2_over_grey(struct kunit *test)
 	for (i = 0; i < ARRAY_SIZE(kept); i++) {
 		mode = kept[i];
 		over_grey = false;
-		rk3026_ebc_build_snapshot(&sh, next, &box, &mode, &two_level,
-					  &over_grey, &changed);
+		rows = rk3026_ebc_rows_all(T_H);
+		rk3026_ebc_build_snapshot(&sh, next, &box, &rows, &mode,
+					  &two_level, &over_grey, &changed);
 		KUNIT_EXPECT_EQ(test, mode, kept[i]);
 		KUNIT_EXPECT_TRUE(test, over_grey);
 	}
@@ -719,8 +777,9 @@ static void ebc_test_snapshot_a2_over_grey(struct kunit *test)
 	for (i = 0; i < ARRAY_SIZE(kept); i++) {
 		mode = kept[i];
 		over_grey = true;
-		rk3026_ebc_build_snapshot(&sh, next, &box, &mode, &two_level,
-					  &over_grey, &changed);
+		rows = rk3026_ebc_rows_all(T_H);
+		rk3026_ebc_build_snapshot(&sh, next, &box, &rows, &mode,
+					  &two_level, &over_grey, &changed);
 		KUNIT_EXPECT_FALSE(test, over_grey);
 	}
 }
@@ -13803,6 +13862,7 @@ static bool t_ref_snapshot_pair(struct kunit *test, const struct t_fix *f,
 	for (mi = 0; mi < ARRAY_SIZE(t_snap_modes); mi++) {
 		for (c = 0; c < n; c++) {
 			u32 mode_ref = t_snap_modes[mi], mode = mode_ref;
+			struct rk3026_ebc_rows rows;
 			bool ret_ref, ret, tl_ref, tl, og_ref, og;
 			u32 chg_ref, chg;
 			int diff;
@@ -13815,8 +13875,10 @@ static bool t_ref_snapshot_pair(struct kunit *test, const struct t_fix *f,
 			tl_ref = t_ref_two_level(f, prev, next, &clips[c],
 						 &og_ref, &chg_ref);
 			sh.scan = scan;
+			rows = rk3026_ebc_rows_all(f->h);
 			ret = rk3026_ebc_build_snapshot(&sh, next, &clips[c],
-							&mode, &tl, &og, &chg);
+							&rows, &mode, &tl, &og,
+							&chg);
 			diff = t_fix_diff(f, scan_ref, scan);
 			if (ret != ret_ref || mode != mode_ref ||
 			    diff != INT_MAX || tl != tl_ref || og != og_ref ||
@@ -13898,6 +13960,7 @@ static bool t_snap_vs_ref(struct kunit *test, const struct t_fix *f,
 	struct rk3026_ebc_shadows sh = {
 		.prev = prev, .pitch = t_fix_pitch(f), .height = f->h,
 	};
+	struct rk3026_ebc_rows rows = rk3026_ebc_rows_all(f->h);
 	u32 mode_ref = mode, chg_ref, chg;
 	bool ret_ref, ret, tl_ref, tl, og_ref;
 	int diff;
@@ -13909,8 +13972,8 @@ static bool t_snap_vs_ref(struct kunit *test, const struct t_fix *f,
 	tl_ref = t_ref_two_level(f, prev, next, box, &og_ref, &chg_ref);
 	sh.scan = scan;
 	*mode_out = mode;
-	ret = rk3026_ebc_build_snapshot(&sh, next, box, mode_out, &tl, og_out,
-					&chg);
+	ret = rk3026_ebc_build_snapshot(&sh, next, box, &rows, mode_out, &tl,
+					og_out, &chg);
 	diff = t_fix_diff(f, scan_ref, scan);
 	if (ret == ret_ref && *mode_out == mode_ref && diff == INT_MAX &&
 	    tl == tl_ref && *og_out == og_ref && chg == chg_ref)
@@ -13961,6 +14024,398 @@ static void ebc_test_snapshot_nibble_pairs(struct kunit *test)
 					   &og, &rs))
 				return;
 	KUNIT_EXPECT_TRUE(test, t_fix_guard_ok(f, scan));
+}
+
+/* --- the stale rows of the snapshot and of the scanned images --- */
+
+/*
+ * One box and mode on fixture @f: the scan image holds prev outside a
+ * random range of rows and junk inside it; given that range,
+ * rk3026_ebc_build_snapshot() writes the reference's snapshot (built over
+ * junk everywhere) byte for byte, guards included, and returns the rows of
+ * the widened box when it moves, else none, the snapshot equal to prev
+ * outside them. False, with a failure, if anything differs.
+ */
+static bool t_stale_rows_case(struct kunit *test, const struct t_fix *f,
+			      u8 *prev, const u8 *next, u8 *scan_ref,
+			      u8 *scan, const struct drm_rect *box, u32 mode,
+			      struct rnd_state *rs, unsigned int *partial)
+{
+	struct rk3026_ebc_shadows sh = {
+		.prev = prev, .pitch = t_fix_pitch(f), .height = f->h,
+	};
+	struct rk3026_ebc_rows in = t_rows_random(rs, f->h), rows = in, want;
+	u32 pitch = t_fix_pitch(f), mode_ref = mode, mode_drv = mode, chg;
+	struct drm_rect r = *box;
+	bool any = rk3026_ebc_widen_clip(&r, f->w, f->h);
+	bool ret_ref, ret, tl, og;
+	int diff, outside;
+	u32 y2 = min_t(u32, in.y2, f->h);
+
+	/*
+	 * The reference widens before it clips, so it takes a box of no width
+	 * at an odd x for two pixels; the driver, as nothing.
+	 */
+	if (any) {
+		prandom_bytes_state(rs, scan_ref, t_fix_size(f));
+		sh.scan = scan_ref;
+		ret_ref = rk3026_ebc_ref_snapshot(&sh, next, box, &mode_ref);
+	} else {
+		memcpy(scan_ref, prev, t_fix_size(f));
+		ret_ref = false;
+	}
+
+	memcpy(scan, prev, t_fix_size(f));
+	if (in.y1 < y2)
+		prandom_bytes_state(rs, scan + (size_t)in.y1 * pitch,
+				    (size_t)(y2 - in.y1) * pitch);
+	sh.scan = scan;
+	ret = rk3026_ebc_build_snapshot(&sh, next, box, &rows, &mode_drv, &tl,
+					&og, &chg);
+	want = ret_ref && any ?
+	       (struct rk3026_ebc_rows){ r.y1, r.y2 } :
+	       (struct rk3026_ebc_rows){ 0 };
+	diff = t_fix_diff(f, scan_ref, scan);
+	outside = t_rows_outside_diff(scan, prev, pitch, f->h, &rows);
+	*partial += in.y1 < y2 && (in.y1 > 0 || y2 < (u32)f->h);
+	if (ret == ret_ref && mode_drv == mode_ref && diff == INT_MAX &&
+	    rows.y1 == want.y1 && rows.y2 == want.y2 && outside < 0)
+		return true;
+	KUNIT_FAIL(test, "%s mode %u box " DRM_RECT_FMT
+		   " stale %u..%u: ret %d/%d mode %u/%u byte %d rows %u..%u/%u..%u differs outside at row %d",
+		   f->name, mode, DRM_RECT_ARG(box), in.y1, in.y2, ret,
+		   ret_ref, mode_drv, mode_ref, diff, rows.y1, rows.y2,
+		   want.y1, want.y2, outside);
+	return false;
+}
+
+/*
+ * rk3026_ebc_build_snapshot() given the rows where the scan image is stale
+ * equals the reference given none, on every fixture, image pair, mode and
+ * box, with a random range each time (t_stale_rows_case()).
+ */
+static void ebc_test_snapshot_stale_rows(struct kunit *test)
+{
+	unsigned int fi, ii, mi, partial = 0;
+	struct rnd_state rs;
+	int c, n;
+
+	for (fi = 0; fi < ARRAY_SIZE(t_fixes); fi++) {
+		const struct t_fix *f = &t_fixes[fi];
+		u8 *prev = t_fix_img(test, f), *next = t_fix_img(test, f);
+		u8 *scan_ref = t_fix_img(test, f), *scan = t_fix_img(test, f);
+		struct drm_rect clips[T_CLIPS_MAX];
+
+		for (ii = 0; ii < ARRAY_SIZE(t_snap_imgs); ii++) {
+			prandom_seed_state(&rs, 977 + fi * 31 + ii);
+			t_img_gen(prev, f, NULL, t_snap_imgs[ii][0], &rs);
+			t_img_gen(next, f, prev, t_snap_imgs[ii][1], &rs);
+			n = t_fix_clips(f, &rs, clips);
+			for (mi = 0; mi < ARRAY_SIZE(t_snap_modes); mi++)
+				for (c = 0; c < n; c++)
+					if (!t_stale_rows_case(test, f, prev,
+							       next, scan_ref,
+							       scan, &clips[c],
+							       t_snap_modes[mi],
+							       &rs, &partial))
+						return;
+		}
+		KUNIT_EXPECT_TRUE(test, t_fix_guard_ok(f, scan));
+	}
+	KUNIT_EXPECT_GT(test, partial, 0);
+}
+
+/*
+ * A part whose target is what the glass shows, on a scan image known to be
+ * prev: the snapshot writes nothing outside the box (the canary there
+ * stays), returns no rows, and neither scanned image has a row to take
+ * from either CPU-side image; the skip finishes with every range empty.
+ * Then a one-row change: one row to put into the next image, one into the
+ * prev image after the drive.
+ */
+static void ebc_test_skip_writes_nothing(struct kunit *test)
+{
+	struct drm_rect box = DRM_RECT_INIT(3, 2, 6, 2), line;
+	u8 *prev = t_img_alloc(test, 7), *next = t_img_alloc(test, 7);
+	u8 *scan = t_img_alloc(test, 7);
+	struct rk3026_ebc_shadows sh = {
+		.prev = prev, .scan = scan, .pitch = T_PITCH, .height = T_H,
+	};
+	struct rk3026_ebc_set part = { .box = box, .mode = EBC_MODE_PART };
+	struct rk3026_ebc_pending p = { 0 };
+	struct rk3026_ebc_rows rows = { 0 }, put;
+	enum rk3026_ebc_gave_up gave_up;
+	struct drm_rect r = box;
+	bool tl, og;
+	u32 mode = EBC_MODE_PART, chg;
+	int x, y;
+
+	t_px_set(prev, 4, 3, 2);
+	t_px_set(next, 4, 3, 2);
+	/* What the snapshot may not write: everything outside the box. */
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_widen_clip(&r, T_W, T_H));
+	for (y = 0; y < T_H; y++)
+		for (x = 0; x < T_W; x++)
+			if (!t_in_rect(&r, x, y))
+				t_px_set(scan, x, y, 0xa);
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_build_snapshot(&sh, next, &box,
+							   &rows, &mode, &tl,
+							   &og, &chg));
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_rows_empty(&rows));
+	for (y = 0; y < T_H; y++)
+		for (x = 0; x < T_W; x++)
+			KUNIT_EXPECT_EQ(test, t_px(scan, x, y),
+					t_in_rect(&r, x, y) ? t_px(prev, x, y) :
+					0xa);
+	t_expect_guard(test, scan);
+
+	rk3026_ebc_rows_snapshot(&sh, &rows);
+	put = rk3026_ebc_rows_put_scan(&sh, EBC_HALF_HIGH);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_rows_empty(&put));
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_scan_finish(&sh, &p, &part,
+						     EBC_OUTCOME_SKIPPED,
+						     EBC_REPAIR_NONE, 0,
+						     &gave_up),
+			EBC_PREV_KEPT);
+	put = rk3026_ebc_rows_put_prev(&sh, EBC_HALF_LOW);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_rows_empty(&put));
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_rows_empty(&sh.scan_rows));
+	for (x = 0; x < EBC_HALVES; x++) {
+		KUNIT_EXPECT_TRUE(test, rk3026_ebc_rows_empty(&sh.half[x].prev));
+		KUNIT_EXPECT_TRUE(test, rk3026_ebc_rows_empty(&sh.half[x].scan));
+	}
+
+	/* One row changes: one row each way, on a clean scan image. */
+	memcpy(scan, prev, T_SIZE);
+	line = DRM_RECT_INIT(0, 4, T_W, 1);
+	t_px_set(next, 9, 4, 0);
+	rows = (struct rk3026_ebc_rows){ 0 };
+	part.box = line;
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_build_snapshot(&sh, next, &line,
+							  &rows, &mode, &tl,
+							  &og, &chg));
+	KUNIT_EXPECT_EQ(test, rows.y1, 4);
+	KUNIT_EXPECT_EQ(test, rows.y2, 5);
+	rk3026_ebc_rows_snapshot(&sh, &rows);
+	put = rk3026_ebc_rows_put_scan(&sh, EBC_HALF_HIGH);
+	KUNIT_EXPECT_TRUE(test, t_rows_eq(&put, &rows));
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_scan_finish(&sh, &p, &part,
+						     EBC_OUTCOME_DRIVEN,
+						     EBC_REPAIR_NONE, 0,
+						     &gave_up),
+			EBC_PREV_SWAPPED);
+	KUNIT_EXPECT_PTR_EQ(test, sh.prev, scan);
+	put = rk3026_ebc_rows_put_prev(&sh, EBC_HALF_LOW);
+	KUNIT_EXPECT_TRUE(test, t_rows_eq(&put, &rows));
+	/* The image put into the next one already holds the new prev. */
+	put = rk3026_ebc_rows_put_prev(&sh, EBC_HALF_HIGH);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_rows_empty(&put));
+}
+
+/*
+ * The images of a random walk over the row bookkeeping: the two CPU-side
+ * ones in @sh and the two scanned ones, @half.
+ */
+struct t_rows_walk {
+	const struct t_fix		*f;
+	struct rk3026_ebc_shadows	sh;
+	struct rk3026_ebc_pending	p;
+	u8				*half[EBC_HALVES];
+	u8				*next;
+	unsigned int			partial;
+	unsigned int			changes[3];
+};
+
+/*
+ * Every range of @w covers every row where its two images differ, and
+ * stays within the image. False, with a failure naming @step, if not.
+ */
+static bool t_rows_walk_holds(struct kunit *test, struct t_rows_walk *w,
+			      unsigned int step)
+{
+	const struct rk3026_ebc_shadows *sh = &w->sh;
+	u32 pitch = t_fix_pitch(w->f), h = w->f->h;
+	int bad = t_rows_outside_diff(sh->scan, sh->prev, pitch, h,
+				      &sh->scan_rows);
+	unsigned int i;
+
+	if (bad >= 0 || (!rk3026_ebc_rows_empty(&sh->scan_rows) &&
+			 sh->scan_rows.y2 > h)) {
+		KUNIT_FAIL(test, "step %u: scan differs from prev at row %d outside %u..%u",
+			   step, bad, sh->scan_rows.y1, sh->scan_rows.y2);
+		return false;
+	}
+	for (i = 0; i < EBC_HALVES; i++) {
+		const struct rk3026_ebc_half_rows *r = &sh->half[i];
+		int bp = t_rows_outside_diff(w->half[i], sh->prev, pitch, h,
+					     &r->prev);
+		int bs = t_rows_outside_diff(w->half[i], sh->scan, pitch, h,
+					     &r->scan);
+
+		if (bp < 0 && bs < 0)
+			continue;
+		KUNIT_FAIL(test,
+			   "step %u: half %u: row %d not prev outside %u..%u, row %d not scan outside %u..%u",
+			   step, i, bp, r->prev.y1, r->prev.y2, bs, r->scan.y1,
+			   r->scan.y2);
+		return false;
+	}
+	return true;
+}
+
+/* A part finished with a random outcome and repair; checks the change. */
+static bool t_rows_walk_finish(struct kunit *test, struct t_rows_walk *w,
+			       struct rnd_state *rs, unsigned int step)
+{
+	static const u8 outcomes[] = {
+		EBC_OUTCOME_DRIVEN, EBC_OUTCOME_TIMEOUT, EBC_OUTCOME_ABANDONED,
+		EBC_OUTCOME_SKIPPED, EBC_OUTCOME_CRTC_OFF,
+		EBC_OUTCOME_NO_RAILS, EBC_OUTCOME_NO_LUT,
+		EBC_OUTCOME_NO_WAVEFORM,
+	};
+	struct rk3026_ebc_set part = {
+		.box = DRM_RECT_INIT(0, 0, w->f->w, w->f->h),
+		.mode = prandom_u32_state(rs) % 4 ? EBC_MODE_PART :
+						    EBC_MODE_RESET,
+		.seq = step,
+		.merged = 1,
+	};
+	u32 outcome = outcomes[prandom_u32_state(rs) % ARRAY_SIZE(outcomes)];
+	enum rk3026_ebc_repair repair = prandom_u32_state(rs) % 3;
+	bool reset = part.mode == EBC_MODE_RESET, entered;
+	enum rk3026_ebc_prev_change change, want = EBC_PREV_KEPT;
+	enum rk3026_ebc_gave_up gave_up;
+	u8 *scan = w->sh.scan;
+
+	entered = outcome == EBC_OUTCOME_DRIVEN ||
+		  outcome == EBC_OUTCOME_TIMEOUT ||
+		  outcome == EBC_OUTCOME_ABANDONED;
+	if (repair == EBC_REPAIR_FAILED && !reset)
+		want = EBC_PREV_KEPT;
+	else if (entered)
+		want = reset ? EBC_PREV_WHITE : EBC_PREV_SWAPPED;
+	else if (repair == EBC_REPAIR_DONE && !reset &&
+		 (outcome == EBC_OUTCOME_NO_RAILS ||
+		  outcome == EBC_OUTCOME_NO_LUT ||
+		  outcome == EBC_OUTCOME_NO_WAVEFORM))
+		want = EBC_PREV_WHITE;
+	change = rk3026_ebc_scan_finish(&w->sh, &w->p, &part, outcome, repair,
+					ms_to_ktime(step * 10), &gave_up);
+	w->changes[change]++;
+	if (change != want) {
+		KUNIT_FAIL(test, "step %u: outcome %u repair %u reset %d: change %u, not %u",
+			   step, outcome, repair, reset, change, want);
+		return false;
+	}
+	if (change == EBC_PREV_SWAPPED && w->sh.prev != scan) {
+		KUNIT_FAIL(test, "step %u: not swapped", step);
+		return false;
+	}
+	return true;
+}
+
+/*
+ * The row bookkeeping on a random walk: snapshots of random parts, the
+ * snapshot or prev put into a random scanned image, a scanned image
+ * whitened, a finish of every outcome. After every step each range covers
+ * every row where its images differ (t_rows_walk_holds()), and a put makes
+ * the scanned image equal to its source.
+ */
+static void ebc_test_rows_bookkeeping(struct kunit *test)
+{
+	struct t_rows_walk *w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
+	const struct t_fix *f = &t_fixes[1];
+	struct drm_rect clips[T_CLIPS_MAX];
+	u32 pitch = t_fix_pitch(f);
+	unsigned int step, i, seed;
+	struct rnd_state rs;
+
+	KUNIT_ASSERT_NOT_NULL(test, w);
+	w->f = f;
+	w->next = t_fix_img(test, f);
+	for (seed = 1; seed <= 4; seed++) {
+		memset(&w->sh, 0, sizeof(w->sh));
+		memset(&w->p, 0, sizeof(w->p));
+		w->sh.prev = t_fix_img(test, f);
+		w->sh.scan = t_fix_img(test, f);
+		w->sh.pitch = pitch;
+		w->sh.height = f->h;
+		for (i = 0; i < EBC_HALVES; i++)
+			w->half[i] = t_fix_img(test, f);
+		/* As at probe: everything white, nothing differs. */
+		memset(w->sh.prev, 0xff, t_fix_size(f));
+		memset(w->sh.scan, 0xff, t_fix_size(f));
+		for (i = 0; i < EBC_HALVES; i++)
+			memset(w->half[i], 0xff, t_fix_size(f));
+		prandom_seed_state(&rs, 4099 * seed);
+
+		for (step = 0; step < 600; step++) {
+			unsigned int op = prandom_u32_state(&rs) % 8;
+			enum rk3026_ebc_half h = prandom_u32_state(&rs) %
+						 EBC_HALVES;
+			struct rk3026_ebc_rows rows;
+			struct drm_rect box;
+			u32 mode, chg;
+			bool tl, og;
+			int n;
+
+			switch (op) {
+			case 0:
+			case 1:
+			case 2:
+				t_img_gen(w->next, f, w->sh.prev,
+					  op ? T_IMG_SOME : T_IMG_SAME, &rs);
+				n = t_fix_clips(f, &rs, clips);
+				mode = t_snap_modes[prandom_u32_state(&rs) %
+						    ARRAY_SIZE(t_snap_modes)];
+				box = clips[prandom_u32_state(&rs) % n];
+				rows = w->sh.scan_rows;
+				rk3026_ebc_build_snapshot(&w->sh, w->next,
+							  &box, &rows, &mode,
+							  &tl, &og, &chg);
+				rk3026_ebc_rows_snapshot(&w->sh, &rows);
+				w->partial += !rk3026_ebc_rows_empty(&rows) &&
+					      (rows.y1 > 0 || rows.y2 < f->h);
+				break;
+			case 3:
+				rows = rk3026_ebc_rows_put_scan(&w->sh, h);
+				rk3026_ebc_rows_copy(w->half[h], w->sh.scan,
+						     pitch, &rows);
+				KUNIT_EXPECT_EQ(test, memcmp(w->half[h],
+							     w->sh.scan,
+							     t_fix_size(f)),
+						0);
+				break;
+			case 4:
+				rows = rk3026_ebc_rows_put_prev(&w->sh, h);
+				rk3026_ebc_rows_copy(w->half[h], w->sh.prev,
+						     pitch, &rows);
+				KUNIT_EXPECT_EQ(test, memcmp(w->half[h],
+							     w->sh.prev,
+							     t_fix_size(f)),
+						0);
+				break;
+			case 5:
+				memset(w->half[h], 0xff, t_fix_size(f));
+				rk3026_ebc_rows_whiten(&w->sh, h);
+				break;
+			default:
+				if (!t_rows_walk_finish(test, w, &rs, step))
+					return;
+				break;
+			}
+			if (!t_rows_walk_holds(test, w, step)) {
+				kunit_info(test, "seed %u op %u half %u\n",
+					   seed, op, h);
+				return;
+			}
+		}
+		KUNIT_EXPECT_TRUE(test, t_fix_guard_ok(f, w->sh.prev));
+		KUNIT_EXPECT_TRUE(test, t_fix_guard_ok(f, w->sh.scan));
+	}
+	KUNIT_EXPECT_GT(test, w->partial, 0);
+	for (i = 0; i < ARRAY_SIZE(w->changes); i++)
+		KUNIT_EXPECT_GT(test, w->changes[i], 0);
 }
 
 /*
@@ -14030,10 +14485,11 @@ static bool t_snap_tl(const struct t_fix *f, u8 *prev, const u8 *next,
 		.prev = prev, .scan = scan, .pitch = t_fix_pitch(f),
 		.height = f->h,
 	};
+	struct rk3026_ebc_rows rows = rk3026_ebc_rows_all(f->h);
 	bool over_grey;
 
-	return rk3026_ebc_build_snapshot(&sh, next, box, &mode, two_level,
-					 &over_grey, changed_px);
+	return rk3026_ebc_build_snapshot(&sh, next, box, &rows, &mode,
+					 two_level, &over_grey, changed_px);
 }
 
 /*
@@ -15560,6 +16016,9 @@ static void ebc_test_mxcfb_invert(struct kunit *test)
 static struct kunit_case rk3026_ebc_conv_test_cases[] = {
 	KUNIT_CASE(ebc_test_ref_snapshot),
 	KUNIT_CASE(ebc_test_snapshot_nibble_pairs),
+	KUNIT_CASE(ebc_test_snapshot_stale_rows),
+	KUNIT_CASE(ebc_test_skip_writes_nothing),
+	KUNIT_CASE(ebc_test_rows_bookkeeping),
 	KUNIT_CASE(ebc_test_snapshot_a2_guard_positions),
 	KUNIT_CASE(ebc_test_snapshot_two_level_result),
 	KUNIT_CASE(ebc_test_snapshot_two_level_positions),

@@ -971,6 +971,51 @@ rk3026_ebc_pending_parts(const struct rk3026_ebc_pending *p)
 	return !!p->pre.merged + !!p->reset.merged + !!p->post.merged;
 }
 
+/*
+ * WIN_MST latch probe, a debug knob (debugfs mst_probe). Bit 0 logs the
+ * WIN_MST0/1 readbacks at fixed points of every drive; bit 1 programs the
+ * transposed pair (next in MST0, prev in MST1). The samples of chunks 0 to
+ * EBC_MST_PROBE_CHUNKS - 1 are all kept, later chunks keep only their end.
+ */
+#define EBC_MST_PROBE_LOG	BIT(0)
+#define EBC_MST_PROBE_SWAP	BIT(1)
+#define EBC_MST_PROBE_CHUNKS	8
+#define EBC_MST_PROBE_SAMPLES	(3 + 6 * EBC_MST_PROBE_CHUNKS + \
+				 DIV_ROUND_UP(EBC_WAVEFORM_MAX_FRAMES, \
+					      EBC_LUT_MAX_FRAMES))
+
+enum rk3026_ebc_mst_point {
+	EBC_MST_PRE,
+	EBC_MST_ARMED,
+	EBC_MST_KICK,
+	EBC_MST_KICK_20US,
+	EBC_MST_KICK_200US,
+	EBC_MST_KICK_30MS,
+	EBC_MST_MID,
+	EBC_MST_END,
+	EBC_MST_DONE,
+};
+
+struct rk3026_ebc_mst_sample {
+	u64	ns;
+	u32	mst0;
+	u32	mst1;
+	u8	point;
+	u8	chunk;
+};
+
+/*
+ * One drive's samples, the refresh thread's alone. @t0 is the time of chunk
+ * 0's FRAME_START write, 0 until it is made.
+ */
+struct rk3026_ebc_mst_probe {
+	u32				flags;
+	u32				n;
+	u32				dropped;
+	u64				t0;
+	struct rk3026_ebc_mst_sample	s[EBC_MST_PROBE_SAMPLES];
+};
+
 struct rk3026_ebc {
 	struct drm_device	drm;
 	struct drm_plane	plane;
@@ -1188,6 +1233,13 @@ struct rk3026_ebc {
 	 */
 	int			force_mode;
 	atomic_t		debug_timeout;
+
+	/*
+	 * @mst_probe: debugfs mst_probe, read once per drive into @mst.flags
+	 * (EBC_MST_PROBE_*); 0 is the normal behaviour.
+	 */
+	u32			mst_probe;
+	struct rk3026_ebc_mst_probe	mst;
 
 	/* Write-only registers the controller does not read back. */
 	u32			dsp_start;

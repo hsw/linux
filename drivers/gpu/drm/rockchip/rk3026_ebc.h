@@ -1046,7 +1046,9 @@ struct rk3026_ebc {
 	 *
 	 * @prev_virt and @next_virt, the write-combined images the controller
 	 * scans, are written by the thread alone, outside @image_lock, and
-	 * never read by the CPU.
+	 * never read by the CPU; only in the rows where they may differ from
+	 * their source (@shadows.half: @prev_virt is EBC_HALF_LOW, @next_virt
+	 * EBC_HALF_HIGH).
 	 *
 	 * @c8_levels: the level of each C8 index, the levels of the CRTC's
 	 * GAMMA_LUT or of the default grey ramp without one
@@ -1547,6 +1549,7 @@ void rk3026_ebc_debugfs_fini(struct rk3026_ebc *ebc);
 #if IS_ENABLED(CONFIG_KUNIT)
 struct seq_file;
 int rk3026_ebc_palette_show(struct seq_file *m, void *unused);
+int rk3026_ebc_rows_show(struct seq_file *m, void *unused);
 #endif
 #else
 static inline void rk3026_ebc_debugfs_init(struct rk3026_ebc *ebc) { }

@@ -762,7 +762,8 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_drive);
  *
  * White is the state a RESET lands on -- the same assumption
  * rk3026_ebc_add_update() makes when it fills @next_shadow with 0xff for a
- * RESET. @prev_virt follows here, for the part's scan; @shadows.prev follows
+ * RESET. @prev_virt follows here, for the part's scan, every row of it (the
+ * finish accounts for it: rk3026_ebc_rows_whiten()); @shadows.prev follows
  * in rk3026_ebc_scan_finish() (EBC_REPAIR_DONE), whatever the part's outcome.
  *
  * Called for EBC_REPAIR_BY_RESET alone (ebc_repair_by() found the RESET
@@ -1334,15 +1335,17 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_flip_fini);
  *     blit into @next_shadow and add to @pending as soon as the lock is
  *     dropped: the snapshot is what this scan drives, and their updates go
  *     to the next part.
- *  3. without it: the snapshot into @next_virt, a repair if the glass is
- *     not known, the waveform;
+ *  3. without it: the snapshot into @next_virt, in the rows where it may
+ *     differ (struct rk3026_ebc_shadows), a repair if the glass is not
+ *     known, the waveform;
  *  4. under @image_lock again: rk3026_ebc_scan_finish() says what the glass
  *     shows now and moves @pending.done_seq over the part, or arms the
  *     retry of a carry, the DU cleanup budget follows it
  *     (rk3026_ebc_du_account()), and the record is published and traced
  *     (part_done) with them. A commit event held to the finish for an
  *     update in the part is sent (ebc_flip_check()), the waiters on the
- *     part's updates are woken then, and @prev_virt follows.
+ *     part's updates are woken then, and @prev_virt follows, in the rows
+ *     where it may differ.
  *
  * The part is the carry alone at its retry (rk3026_ebc_retry_ready()).
  *
@@ -1364,7 +1367,7 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 	enum rk3026_ebc_gave_up gave_up;
 	struct rk3026_ebc_set part;
 	struct rk3026_ebc_rows rows;
-	bool identical, prev_changed, two_level, prepared = false;
+	bool identical, two_level, prepared = false, wrote_next = false;
 	u32 frames, mode, scan_mode, resolved, lut_mode, tries;
 	u32 changed_px = 0;
 	const u8 *lut, *target;
@@ -1500,10 +1503,11 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 
 	/* An A2 scan over a grey of the glass comes back as DU. */
 	snap_start = ktime_get();
-	rows = rk3026_ebc_rows_all(sh->height);
+	rows = sh->scan_rows;
 	identical = !rk3026_ebc_build_snapshot(sh, target, &part.box, &rows,
 					       &scan_mode, &two_level,
 					       &a2.over_grey, &changed_px);
+	rk3026_ebc_rows_snapshot(sh, &rows);
 	last->snap_us = ebc_us_since(snap_start);
 	last->changed_px = changed_px;
 
@@ -1612,8 +1616,15 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 		goto relock;
 	}
 
-	/* The controller reads the snapshot; nothing on the CPU reads it back. */
-	memcpy(ebc->next_virt, sh->scan, ebc->img_size);
+	/*
+	 * The controller reads the snapshot; nothing on the CPU reads it back.
+	 * Only the rows where @next_virt may differ from it are written, and
+	 * they are accounted for at the finish, under @image_lock
+	 * (rk3026_ebc_rows_put_scan()).
+	 */
+	rows = sh->half[EBC_HALF_HIGH].scan;
+	rk3026_ebc_rows_copy(ebc->next_virt, sh->scan, sh->pitch, &rows);
+	wrote_next = true;
 
 	/*
 	 * Repair before drawing, never instead of it: this returns with the prev
@@ -1662,6 +1673,14 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 
 relock:
 	mutex_lock(&ebc->image_lock);
+	/*
+	 * What step 3 wrote into the scanned images: the snapshot into
+	 * @next_virt, and a repair's white into @prev_virt (ebc_recover_panel()).
+	 */
+	if (wrote_next)
+		rk3026_ebc_rows_put_scan(sh, EBC_HALF_HIGH);
+	if (repair_result == EBC_REPAIR_DONE)
+		rk3026_ebc_rows_whiten(sh, EBC_HALF_LOW);
 finish:
 	/*
 	 * What was driven in is now what the panel shows: once rk3026_ebc_drive()
@@ -1675,10 +1694,14 @@ finish:
 	 * then hold a still older image, equally false and carrying no mark
 	 * saying so. @prev_unknown is the mark, and the next draw acts on it.
 	 */
-	prev_changed = rk3026_ebc_scan_finish(sh, &ebc->pending, &part,
-					      last->outcome, repair_result,
-					      rk3026_ebc_clock(ebc),
-					      &gave_up) != EBC_PREV_KEPT;
+	rk3026_ebc_scan_finish(sh, &ebc->pending, &part, last->outcome,
+			       repair_result, rk3026_ebc_clock(ebc), &gave_up);
+	/*
+	 * @prev_virt follows @shadows.prev below, in the rows where it may
+	 * differ: those the part changed when the snapshot became prev, every
+	 * row after a repair or a RESET, none when prev was kept.
+	 */
+	rows = rk3026_ebc_rows_put_prev(sh, EBC_HALF_LOW);
 	last->gave_up = gave_up != EBC_GAVE_UP_NONE;
 	if (last->gave_up) {
 		ebc->stats.carry_failed++;
@@ -1720,8 +1743,7 @@ finish:
 	wake_up_all(&ebc->marker_wq);
 
 	/* Only this thread writes either prev image, so this needs no lock. */
-	if (prev_changed)
-		memcpy(ebc->prev_virt, sh->prev, ebc->img_size);
+	rk3026_ebc_rows_copy(ebc->prev_virt, sh->prev, sh->pitch, &rows);
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_do_refresh);
 

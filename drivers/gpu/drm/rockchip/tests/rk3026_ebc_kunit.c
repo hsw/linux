@@ -6808,6 +6808,460 @@ static void ebc_test_glue_reset_lost(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, d.n, 0);
 }
 
+/* --- the scanned images, row by row --- */
+
+/* What a drive of t_drive_rows() does. */
+enum t_rows_drive {
+	T_ROWS_OK,		/* every frame driven */
+	T_ROWS_TIMEOUT,		/* a chunk timed out */
+	T_ROWS_ABANDONED,	/* the rails were down before a chunk */
+};
+
+/*
+ * The state of ebc_test_glue_rows_model() and of its drive stub,
+ * t_drive_rows(), which checks what the controller would read at every
+ * drive against the model in which every part copies whole images: the
+ * next image holds the snapshot, the prev image what the glass shows
+ * (@shadows.prev, or white after a repair RESET that ran to its end in
+ * this part), and the snapshot is the reference one, built from
+ * @shadows.prev and the part's @target over its box. @how is what drive k
+ * of the part does; @repaired is set by a repair RESET that ran to its
+ * end. @bad is the first failure's step.
+ */
+struct t_rows_model {
+	struct t_drives		d;	/* first: t_rails()'s and t_clock()'s priv */
+	u8			*ref;
+	u8			*ref_tl;
+	const u8		*target;
+	enum t_rows_drive	how[2];
+	unsigned int		calls;
+	bool			repaired;
+	bool			repair_failed;
+	unsigned int		step;
+	int			bad;
+	unsigned int		drives;
+};
+
+/* A failure of the model at its step, the first one only. */
+static void t_rows_fail(struct kunit *test, struct t_rows_model *m,
+			const char *what)
+{
+	if (m->bad < 0)
+		KUNIT_FAIL(test, "step %u, drive %u: %s", m->step, m->calls,
+			   what);
+	m->bad = m->step;
+}
+
+/*
+ * rk3026_ebc_drive() without the controller, checking the images it would
+ * read (struct t_rows_model), then ending as @how says for this call.
+ */
+static int t_drive_rows(struct rk3026_ebc *ebc, const u8 *lut, u32 frames,
+			u32 mode, u32 lut_mode, struct rk3026_ebc_last *last)
+{
+	struct kunit *test = kunit_get_current_test();
+	struct t_rows_model *m = test->priv;
+	struct rk3026_ebc_shadows *sh = &ebc->shadows;
+	struct rk3026_ebc_shadows ref = *sh;
+	bool unknown = READ_ONCE(sh->prev_unknown);
+	bool repair = !m->calls && last->repaired;
+	enum t_rows_drive how = m->how[min(m->calls, 1u)];
+	u32 m_plain = EBC_MODE_PART, m_tl = EBC_MODE_BLACK_WHITE;
+	int i;
+
+	m->drives++;
+	if (memcmp(ebc->next_virt, sh->scan, T_SIZE))
+		t_rows_fail(test, m, "next image is not the snapshot");
+	for (i = 0; i < T_SIZE; i++) {
+		u8 want = m->repaired ? 0xff : sh->prev[i];
+
+		if (((u8 *)ebc->prev_virt)[i] != want) {
+			t_rows_fail(test, m, m->repaired ?
+				    "prev image not white after the repair" :
+				    "prev image is not prev");
+			break;
+		}
+	}
+	/* The snapshot, two-level or not, as a full copy builds it. */
+	ref.scan = m->ref;
+	rk3026_ebc_ref_snapshot(&ref, m->target, &last->clip, &m_plain);
+	ref.scan = m->ref_tl;
+	rk3026_ebc_ref_snapshot(&ref, m->target, &last->clip, &m_tl);
+	if (memcmp(sh->scan, m->ref, T_SIZE) &&
+	    memcmp(sh->scan, m->ref_tl, T_SIZE))
+		t_rows_fail(test, m, "snapshot differs from a full build");
+
+	m->calls++;
+	last->scans++;
+	last->lut_mode = lut_mode;
+	last->frames = frames;
+	if (how == T_ROWS_OK) {
+		last->driven = frames;
+		last->outcome = EBC_OUTCOME_DRIVEN;
+		if (!unknown || rk3026_ebc_drive_knows_glass(mode, lut_mode))
+			WRITE_ONCE(sh->prev_unknown, false);
+		m->repaired |= repair;
+		return 0;
+	}
+	WRITE_ONCE(sh->prev_unknown, true);
+	m->repair_failed |= repair;
+	if (how == T_ROWS_TIMEOUT) {
+		last->timeouts++;
+		last->outcome = EBC_OUTCOME_TIMEOUT;
+		return -ETIMEDOUT;
+	}
+	last->outcome = EBC_OUTCOME_ABANDONED;
+	return -EIO;
+}
+
+/*
+ * After a part: the prev image holds prev, as after every part of the
+ * whole-copy model, and each range of struct rk3026_ebc_shadows covers
+ * every row where its two images differ.
+ */
+static void t_rows_after(struct kunit *test, struct t_rows_model *m,
+			 struct rk3026_ebc *ebc)
+{
+	const struct rk3026_ebc_shadows *sh = &ebc->shadows;
+	const u8 *half[EBC_HALVES] = { ebc->prev_virt, ebc->next_virt };
+	unsigned int i;
+
+	if (memcmp(ebc->prev_virt, sh->prev, T_SIZE))
+		t_rows_fail(test, m, "prev image is not prev after the part");
+	if (t_rows_outside_diff(sh->scan, sh->prev, T_PITCH, T_H,
+				&sh->scan_rows) >= 0)
+		t_rows_fail(test, m, "snapshot differs outside scan_rows");
+	for (i = 0; i < EBC_HALVES; i++) {
+		if (t_rows_outside_diff(half[i], sh->prev, T_PITCH, T_H,
+					&sh->half[i].prev) >= 0)
+			t_rows_fail(test, m, "half differs from prev outside its rows");
+		if (t_rows_outside_diff(half[i], sh->scan, T_PITCH, T_H,
+					&sh->half[i].scan) >= 0)
+			t_rows_fail(test, m, "half differs from scan outside its rows");
+	}
+}
+
+/* Random greys, or 0 and 15, or nothing new, over @box of @img. */
+static void t_rows_paint(u8 *img, const struct drm_rect *box,
+			 struct rnd_state *rs)
+{
+	unsigned int kind = prandom_u32_state(rs) % 4;
+	int x, y;
+
+	for (y = max(box->y1, 0); y < min(box->y2, T_H); y++) {
+		for (x = max(box->x1, 0); x < min(box->x2, T_W); x++) {
+			u32 r = prandom_u32_state(rs);
+
+			if (kind == 3 || r & 0x100)
+				continue;
+			t_px_set(img, x, y, kind == 2 ? (r & 1) * 15 : r & 15);
+		}
+	}
+}
+
+/*
+ * The scanned images over random sequences of parts and outcomes: sends of
+ * random boxes, pixels and modes, a RESET now and then; the CRTC off, no
+ * waveform, a waveform with the RESET alone (no LUT for the part) or
+ * without it (the repair is a FULL), rails that do not come up, drives and
+ * repair RESETs that run to their end, time out or are abandoned, parts
+ * skipped as identical, and the carries all this makes. At every drive the
+ * next image is the snapshot, the prev image prev (white after a repair),
+ * and the snapshot the one a full copy builds (t_drive_rows()); after
+ * every part the prev image is prev and the ranges cover the rows that
+ * differ (t_rows_after()). Every outcome, both repair results and a
+ * driven RESET part occur.
+ */
+static void ebc_test_glue_rows_model(struct kunit *test)
+{
+	static const struct t_rkf_seg reset_only[] = { { T_RKF_RESET, 5 } };
+	static const struct t_rkf_seg no_reset[] = {
+		{ T_RKF_GRAY16, 1 }, { T_RKF_GRAY2, 1 },
+	};
+	static const u32 modes[] = {
+		EBC_MODE_PART, EBC_MODE_FULL, EBC_MODE_BLACK_WHITE, EBC_MODE_A2,
+	};
+	struct t_rows_model *m = kunit_kzalloc(test, sizeof(*m), GFP_KERNEL);
+	unsigned int seen[EBC_OUTCOME_ABANDONED + 1] = { 0 };
+	unsigned int step, i, repaired = 0, repair_failed = 0, resets = 0;
+	struct ebc_waveform *wf[3];
+	struct rk3026_ebc *ebc;
+	struct rnd_state rs;
+
+	KUNIT_ASSERT_NOT_NULL(test, m);
+	m->ref = t_img_alloc(test, 0);
+	m->ref_tl = t_img_alloc(test, 0);
+	m->bad = -1;
+	ebc = t_rails_ebc(test, &m->d);
+	test->priv = m;
+	kunit_activate_static_stub(test, rk3026_ebc_drive, t_drive_rows);
+	kunit_activate_static_stub(test, rk3026_ebc_clock, t_clock);
+	wf[0] = ebc->waveform;
+	wf[1] = t_rkf_wf(test, ebc->dev, reset_only, 1, 0);
+	wf[2] = t_rkf_wf(test, ebc->dev, no_reset, 2, 0);
+	prandom_seed_state(&rs, 7919);
+
+	for (step = 0; step < 1500; step++) {
+		unsigned int sends = prandom_u32_state(&rs) % 4, r;
+		const struct rk3026_ebc_shadows *sh = &ebc->shadows;
+		struct rk3026_ebc_last last;
+		bool swapped;
+
+		m->step = step;
+		/* A glass not known: a hibernation restore, or the boot. */
+		if (!step || prandom_u32_state(&rs) % 50 == 0)
+			ebc->shadows.prev_unknown = true;
+		for (i = 0; i < sends; i++) {
+			int x1 = prandom_u32_state(&rs) % (T_W + 2) - 1;
+			int x2 = prandom_u32_state(&rs) % (T_W + 2) - 1;
+			int y1 = prandom_u32_state(&rs) % (T_H + 2) - 1;
+			int y2 = prandom_u32_state(&rs) % (T_H + 2) - 1;
+			struct drm_rect box = {
+				min(x1, x2), min(y1, y2),
+				max(x1, x2) + 1, max(y1, y2) + 1,
+			};
+
+			if (prandom_u32_state(&rs) % 12 == 0) {
+				t_send(ebc, &t_panel, EBC_MODE_RESET, 0,
+				       EBC_SOURCE_MXCFB);
+				continue;
+			}
+			t_rows_paint(ebc->next_shadow, &box, &rs);
+			t_send(ebc, &box,
+			       modes[prandom_u32_state(&rs) %
+				     ARRAY_SIZE(modes)], 0,
+			       prandom_u32_state(&rs) & 1 ?
+			       EBC_SOURCE_MXCFB : EBC_SOURCE_PLANE);
+		}
+
+		r = prandom_u32_state(&rs) % 100;
+		ebc->crtc_on = r >= 6;
+		r = prandom_u32_state(&rs) % 100;
+		ebc->waveform = r < 4 ? NULL : r < 12 ? wf[1] :
+				r < 18 ? wf[2] : wf[0];
+		if (prandom_u32_state(&rs) % 100 < 8) {
+			ebc->epd_on = false;
+			ebc->vcom_on = false;
+			m->d.rails_ret = -EIO;
+		} else {
+			m->d.rails_ret = 0;
+		}
+		for (i = 0; i < ARRAY_SIZE(m->how); i++) {
+			r = prandom_u32_state(&rs) % 100;
+			m->how[i] = r < 72 ? T_ROWS_OK :
+				    r < 88 ? T_ROWS_TIMEOUT :
+					     T_ROWS_ABANDONED;
+		}
+		m->d.now = ktime_add_ms(m->d.now, 700);
+
+		m->target = ebc->pre_split ? ebc->pre_shadow :
+					     ebc->next_shadow;
+		m->calls = 0;
+		m->repaired = false;
+		m->repair_failed = false;
+		last.outcome = EBC_OUTCOME_NONE;
+		rk3026_ebc_do_refresh(ebc, &last);
+		t_rows_after(test, m, ebc);
+		if (m->bad >= 0) {
+			kunit_info(test, "outcome %u repaired %d\n",
+				   last.outcome, last.repaired);
+			return;
+		}
+		/*
+		 * Not only covered but tight: the image that held the snapshot
+		 * holds prev after a swap, and the prev image was just copied.
+		 */
+		swapped = (last.outcome == EBC_OUTCOME_DRIVEN ||
+			   last.outcome == EBC_OUTCOME_TIMEOUT ||
+			   last.outcome == EBC_OUTCOME_ABANDONED) &&
+			  last.asked_mode != EBC_MODE_RESET && !m->repair_failed;
+		if (!rk3026_ebc_rows_empty(&sh->half[EBC_HALF_LOW].prev) ||
+		    (swapped &&
+		     !rk3026_ebc_rows_empty(&sh->half[EBC_HALF_HIGH].prev)))
+			t_rows_fail(test, m, "a scanned image left stale");
+		if (m->bad >= 0)
+			return;
+		if (last.outcome <= EBC_OUTCOME_ABANDONED)
+			seen[last.outcome]++;
+		repaired += m->repaired;
+		repair_failed += m->repair_failed;
+		resets += last.asked_mode == EBC_MODE_RESET &&
+			  last.outcome == EBC_OUTCOME_DRIVEN;
+	}
+	t_expect_guard(test, ebc->prev_virt);
+	t_expect_guard(test, ebc->next_virt);
+	kunit_info(test, "drives %u repaired %u failed %u resets %u\n",
+		   m->drives, repaired, repair_failed, resets);
+	for (i = EBC_OUTCOME_DRIVEN; i <= EBC_OUTCOME_ABANDONED; i++)
+		KUNIT_EXPECT_GT_MSG(test, seen[i], 0, "outcome %u", i);
+	KUNIT_EXPECT_GT(test, repaired, 0);
+	KUNIT_EXPECT_GT(test, repair_failed, 0);
+	KUNIT_EXPECT_GT(test, resets, 0);
+}
+
+/*
+ * The row ranges of @ebc are @scan, then each scanned image's prev and
+ * scan ranges, low then high, as y1 y2 pairs; and debugfs "rows" says so.
+ */
+static void t_expect_rows(struct kunit *test, struct rk3026_ebc *ebc,
+			  const u32 *want)
+{
+	const struct rk3026_ebc_shadows *sh = &ebc->shadows;
+	const struct rk3026_ebc_rows *got[] = {
+		&sh->scan_rows,
+		&sh->half[EBC_HALF_LOW].prev, &sh->half[EBC_HALF_LOW].scan,
+		&sh->half[EBC_HALF_HIGH].prev, &sh->half[EBC_HALF_HIGH].scan,
+	};
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(got); i++) {
+		KUNIT_EXPECT_EQ_MSG(test, got[i]->y1, want[2 * i], "range %u", i);
+		KUNIT_EXPECT_EQ_MSG(test, got[i]->y2, want[2 * i + 1],
+				    "range %u", i);
+	}
+#if IS_ENABLED(CONFIG_DEBUG_FS)
+	{
+		struct seq_file m = { .size = 256, .private = ebc };
+		char *text = kunit_kzalloc(test, 256, GFP_KERNEL);
+
+		m.buf = kunit_kzalloc(test, m.size, GFP_KERNEL);
+		KUNIT_ASSERT_NOT_NULL(test, m.buf);
+		KUNIT_ASSERT_NOT_NULL(test, text);
+		KUNIT_ASSERT_EQ(test, rk3026_ebc_rows_show(&m, NULL), 0);
+		KUNIT_ASSERT_LT(test, m.count, m.size);
+		snprintf(text, 256,
+			 "scan_rows %u %u\nhalf0_prev %u %u\nhalf0_scan %u %u\nhalf1_prev %u %u\nhalf1_scan %u %u\n",
+			 want[0], want[1], want[2], want[3], want[4], want[5],
+			 want[6], want[7], want[8], want[9]);
+		KUNIT_EXPECT_STREQ(test, m.buf, text);
+	}
+#endif
+}
+
+/*
+ * After a whole-panel part, a one-row change writes that row alone into
+ * each scanned image, and a part identical to the glass writes none: a
+ * canary in every other byte stays.
+ */
+static void ebc_test_glue_rows_partial(struct kunit *test)
+{
+	static const u32 one_row[] = { 3, 4, 0, 0, 3, 4, 0, 0, 3, 4 };
+	static const u32 none[10];
+	struct t_drives d;
+	struct rk3026_ebc *ebc = t_driven_ebc(test, &d, true);
+	struct drm_rect line = DRM_RECT_INIT(0, 3, T_W, 1);
+	u8 *lo = ebc->prev_virt, *hi = ebc->next_virt;
+	u8 *lo_was = t_img_alloc(test, 0), *hi_was = t_img_alloc(test, 0);
+	struct rk3026_ebc_last last;
+	int y;
+
+	t_img_fill(ebc->next_shadow, 8);
+	t_send(ebc, &t_panel, EBC_MODE_FULL, 1, EBC_SOURCE_MXCFB);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_ASSERT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_EXPECT_MEMEQ(test, lo, ebc->shadows.prev, T_SIZE);
+	KUNIT_EXPECT_MEMEQ(test, hi, ebc->shadows.prev, T_SIZE);
+
+	memset(lo, 0x5a, T_SIZE);
+	memset(hi, 0x5a, T_SIZE);
+	t_px_set(ebc->next_shadow, 5, 3, 0);
+	t_send(ebc, &line, EBC_MODE_PART, 2, EBC_SOURCE_MXCFB);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_ASSERT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_EXPECT_EQ(test, t_px(ebc->shadows.prev, 5, 3), 0);
+	for (y = 0; y < T_H; y++) {
+		const u8 *p = ebc->shadows.prev + y * T_PITCH;
+		int x;
+
+		for (x = 0; x < T_PITCH; x++) {
+			KUNIT_EXPECT_EQ_MSG(test, lo[y * T_PITCH + x],
+					    y == 3 ? p[x] : 0x5a, "row %d", y);
+			KUNIT_EXPECT_EQ_MSG(test, hi[y * T_PITCH + x],
+					    y == 3 ? p[x] : 0x5a, "row %d", y);
+		}
+	}
+	t_expect_rows(test, ebc, one_row);
+
+	memcpy(lo_was, lo, T_SIZE);
+	memcpy(hi_was, hi, T_SIZE);
+	t_send(ebc, &line, EBC_MODE_PART, 3, EBC_SOURCE_MXCFB);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_ASSERT_EQ(test, last.outcome, EBC_OUTCOME_SKIPPED);
+	KUNIT_EXPECT_MEMEQ(test, lo, lo_was, T_SIZE);
+	KUNIT_EXPECT_MEMEQ(test, hi, hi_was, T_SIZE);
+	t_expect_rows(test, ebc, none);
+	t_expect_guard(test, lo);
+	t_expect_guard(test, hi);
+}
+
+/*
+ * What is written whole: after a repair RESET whitened the prev image,
+ * the finish copies every row of prev back into it, whatever the part's
+ * box (here over a grey glass, so a row left white would show). A repair
+ * with no LUT for the part after it leaves prev white: the prev image is
+ * white already, the snapshot and the next image stale in every row, and
+ * the next part writes the next image whole. A RESET part leaves the same.
+ */
+static void ebc_test_glue_repair_marks_full(struct kunit *test)
+{
+	static const struct t_rkf_seg reset_only[] = { { T_RKF_RESET, 5 } };
+	static const u32 boxed[] = { 2, 3, 0, 0, 2, 3, 0, 0, 2, 3 };
+	static const u32 white[] = { 0, T_H, 0, 0, 0, T_H, 0, T_H, 0, 0 };
+	struct t_drives d;
+	struct rk3026_ebc *ebc = t_driven_ebc(test, &d, true);
+	struct ebc_waveform *wf = ebc->waveform;
+	struct drm_rect r = DRM_RECT_INIT(4, 2, 2, 1);
+	u8 *lo = ebc->prev_virt, *hi = ebc->next_virt;
+	struct rk3026_ebc_last last;
+
+	t_img_fill(ebc->next_shadow, 8);
+	t_send(ebc, &t_panel, EBC_MODE_FULL, 1, EBC_SOURCE_MXCFB);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_ASSERT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+
+	/* Repaired, then drawn: prev grey with one black pixel, all of it. */
+	ebc->shadows.prev_unknown = true;
+	t_px_set(ebc->next_shadow, 4, 2, 0);
+	t_send(ebc, &r, EBC_MODE_PART, 2, EBC_SOURCE_MXCFB);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_TRUE(test, last.repaired);
+	KUNIT_ASSERT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_EXPECT_EQ(test, d.n, 3);
+	KUNIT_EXPECT_EQ(test, lo[0], 0x88);
+	KUNIT_EXPECT_MEMEQ(test, lo, ebc->shadows.prev, T_SIZE);
+	KUNIT_EXPECT_MEMEQ(test, hi, ebc->shadows.prev, T_SIZE);
+	t_expect_rows(test, ebc, boxed);
+
+	/* Repaired, no LUT for the part: prev white, the rest stale. */
+	ebc->waveform = t_rkf_wf(test, ebc->dev, reset_only, 1, 0);
+	ebc->shadows.prev_unknown = true;
+	t_px_set(ebc->next_shadow, 4, 2, 15);
+	t_send(ebc, &r, EBC_MODE_PART, 3, EBC_SOURCE_MXCFB);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_TRUE(test, last.repaired);
+	KUNIT_ASSERT_EQ(test, last.outcome, EBC_OUTCOME_NO_LUT);
+	t_expect_white(test, ebc->shadows.prev);
+	t_expect_white(test, lo);
+	t_expect_rows(test, ebc, white);
+
+	/*
+	 * A RESET part over it, the next image holding a canary: written
+	 * whole, being stale in every row; the same ranges after it.
+	 */
+	ebc->waveform = wf;
+	memset(hi, 0x5a, T_SIZE);
+	t_send(ebc, &t_panel, EBC_MODE_RESET, 4, EBC_SOURCE_MXCFB);
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_ASSERT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_EXPECT_EQ(test, last.asked_mode, EBC_MODE_RESET);
+	KUNIT_EXPECT_EQ(test, d.n, 5);
+	t_expect_white(test, hi);
+	t_expect_white(test, lo);
+	t_expect_rows(test, ebc, white);
+	t_expect_guard(test, lo);
+	t_expect_guard(test, hi);
+}
+
 /*
  * t_rails_ebc() on the fake clock, at 1 s, with the take's gap as probe
  * sets it; the last part finished long before.
@@ -12942,6 +13396,9 @@ static struct kunit_case rk3026_ebc_glue_test_cases[] = {
 	KUNIT_CASE(ebc_test_glue_gap_retry),
 	KUNIT_CASE(ebc_test_glue_retry_reset_tries),
 	KUNIT_CASE(ebc_test_glue_reset_lost),
+	KUNIT_CASE(ebc_test_glue_rows_model),
+	KUNIT_CASE(ebc_test_glue_rows_partial),
+	KUNIT_CASE(ebc_test_glue_repair_marks_full),
 	KUNIT_CASE(ebc_test_glue_repair_sensor),
 	KUNIT_CASE(ebc_test_glue_repair_no_full),
 	KUNIT_CASE(ebc_test_glue_retry_temp),

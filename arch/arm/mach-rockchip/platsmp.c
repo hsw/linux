@@ -162,7 +162,23 @@ static int pmu_set_power_domain(int pd, bool on)
 		int err = 0;
 
 		/*
-		 * RK3026: map the SRAM at 0 right before the assert that
+		 * RK3026: only a write that takes the core reset from
+		 * deasserted to asserted restarts the core. Writing the assert
+		 * again while it is already asserted stops the core until the
+		 * next such edge, and a deassert does nothing to the core,
+		 * running or stopped. A boot loader may leave the reset
+		 * asserted, so deassert it first: the assert below then always
+		 * makes the edge that starts the core.
+		 */
+		ret = reset_control_deassert(rstc);
+		if (ret) {
+			pr_err("%s: could not deassert reset of core %d: %d\n",
+			       __func__, pd, ret);
+			return ret;
+		}
+
+		/*
+		 * Map the SRAM at 0 right before the assert that
 		 * restarts the core. A core parked by the BootROM waits in WFE
 		 * at a low address; once the SRAM is mapped, any SEV wakes it
 		 * to fetch SRAM contents at that address instead of the

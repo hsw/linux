@@ -213,6 +213,23 @@ config DRM_RK3026_EBC_NEON
 
 	  If unsure, say Y.
 
+config DRM_RK3026_EBC_ROTATE_BUFFERS
+	bool "Rotate the RK3026 EBC scan buffers"
+	depends on DRM_RK3026_EBC
+	default y
+	help
+	  The controller scans two images, the one on the glass and the one
+	  being driven towards, from the two halves of one buffer. With
+	  this option the two halves swap roles after each scan: the half
+	  just drawn into becomes the image on the glass by a register
+	  write, so the image on the glass is not copied again after every
+	  update, and the next update is drawn into the other half. Saying
+	  N keeps both buffers in fixed roles and copies the image on the
+	  glass back after each update, as before; the pictures drawn are
+	  the same.
+
+	  If unsure, say Y.
+
 config DRM_RK3026_EBC_KUNIT_TEST
 	tristate "KUnit tests for the RK3026 EBC" if !KUNIT_ALL_TESTS
 	depends on DRM_RK3026_EBC && KUNIT

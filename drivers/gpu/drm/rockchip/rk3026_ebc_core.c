@@ -607,6 +607,75 @@ void rk3026_ebc_rows_whiten(struct rk3026_ebc_shadows *sh,
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_rows_whiten);
 
+/* The half whose address is @addr, or EBC_HALVES for none. */
+static enum rk3026_ebc_half ebc_half_at(const u32 *base, u32 addr)
+{
+	enum rk3026_ebc_half h;
+
+	for (h = EBC_HALF_LOW; h < EBC_HALVES; h++)
+		if (base[h] == addr)
+			break;
+	return h;
+}
+
+/**
+ * rk3026_ebc_rotate_roles - the halves a scan reads, from the last scan's
+ * @sh: the shadow images
+ * @mst: WIN_MST0 and WIN_MST1 as read back before the snapshot is copied,
+ *	or NULL when they were not written since the block started (probe,
+ *	resume, a CRTC enable)
+ * @base: the address of each half, as WIN_MST0/1 hold it
+ * @roles: returns the half the scan reads as prev and the one it reads as
+ *	next, which the snapshot is copied into
+ *
+ * The WIN_MST0/1 pair latches at the FRAME_START of the scan the write
+ * precedes, and a read returns the pair latched, the pair the last scan
+ * read: its MST1 half holds what that scan drove in, the glass now, and
+ * its MST0 half the image before. The scan reads the first as prev and is
+ * drawn into the second: the program is the swap of the readback, and the
+ * snapshot goes into the half the readback names as MST0. The half just
+ * scanned as next becomes prev by that write, with no copy, and only the
+ * rows the snapshot or the part before it changed are copied into the
+ * other (struct rk3026_ebc_shadows). A scan that never started latched
+ * nothing; the next part reads the same pair and writes the same swap.
+ *
+ * Any other readback names no pair of the pool: 0/0 after a stop that
+ * reset the block (the reset clears the pair), or a value this driver did
+ * not write. The pair is then programmed explicitly, the low half as prev
+ * and the high one as next, and both are taken as stale in every row
+ * (rk3026_ebc_rows_whiten()): the copies before the scan write them whole.
+ *
+ * Return: what the readback named (enum rk3026_ebc_mst).
+ */
+enum rk3026_ebc_mst rk3026_ebc_rotate_roles(struct rk3026_ebc_shadows *sh,
+					    const u32 *mst, const u32 *base,
+					    struct rk3026_ebc_roles *roles)
+{
+	enum rk3026_ebc_half h0, h1;
+	enum rk3026_ebc_mst got;
+
+	if (!mst) {
+		got = EBC_MST_UNSET;
+	} else if (!mst[0] && !mst[1]) {
+		got = EBC_MST_CLEARED;
+	} else {
+		h0 = ebc_half_at(base, mst[0]);
+		h1 = ebc_half_at(base, mst[1]);
+		if (h0 != EBC_HALVES && h1 != EBC_HALVES && h0 != h1) {
+			roles->prev = h1;
+			roles->next = h0;
+			return EBC_MST_LATCHED;
+		}
+		got = EBC_MST_FOREIGN;
+	}
+	roles->prev = EBC_HALF_LOW;
+	roles->next = EBC_HALF_HIGH;
+	rk3026_ebc_rows_whiten(sh, EBC_HALF_LOW);
+	rk3026_ebc_rows_whiten(sh, EBC_HALF_HIGH);
+	return got;
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_rotate_roles);
+
 /**
  * rk3026_ebc_target_differs - whether a part's target differs from the glass
  * @sh: the shadow images; only @sh->prev is read

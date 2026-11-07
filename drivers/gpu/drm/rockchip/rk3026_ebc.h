@@ -750,6 +750,23 @@ enum rk3026_ebc_half {
 };
 
 /*
+ * The halves one scan reads: @prev as its prev image (WIN_MST0), @next as
+ * its next one (WIN_MST1), which the snapshot is copied into.
+ */
+struct rk3026_ebc_roles {
+	enum rk3026_ebc_half	prev;
+	enum rk3026_ebc_half	next;
+};
+
+/* What the WIN_MST0/1 pair read back before a scan named. */
+enum rk3026_ebc_mst {
+	EBC_MST_LATCHED,	/* the two halves, as the last scan read them */
+	EBC_MST_UNSET,		/* not written since the block started */
+	EBC_MST_CLEARED,	/* 0/0: a block reset cleared the pair */
+	EBC_MST_FOREIGN,	/* anything else */
+};
+
+/*
  * What one scanned image may differ in from the CPU-side ones: outside
  * @prev its rows hold the bytes of &rk3026_ebc_shadows.prev, outside @scan
  * those of &rk3026_ebc_shadows.scan.
@@ -995,12 +1012,25 @@ struct rk3026_ebc {
 	u32			lgonl;
 	enum drm_panel_orientation rotation;
 
-	/* The two 4bpp images the EBC scans: on-panel and target. */
-	void			*prev_virt;
-	dma_addr_t		prev_phys;
-	void			*next_virt;
-	dma_addr_t		next_phys;
+	/*
+	 * The two 4bpp images the EBC scans, the halves of one allocation
+	 * (enum rk3026_ebc_half). @roles is the pair the next scan is
+	 * programmed with (rk3026_ebc_set_image_addr()): the low half as
+	 * prev and the high one as next, unless @rotate. With @rotate the
+	 * refresh thread derives it for each part from the pair the
+	 * controller read back (rk3026_ebc_rotate_roles()), and
+	 * @mst_explicit, set whenever the block starts (probe, resume, a
+	 * CRTC enable), has the next part program it explicitly instead.
+	 * @half_virt, @half_phys and @rotate are set at probe; @roles is the
+	 * thread's alone, and @mst_explicit is cleared by the thread under
+	 * @image_lock.
+	 */
+	void			*half_virt[EBC_HALVES];
+	dma_addr_t		half_phys[EBC_HALVES];
 	size_t			img_size;
+	struct rk3026_ebc_roles	roles;
+	bool			rotate;
+	bool			mst_explicit;
 
 	/*
 	 * The CPU-side images, all cached, the pending updates and the
@@ -1044,11 +1074,10 @@ struct rk3026_ebc {
 	 * @pending.taken_seq and @pending.done_seq are also read without the
 	 * lock, by the waits on them.
 	 *
-	 * @prev_virt and @next_virt, the write-combined images the controller
-	 * scans, are written by the thread alone, outside @image_lock, and
-	 * never read by the CPU; only in the rows where they may differ from
-	 * their source (@shadows.half: @prev_virt is EBC_HALF_LOW, @next_virt
-	 * EBC_HALF_HIGH).
+	 * @half_virt, the write-combined images the controller scans, are
+	 * written by the thread alone, outside @image_lock, and never read by
+	 * the CPU; only in the rows where they may differ from their source
+	 * (@shadows.half).
 	 *
 	 * @c8_levels: the level of each C8 index, the levels of the CRTC's
 	 * GAMMA_LUT or of the default grey ramp without one
@@ -1056,8 +1085,8 @@ struct rk3026_ebc {
 	 * a blit sees one whole table.
 	 *
 	 * @image_lock is never held across a waveform, the sensor read or a
-	 * write into @prev_virt or @next_virt, so a sender waits at most for
-	 * one snapshot to be built; @rails_lock is never taken under it.
+	 * write into @half_virt, so a sender waits at most for one snapshot
+	 * to be built; @rails_lock is never taken under it.
 	 */
 	struct mutex		image_lock;
 	u8			*next_shadow;
@@ -1359,6 +1388,7 @@ int rk3026_ebc_wait_marker(struct rk3026_ebc *ebc, u32 marker,
 			   enum rk3026_ebc_wait_for until);
 #if IS_ENABLED(CONFIG_KUNIT)
 void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc, struct rk3026_ebc_last *last);
+void rk3026_ebc_set_image_addr(struct rk3026_ebc *ebc, u32 x, u32 y);
 int rk3026_ebc_drive(struct rk3026_ebc *ebc, const u8 *lut, u32 frames,
 		     u32 mode, u32 lut_mode, struct rk3026_ebc_last *last);
 int rk3026_ebc_wait_seq(struct rk3026_ebc *ebc, u32 seq,
@@ -1477,6 +1507,9 @@ struct rk3026_ebc_rows rk3026_ebc_rows_put_prev(struct rk3026_ebc_shadows *sh,
 						enum rk3026_ebc_half half);
 void rk3026_ebc_rows_whiten(struct rk3026_ebc_shadows *sh,
 			    enum rk3026_ebc_half half);
+enum rk3026_ebc_mst rk3026_ebc_rotate_roles(struct rk3026_ebc_shadows *sh,
+					    const u32 *mst, const u32 *base,
+					    struct rk3026_ebc_roles *roles);
 bool rk3026_ebc_target_differs(const struct rk3026_ebc_shadows *sh,
 			       const u8 *next, const struct drm_rect *box);
 bool rk3026_ebc_should_skip(const struct rk3026_ebc_set *part,

@@ -71,6 +71,8 @@
  *                    Probe sets "done".
  *   palette          text, the level of each C8 index
  *                    (rk3026_ebc_palette_show())
+ *   rows             text, the rows where each image may differ from
+ *                    another (rk3026_ebc_rows_show())
  *
  * flip_held and flip_late are counters, yet files of their own next to
  * flip_timeout_ms rather than lines of "state" (struct rk3026_ebc_stats):
@@ -454,6 +456,43 @@ VISIBLE_IF_KUNIT int rk3026_ebc_palette_show(struct seq_file *m,
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_palette_show);
 DEFINE_SHOW_ATTRIBUTE(rk3026_ebc_palette);
 
+/*
+ * "rows", apart from "state" so that file keeps its version: the row
+ * ranges of struct rk3026_ebc_shadows, "y1 y2" with y2 exclusive, "0 0"
+ * for none, as the refresh thread last accounted for them: scan_rows where
+ * the snapshot image may differ from the on-panel one ("panel");
+ * half<N>_prev and half<N>_scan where scanned image N (enum
+ * rk3026_ebc_half: 0 the lower address, 1 the higher) may differ from the
+ * on-panel image and from the snapshot image. The scanned images are
+ * written outside @image_lock: the next one before the drive, so before
+ * the part's finish accounts for it; the prev one with @rotate before the
+ * drive as well (rk3026_ebc_do_refresh(), step 3), in fixed roles just
+ * after the finish.
+ */
+VISIBLE_IF_KUNIT int rk3026_ebc_rows_show(struct seq_file *m, void *unused)
+{
+	struct rk3026_ebc *ebc = m->private;
+	struct rk3026_ebc_half_rows half[EBC_HALVES];
+	struct rk3026_ebc_rows scan;
+	unsigned int i;
+
+	mutex_lock(&ebc->image_lock);
+	scan = ebc->shadows.scan_rows;
+	memcpy(half, ebc->shadows.half, sizeof(half));
+	mutex_unlock(&ebc->image_lock);
+
+	seq_printf(m, "scan_rows %u %u\n", scan.y1, scan.y2);
+	for (i = 0; i < EBC_HALVES; i++) {
+		seq_printf(m, "half%u_prev %u %u\n", i, half[i].prev.y1,
+			   half[i].prev.y2);
+		seq_printf(m, "half%u_scan %u %u\n", i, half[i].scan.y1,
+			   half[i].scan.y2);
+	}
+	return 0;
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_rows_show);
+DEFINE_SHOW_ATTRIBUTE(rk3026_ebc_rows);
+
 void rk3026_ebc_debugfs_init(struct rk3026_ebc *ebc)
 {
 	struct dentry *dir = debugfs_create_dir("rk3026-ebc", NULL);
@@ -490,6 +529,7 @@ void rk3026_ebc_debugfs_init(struct rk3026_ebc *ebc)
 	debugfs_create_atomic_t("debug_timeout", 0644, dir, &ebc->debug_timeout);
 	debugfs_create_u32("rails_off_ms", 0644, dir, &ebc->rails_off_ms);
 	debugfs_create_file("palette", 0444, dir, ebc, &rk3026_ebc_palette_fops);
+	debugfs_create_file("rows", 0444, dir, ebc, &rk3026_ebc_rows_fops);
 }
 
 void rk3026_ebc_debugfs_fini(struct rk3026_ebc *ebc)

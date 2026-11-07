@@ -355,20 +355,58 @@ static void ebc_set_dsp_ctrl(struct rk3026_ebc *ebc, u32 mode)
  * WIN_MST0/1 latch at the FRAME_START of the scan the write precedes: the
  * readback shows the new pair from the FRAME_START write on and holds it for
  * the whole scan. CONFIG_DONE does not latch them, and the block reset clears
- * them, which is why this runs before every scan.
+ * them, which is why this runs before every scan. Which half is prev and
+ * which next is @roles (rk3026_ebc_rotate_roles()).
  *
  * Both hold absolute physical addresses, biased by the window origin at two
  * pixels per byte. The row stride is the panel width: the images are packed
  * at width / 2 bytes per line (rk3026_ebc_blit()), and WIN_VIR, from
  * which the controller takes its line step, is the width as well.
  */
-static void ebc_set_image_addr(struct rk3026_ebc *ebc, u32 x, u32 y)
+VISIBLE_IF_KUNIT void rk3026_ebc_set_image_addr(struct rk3026_ebc *ebc,
+						u32 x, u32 y)
 {
 	u32 off = (x + y * ebc->width) / 2;
 
-	ebc_write(ebc, EBC_WIN_MST0, lower_32_bits(ebc->prev_phys) + off);
-	ebc_write(ebc, EBC_WIN_MST1, lower_32_bits(ebc->next_phys) + off);
+	ebc_write(ebc, EBC_WIN_MST0,
+		  lower_32_bits(ebc->half_phys[ebc->roles.prev]) + off);
+	ebc_write(ebc, EBC_WIN_MST1,
+		  lower_32_bits(ebc->half_phys[ebc->roles.next]) + off);
 	ebc_config_done(ebc);
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_set_image_addr);
+
+/*
+ * The halves the part's scans read (@ebc->roles is set from them before
+ * the copies), under @image_lock. In fixed roles the low half is prev and
+ * the high one next. With @rotate they follow the pair the controller read
+ * back, swapped (rk3026_ebc_rotate_roles()); the first part after the
+ * block started programs the pair explicitly. Every scan of the part, a
+ * repair RESET and the part's own, is written the same pair: under the
+ * latch at FRAME_START the RESET's scan latched it already, and the RESET
+ * reads neither image.
+ */
+static struct rk3026_ebc_roles ebc_take_roles(struct rk3026_ebc *ebc)
+{
+	struct rk3026_ebc_roles roles = { EBC_HALF_LOW, EBC_HALF_HIGH };
+	u32 base[EBC_HALVES], mst[2];
+	unsigned int i;
+
+	if (!ebc->rotate)
+		return roles;
+
+	for (i = 0; i < EBC_HALVES; i++)
+		base[i] = lower_32_bits(ebc->half_phys[i]);
+	mst[0] = ebc_read(ebc, EBC_WIN_MST0);
+	mst[1] = ebc_read(ebc, EBC_WIN_MST1);
+	if (rk3026_ebc_rotate_roles(&ebc->shadows,
+				    ebc->mst_explicit ? NULL : mst, base,
+				    &roles) == EBC_MST_FOREIGN)
+		dev_warn_once(ebc->dev,
+			      "image pair %#x/%#x is not one of the pool, programmed again\n",
+			      mst[0], mst[1]);
+	ebc->mst_explicit = false;
+	return roles;
 }
 
 /*
@@ -379,13 +417,20 @@ static void ebc_set_image_addr(struct rk3026_ebc *ebc, u32 x, u32 y)
  * Everything up to CONFIG_DONE is a register group latched by that write, and
  * FRAME_START is only asserted afterwards. VCOM_MODE stays set while further
  * chunks follow so the rails are not dropped mid-waveform.
+ *
+ * KUnit replaces it with a static stub, so that rk3026_ebc_drive() can be
+ * run without the controller and its register writes seen at each kick.
  */
-static void ebc_frame_kick(struct rk3026_ebc *ebc, const u8 *lut,
-			   u32 chunk, u32 frames, bool last)
+VISIBLE_IF_KUNIT void rk3026_ebc_frame_kick(struct rk3026_ebc *ebc,
+					    const u8 *lut, u32 chunk,
+					    u32 frames, bool last)
 {
 	const u8 *src = lut + chunk * EBC_LUT_MAX_FRAMES * EBC_LUT_FRAME_BYTES;
 	u32 size = EBC_HALVES(ebc->width, ebc->height);
 	const struct display_timing *t = &ebc->timing;
+
+	KUNIT_STATIC_STUB_REDIRECT(rk3026_ebc_frame_kick, ebc, lut, chunk,
+				   frames, last);
 
 	/*
 	 * Word copies need a word-aligned source: @lut is the waveform's
@@ -418,12 +463,13 @@ static void ebc_frame_kick(struct rk3026_ebc *ebc, const u8 *lut,
 	 * FRAME_START with writel(), not the relaxed accessor: its barrier
 	 * completes every earlier CPU write before the controller starts, the
 	 * image stores still in the write-combining buffers
-	 * (prev_virt/next_virt, ebc_setup_buffers()) and the relaxed LUT and
+	 * (@half_virt, ebc_setup_buffers()) and the relaxed LUT and
 	 * register writes above alike.
 	 */
 	ebc->dsp_start |= DSP_FRAME_START;
 	writel(ebc->dsp_start, ebc->regs + EBC_DSP_START);
 }
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_frame_kick);
 
 static irqreturn_t ebc_irq(int irq, void *data)
 {
@@ -690,7 +736,7 @@ VISIBLE_IF_KUNIT int rk3026_ebc_drive(struct rk3026_ebc *ebc, const u8 *lut,
 	last->frames = frames;
 
 	ebc_set_dsp_ctrl(ebc, mode);
-	ebc_set_image_addr(ebc, 0, 0);
+	rk3026_ebc_set_image_addr(ebc, 0, 0);
 
 	while (done < frames) {
 		u32 n = min_t(u32, frames - done, EBC_LUT_MAX_FRAMES);
@@ -711,7 +757,7 @@ VISIBLE_IF_KUNIT int rk3026_ebc_drive(struct rk3026_ebc *ebc, const u8 *lut,
 			budget = 1;
 
 		reinit_completion(&ebc->frame_done);
-		ebc_frame_kick(ebc, lut, chunk, n, done + n >= frames);
+		rk3026_ebc_frame_kick(ebc, lut, chunk, n, done + n >= frames);
 		ok = wait_for_completion_timeout(&ebc->frame_done,
 						msecs_to_jiffies(budget));
 		if (!ok) {
@@ -745,7 +791,7 @@ out:
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_drive);
 
 /**
- * ebc_recover_panel - drive the glass back to a state @prev_virt can describe
+ * ebc_recover_panel - drive the glass back to a state the prev half can describe
  * @ebc: controller
  * @temp: panel temperature, already clamped
  * @last: the update's record
@@ -757,13 +803,16 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_drive);
  *
  * That is what makes this repair cheap and content-preserving. It needs no third
  * buffer and no MST reprogramming, since the RESET reads neither image;
- * @next_virt keeps the snapshot untouched through the RESET and is drawn
+ * the next half keeps the snapshot untouched through the RESET and is drawn
  * immediately afterwards from a @prev that is now true.
  *
  * White is the state a RESET lands on -- the same assumption
  * rk3026_ebc_add_update() makes when it fills @next_shadow with 0xff for a
- * RESET. @prev_virt follows here, for the part's scan; @shadows.prev follows
- * in rk3026_ebc_scan_finish() (EBC_REPAIR_DONE), whatever the part's outcome.
+ * RESET. The half the part's scan reads as prev, @ebc->roles.prev, the
+ * half the pair written before the RESET names as MST0, follows here,
+ * every row of it (the finish accounts for it: rk3026_ebc_rows_whiten());
+ * @shadows.prev follows in rk3026_ebc_scan_finish() (EBC_REPAIR_DONE),
+ * whatever the part's outcome.
  *
  * Called for EBC_REPAIR_BY_RESET alone (ebc_repair_by() found the RESET
  * at @temp).
@@ -792,7 +841,7 @@ static enum rk3026_ebc_repair ebc_recover_panel(struct rk3026_ebc *ebc,
 			     last))
 		return EBC_REPAIR_FAILED;
 
-	memset(ebc->prev_virt, 0xff, ebc->img_size);
+	memset(ebc->half_virt[ebc->roles.prev], 0xff, ebc->img_size);
 	return EBC_REPAIR_DONE;
 }
 
@@ -1334,15 +1383,20 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_flip_fini);
  *     blit into @next_shadow and add to @pending as soon as the lock is
  *     dropped: the snapshot is what this scan drives, and their updates go
  *     to the next part.
- *  3. without it: the snapshot into @next_virt, a repair if the glass is
- *     not known, the waveform;
+ *  3. without it: the snapshot into the next half, in the rows where it
+ *     may differ (struct rk3026_ebc_shadows), a repair if the glass is not
+ *     known, the waveform; with @rotate the halves are those the
+ *     controller's last pair names (ebc_take_roles(), under the lock),
+ *     and prev goes into the prev half here too, in the rows where it may
+ *     differ, none as a rule;
  *  4. under @image_lock again: rk3026_ebc_scan_finish() says what the glass
  *     shows now and moves @pending.done_seq over the part, or arms the
  *     retry of a carry, the DU cleanup budget follows it
  *     (rk3026_ebc_du_account()), and the record is published and traced
  *     (part_done) with them. A commit event held to the finish for an
  *     update in the part is sent (ebc_flip_check()), the waiters on the
- *     part's updates are woken then, and @prev_virt follows.
+ *     part's updates are woken then, and in fixed roles the prev half
+ *     follows, in the rows where it may differ.
  *
  * The part is the carry alone at its retry (rk3026_ebc_retry_ready()).
  *
@@ -1363,7 +1417,9 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 	struct rk3026_ebc_a2 a2 = { 0 };
 	enum rk3026_ebc_gave_up gave_up;
 	struct rk3026_ebc_set part;
-	bool identical, prev_changed, two_level, prepared = false;
+	struct rk3026_ebc_roles roles = { EBC_HALF_LOW, EBC_HALF_HIGH };
+	struct rk3026_ebc_rows rows;
+	bool identical, two_level, prepared = false, wrote_next = false;
 	u32 frames, mode, scan_mode, resolved, lut_mode, tries;
 	u32 changed_px = 0;
 	const u8 *lut, *target;
@@ -1499,9 +1555,11 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 
 	/* An A2 scan over a grey of the glass comes back as DU. */
 	snap_start = ktime_get();
-	identical = !rk3026_ebc_build_snapshot(sh, target, &part.box,
+	rows = sh->scan_rows;
+	identical = !rk3026_ebc_build_snapshot(sh, target, &part.box, &rows,
 					       &scan_mode, &two_level,
 					       &a2.over_grey, &changed_px);
+	rk3026_ebc_rows_snapshot(sh, &rows);
 	last->snap_us = ebc_us_since(snap_start);
 	last->changed_px = changed_px;
 
@@ -1580,6 +1638,7 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 	forced = READ_ONCE(ebc->force_mode);
 	mode = forced >= 0 && forced <= EBC_MODE_MAX ? forced : resolved;
 	last->mode = mode;
+	roles = ebc_take_roles(ebc);
 	mutex_unlock(&ebc->image_lock);
 
 	/*
@@ -1610,13 +1669,30 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 		goto relock;
 	}
 
-	/* The controller reads the snapshot; nothing on the CPU reads it back. */
-	memcpy(ebc->next_virt, sh->scan, ebc->img_size);
+	/*
+	 * The controller reads the snapshot; nothing on the CPU reads it back.
+	 * Only the rows where the next half may differ from it are written,
+	 * and they are accounted for at the finish, under @image_lock
+	 * (rk3026_ebc_rows_put_scan()). With @rotate the prev half is made to
+	 * hold prev the same way (rk3026_ebc_rows_put_prev()): the half the
+	 * last scan drew into holds it already, but for the rows a part not
+	 * drawn, a repair or a RESET left stale.
+	 */
+	ebc->roles = roles;
+	rows = sh->half[roles.next].scan;
+	rk3026_ebc_rows_copy(ebc->half_virt[roles.next], sh->scan, sh->pitch,
+			     &rows);
+	if (ebc->rotate) {
+		rows = sh->half[roles.prev].prev;
+		rk3026_ebc_rows_copy(ebc->half_virt[roles.prev], sh->prev,
+				     sh->pitch, &rows);
+	}
+	wrote_next = true;
 
 	/*
 	 * Repair before drawing, never instead of it: this returns with the prev
-	 * images describing the glass again, and @next_virt still holding the
-	 * snapshot, so the part below is driven from a true prev.
+	 * images describing the glass again, and the next half still holding
+	 * the snapshot, so the part below is driven from a true prev.
 	 *
 	 * It must run BEFORE the LUT is fetched. rk3026_ebc_waveform_lut()
 	 * decodes into one buffer inside the container and hands out a pointer to
@@ -1660,6 +1736,18 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 
 relock:
 	mutex_lock(&ebc->image_lock);
+	/*
+	 * What step 3 wrote into the scanned images: the snapshot into the
+	 * next half, with @rotate prev into the prev half, and a repair's white
+	 * into the prev half (ebc_recover_panel()).
+	 */
+	if (wrote_next) {
+		rk3026_ebc_rows_put_scan(sh, roles.next);
+		if (ebc->rotate)
+			rk3026_ebc_rows_put_prev(sh, roles.prev);
+	}
+	if (repair_result == EBC_REPAIR_DONE)
+		rk3026_ebc_rows_whiten(sh, roles.prev);
 finish:
 	/*
 	 * What was driven in is now what the panel shows: once rk3026_ebc_drive()
@@ -1673,9 +1761,18 @@ finish:
 	 * then hold a still older image, equally false and carrying no mark
 	 * saying so. @prev_unknown is the mark, and the next draw acts on it.
 	 */
-	prev_changed = rk3026_ebc_scan_finish(sh, &ebc->pending, &part,
-					      last->outcome, repair_result,
-					      rk3026_ebc_clock(ebc), &gave_up);
+	rk3026_ebc_scan_finish(sh, &ebc->pending, &part, last->outcome,
+			       repair_result, rk3026_ebc_clock(ebc), &gave_up);
+	/*
+	 * In fixed roles the prev half follows @shadows.prev below, in the
+	 * rows where it may differ: those the part changed when the snapshot
+	 * became prev, every row after a repair or a RESET, none when prev was
+	 * kept. With @rotate nothing follows: the next part's pair names the
+	 * half the snapshot went into as prev.
+	 */
+	rows = (struct rk3026_ebc_rows){ 0 };
+	if (!ebc->rotate)
+		rows = rk3026_ebc_rows_put_prev(sh, EBC_HALF_LOW);
 	last->gave_up = gave_up != EBC_GAVE_UP_NONE;
 	if (last->gave_up) {
 		ebc->stats.carry_failed++;
@@ -1716,9 +1813,9 @@ finish:
 	 */
 	wake_up_all(&ebc->marker_wq);
 
-	/* Only this thread writes either prev image, so this needs no lock. */
-	if (prev_changed)
-		memcpy(ebc->prev_virt, sh->prev, ebc->img_size);
+	/* Only this thread writes either half, so this needs no lock. */
+	rk3026_ebc_rows_copy(ebc->half_virt[EBC_HALF_LOW], sh->prev, sh->pitch,
+			     &rows);
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_do_refresh);
 
@@ -2606,6 +2703,7 @@ static void ebc_crtc_atomic_enable(struct drm_crtc *crtc,
 	 */
 	mutex_lock(&ebc->image_lock);
 	WRITE_ONCE(ebc->crtc_on, true);
+	ebc->mst_explicit = true;
 	seq = rk3026_ebc_add_update(ebc, &upd);
 	mutex_unlock(&ebc->image_lock);
 	ebc_wait_finished(ebc, seq);
@@ -3401,9 +3499,10 @@ static int ebc_setup_buffers(struct rk3026_ebc *ebc)
 	ebc->img_size = (size_t)ebc->shadows.pitch * ebc->shadows.height;
 	pool = ebc->img_size * 2;
 
-	ebc->prev_virt = dmam_alloc_attrs(ebc->dev, pool, &ebc->prev_phys,
-					  GFP_KERNEL, DMA_ATTR_WRITE_COMBINE);
-	if (!ebc->prev_virt) {
+	ebc->half_virt[EBC_HALF_LOW] =
+		dmam_alloc_attrs(ebc->dev, pool, &ebc->half_phys[EBC_HALF_LOW],
+				 GFP_KERNEL, DMA_ATTR_WRITE_COMBINE);
+	if (!ebc->half_virt[EBC_HALF_LOW]) {
 		struct resource res;
 		resource_size_t avail;
 
@@ -3418,14 +3517,20 @@ static int ebc_setup_buffers(struct rk3026_ebc *ebc)
 				     pool, ebc->width, ebc->height, &res, &avail);
 	}
 
-	ebc->next_virt = ebc->prev_virt + ebc->img_size;
-	ebc->next_phys = ebc->prev_phys + ebc->img_size;
+	ebc->half_virt[EBC_HALF_HIGH] = ebc->half_virt[EBC_HALF_LOW] +
+					ebc->img_size;
+	ebc->half_phys[EBC_HALF_HIGH] = ebc->half_phys[EBC_HALF_LOW] +
+					ebc->img_size;
+	ebc->roles = (struct rk3026_ebc_roles){ EBC_HALF_LOW, EBC_HALF_HIGH };
+	ebc->rotate = IS_ENABLED(CONFIG_DRM_RK3026_EBC_ROTATE_BUFFERS);
 
-	dev_info(ebc->dev, "images: prev %pad next %pad (delta %#zx, one pool of %#zx)\n",
-		 &ebc->prev_phys, &ebc->next_phys, (size_t)ebc->img_size, pool);
+	dev_info(ebc->dev, "images: %pad and %pad (delta %#zx, one pool of %#zx), %s roles\n",
+		 &ebc->half_phys[EBC_HALF_LOW], &ebc->half_phys[EBC_HALF_HIGH],
+		 (size_t)ebc->img_size, pool,
+		 ebc->rotate ? "rotating" : "fixed");
 
 	/* The panel is assumed white after power-up. */
-	memset(ebc->prev_virt, 0xff, pool);
+	memset(ebc->half_virt[EBC_HALF_LOW], 0xff, pool);
 
 	ret = ebc_alloc_shadow(ebc, &ebc->next_shadow);
 	if (ret)
@@ -3474,6 +3579,8 @@ static void ebc_hw_setup(struct rk3026_ebc *ebc)
 			     FIELD_PREP_WM16(GRF_LVDS_OUT_SEL_BIT, 1));
 
 	ebc_program_regs(ebc);
+	/* The image pair is not known: the next part writes it explicitly. */
+	WRITE_ONCE(ebc->mst_explicit, true);
 }
 
 static int ebc_hw_init(struct rk3026_ebc *ebc)

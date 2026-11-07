@@ -21,6 +21,15 @@ irqreturn_t hantro_g1_irq(int irq, void *dev_id)
 	state = (status & G1_REG_INTERRUPT_DEC_RDY_INT) ?
 		 VB2_BUF_STATE_DONE : VB2_BUF_STATE_ERROR;
 
+	/* Debug only: the raw status of every job, never to be merged. */
+	dev_info(vpu->dev, "g1 irq status %08x%s%s%s%s%s%s\n", status,
+		 status & G1_REG_INTERRUPT_DEC_RDY_INT ? " rdy" : "",
+		 status & G1_REG_INTERRUPT_DEC_BUS_INT ? " bus" : "",
+		 status & G1_REG_INTERRUPT_DEC_BUFFER_INT ? " buffer" : "",
+		 status & G1_REG_INTERRUPT_DEC_ASO_INT ? " aso" : "",
+		 status & G1_REG_INTERRUPT_DEC_ERROR_INT ? " error" : "",
+		 status & G1_REG_INTERRUPT_DEC_TIMEOUT ? " timeout" : "");
+
 	vdpu_write(vpu, 0, G1_REG_INTERRUPT);
 	vdpu_write(vpu, G1_REG_CONFIG_DEC_CLK_GATE_E, G1_REG_CONFIG);
 

@@ -10588,6 +10588,66 @@ static void ebc_test_glue_plane_r8(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, ebc->plane_resync);
 }
 
+/* @p, XRGB8888, with the bytes of R and B swapped: XBGR8888 of the colour. */
+static u32 t_swap_rb(u32 p)
+{
+	return (p & 0xff00ff00) | (p >> 16 & 0xff) | (p & 0xff) << 16;
+}
+
+/*
+ * A plane of each other 32-bit format draws as an XRGB8888 plane of the
+ * same colours: ARGB8888 in XRGB8888's layout, XBGR8888 and ABGR8888 with
+ * R and B swapped, each with random alpha. The blit widens an odd box to
+ * whole bytes and leaves the rest of the target alone.
+ */
+static void ebc_test_glue_plane_rgb32(struct kunit *test)
+{
+	static const u32 formats[] = {
+		DRM_FORMAT_ARGB8888, DRM_FORMAT_XBGR8888, DRM_FORMAT_ABGR8888,
+	};
+	const unsigned int pitch = T_W * 4 + 8;
+	struct rk3026_ebc *ebc = t_ebc_alloc(test);
+	u8 *fb = kunit_kzalloc(test, pitch * T_H, GFP_KERNEL);
+	u32 *xrgb = t_plane_fb(test, 0);
+	u8 *want = t_img_alloc(test, 15);
+	struct rnd_state rs;
+	unsigned int i;
+	int x, y;
+
+	KUNIT_ASSERT_NOT_NULL(test, fb);
+	prandom_seed_state(&rs, 3233);
+	for (i = 0; i < T_W * T_H; i++)
+		xrgb[i] = prandom_u32_state(&rs) & 0xffffff;
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, xrgb, &t_odd_box));
+	memcpy(want, ebc->next_shadow, T_SIZE);
+	for (y = 0; y < T_H; y++)
+		for (x = 0; x < T_W; x++)
+			if (!t_in_rect(&t_odd_wide, x, y))
+				KUNIT_EXPECT_EQ_MSG(test, t_px(want, x, y), 15,
+						    "pixel %d,%d", x, y);
+
+	for (i = 0; i < ARRAY_SIZE(formats); i++) {
+		bool bgr = formats[i] != DRM_FORMAT_ARGB8888;
+
+		for (y = 0; y < T_H; y++) {
+			for (x = 0; x < T_W; x++) {
+				u32 p = xrgb[y * T_W + x];
+
+				p = (bgr ? t_swap_rb(p) : p) |
+				    (prandom_u32_state(&rs) & 0xff000000);
+				put_unaligned_le32(p, fb + y * pitch + x * 4);
+			}
+		}
+		t_img_fill(ebc->next_shadow, 15);
+		KUNIT_ASSERT_TRUE(test, rk3026_ebc_plane_update(ebc, fb, pitch,
+								formats[i],
+								&t_odd_box));
+		KUNIT_EXPECT_MEMEQ_MSG(test, ebc->next_shadow, want, T_SIZE,
+				       "%p4cc", &formats[i]);
+		t_expect_guard(test, ebc->next_shadow);
+	}
+}
+
 /*
  * A C8 plane: one index a pixel at the framebuffer's pitch. Without a
  * palette an index blits as the grey of R8; with the console's palette as
@@ -13397,6 +13457,58 @@ static void ebc_test_glue_kms_init(struct kunit *test)
 	KUNIT_EXPECT_NOT_NULL(test, ebc->connector.state);
 }
 
+/*
+ * Every format of the plane converts, plain and with every dither an mxcfb
+ * send can ask for (the formats without dither rows convert plainly),
+ * through no default branch of rk3026_ebc_blit(): a white source (all
+ * bytes 0xff: white in every format, index 255 at the default palette's
+ * white) over a black panel draws it white, and black (all bytes 0) over
+ * white draws it black. ARGB8888, XBGR8888 and ABGR8888 are among them.
+ */
+static void ebc_test_glue_plane_formats(struct kunit *test)
+{
+	static const enum rk3026_ebc_dither dithers[] = {
+		EBC_DITHER_NONE, EBC_DITHER_Y4, EBC_DITHER_Y1,
+	};
+	static const u32 needed[] = {
+		DRM_FORMAT_ARGB8888, DRM_FORMAT_XBGR8888, DRM_FORMAT_ABGR8888,
+	};
+	struct rk3026_ebc *ebc = t_kms_ebc(test);
+	u8 *src = kunit_kmalloc(test, T_W * 4 * T_H, GFP_KERNEL);
+	unsigned int i, d, k;
+
+	KUNIT_ASSERT_NOT_NULL(test, src);
+	for (i = 0; i < ARRAY_SIZE(needed); i++)
+		KUNIT_EXPECT_TRUE_MSG(test,
+				      drm_plane_has_format(&ebc->plane,
+							   needed[i],
+							   DRM_FORMAT_MOD_LINEAR),
+				      "%p4cc", &needed[i]);
+
+	for (i = 0; i < ebc->plane.format_count; i++) {
+		u32 format = ebc->plane.format_types[i];
+
+		for (d = 0; d < ARRAY_SIZE(dithers); d++) {
+			for (k = 0; k < 2; k++) {
+				u8 fill = k ? 0x00 : 0xff;
+
+				memset(src, fill, T_W * 4 * T_H);
+				t_img_fill(ebc->next_shadow, k ? 15 : 0);
+				mutex_lock(&ebc->image_lock);
+				rk3026_ebc_blit(ebc, src, T_W * 4, format,
+						&t_panel, dithers[d]);
+				mutex_unlock(&ebc->image_lock);
+				KUNIT_EXPECT_NULL_MSG(test,
+						      memchr_inv(ebc->next_shadow,
+								 fill, T_SIZE),
+						      "%p4cc dither %d fill %#x",
+						      &format, dithers[d], fill);
+			}
+		}
+	}
+	t_expect_guard(test, ebc->next_shadow);
+}
+
 static void t_kms_fb_destroy(struct drm_framebuffer *fb)
 {
 	drm_framebuffer_cleanup(fb);
@@ -13915,6 +14027,7 @@ static struct kunit_case rk3026_ebc_glue_test_cases[] = {
 	KUNIT_CASE(ebc_test_glue_plane_box_merge),
 	KUNIT_CASE(ebc_test_glue_plane_resync),
 	KUNIT_CASE(ebc_test_glue_plane_r8),
+	KUNIT_CASE(ebc_test_glue_plane_rgb32),
 	KUNIT_CASE(ebc_test_glue_plane_c8),
 	KUNIT_CASE(ebc_test_glue_palette_swap),
 #if IS_ENABLED(CONFIG_DRM_RK3026_EBC_MXCFB)
@@ -13962,6 +14075,7 @@ static struct kunit_case rk3026_ebc_glue_test_cases[] = {
 	KUNIT_CASE(ebc_test_glue_flip_take_window),
 	KUNIT_CASE(ebc_test_glue_flip_take_sleep),
 	KUNIT_CASE(ebc_test_glue_kms_init),
+	KUNIT_CASE(ebc_test_glue_plane_formats),
 	KUNIT_CASE(ebc_test_glue_kms_palette),
 	{}
 };
@@ -16089,6 +16203,287 @@ static void ebc_test_blit_convert(struct kunit *test)
 			return;
 }
 
+/* rk3026_ebc_blit_rows() of the other 32-bit formats. */
+static void t_argb_rows(u8 *dst, const void *src, unsigned int src_pitch,
+			int x1, int x2, int y1, int y2, unsigned int width)
+{
+	rk3026_ebc_blit_rows(dst, src, src_pitch, DRM_FORMAT_ARGB8888, x1, x2,
+			     y1, y2, width);
+}
+
+static void t_xbgr_rows(u8 *dst, const void *src, unsigned int src_pitch,
+			int x1, int x2, int y1, int y2, unsigned int width)
+{
+	rk3026_ebc_blit_rows(dst, src, src_pitch, DRM_FORMAT_XBGR8888, x1, x2,
+			     y1, y2, width);
+}
+
+static void t_abgr_rows(u8 *dst, const void *src, unsigned int src_pitch,
+			int x1, int x2, int y1, int y2, unsigned int width)
+{
+	rk3026_ebc_blit_rows(dst, src, src_pitch, DRM_FORMAT_ABGR8888, x1, x2,
+			     y1, y2, width);
+}
+
+#if IS_ENABLED(CONFIG_DRM_RK3026_EBC_NEON)
+/* rk3026_ebc_blit_rows_neon() of the other 32-bit formats. */
+static void t_argb_neon(u8 *dst, const void *src, unsigned int src_pitch,
+			int x1, int x2, int y1, int y2, unsigned int width)
+{
+	scoped_ksimd()
+		rk3026_ebc_blit_rows_neon(dst, src, src_pitch,
+					  DRM_FORMAT_ARGB8888, x1, x2, y1, y2,
+					  width);
+}
+
+static void t_xbgr_neon(u8 *dst, const void *src, unsigned int src_pitch,
+			int x1, int x2, int y1, int y2, unsigned int width)
+{
+	scoped_ksimd()
+		rk3026_ebc_blit_rows_neon(dst, src, src_pitch,
+					  DRM_FORMAT_XBGR8888, x1, x2, y1, y2,
+					  width);
+}
+
+static void t_abgr_neon(u8 *dst, const void *src, unsigned int src_pitch,
+			int x1, int x2, int y1, int y2, unsigned int width)
+{
+	scoped_ksimd()
+		rk3026_ebc_blit_rows_neon(dst, src, src_pitch,
+					  DRM_FORMAT_ABGR8888, x1, x2, y1, y2,
+					  width);
+}
+
+/* The NEON rows of each entry of t_fmt32s[], in its order. */
+static t_rows_fn *const t_fmt32_neon[] = {
+	t_argb_neon, t_xbgr_neon, t_abgr_neon,
+};
+#endif
+
+/*
+ * The 32-bit formats beside XRGB8888: the scalar rows of each and its
+ * per-pixel reference. ARGB8888 is XRGB8888's layout, XBGR8888 and
+ * ABGR8888 hold R in the low byte; the alpha byte is ignored.
+ */
+static const struct t_fmt32 {
+	u32 format;
+	t_rows_fn *rows;
+	t_rows_fn *ref_rows;
+} t_fmt32s[] = {
+	{ DRM_FORMAT_ARGB8888, t_argb_rows, rk3026_ebc_ref_blit_rows },
+	{ DRM_FORMAT_XBGR8888, t_xbgr_rows, rk3026_ebc_ref_blit_rows_bgr },
+	{ DRM_FORMAT_ABGR8888, t_abgr_rows, rk3026_ebc_ref_blit_rows_bgr },
+};
+
+/*
+ * rk3026_ebc_blit_rows() of ARGB8888, XBGR8888 and ABGR8888 writes the
+ * bytes of the per-pixel reference of its byte order: every fixture,
+ * source set (a random alpha byte in each), dense and padded pitch, clip.
+ */
+static void ebc_test_rgb32_rows(struct kunit *test)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(t_fmt32s); i++) {
+		kunit_info(test, "%p4cc\n", &t_fmt32s[i].format);
+		t_rows_sets(test, t_fmt32s[i].rows, t_fmt32s[i].ref_rows);
+	}
+}
+
+/* The 4-px stores and the 2-px tail from every start, each format. */
+static void ebc_test_rgb32_rows_tails(struct kunit *test)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(t_fmt32s); i++) {
+		kunit_info(test, "%p4cc\n", &t_fmt32s[i].format);
+		t_rows_tails(test, t_fmt32s[i].rows, t_fmt32s[i].ref_rows);
+	}
+}
+
+#if IS_ENABLED(CONFIG_DRM_RK3026_EBC_NEON)
+static_assert(ARRAY_SIZE(t_fmt32_neon) == ARRAY_SIZE(t_fmt32s));
+
+/*
+ * rk3026_ebc_blit_rows_neon() of each 32-bit format writes the bytes of
+ * its rk3026_ebc_blit_rows(): every fixture, source set, pitch and clip.
+ */
+static void ebc_test_rgb32_neon_rows(struct kunit *test)
+{
+	unsigned int i;
+
+	if (!t_neon_ready(test))
+		return;
+	for (i = 0; i < ARRAY_SIZE(t_fmt32s); i++) {
+		kunit_info(test, "%p4cc\n", &t_fmt32s[i].format);
+		t_rows_sets(test, t_fmt32_neon[i], t_fmt32s[i].rows);
+	}
+}
+
+/* The 16-px blocks and every tail after them, each format. */
+static void ebc_test_rgb32_neon_tails(struct kunit *test)
+{
+	unsigned int i;
+
+	if (!t_neon_ready(test))
+		return;
+	for (i = 0; i < ARRAY_SIZE(t_fmt32s); i++) {
+		kunit_info(test, "%p4cc\n", &t_fmt32s[i].format);
+		t_rows_tails(test, t_fmt32_neon[i], t_fmt32s[i].rows);
+	}
+}
+#else
+/* No NEON rows: a skip. */
+static void ebc_test_rgb32_neon_rows(struct kunit *test)
+{
+	t_neon_ready(test);
+}
+
+static void ebc_test_rgb32_neon_tails(struct kunit *test)
+{
+	t_neon_ready(test);
+}
+#endif
+
+/*
+ * rk3026_ebc_blit() of each 32-bit format widens and clamps the clip and
+ * writes the bytes of its reference, as for XRGB8888; asked for either
+ * dither, it converts plainly: these formats have no dither rows.
+ */
+static void ebc_test_ref_blit_rgb32(struct kunit *test)
+{
+	static const enum rk3026_ebc_dither dithers[] = {
+		EBC_DITHER_NONE, EBC_DITHER_Y4, EBC_DITHER_Y1,
+	};
+	unsigned int i, d;
+
+	for (i = 0; i < ARRAY_SIZE(t_fmt32s); i++) {
+		for (d = 0; d < ARRAY_SIZE(dithers); d++) {
+			const struct t_blit_fmt fmt = {
+				t_fmt32s[i].format, t_fmt32s[i].ref_rows,
+				dithers[d],
+			};
+
+			kunit_info(test, "%p4cc dither %d\n", &fmt.format,
+				   fmt.dither);
+			t_blit_sets(test, &t_xrgb_srcs, &fmt);
+		}
+	}
+}
+
+/*
+ * The colours of ebc_test_rgb32_as_xrgb(), and the nibble each converts
+ * to, (77 R + 150 G + 29 B) / 256 / 16: black, white, the primaries and
+ * secondaries, a grey and a colour between the steps.
+ */
+static const struct {
+	u32 xrgb;
+	u8 nibble;
+} t_rgb32_cols[] = {
+	{ 0x000000, 0 }, { 0xffffff, 15 }, { 0xff0000, 4 }, { 0x00ff00, 9 },
+	{ 0x0000ff, 1 }, { 0xffff00, 14 }, { 0xff00ff, 6 }, { 0x00ffff, 11 },
+	{ 0x808080, 8 }, { 0x204060, 3 },
+};
+
+/*
+ * A colour of every 32-bit format converts as the same colour in
+ * XRGB8888, whatever its alpha: rk3026_ebc_blit() of the format and of
+ * XRGB8888 write the same bytes, on rows of the fixed colours (whose
+ * nibbles are checked as well), a grey ramp, a colour gradient and random
+ * colours, from a source pitch wider than the row and through odd clips.
+ */
+static void ebc_test_rgb32_as_xrgb(struct kunit *test)
+{
+	static const struct t_fix f = { "40x4", 40, 4 };
+	static const struct drm_rect clips[] = {
+		DRM_RECT_INIT(0, 0, 40, 4), DRM_RECT_INIT(1, 0, 37, 4),
+		DRM_RECT_INIT(3, 1, 18, 2), DRM_RECT_INIT(17, 0, 1, 4),
+	};
+	const unsigned int pitch = f.w * 4 + 12;
+	struct rk3026_ebc *ebc = kunit_kzalloc(test, sizeof(*ebc), GFP_KERNEL);
+	u8 *xrgb = kunit_kzalloc(test, (size_t)pitch * f.h, GFP_KERNEL);
+	u8 *src = kunit_kzalloc(test, (size_t)pitch * f.h, GFP_KERNEL);
+	u8 *out = t_fix_img(test, &f);
+	u8 *ref = t_fix_img(test, &f);
+	struct rnd_state rs;
+	unsigned int i, c;
+	int x, y;
+
+	KUNIT_ASSERT_NOT_NULL(test, ebc);
+	KUNIT_ASSERT_NOT_NULL(test, xrgb);
+	KUNIT_ASSERT_NOT_NULL(test, src);
+	mutex_init(&ebc->image_lock);
+	ebc->width = f.w;
+	ebc->height = f.h;
+	prandom_seed_state(&rs, 3232);
+	for (y = 0; y < f.h; y++) {
+		for (x = 0; x < f.w; x++) {
+			u32 p;
+
+			switch (y) {
+			case 0:
+				p = t_rgb32_cols[x % ARRAY_SIZE(t_rgb32_cols)].xrgb;
+				break;
+			case 1:
+				p = (x * 255 / (f.w - 1)) * 0x010101;
+				break;
+			case 2:
+				p = (x * 6) << 16 | (255 - x * 6) << 8 | x * 3;
+				break;
+			default:
+				p = prandom_u32_state(&rs) & 0xffffff;
+				break;
+			}
+			put_unaligned_le32(p, xrgb + y * pitch + x * 4);
+		}
+	}
+
+	for (i = 0; i < ARRAY_SIZE(t_fmt32s); i++) {
+		u32 format = t_fmt32s[i].format;
+		bool bgr = format != DRM_FORMAT_ARGB8888;
+
+		for (y = 0; y < f.h; y++) {
+			for (x = 0; x < f.w; x++) {
+				u32 p = get_unaligned_le32(xrgb + y * pitch +
+							   x * 4);
+
+				p = (bgr ? t_swap_rb(p) : p) |
+				    (prandom_u32_state(&rs) & 0xff000000);
+				put_unaligned_le32(p, src + y * pitch + x * 4);
+			}
+		}
+		for (c = 0; c < ARRAY_SIZE(clips); c++) {
+			int diff;
+
+			memset(out, 0x5a, t_fix_size(&f));
+			memset(ref, 0x5a, t_fix_size(&f));
+			mutex_lock(&ebc->image_lock);
+			ebc->next_shadow = out;
+			rk3026_ebc_blit(ebc, src, pitch, format, &clips[c],
+					EBC_DITHER_NONE);
+			ebc->next_shadow = ref;
+			rk3026_ebc_blit(ebc, xrgb, pitch, DRM_FORMAT_XRGB8888,
+					&clips[c], EBC_DITHER_NONE);
+			mutex_unlock(&ebc->image_lock);
+			diff = t_fix_diff(&f, ref, out);
+			KUNIT_EXPECT_EQ_MSG(test, diff, INT_MAX,
+					    "%p4cc clip " DRM_RECT_FMT,
+					    &format, DRM_RECT_ARG(&clips[c]));
+		}
+		/* Row 0, the fixed colours, pixel by pixel. */
+		ebc->next_shadow = out;
+		mutex_lock(&ebc->image_lock);
+		rk3026_ebc_blit(ebc, src, pitch, format, &clips[0],
+				EBC_DITHER_NONE);
+		mutex_unlock(&ebc->image_lock);
+		for (x = 0; x < f.w; x++)
+			KUNIT_EXPECT_EQ_MSG(test, t_px_w(out, &f, x, 0),
+					    t_rgb32_cols[x % ARRAY_SIZE(t_rgb32_cols)].nibble,
+					    "%p4cc pixel %d", &format, x);
+		KUNIT_EXPECT_TRUE(test, t_fix_guard_ok(&f, out));
+	}
+}
+
 /*
  * rk3026_ebc_grey_level() on every grey: at most 15, the nearest level
  * (|g - 17 * level| <= 8, no tie as 17 is odd), so the levels k * 17 of a
@@ -17118,6 +17513,12 @@ static struct kunit_case rk3026_ebc_conv_test_cases[] = {
 	KUNIT_CASE(ebc_test_blit_neon_rows),
 	KUNIT_CASE(ebc_test_blit_neon_tails),
 	KUNIT_CASE(ebc_test_blit_convert),
+	KUNIT_CASE(ebc_test_rgb32_rows),
+	KUNIT_CASE(ebc_test_rgb32_rows_tails),
+	KUNIT_CASE(ebc_test_rgb32_neon_rows),
+	KUNIT_CASE(ebc_test_rgb32_neon_tails),
+	KUNIT_CASE(ebc_test_ref_blit_rgb32),
+	KUNIT_CASE(ebc_test_rgb32_as_xrgb),
 	KUNIT_CASE(ebc_test_grey_level),
 	KUNIT_CASE(ebc_test_r8_rows),
 	KUNIT_CASE(ebc_test_r8_rows_tails),

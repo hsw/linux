@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Rockchip RK3026 EBC: XRGB8888 and R8 to packed 4bpp grey with NEON.
+ * Rockchip RK3026 EBC: 32-bit RGB and R8 to packed 4bpp grey with NEON.
  *
  * Built with CC_FLAGS_FPU, so the compiler may use NEON anywhere in this
  * unit: nothing here may run outside a kernel-mode NEON section.
@@ -19,7 +19,9 @@
  * The source is read once and nothing is tested, so every page costs about
  * the same; on the RK3026 (Cortex-A9 at 600 MHz, with the L2 cache
  * controller's prefetch and line-fill options set as the vendor firmware
- * sets them) that is the memory floor.
+ * sets them) that is the memory floor. ARGB8888 takes the same rows;
+ * XBGR8888 and ABGR8888 the same with the planes of R and B exchanged at
+ * the multiplies, which costs nothing.
  *
  * For R8 each grey is rounded to the nearest level as (g * 15 + 135) >> 8
  * (rk3026_ebc_grey_level()). Per 32 pixels: vld2.8 splits the even and the
@@ -38,42 +40,51 @@
 
 #include "rk3026_ebc_blit_neon.h"
 
-/* The grey nibble of the XRGB8888 pixel at @s (B, G, R, X in memory). */
-static __always_inline unsigned char ebc_neon_nibble(const unsigned char *s)
+/*
+ * The grey nibble of the 32-bit pixel at @s whose byte @r is R and byte
+ * 2 - @r is B: @r = 2 for XRGB8888 (B, G, R, X in memory), 0 for XBGR8888
+ * (R, G, B, X).
+ */
+static __always_inline unsigned char ebc_neon_nibble(const unsigned char *s,
+						     int r)
 {
-	return (77 * s[2] + 150 * s[1] + 29 * s[0]) >> 12;
+	return (77 * s[r] + 150 * s[1] + 29 * s[2 - r]) >> 12;
 }
 
-/* Sixteen pixels at @s into eight bytes, pixel 0 in the low nibble. */
-static __always_inline uint8x8_t ebc_neon_pack16(const unsigned char *s)
+/*
+ * Sixteen 32-bit pixels at @s into eight bytes, pixel 0 in the low nibble;
+ * @r as for ebc_neon_nibble(), the plane of R after vld4.8.
+ */
+static __always_inline uint8x8_t ebc_neon_pack16(const unsigned char *s,
+						 int r)
 {
 	const uint8x8_t k77 = vdup_n_u8(77);
 	const uint8x8_t k150 = vdup_n_u8(150);
 	const uint8x8_t k29 = vdup_n_u8(29);
-	uint8x16x4_t v = vld4q_u8(s);	/* val[0] B, [1] G, [2] R, [3] X */
+	uint8x16x4_t v = vld4q_u8(s);	/* the bytes of a pixel, G in val[1] */
 	uint16x8_t lo, hi;
 	uint8x8x2_t eo;
 
-	lo = vmull_u8(vget_low_u8(v.val[2]), k77);
-	hi = vmull_u8(vget_high_u8(v.val[2]), k77);
+	lo = vmull_u8(vget_low_u8(v.val[r]), k77);
+	hi = vmull_u8(vget_high_u8(v.val[r]), k77);
 	lo = vmlal_u8(lo, vget_low_u8(v.val[1]), k150);
 	hi = vmlal_u8(hi, vget_high_u8(v.val[1]), k150);
-	lo = vmlal_u8(lo, vget_low_u8(v.val[0]), k29);
-	hi = vmlal_u8(hi, vget_high_u8(v.val[0]), k29);
+	lo = vmlal_u8(lo, vget_low_u8(v.val[2 - r]), k29);
+	hi = vmlal_u8(hi, vget_high_u8(v.val[2 - r]), k29);
 	eo = vuzp_u8(vshrn_n_u16(lo, 8), vshrn_n_u16(hi, 8));	/* even, odd */
 	return vsri_n_u8(eo.val[1], eo.val[0], 4);
 }
 
 /*
- * The XRGB8888 rows: sixteen pixels at a time, with the source read 256
- * bytes ahead (pld, as prefetch()); a row's last 2 to 14 pixels take the
- * luma two at a time.
+ * The 32-bit rows, @r as for ebc_neon_nibble(): sixteen pixels at a time,
+ * with the source read 256 bytes ahead (pld, as prefetch()); a row's last
+ * 2 to 14 pixels take the luma two at a time.
  */
-static __always_inline void ebc_neon_xrgb_rows(unsigned char *dst,
-					       const void *src,
-					       unsigned int src_pitch, int x1,
-					       int x2, int y1, int y2,
-					       unsigned int width)
+static __always_inline void ebc_neon_rgb32_rows(unsigned char *dst,
+						const void *src,
+						unsigned int src_pitch, int x1,
+						int x2, int y1, int y2,
+						unsigned int width, int r)
 {
 	int y;
 
@@ -86,10 +97,11 @@ static __always_inline void ebc_neon_xrgb_rows(unsigned char *dst,
 		for (; n >= 16; n -= 16, s += 64, d += 8) {
 			__builtin_prefetch(s + 256);
 			__builtin_prefetch(s + 256 + 32);
-			vst1_u8(d, ebc_neon_pack16(s));
+			vst1_u8(d, ebc_neon_pack16(s, r));
 		}
 		for (; n > 0; n -= 2, s += 8, d++)
-			*d = ebc_neon_nibble(s) | ebc_neon_nibble(s + 4) << 4;
+			*d = ebc_neon_nibble(s, r) |
+			     ebc_neon_nibble(s + 4, r) << 4;
 	}
 }
 
@@ -155,7 +167,8 @@ static __always_inline void ebc_neon_r8_rows(unsigned char *dst,
  * @dst: target image, @width / 2 bytes per row, low nibble first
  * @src: source, top-left of the whole framebuffer
  * @src_pitch: source stride in bytes
- * @format: source format, EBC_NEON_XRGB8888 or EBC_NEON_R8
+ * @format: source format: EBC_NEON_XRGB8888, EBC_NEON_ARGB8888,
+ *	EBC_NEON_XBGR8888, EBC_NEON_ABGR8888 or EBC_NEON_R8
  * @x1: first column, even
  * @x2: end column, even, at most @width, above @x1
  * @y1: first row
@@ -174,7 +187,14 @@ void rk3026_ebc_blit_rows_neon(unsigned char *dst, const void *src,
 {
 	switch (format) {
 	case EBC_NEON_XRGB8888:
-		ebc_neon_xrgb_rows(dst, src, src_pitch, x1, x2, y1, y2, width);
+	case EBC_NEON_ARGB8888:
+		ebc_neon_rgb32_rows(dst, src, src_pitch, x1, x2, y1, y2, width,
+				    2);
+		break;
+	case EBC_NEON_XBGR8888:
+	case EBC_NEON_ABGR8888:
+		ebc_neon_rgb32_rows(dst, src, src_pitch, x1, x2, y1, y2, width,
+				    0);
 		break;
 	case EBC_NEON_R8:
 		ebc_neon_r8_rows(dst, src, src_pitch, x1, x2, y1, y2, width);

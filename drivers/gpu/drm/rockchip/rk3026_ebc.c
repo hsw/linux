@@ -556,16 +556,17 @@ static u32 ebc_us_since(ktime_t start)
  *
  * The panel is 4bpp with two pixels per byte, low nibble first. The clip is
  * widened to an even pixel boundary so byte writes stay whole, and clamped
- * to the panel. XRGB8888 and R8 go through rk3026_ebc_blit_convert() with
- * their format: the top four bits of the luma, the nearest of the 16
- * levels; C8 through rk3026_ebc_blit_c8_rows(), a byte lookup in
- * @c8_levels, the levels of the palette. A format with no conversion here
- * is a driver bug: it warns once and writes nothing.
+ * to the panel. The 32-bit formats and R8 go through
+ * rk3026_ebc_blit_convert() with their format: the top four bits of the
+ * luma, the nearest of the 16 levels; C8 through rk3026_ebc_blit_c8_rows(),
+ * a byte lookup in @c8_levels, the levels of the palette. A format with no
+ * conversion here is a driver bug: it warns once and writes nothing.
  *
  * With @dither other than EBC_DITHER_NONE, XRGB8888 and R8 go through
- * rk3026_ebc_blit_dither() instead. C8 takes no dither: only the plane,
- * which never asks for one, blits indices, and an mxcfb send blits a C8
- * framebuffer as R8.
+ * rk3026_ebc_blit_dither() instead. The other formats take no dither and
+ * convert plainly: an mxcfb send, the only sender that asks, blits the
+ * fbdev's XRGB8888, or its C8 as R8, and only the plane, which never asks,
+ * blits the others.
  *
  * Writes @next_shadow. Called under @image_lock, in the same section that
  * queues the update, so no snapshot sees the pixels without their update.
@@ -589,14 +590,19 @@ u32 rk3026_ebc_blit(struct rk3026_ebc *ebc, const void *src,
 	switch (format) {
 	case DRM_FORMAT_XRGB8888:
 	case DRM_FORMAT_R8:
-		if (dither != EBC_DITHER_NONE)
+		if (dither != EBC_DITHER_NONE) {
 			rk3026_ebc_blit_dither(ebc->next_shadow, src,
 					       src_pitch, format, r.x1, r.x2,
 					       r.y1, r.y2, ebc->width, dither);
-		else
-			rk3026_ebc_blit_convert(ebc->next_shadow, src,
-						src_pitch, format, r.x1, r.x2,
-						r.y1, r.y2, ebc->width);
+			break;
+		}
+		fallthrough;
+	case DRM_FORMAT_ARGB8888:
+	case DRM_FORMAT_XBGR8888:
+	case DRM_FORMAT_ABGR8888:
+		rk3026_ebc_blit_convert(ebc->next_shadow, src, src_pitch,
+					format, r.x1, r.x2, r.y1, r.y2,
+					ebc->width);
 		break;
 	case DRM_FORMAT_C8:
 		rk3026_ebc_blit_c8_rows(ebc->next_shadow, src, src_pitch,
@@ -2374,6 +2380,11 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_wait_marker);
 
 /*
  * XRGB8888 first, the format of the fbdev emulation and of most clients.
+ * ARGB8888, XBGR8888 and ABGR8888 are the other 32-bit layouts a client
+ * may render in (Android's composer hands its target and its layers over
+ * as ABGR8888, XBGR8888 and ARGB8888): each colour shows as it would in
+ * XRGB8888, and the alpha byte is ignored, as the plane has nothing below
+ * it (a premultiplied colour without its alpha is that colour over black).
  * C8 is indexed through the CRTC's GAMMA_LUT as its palette, each colour
  * shown as the nearest level to its luma (rk3026_ebc_load_palette()); it
  * is also the 8-bit fbdev format of "video=<connector>:<width>x<height>-8"
@@ -2385,6 +2396,9 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_wait_marker);
  */
 static const u32 ebc_plane_formats[] = {
 	DRM_FORMAT_XRGB8888,
+	DRM_FORMAT_ARGB8888,
+	DRM_FORMAT_XBGR8888,
+	DRM_FORMAT_ABGR8888,
 	DRM_FORMAT_C8,
 	DRM_FORMAT_R8,
 };

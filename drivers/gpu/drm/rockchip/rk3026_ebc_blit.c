@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Rockchip RK3026 EBC: XRGB8888 and 8-bit grey to the panel's packed 4bpp
- * grey.
+ * Rockchip RK3026 EBC: 32-bit RGB and 8-bit grey to the panel's packed
+ * 4bpp grey.
  *
  * Every plane and mxcfb update converts its damage here, under @image_lock,
  * so this loop is most of the CPU time of a refresh. It is a pure function
@@ -12,7 +12,11 @@
  * its rows with a loop of that format. For XRGB8888 the grey is the BT.601
  * luma, (77 R + 150 G + 29 B) / 256 rounded down, and the nibble is its
  * top four bits: the same few operations for every pixel, with no test of
- * the content, so every page costs the same.
+ * the content, so every page costs the same. ARGB8888 takes the same rows,
+ * XBGR8888 and ABGR8888 the same with the weights of R and B exchanged:
+ * a colour gives the same nibble in all four, at the same cost. The alpha
+ * byte is ignored: the plane has nothing below it, and a premultiplied
+ * colour without its alpha is that colour over black.
  *
  * With CONFIG_DRM_RK3026_EBC_NEON, rk3026_ebc_blit_convert() runs the NEON
  * rows of rk3026_ebc_blit_neon.c instead where it can, and these rows
@@ -57,39 +61,55 @@
 #include "rk3026_ebc_blit_neon.h"
 
 static_assert(EBC_NEON_XRGB8888 == DRM_FORMAT_XRGB8888);
+static_assert(EBC_NEON_ARGB8888 == DRM_FORMAT_ARGB8888);
+static_assert(EBC_NEON_XBGR8888 == DRM_FORMAT_XBGR8888);
+static_assert(EBC_NEON_ABGR8888 == DRM_FORMAT_ABGR8888);
 static_assert(EBC_NEON_R8 == DRM_FORMAT_R8);
 
 /*
- * The luma of one XRGB8888 pixel @p in bits 31:24, so its nibble is in bits
- * 31:28. With a = @p & 0x00ff00ff (R << 16 | B), a * 0x001d004d holds
- * 77 R + 29 B in the high half (29 R leaves at bit 32) and 77 B < 2^16 in
- * the low half, and (@p & 0xff00) * 0x9600 adds 150 G to the high half:
- * the high half is the sum, and the low half cannot carry into it.
- * a * (0x001d004d - 0x9600) + @p * 0x9600 is the same mod 2^32 with one
- * mask less: @p * 0x9600 adds the 150 R << 24 and 150 B << 8 that
- * a * -0x9600 takes away, and the X byte leaves at bit 32.
+ * The BT.601 weights of the two outer bytes of a 32-bit pixel, for
+ * ebc_luma_k(): EBC_LUMA_XRGB for R in bits 23:16 (XRGB8888, ARGB8888),
+ * EBC_LUMA_XBGR for R in bits 7:0 (XBGR8888, ABGR8888).
  */
-static __always_inline u32 ebc_luma(u32 p)
+#define EBC_LUMA_XRGB	(0x001d004d - 0x9600)
+#define EBC_LUMA_XBGR	(0x004d001d - 0x9600)
+
+/*
+ * The luma of one XRGB8888 pixel @p in bits 31:24 with @k = EBC_LUMA_XRGB,
+ * so its nibble is in bits 31:28. With a = @p & 0x00ff00ff (R << 16 | B),
+ * a * 0x001d004d holds 77 R + 29 B in the high half (29 R leaves at bit
+ * 32) and 77 B < 2^16 in the low half, and (@p & 0xff00) * 0x9600 adds
+ * 150 G to the high half: the high half is the sum, and the low half
+ * cannot carry into it. a * (0x001d004d - 0x9600) + @p * 0x9600 is the
+ * same mod 2^32 with one mask less: @p * 0x9600 adds the 150 R << 24 and
+ * 150 B << 8 that a * -0x9600 takes away, and the X byte leaves at bit 32.
+ *
+ * In an XBGR8888 pixel a is B << 16 | R, and @k = EBC_LUMA_XBGR swaps the
+ * two weights: 77 R + 29 B again in the high half, 29 R < 2^16 in the low
+ * one. The sum, and so the luma, is that of the same colour in XRGB8888,
+ * at the same cost.
+ */
+static __always_inline u32 ebc_luma_k(u32 p, u32 k)
 {
-	return (p & 0x00ff00ff) * 0x001c6a4d + p * 0x9600;
+	return (p & 0x00ff00ff) * k + p * 0x9600;
 }
 
-/* Two pixels into one byte, @p0 in the low nibble. */
-static __always_inline u32 ebc_pack2(u32 p0, u32 p1)
+/* Two pixels into one byte, @p0 in the low nibble; @k as for ebc_luma_k(). */
+static __always_inline u32 ebc_pack2(u32 p0, u32 p1, u32 k)
 {
-	return (ebc_luma(p0) >> 28) | ((ebc_luma(p1) >> 24) & 0xf0);
+	return (ebc_luma_k(p0, k) >> 28) | ((ebc_luma_k(p1, k) >> 24) & 0xf0);
 }
 
 /*
- * The XRGB8888 rows: four pixels per 16-bit store, with the source
- * prefetched 128 bytes ahead (twice per 32-byte cache line); a row's last
- * two pixels, if any, go into one byte. Four pixels, not eight: a body of
- * eight pixels spills registers at -Os on 32-bit ARM.
+ * The 32-bit rows, @k as for ebc_luma_k(): four pixels per 16-bit store,
+ * with the source prefetched 128 bytes ahead (twice per 32-byte cache
+ * line); a row's last two pixels, if any, go into one byte. Four pixels,
+ * not eight: a body of eight pixels spills registers at -Os on 32-bit ARM.
  */
-static __always_inline void ebc_xrgb_rows(u8 *dst, const void *src,
-					  unsigned int src_pitch, int x1,
-					  int x2, int y1, int y2,
-					  unsigned int width)
+static __always_inline void ebc_rgb32_rows(u8 *dst, const void *src,
+					   unsigned int src_pitch, int x1,
+					   int x2, int y1, int y2,
+					   unsigned int width, u32 k)
 {
 	int y;
 
@@ -101,15 +121,23 @@ static __always_inline void ebc_xrgb_rows(u8 *dst, const void *src,
 		for (; n >= 4; n -= 4, s += 16, d += 2) {
 			prefetch(s + 128);
 			put_unaligned_le16(ebc_pack2(get_unaligned_le32(s),
-						     get_unaligned_le32(s + 4)) |
+						     get_unaligned_le32(s + 4),
+						     k) |
 					   ebc_pack2(get_unaligned_le32(s + 8),
-						     get_unaligned_le32(s + 12)) << 8,
+						     get_unaligned_le32(s + 12),
+						     k) << 8,
 					   d);
 		}
 		for (; n > 0; n -= 2, s += 8, d++)
 			*d = ebc_pack2(get_unaligned_le32(s),
-				       get_unaligned_le32(s + 4));
+				       get_unaligned_le32(s + 4), k);
 	}
+}
+
+/* The luma of an XRGB8888 pixel, as ebc_luma_k() computes it. */
+static __always_inline u32 ebc_luma(u32 p)
+{
+	return ebc_luma_k(p, EBC_LUMA_XRGB);
 }
 
 /*
@@ -162,7 +190,8 @@ static __always_inline void ebc_r8_rows(u8 *dst, const void *src,
  * @dst: target image, @width / 2 bytes per row, low nibble first
  * @src: source, top-left of the whole framebuffer
  * @src_pitch: source stride in bytes
- * @format: source format, DRM_FORMAT_XRGB8888 or DRM_FORMAT_R8
+ * @format: source format: DRM_FORMAT_XRGB8888, DRM_FORMAT_ARGB8888,
+ *	DRM_FORMAT_XBGR8888, DRM_FORMAT_ABGR8888 or DRM_FORMAT_R8
  * @x1: first column, even
  * @x2: end column, even, at most @width, above @x1
  * @y1: first row
@@ -170,7 +199,7 @@ static __always_inline void ebc_r8_rows(u8 *dst, const void *src,
  * @width: image width in pixels
  *
  * Writes bytes @x1 / 2 to @x2 / 2 of rows @y1 to @y2 of @dst, nothing else:
- * the top four bits of the luma of an XRGB8888 pixel, the
+ * the top four bits of the luma of a 32-bit pixel, alpha ignored, the
  * rk3026_ebc_grey_level() of an R8 one. Any other format writes nothing.
  */
 void rk3026_ebc_blit_rows(u8 *dst, const void *src, unsigned int src_pitch,
@@ -179,7 +208,14 @@ void rk3026_ebc_blit_rows(u8 *dst, const void *src, unsigned int src_pitch,
 {
 	switch (format) {
 	case DRM_FORMAT_XRGB8888:
-		ebc_xrgb_rows(dst, src, src_pitch, x1, x2, y1, y2, width);
+	case DRM_FORMAT_ARGB8888:
+		ebc_rgb32_rows(dst, src, src_pitch, x1, x2, y1, y2, width,
+			       EBC_LUMA_XRGB);
+		break;
+	case DRM_FORMAT_XBGR8888:
+	case DRM_FORMAT_ABGR8888:
+		ebc_rgb32_rows(dst, src, src_pitch, x1, x2, y1, y2, width,
+			       EBC_LUMA_XBGR);
 		break;
 	case DRM_FORMAT_R8:
 		ebc_r8_rows(dst, src, src_pitch, x1, x2, y1, y2, width);
@@ -580,8 +616,8 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_blit_dither);
  * rk3026_ebc_blit_impl - the XRGB8888 conversion rk3026_ebc_blit() runs
  *
  * For the probe line and debugfs "timing", so a measured blit time says
- * which loop it is from. R8 and the dither take NEON under the same
- * conditions; C8 always takes the scalar table rows
+ * which loop it is from. The other 32-bit formats, R8 and the dither take
+ * NEON under the same conditions; C8 always takes the scalar table rows
  * (rk3026_ebc_blit_c8_rows()), whatever this says.
  *
  * Returns "neon" if rk3026_ebc_blit_convert() takes the NEON rows for a

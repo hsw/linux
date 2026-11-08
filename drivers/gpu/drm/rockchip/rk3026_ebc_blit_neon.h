@@ -15,6 +15,9 @@
 	((unsigned int)(a) | (unsigned int)(b) << 8 |			\
 	 (unsigned int)(c) << 16 | (unsigned int)(d) << 24)
 #define EBC_NEON_XRGB8888	EBC_NEON_FOURCC('X', 'R', '2', '4')
+#define EBC_NEON_ARGB8888	EBC_NEON_FOURCC('A', 'R', '2', '4')
+#define EBC_NEON_XBGR8888	EBC_NEON_FOURCC('X', 'B', '2', '4')
+#define EBC_NEON_ABGR8888	EBC_NEON_FOURCC('A', 'B', '2', '4')
 #define EBC_NEON_R8		EBC_NEON_FOURCC('R', '8', ' ', ' ')
 
 void rk3026_ebc_blit_rows_neon(unsigned char *dst, const void *src,

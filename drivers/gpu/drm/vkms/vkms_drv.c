@@ -10,7 +10,7 @@
  */
 
 #include <linux/module.h>
-#include <linux/device/faux.h>
+#include <linux/platform_device.h>
 #include <linux/dma-mapping.h>
 
 #include <drm/clients/drm_client_setup.h>
@@ -160,14 +160,15 @@ static int vkms_modeset_init(struct vkms_device *vkmsdev)
 int vkms_create(struct vkms_config *config)
 {
 	int ret;
-	struct faux_device *fdev;
+	struct platform_device *fdev;
 	struct vkms_device *vkms_device;
 	const char *dev_name;
 
 	dev_name = vkms_config_get_device_name(config);
-	fdev = faux_device_create(dev_name, NULL, NULL);
-	if (!fdev)
-		return -ENODEV;
+	/* test hack: a platform device (as before 6.15), libdrm's drmGetDevices2() skips the faux bus */
+	fdev = platform_device_register_simple(dev_name, -1, NULL, 0);
+	if (IS_ERR(fdev))
+		return PTR_ERR(fdev);
 
 	if (!devres_open_group(&fdev->dev, NULL, GFP_KERNEL)) {
 		ret = -ENOMEM;
@@ -216,7 +217,7 @@ int vkms_create(struct vkms_config *config)
 out_devres:
 	devres_release_group(&fdev->dev, NULL);
 out_unregister:
-	faux_device_destroy(fdev);
+	platform_device_unregister(fdev);
 	return ret;
 }
 
@@ -250,7 +251,7 @@ static int __init vkms_init(void)
 
 void vkms_destroy(struct vkms_config *config)
 {
-	struct faux_device *fdev;
+	struct platform_device *fdev;
 
 	if (!config->dev) {
 		DRM_INFO("vkms_device is NULL.\n");
@@ -262,7 +263,7 @@ void vkms_destroy(struct vkms_config *config)
 	drm_dev_unregister(&config->dev->drm);
 	drm_atomic_helper_shutdown(&config->dev->drm);
 	devres_release_group(&fdev->dev, NULL);
-	faux_device_destroy(fdev);
+	platform_device_unregister(fdev);
 
 	config->dev = NULL;
 }

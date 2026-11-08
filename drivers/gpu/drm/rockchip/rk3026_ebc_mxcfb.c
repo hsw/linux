@@ -267,6 +267,10 @@ VISIBLE_IF_KUNIT int rk3026_ebc_mxcfb_send(struct rk3026_ebc *ebc,
 	bool auto_mode;
 	u32 mode;
 
+	/*
+	 * The fbdev's two formats, each with the dither the flags may ask
+	 * for (rk3026_ebc_blit_dither()); any other is refused.
+	 */
 	switch (format) {
 	case DRM_FORMAT_XRGB8888:
 		blit_format = format;

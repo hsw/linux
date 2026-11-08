@@ -1443,27 +1443,22 @@ bool rk3026_ebc_fbdev_held(const struct rk3026_ebc *ebc, u32 taken);
 
 /* rk3026_ebc_blit.c */
 void rk3026_ebc_blit_rows(u8 *dst, const void *src, unsigned int src_pitch,
-			  int x1, int x2, int y1, int y2, unsigned int width);
-void rk3026_ebc_blit_convert(u8 *dst, const void *src, unsigned int src_pitch,
-			     int x1, int x2, int y1, int y2,
+			  u32 format, int x1, int x2, int y1, int y2,
+			  unsigned int width);
+bool rk3026_ebc_blit_convert(u8 *dst, const void *src, unsigned int src_pitch,
+			     u32 format, int x1, int x2, int y1, int y2,
 			     unsigned int width);
 const char *rk3026_ebc_blit_impl(void);
-void rk3026_ebc_blit_r8_rows(u8 *dst, const void *src, unsigned int src_pitch,
-			     int x1, int x2, int y1, int y2,
-			     unsigned int width);
-bool rk3026_ebc_blit_r8_convert(u8 *dst, const void *src,
-				unsigned int src_pitch, int x1, int x2, int y1,
-				int y2, unsigned int width);
 void rk3026_ebc_blit_c8_rows(u8 *dst, const void *src, unsigned int src_pitch,
 			     int x1, int x2, int y1, int y2,
 			     unsigned int width, const u8 *levels);
 u8 rk3026_ebc_palette_level(u16 red, u16 green, u16 blue);
 void rk3026_ebc_blit_rows_dither(u8 *dst, const void *src,
-				 unsigned int src_pitch, int x1, int x2,
-				 int y1, int y2, unsigned int width,
-				 unsigned int cpp, unsigned int steps);
+				 unsigned int src_pitch, u32 format, int x1,
+				 int x2, int y1, int y2, unsigned int width,
+				 unsigned int steps);
 bool rk3026_ebc_blit_dither(u8 *dst, const void *src, unsigned int src_pitch,
-			    unsigned int cpp, int x1, int x2, int y1, int y2,
+			    u32 format, int x1, int x2, int y1, int y2,
 			    unsigned int width, enum rk3026_ebc_dither dither);
 
 /**

@@ -556,11 +556,11 @@ static u32 ebc_us_since(ktime_t start)
  *
  * The panel is 4bpp with two pixels per byte, low nibble first. The clip is
  * widened to an even pixel boundary so byte writes stay whole, and clamped
- * to the panel. XRGB8888 goes through rk3026_ebc_blit_convert(), the top
- * four bits of the luma; R8 through rk3026_ebc_blit_r8_convert(), the
- * nearest of the 16 levels; C8 through rk3026_ebc_blit_c8_rows(), a byte
- * lookup in @c8_levels, the levels of the palette. A format with no
- * conversion here is a driver bug: it warns once and writes nothing.
+ * to the panel. XRGB8888 and R8 go through rk3026_ebc_blit_convert() with
+ * their format: the top four bits of the luma, the nearest of the 16
+ * levels; C8 through rk3026_ebc_blit_c8_rows(), a byte lookup in
+ * @c8_levels, the levels of the palette. A format with no conversion here
+ * is a driver bug: it warns once and writes nothing.
  *
  * With @dither other than EBC_DITHER_NONE, XRGB8888 and R8 go through
  * rk3026_ebc_blit_dither() instead. C8 takes no dither: only the plane,
@@ -588,24 +588,15 @@ u32 rk3026_ebc_blit(struct rk3026_ebc *ebc, const void *src,
 	start = ktime_get();
 	switch (format) {
 	case DRM_FORMAT_XRGB8888:
-		if (dither != EBC_DITHER_NONE)
-			rk3026_ebc_blit_dither(ebc->next_shadow, src,
-					       src_pitch, 4, r.x1, r.x2, r.y1,
-					       r.y2, ebc->width, dither);
-		else
-			rk3026_ebc_blit_convert(ebc->next_shadow, src,
-						src_pitch, r.x1, r.x2, r.y1,
-						r.y2, ebc->width);
-		break;
 	case DRM_FORMAT_R8:
 		if (dither != EBC_DITHER_NONE)
 			rk3026_ebc_blit_dither(ebc->next_shadow, src,
-					       src_pitch, 1, r.x1, r.x2, r.y1,
-					       r.y2, ebc->width, dither);
+					       src_pitch, format, r.x1, r.x2,
+					       r.y1, r.y2, ebc->width, dither);
 		else
-			rk3026_ebc_blit_r8_convert(ebc->next_shadow, src,
-						   src_pitch, r.x1, r.x2, r.y1,
-						   r.y2, ebc->width);
+			rk3026_ebc_blit_convert(ebc->next_shadow, src,
+						src_pitch, format, r.x1, r.x2,
+						r.y1, r.y2, ebc->width);
 		break;
 	case DRM_FORMAT_C8:
 		rk3026_ebc_blit_c8_rows(ebc->next_shadow, src, src_pitch,
@@ -2549,7 +2540,7 @@ static void ebc_set_palette_entry(struct drm_crtc *crtc, unsigned int index,
  * section, so a blit sees the old table or the new one, never part of
  * each.
  *
- * Only C8 reads the table. XRGB8888 and R8 pass the GAMMA_LUT by: the
+ * Only C8 reads the table. The other formats pass the GAMMA_LUT by: the
  * panel has no colour to correct, a tone curve for them is a feature of
  * its own, and the palette a C8 fbdev leaves in the CRTC state (the
  * console's 16 colours) would garble a client that takes the CRTC over in
@@ -3146,10 +3137,10 @@ static const struct drm_connector_helper_funcs ebc_connector_helper_funcs = {
  * CRTC alone. Its planes join the commit before the helper checks them,
  * so they are checked like any other, and a C8 plane redraws the whole
  * panel with the new table, whatever damage clips a client sent in the
- * same commit (ebc_plane_atomic_check()). An XRGB8888 or R8
- * plane redraws the same pixels, a part skipped as identical: those
- * formats do not apply the LUT (rk3026_ebc_load_palette()), which the
- * atomic debug log says.
+ * same commit (ebc_plane_atomic_check()). A plane of any other format
+ * redraws the same pixels, a part skipped as identical: those formats do
+ * not apply the LUT (rk3026_ebc_load_palette()), which the atomic debug
+ * log says.
  */
 static int ebc_atomic_check(struct drm_device *drm,
 			    struct drm_atomic_state *state)

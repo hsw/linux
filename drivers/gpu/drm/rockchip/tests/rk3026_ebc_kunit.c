@@ -15691,7 +15691,7 @@ static void ebc_test_snapshot_two_level_positions(struct kunit *test)
 	}
 }
 
-/* A row conversion in the shape of rk3026_ebc_blit_rows(). */
+/* A row conversion of one source format. */
 typedef void t_rows_fn(u8 *dst, const void *src, unsigned int src_pitch,
 		       int x1, int x2, int y1, int y2, unsigned int width);
 
@@ -15961,16 +15961,24 @@ static void t_rows_tails(struct kunit *test, t_rows_fn *rows,
 	}
 }
 
+/* rk3026_ebc_blit_rows() of XRGB8888. */
+static void t_xrgb_rows(u8 *dst, const void *src, unsigned int src_pitch,
+			int x1, int x2, int y1, int y2, unsigned int width)
+{
+	rk3026_ebc_blit_rows(dst, src, src_pitch, DRM_FORMAT_XRGB8888, x1, x2,
+			     y1, y2, width);
+}
+
 /* rk3026_ebc_blit_rows() writes the bytes of the per-pixel reference. */
 static void ebc_test_blit_rows(struct kunit *test)
 {
-	t_rows_sets(test, rk3026_ebc_blit_rows, rk3026_ebc_ref_blit_rows);
+	t_rows_sets(test, t_xrgb_rows, rk3026_ebc_ref_blit_rows);
 }
 
 /* The 4-px stores and the 2-px tail from every start. */
 static void ebc_test_blit_rows_tails(struct kunit *test)
 {
-	t_rows_tails(test, rk3026_ebc_blit_rows, rk3026_ebc_ref_blit_rows);
+	t_rows_tails(test, t_xrgb_rows, rk3026_ebc_ref_blit_rows);
 }
 
 /*
@@ -15994,12 +16002,13 @@ static bool t_neon_ready(struct kunit *test)
 }
 
 #if IS_ENABLED(CONFIG_DRM_RK3026_EBC_NEON)
-/* rk3026_ebc_blit_rows_neon() in the NEON section it needs. */
+/* rk3026_ebc_blit_rows_neon() of XRGB8888 in the NEON section it needs. */
 static void t_rows_neon(u8 *dst, const void *src, unsigned int src_pitch,
 			int x1, int x2, int y1, int y2, unsigned int width)
 {
 	scoped_ksimd()
-		rk3026_ebc_blit_rows_neon(dst, src, src_pitch, x1, x2, y1, y2,
+		rk3026_ebc_blit_rows_neon(dst, src, src_pitch,
+					  DRM_FORMAT_XRGB8888, x1, x2, y1, y2,
 					  width);
 }
 
@@ -16011,7 +16020,7 @@ static void ebc_test_blit_neon_rows(struct kunit *test)
 {
 	if (!t_neon_ready(test))
 		return;
-	t_rows_sets(test, t_rows_neon, rk3026_ebc_blit_rows);
+	t_rows_sets(test, t_rows_neon, t_xrgb_rows);
 }
 
 /* The 16-px blocks and every tail of 0 to 14 px after 0 to 5 of them. */
@@ -16019,7 +16028,7 @@ static void ebc_test_blit_neon_tails(struct kunit *test)
 {
 	if (!t_neon_ready(test))
 		return;
-	t_rows_tails(test, t_rows_neon, rk3026_ebc_blit_rows);
+	t_rows_tails(test, t_rows_neon, t_xrgb_rows);
 }
 #else
 /* No NEON rows: a skip. */
@@ -16033,6 +16042,14 @@ static void ebc_test_blit_neon_tails(struct kunit *test)
 	t_neon_ready(test);
 }
 #endif
+
+/* rk3026_ebc_blit_convert() of XRGB8888, its answer dropped. */
+static void t_xrgb_convert(u8 *dst, const void *src, unsigned int src_pitch,
+			   int x1, int x2, int y1, int y2, unsigned int width)
+{
+	rk3026_ebc_blit_convert(dst, src, src_pitch, DRM_FORMAT_XRGB8888, x1,
+				x2, y1, y2, width);
+}
 
 /*
  * rk3026_ebc_blit_convert() writes the bytes of rk3026_ebc_blit_rows() on
@@ -16066,8 +16083,8 @@ static void ebc_test_blit_convert(struct kunit *test)
 	t_src_fill(src, pitch, &f, T_SRC_RANDOM, 77);
 	prandom_seed_state(&rs, 7700);
 	for (i = 0; i < ARRAY_SIZE(r); i++)
-		if (!t_rows_vs_ref(test, &f, rk3026_ebc_blit_convert,
-				   rk3026_ebc_blit_rows, out, ref, src, pitch,
+		if (!t_rows_vs_ref(test, &f, t_xrgb_convert, t_xrgb_rows, out,
+				   ref, src, pitch,
 				   r[i].x1, r[i].x2, r[i].y1, r[i].y2, &rs))
 			return;
 }
@@ -16164,11 +16181,20 @@ static void t_grey_ref_round(u8 *dst, const void *src, unsigned int src_pitch,
 				 NULL);
 }
 
-/* rk3026_ebc_blit_r8_convert() as a row function, its answer dropped. */
+/* rk3026_ebc_blit_rows() of R8. */
+static void t_r8_rows(u8 *dst, const void *src, unsigned int src_pitch,
+		      int x1, int x2, int y1, int y2, unsigned int width)
+{
+	rk3026_ebc_blit_rows(dst, src, src_pitch, DRM_FORMAT_R8, x1, x2, y1,
+			     y2, width);
+}
+
+/* rk3026_ebc_blit_convert() of R8, its answer dropped. */
 static void t_r8_convert(u8 *dst, const void *src, unsigned int src_pitch,
 			 int x1, int x2, int y1, int y2, unsigned int width)
 {
-	rk3026_ebc_blit_r8_convert(dst, src, src_pitch, x1, x2, y1, y2, width);
+	rk3026_ebc_blit_convert(dst, src, src_pitch, DRM_FORMAT_R8, x1, x2, y1,
+				y2, width);
 }
 
 /* 8-bit sources: every kind of t_grey_fill(), an odd 3 bytes of padding. */
@@ -16230,32 +16256,32 @@ static void t_grey_tails(struct kunit *test, t_rows_fn *rows,
 }
 
 /*
- * rk3026_ebc_blit_r8_rows() writes the bytes of the per-pixel rounding
+ * rk3026_ebc_blit_rows() of R8 writes the bytes of the per-pixel rounding
  * reference: every fixture, 8-bit source set, pitch and clip.
  */
 static void ebc_test_r8_rows(struct kunit *test)
 {
-	t_grey_sets(test, rk3026_ebc_blit_r8_rows, t_grey_ref_round);
+	t_grey_sets(test, t_r8_rows, t_grey_ref_round);
 }
 
 /* The two-word stores and the 2-px tail from every start. */
 static void ebc_test_r8_rows_tails(struct kunit *test)
 {
-	t_grey_tails(test, rk3026_ebc_blit_r8_rows, t_grey_ref_round);
+	t_grey_tails(test, t_r8_rows, t_grey_ref_round);
 }
 
 #if IS_ENABLED(CONFIG_DRM_RK3026_EBC_NEON)
-/* rk3026_ebc_blit_r8_rows_neon() in the NEON section it needs. */
+/* rk3026_ebc_blit_rows_neon() of R8 in the NEON section it needs. */
 static void t_r8_neon(u8 *dst, const void *src, unsigned int src_pitch,
 		      int x1, int x2, int y1, int y2, unsigned int width)
 {
 	scoped_ksimd()
-		rk3026_ebc_blit_r8_rows_neon(dst, src, src_pitch, x1, x2, y1,
-					     y2, width);
+		rk3026_ebc_blit_rows_neon(dst, src, src_pitch, DRM_FORMAT_R8,
+					  x1, x2, y1, y2, width);
 }
 
 /*
- * rk3026_ebc_blit_r8_rows_neon() writes the bytes of the per-pixel
+ * rk3026_ebc_blit_rows_neon() of R8 writes the bytes of the per-pixel
  * rounding reference: every fixture, 8-bit source set, pitch and clip.
  */
 static void ebc_test_r8_neon_rows(struct kunit *test)
@@ -16289,7 +16315,7 @@ static void ebc_test_r8_neon_tails(struct kunit *test)
 #endif
 
 /*
- * rk3026_ebc_blit_r8_convert() writes the bytes of the reference on the
+ * rk3026_ebc_blit_convert() of R8 writes the bytes of the reference on the
  * band edges and below 16 px as ebc_test_blit_convert() checks it, and
  * says which rows ran: NEON from 16 px where it is built in, never below.
  */
@@ -16323,12 +16349,13 @@ static void ebc_test_r8_convert(struct kunit *test)
 			return;
 
 	KUNIT_EXPECT_EQ(test,
-			rk3026_ebc_blit_r8_convert(out, src, pitch, 0, 16, 0,
-						   2, f.w),
+			rk3026_ebc_blit_convert(out, src, pitch, DRM_FORMAT_R8,
+						0, 16, 0, 2, f.w),
 			IS_ENABLED(CONFIG_DRM_RK3026_EBC_NEON));
 	KUNIT_EXPECT_FALSE(test,
-			   rk3026_ebc_blit_r8_convert(out, src, pitch, 0, 14,
-						      0, 2, f.w));
+			   rk3026_ebc_blit_convert(out, src, pitch,
+						   DRM_FORMAT_R8, 0, 14, 0, 2,
+						   f.w));
 }
 
 static const struct t_blit_fmt t_blit_r8 = {
@@ -16479,22 +16506,30 @@ static void ebc_test_palette_levels(struct kunit *test)
 
 /*
  * The dither rows and their reference as t_rows_fn, on the source format
- * (bytes a pixel) and the steps set here; KUnit runs one case at a time.
+ * and the steps set here; KUnit runs one case at a time.
  */
-static unsigned int t_dither_cpp, t_dither_steps;
+static u32 t_dither_format;
+static unsigned int t_dither_steps;
+
+/* The bytes per pixel of a dither source: XRGB8888 or R8. */
+static unsigned int t_dither_cpp(u32 format)
+{
+	return format == DRM_FORMAT_XRGB8888 ? 4 : 1;
+}
 
 static void t_dither_rows(u8 *dst, const void *src, unsigned int src_pitch,
 			  int x1, int x2, int y1, int y2, unsigned int width)
 {
-	rk3026_ebc_blit_rows_dither(dst, src, src_pitch, x1, x2, y1, y2,
-				    width, t_dither_cpp, t_dither_steps);
+	rk3026_ebc_blit_rows_dither(dst, src, src_pitch, t_dither_format, x1,
+				    x2, y1, y2, width, t_dither_steps);
 }
 
 static void t_dither_ref(u8 *dst, const void *src, unsigned int src_pitch,
 			 int x1, int x2, int y1, int y2, unsigned int width)
 {
 	rk3026_ebc_ref_blit_rows_dither(dst, src, src_pitch, x1, x2, y1, y2,
-					width, t_dither_cpp, t_dither_steps);
+					width, t_dither_cpp(t_dither_format),
+					t_dither_steps);
 }
 
 /* The steps of EBC_DITHER_Y4 and EBC_DITHER_Y1. */
@@ -16511,9 +16546,9 @@ static void ebc_test_dither_rows(struct kunit *test)
 
 	for (i = 0; i < ARRAY_SIZE(t_dither_all_steps); i++) {
 		t_dither_steps = t_dither_all_steps[i];
-		t_dither_cpp = 4;
+		t_dither_format = DRM_FORMAT_XRGB8888;
 		t_rows_sets(test, t_dither_rows, t_dither_ref);
-		t_dither_cpp = 1;
+		t_dither_format = DRM_FORMAT_R8;
 		t_grey_sets(test, t_dither_rows, t_dither_ref);
 	}
 }
@@ -16525,9 +16560,9 @@ static void ebc_test_dither_rows_tails(struct kunit *test)
 
 	for (i = 0; i < ARRAY_SIZE(t_dither_all_steps); i++) {
 		t_dither_steps = t_dither_all_steps[i];
-		t_dither_cpp = 4;
+		t_dither_format = DRM_FORMAT_XRGB8888;
 		t_rows_tails(test, t_dither_rows, t_dither_ref);
-		t_dither_cpp = 1;
+		t_dither_format = DRM_FORMAT_R8;
 		t_grey_tails(test, t_dither_rows, t_dither_ref);
 	}
 }
@@ -16551,9 +16586,9 @@ static void ebc_test_ref_blit_dither(struct kunit *test)
 		struct t_blit_fmt r8 = { DRM_FORMAT_R8, t_dither_ref, d[i] };
 
 		t_dither_steps = d[i] == EBC_DITHER_Y1 ? 1 : 15;
-		t_dither_cpp = 4;
+		t_dither_format = DRM_FORMAT_XRGB8888;
 		t_blit_sets(test, &t_xrgb_srcs, &xrgb);
-		t_dither_cpp = 1;
+		t_dither_format = DRM_FORMAT_R8;
 		t_blit_sets(test, &t_grey_srcs, &r8);
 	}
 }
@@ -16569,6 +16604,7 @@ static bool t_dither_flat(struct kunit *test, u8 *src, unsigned int cpp,
 			  unsigned int g, unsigned int steps)
 {
 	static const struct t_fix sq = { "16x16", 16, 16 };
+	u32 format = cpp == 4 ? DRM_FORMAT_XRGB8888 : DRM_FORMAT_R8;
 	unsigned int lo = g * steps / 255, f = g * steps % 255;
 	u8 nlo = lo * (15 / steps), nhi = min(lo + 1, steps) * (15 / steps);
 	unsigned int tile[4] = {}, i;
@@ -16582,12 +16618,9 @@ static bool t_dither_flat(struct kunit *test, u8 *src, unsigned int cpp,
 		else
 			src[i] = g;
 	}
-	rk3026_ebc_blit_rows_dither(out, src, 16 * cpp, 0, 16, 0, 16, 16, cpp,
-				    steps);
-	if (cpp == 4)
-		rk3026_ebc_blit_rows(plain, src, 16 * 4, 0, 16, 0, 16, 16);
-	else
-		rk3026_ebc_blit_r8_rows(plain, src, 16, 0, 16, 0, 16, 16);
+	rk3026_ebc_blit_rows_dither(out, src, 16 * cpp, format, 0, 16, 0, 16,
+				    16, steps);
+	rk3026_ebc_blit_rows(plain, src, 16 * cpp, format, 0, 16, 0, 16, 16);
 
 	for (y = 0; y < 16; y++) {
 		for (x = 0; x < 16; x++) {
@@ -16839,9 +16872,10 @@ static void t_dither_neon(u8 *dst, const void *src, unsigned int src_pitch,
 
 	rk3026_ebc_ref_dither_thr(thr);
 	scoped_ksimd()
-		rk3026_ebc_blit_rows_dither_neon(dst, src, src_pitch, x1, x2,
-						 y1, y2, width, thr,
-						 t_dither_cpp, t_dither_steps);
+		rk3026_ebc_blit_rows_dither_neon(dst, src, src_pitch,
+						 t_dither_format, x1, x2, y1,
+						 y2, width, thr,
+						 t_dither_steps);
 }
 
 /*
@@ -16857,9 +16891,9 @@ static void ebc_test_dither_neon_rows(struct kunit *test)
 		return;
 	for (i = 0; i < ARRAY_SIZE(t_dither_all_steps); i++) {
 		t_dither_steps = t_dither_all_steps[i];
-		t_dither_cpp = 4;
+		t_dither_format = DRM_FORMAT_XRGB8888;
 		t_rows_sets(test, t_dither_neon, t_dither_rows);
-		t_dither_cpp = 1;
+		t_dither_format = DRM_FORMAT_R8;
 		t_grey_sets(test, t_dither_neon, t_dither_rows);
 	}
 }
@@ -16876,9 +16910,9 @@ static void ebc_test_dither_neon_tails(struct kunit *test)
 		return;
 	for (i = 0; i < ARRAY_SIZE(t_dither_all_steps); i++) {
 		t_dither_steps = t_dither_all_steps[i];
-		t_dither_cpp = 4;
+		t_dither_format = DRM_FORMAT_XRGB8888;
 		t_rows_tails(test, t_dither_neon, t_dither_rows);
-		t_dither_cpp = 1;
+		t_dither_format = DRM_FORMAT_R8;
 		t_grey_tails(test, t_dither_neon, t_dither_rows);
 	}
 }
@@ -16900,8 +16934,8 @@ static void t_dither_convert(u8 *dst, const void *src, unsigned int src_pitch,
 			     int x1, int x2, int y1, int y2,
 			     unsigned int width)
 {
-	rk3026_ebc_blit_dither(dst, src, src_pitch, t_dither_cpp, x1, x2, y1,
-			       y2, width,
+	rk3026_ebc_blit_dither(dst, src, src_pitch, t_dither_format, x1, x2,
+			       y1, y2, width,
 			       t_dither_steps == 1 ? EBC_DITHER_Y1 :
 			       EBC_DITHER_Y4);
 }
@@ -16940,13 +16974,13 @@ static void ebc_test_dither_convert(struct kunit *test)
 	for (k = 0; k < ARRAY_SIZE(t_dither_all_steps); k++) {
 		t_dither_steps = t_dither_all_steps[k];
 		for (i = 0; i < ARRAY_SIZE(r); i++) {
-			t_dither_cpp = 4;
+			t_dither_format = DRM_FORMAT_XRGB8888;
 			if (!t_rows_vs_ref(test, &f, t_dither_convert,
 					   t_dither_ref, out, ref, xrgb,
 					   f.w * 4, r[i].x1, r[i].x2, r[i].y1,
 					   r[i].y2, &rs))
 				return;
-			t_dither_cpp = 1;
+			t_dither_format = DRM_FORMAT_R8;
 			if (!t_rows_vs_ref(test, &f, t_dither_convert,
 					   t_dither_ref, out, ref, r8, f.w + 1,
 					   r[i].x1, r[i].x2, r[i].y1, r[i].y2,
@@ -16958,16 +16992,17 @@ static void ebc_test_dither_convert(struct kunit *test)
 	for (k = 1; k <= 4; k += 3) {
 		const u8 *src = k == 4 ? xrgb : r8;
 		unsigned int pitch = k == 4 ? f.w * 4 : f.w + 1;
+		u32 format = k == 4 ? DRM_FORMAT_XRGB8888 : DRM_FORMAT_R8;
 
 		KUNIT_EXPECT_EQ(test,
-				rk3026_ebc_blit_dither(out, src, pitch, k, 0,
-						       16, 0, 2, f.w,
+				rk3026_ebc_blit_dither(out, src, pitch, format,
+						       0, 16, 0, 2, f.w,
 						       EBC_DITHER_Y4),
 				IS_ENABLED(CONFIG_DRM_RK3026_EBC_NEON));
 		KUNIT_EXPECT_FALSE(test,
-				   rk3026_ebc_blit_dither(out, src, pitch, k,
-							  0, 14, 0, 2, f.w,
-							  EBC_DITHER_Y1));
+				   rk3026_ebc_blit_dither(out, src, pitch,
+							  format, 0, 14, 0, 2,
+							  f.w, EBC_DITHER_Y1));
 	}
 }
 
@@ -17000,8 +17035,9 @@ static bool t_invert_clips(struct kunit *test, const struct t_fix *f,
 				for (x = w.x1; x < w.x2; x++)
 					t_px_set_w(ref, f, x, y,
 						   15 - t_px_w(ref, f, x, y));
-			rk3026_ebc_blit_convert(out, src, pitch, w.x1, w.x2,
-						w.y1, w.y2, f->w);
+			rk3026_ebc_blit_convert(out, src, pitch,
+						DRM_FORMAT_XRGB8888, w.x1,
+						w.x2, w.y1, w.y2, f->w);
 		}
 		rk3026_ebc_mxcfb_invert(out, r, f->w, f->h);
 		diff = t_fix_diff(f, ref, out);

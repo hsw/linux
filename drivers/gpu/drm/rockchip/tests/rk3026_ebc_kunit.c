@@ -3563,6 +3563,231 @@ static void ebc_test_du_account_reset(struct kunit *test)
 	}
 }
 
+/*
+ * A panel's timing for the mode tests: @hz the source clock, the
+ * horizontal sync and porches in source clocks, the vertical ones in
+ * lines, as panel-timing gives them.
+ */
+struct t_scan {
+	u32 hz, w, h, hsync, hbp, hfp, vsync, vbp, vfp;
+};
+
+/* The RC2 board's panel-timing. */
+static const struct t_scan t_scan_rc2 = {
+	.hz = 40000000, .w = 1448, .h = 1072,
+	.hsync = 17, .hbp = 8, .hfp = 55,
+	.vsync = 2, .vbp = 4, .vfp = 4,
+};
+
+/* A made-up panel: every porch different, a rate that rounds down. */
+static const struct t_scan t_scan_other = {
+	.hz = 25000000, .w = 800, .h = 600,
+	.hsync = 10, .hbp = 20, .hfp = 30,
+	.vsync = 3, .vbp = 5, .vfp = 7,
+};
+
+static struct rk3026_ebc *t_scan_ebc(struct kunit *test,
+				     const struct t_scan *s)
+{
+	struct rk3026_ebc *ebc = kunit_kzalloc(test, sizeof(*ebc), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, ebc);
+	ebc->timing.pixelclock.typ = s->hz;
+	ebc->timing.hactive.typ = s->w;
+	ebc->timing.vactive.typ = s->h;
+	ebc->timing.hsync_len.typ = s->hsync;
+	ebc->timing.hback_porch.typ = s->hbp;
+	ebc->timing.hfront_porch.typ = s->hfp;
+	ebc->timing.vsync_len.typ = s->vsync;
+	ebc->timing.vback_porch.typ = s->vbp;
+	ebc->timing.vfront_porch.typ = s->vfp;
+	/* As probe sets them. */
+	ebc->width = s->w;
+	ebc->height = s->h;
+	return ebc;
+}
+
+/* drm_mode_validate_basic()'s order of the timings. */
+static void t_mode_sane(struct kunit *test, const struct drm_display_mode *m)
+{
+	KUNIT_EXPECT_GT(test, m->clock, 0);
+	KUNIT_EXPECT_GT(test, m->hdisplay, 0);
+	KUNIT_EXPECT_LE(test, m->hdisplay, m->hsync_start);
+	KUNIT_EXPECT_LE(test, m->hsync_start, m->hsync_end);
+	KUNIT_EXPECT_LE(test, m->hsync_end, m->htotal);
+	KUNIT_EXPECT_GT(test, m->vdisplay, 0);
+	KUNIT_EXPECT_LE(test, m->vdisplay, m->vsync_start);
+	KUNIT_EXPECT_LE(test, m->vsync_start, m->vsync_end);
+	KUNIT_EXPECT_LE(test, m->vsync_end, m->vtotal);
+	KUNIT_EXPECT_EQ(test, m->flags, 0);
+}
+
+/*
+ * The RC2 scan as a mode: the line is 1448 dots and 80 source clocks of
+ * sync and porches, four dots each; the frame 1072 lines and 10; the dot
+ * clock four times the 40 MHz source clock. 160 MHz / (1768 x 1082) is
+ * 83.64 Hz, which drm_mode_vrefresh() rounds to the nearest: 84.
+ */
+static void ebc_test_mode_rc2(struct kunit *test)
+{
+	struct rk3026_ebc *ebc = t_scan_ebc(test, &t_scan_rc2);
+	struct drm_display_mode m = {};
+
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_display_mode(ebc, &m));
+	KUNIT_EXPECT_EQ(test, m.clock, 160000);
+	KUNIT_EXPECT_EQ(test, m.hdisplay, 1448);
+	KUNIT_EXPECT_EQ(test, m.hsync_start, 1448 + 4 * 55);
+	KUNIT_EXPECT_EQ(test, m.hsync_end, 1448 + 4 * (55 + 17));
+	KUNIT_EXPECT_EQ(test, m.htotal, 1768);
+	KUNIT_EXPECT_EQ(test, m.vdisplay, 1072);
+	KUNIT_EXPECT_EQ(test, m.vsync_start, 1072 + 4);
+	KUNIT_EXPECT_EQ(test, m.vsync_end, 1072 + 4 + 2);
+	KUNIT_EXPECT_EQ(test, m.vtotal, 1082);
+	KUNIT_EXPECT_EQ(test, drm_mode_vrefresh(&m), 84);
+	/* 83.639 Hz in mHz, before the rounding. */
+	KUNIT_EXPECT_EQ(test, div_u64(160000ULL * 1000 * 1000,
+				      1768 * 1082), 83639);
+	t_mode_sane(test, &m);
+}
+
+/*
+ * A made-up panel: 800 dots and 60 clocks a line, 600 and 15 lines a
+ * frame, 100 MHz dots: 156.35 Hz, rounded down to 156.
+ */
+static void ebc_test_mode_other(struct kunit *test)
+{
+	struct rk3026_ebc *ebc = t_scan_ebc(test, &t_scan_other);
+	struct drm_display_mode m = {};
+
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_display_mode(ebc, &m));
+	KUNIT_EXPECT_EQ(test, m.clock, 100000);
+	KUNIT_EXPECT_EQ(test, m.hdisplay, 800);
+	KUNIT_EXPECT_EQ(test, m.hsync_start, 920);
+	KUNIT_EXPECT_EQ(test, m.hsync_end, 960);
+	KUNIT_EXPECT_EQ(test, m.htotal, 1040);
+	KUNIT_EXPECT_EQ(test, m.vdisplay, 600);
+	KUNIT_EXPECT_EQ(test, m.vsync_start, 607);
+	KUNIT_EXPECT_EQ(test, m.vsync_end, 610);
+	KUNIT_EXPECT_EQ(test, m.vtotal, 615);
+	KUNIT_EXPECT_EQ(test, drm_mode_vrefresh(&m), 156);
+	t_mode_sane(test, &m);
+}
+
+/*
+ * The mode's rate and the frame budget come from one count of the scan:
+ * the budget of 1000 frames is 1000 frame times at the margin of four,
+ * and the mode's rate is 1 s over that frame time, rounded to the
+ * nearest as drm_mode_vrefresh() rounds.
+ */
+static void ebc_test_mode_frame_time(struct kunit *test)
+{
+	static const struct t_scan *const scans[] = {
+		&t_scan_rc2, &t_scan_other,
+	};
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(scans); i++) {
+		struct rk3026_ebc *ebc = t_scan_ebc(test, scans[i]);
+		struct drm_display_mode m = {};
+		unsigned int ms = rk3026_ebc_chunk_timeout_ms(ebc, 1000);
+		u32 frame_us, hz;
+
+		KUNIT_ASSERT_TRUE(test, rk3026_ebc_display_mode(ebc, &m));
+		KUNIT_ASSERT_EQ(test, ms % 4, 0);
+		frame_us = ms / 4;
+		hz = DIV_ROUND_CLOSEST(USEC_PER_SEC, frame_us);
+		KUNIT_EXPECT_EQ(test, drm_mode_vrefresh(&m), hz);
+		/* The frame time is the mode's own, in whole us. */
+		KUNIT_EXPECT_EQ(test, frame_us,
+				div_u64((u64)m.htotal * m.vtotal * USEC_PER_SEC,
+					m.clock * 1000ULL));
+	}
+	/* RC2: 11.956 ms a frame, 83.6 Hz. */
+	KUNIT_EXPECT_EQ(test,
+			rk3026_ebc_chunk_timeout_ms(t_scan_ebc(test, &t_scan_rc2),
+						    1000) / 4, 11956);
+}
+
+/*
+ * The frame budget as it was computed before the mode shared its count:
+ * source clocks a line (the active dots / 4, sync and porches) times lines
+ * a frame, at the source clock (20 MHz without one); the margin of four,
+ * at least 5 s.
+ */
+static unsigned int t_chunk_ms_before(const struct t_scan *s, u32 frames)
+{
+	u32 hclks = s->hsync + s->w / 4 + s->hbp + s->hfp;
+	u32 vlines = s->vsync + s->h + s->vbp + s->vfp;
+	u64 us = div_u64((u64)hclks * vlines * USEC_PER_SEC,
+			 s->hz ? s->hz : 20000000);
+	u64 ms = div_u64(us * frames * 4, USEC_PER_MSEC);
+
+	return max_t(u64, ms, 5000);
+}
+
+/* The frame budget is what it was, for any chunk, rate or width. */
+static void ebc_test_mode_chunk_timeout(struct kunit *test)
+{
+	static const u32 frames[] = { 1, 8, 63, 64, 101, 1000, 4096 };
+	struct t_scan scans[] = {
+		t_scan_rc2, t_scan_other, t_scan_rc2, t_scan_rc2, t_scan_other,
+	};
+	unsigned int i, j;
+
+	/* No clock-frequency: the fallback. */
+	scans[2].hz = 0;
+	/* A slow clock, every budget above the floor. */
+	scans[3].hz = 1000000;
+	/* A width the probe refuses (not a multiple of 8, nor of 4). */
+	scans[4].w = 802;
+	scans[4].hz = 100000;
+
+	for (i = 0; i < ARRAY_SIZE(scans); i++) {
+		struct rk3026_ebc *ebc = t_scan_ebc(test, &scans[i]);
+
+		for (j = 0; j < ARRAY_SIZE(frames); j++)
+			KUNIT_EXPECT_EQ_MSG(test,
+					    rk3026_ebc_chunk_timeout_ms(ebc, frames[j]),
+					    t_chunk_ms_before(&scans[i], frames[j]),
+					    "scan %u, %u frames", i, frames[j]);
+	}
+	/* RC2: 64 frames of 11.956 ms, four times over: 3060 ms, floor 5 s. */
+	KUNIT_EXPECT_EQ(test, t_chunk_ms_before(&t_scan_rc2, 64), 5000);
+	KUNIT_EXPECT_EQ(test, t_chunk_ms_before(&t_scan_rc2, 1000), 47824);
+}
+
+/*
+ * A scan longer than a mode can say is refused: DRM's timings are 16-bit.
+ * 65535 dots or lines fit, one more does not.
+ */
+static void ebc_test_mode_too_long(struct kunit *test)
+{
+	struct t_scan s = t_scan_other;
+	struct drm_display_mode m = {};
+
+	/* 65280 dots and 63 clocks: 65532 a line. */
+	s.w = 65280;
+	s.hsync = 21;
+	s.hbp = 21;
+	s.hfp = 21;
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_display_mode(t_scan_ebc(test, &s), &m));
+	KUNIT_EXPECT_EQ(test, m.htotal, 65532);
+	s.hfp = 22;
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_display_mode(t_scan_ebc(test, &s), &m));
+	/* Sync and porches far out of range do not wrap around. */
+	s.hfp = 0x40000000;
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_display_mode(t_scan_ebc(test, &s), &m));
+
+	s = t_scan_other;
+	s.vfp = 65535 - 600 - 3 - 5;
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_display_mode(t_scan_ebc(test, &s), &m));
+	KUNIT_EXPECT_EQ(test, m.vtotal, 65535);
+	s.vfp++;
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_display_mode(t_scan_ebc(test, &s), &m));
+	s.vfp = U32_MAX;
+	KUNIT_EXPECT_FALSE(test, rk3026_ebc_display_mode(t_scan_ebc(test, &s), &m));
+}
+
 static struct kunit_case rk3026_ebc_core_test_cases[] = {
 	KUNIT_CASE(ebc_test_dsp_ctrl_mode),
 	KUNIT_CASE(ebc_test_sdck),
@@ -3631,6 +3856,11 @@ static struct kunit_case rk3026_ebc_core_test_cases[] = {
 	KUNIT_CASE(ebc_test_marker_zero),
 	KUNIT_CASE(ebc_test_marker_newest),
 	KUNIT_CASE(ebc_test_marker_eviction),
+	KUNIT_CASE(ebc_test_mode_rc2),
+	KUNIT_CASE(ebc_test_mode_other),
+	KUNIT_CASE(ebc_test_mode_frame_time),
+	KUNIT_CASE(ebc_test_mode_chunk_timeout),
+	KUNIT_CASE(ebc_test_mode_too_long),
 	{}
 };
 

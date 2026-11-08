@@ -176,20 +176,67 @@ static void ebc_config_done(struct rk3026_ebc *ebc)
  * pixels per clock, which is the same x4 the vendor applies before its own
  * clk_set_rate.
  */
-static unsigned long ebc_pixel_rate(struct rk3026_ebc *ebc)
+static unsigned long ebc_pixel_rate(const struct rk3026_ebc *ebc)
 {
 	unsigned long hz = ebc->timing.pixelclock.typ;
 
 	return hz ? hz : EBC_PIXEL_RATE_FALLBACK;
 }
 
-static unsigned long ebc_dclk_rate(struct rk3026_ebc *ebc)
+static unsigned long ebc_dclk_rate(const struct rk3026_ebc *ebc)
 {
 	return ebc_pixel_rate(ebc) * 4;
 }
 
 /**
- * ebc_chunk_timeout_ms - frame budget for one chunk, DERIVED from the timings
+ * rk3026_ebc_display_mode - the panel's scan as a display mode
+ * @ebc: controller, its panel-timing parsed
+ * @mode: gets the clock and the horizontal and vertical timings
+ *
+ * The scan, not the panel-timing read as a videomode. Each line is the
+ * active dots and then the front porch, the sync and the back porch, which
+ * panel-timing gives in source clocks, four dots each: the 8-bit source
+ * bus carries four 2-bit pixels a clock. The mode counts them all in dots
+ * at the dot clock, dclk, so its refresh rate is the scan's frame rate
+ * (RC2: 160 MHz / (1768 x 1082), 83.6 Hz). The videomode helpers count the
+ * porches as dots at the source clock: 24 Hz on RC2.
+ *
+ * The mode only reports the rate; nothing programs the controller from
+ * it. The frame budget (rk3026_ebc_chunk_timeout_ms()) counts the same
+ * scan.
+ *
+ * Returns false when a total does not fit DRM's 16-bit timings; @mode is
+ * then left alone.
+ */
+VISIBLE_IF_KUNIT bool rk3026_ebc_display_mode(const struct rk3026_ebc *ebc,
+					      struct drm_display_mode *mode)
+{
+	const struct display_timing *t = &ebc->timing;
+	u64 hfp = 4ULL * t->hfront_porch.typ, hsync = 4ULL * t->hsync_len.typ;
+	u64 hbp = 4ULL * t->hback_porch.typ;
+	u64 vfp = t->vfront_porch.typ, vsync = t->vsync_len.typ;
+	u64 vbp = t->vback_porch.typ;
+
+	if ((u64)ebc->width + hfp + hsync + hbp > U16_MAX ||
+	    (u64)ebc->height + vfp + vsync + vbp > U16_MAX)
+		return false;
+
+	mode->clock = div_u64(4ULL * ebc_pixel_rate(ebc), 1000);
+	mode->hdisplay = ebc->width;
+	mode->hsync_start = mode->hdisplay + hfp;
+	mode->hsync_end = mode->hsync_start + hsync;
+	mode->htotal = mode->hsync_end + hbp;
+	mode->vdisplay = ebc->height;
+	mode->vsync_start = mode->vdisplay + vfp;
+	mode->vsync_end = mode->vsync_start + vsync;
+	mode->vtotal = mode->vsync_end + vbp;
+
+	return true;
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_display_mode);
+
+/**
+ * rk3026_ebc_chunk_timeout_ms - frame budget of a chunk, DERIVED from timings
  * @ebc: controller
  * @frames: frames in this chunk
  *
@@ -200,9 +247,10 @@ static unsigned long ebc_dclk_rate(struct rk3026_ebc *ebc)
  * 40 ms over, broke out of the frame loop and drove 0 of 101 frames. The panel
  * came up holding whatever was on it, and nothing in the log said "too slow".
  *
- * So compute it. One frame is htotal source clocks x vtotal lines, at the source
- * clock; the x4 between dclk and the source clock cancels out because both come
- * from the same DT property.
+ * So compute it. One frame is the scan of rk3026_ebc_display_mode(), the
+ * mode's own: vtotal lines of htotal / 4 source clocks, at the source clock;
+ * the x4 between dclk and the source clock cancels out because both come from
+ * the same DT property.
  *
  * The margin is deliberately large. This timeout exists only so a wedged
  * controller cannot hang the thread forever -- it is not a tuning knob, and
@@ -210,27 +258,29 @@ static unsigned long ebc_dclk_rate(struct rk3026_ebc *ebc)
  * panel part-driven and accumulates ghosting that survives into the next boot.
  * Erring generous costs a few seconds once; erring tight corrupts the display.
  */
-static unsigned int ebc_chunk_timeout_ms(struct rk3026_ebc *ebc, u32 frames)
+VISIBLE_IF_KUNIT unsigned int
+rk3026_ebc_chunk_timeout_ms(const struct rk3026_ebc *ebc, u32 frames)
 {
-	const struct display_timing *t = &ebc->timing;
-	u32 hclks = t->hsync_len.typ + ebc->width / 4 +
-		    t->hback_porch.typ + t->hfront_porch.typ;
-	u32 vlines = t->vsync_len.typ + ebc->height +
-		     t->vback_porch.typ + t->vfront_porch.typ;
-	u64 us = div_u64((u64)hclks * vlines * USEC_PER_SEC,
-			 ebc_pixel_rate(ebc));
-	u64 ms = div_u64(us * frames * EBC_FRAME_TIMEOUT_MARGIN, USEC_PER_MSEC);
+	struct drm_display_mode scan = {};
+	u64 us, ms;
+
+	/* It fits: the probe refuses a panel-timing that does not. */
+	rk3026_ebc_display_mode(ebc, &scan);
+	us = div_u64((u64)(scan.htotal / 4) * scan.vtotal * USEC_PER_SEC,
+		     ebc_pixel_rate(ebc));
+	ms = div_u64(us * frames * EBC_FRAME_TIMEOUT_MARGIN, USEC_PER_MSEC);
 
 	return max_t(u64, ms, EBC_FRAME_TIMEOUT_MIN_MS);
 }
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_chunk_timeout_ms);
 
 /*
  * The longest one part takes while the refresh thread works: the setup
  * (EBC_PART_SETUP_MS), then at most two waveforms, a repair RESET and the
  * part's own, of at most EBC_WAVEFORM_MAX_FRAMES frames each. A chunk ends
- * within its budget (ebc_chunk_timeout_ms()) or ends the part, so every
- * chunk counts at its budget. Derived from the timings like the budget: at
- * a lower dot clock a part takes longer.
+ * within its budget (rk3026_ebc_chunk_timeout_ms()) or ends the part, so
+ * every chunk counts at its budget. Derived from the timings like the
+ * budget: at a lower dot clock a part takes longer.
  */
 VISIBLE_IF_KUNIT unsigned int rk3026_ebc_part_max_ms(struct rk3026_ebc *ebc)
 {
@@ -238,7 +288,7 @@ VISIBLE_IF_KUNIT unsigned int rk3026_ebc_part_max_ms(struct rk3026_ebc *ebc)
 				      EBC_LUT_MAX_FRAMES);
 
 	return EBC_PART_SETUP_MS +
-	       chunks * ebc_chunk_timeout_ms(ebc, EBC_LUT_MAX_FRAMES);
+	       chunks * rk3026_ebc_chunk_timeout_ms(ebc, EBC_LUT_MAX_FRAMES);
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_part_max_ms);
 
@@ -739,7 +789,7 @@ VISIBLE_IF_KUNIT int rk3026_ebc_drive(struct rk3026_ebc *ebc, const u8 *lut,
 
 	while (done < frames) {
 		u32 n = min_t(u32, frames - done, EBC_LUT_MAX_FRAMES);
-		unsigned int budget = ebc_chunk_timeout_ms(ebc, n);
+		unsigned int budget = rk3026_ebc_chunk_timeout_ms(ebc, n);
 		bool ok;
 
 		if (!ebc_rails_up(ebc)) {
@@ -3127,16 +3177,11 @@ static int ebc_connector_get_modes(struct drm_connector *connector)
 	if (!mode)
 		return 0;
 
+	if (!rk3026_ebc_display_mode(ebc, mode)) {
+		drm_mode_destroy(connector->dev, mode);
+		return 0;
+	}
 	mode->type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED;
-	mode->clock = ebc_pixel_rate(ebc) / 1000;
-	mode->hdisplay = ebc->width;
-	mode->hsync_start = ebc->width;
-	mode->hsync_end = ebc->width;
-	mode->htotal = ebc->width;
-	mode->vdisplay = ebc->height;
-	mode->vsync_start = ebc->height;
-	mode->vsync_end = ebc->height;
-	mode->vtotal = ebc->height;
 	drm_mode_set_name(mode);
 	drm_mode_probed_add(connector, mode);
 
@@ -3849,6 +3894,7 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_kms_init);
 static int ebc_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
+	struct drm_display_mode scan = {};
 	struct rk3026_ebc *ebc;
 	struct drm_device *drm;
 	int ret;
@@ -3934,6 +3980,9 @@ static int ebc_probe(struct platform_device *pdev)
 	ebc->height = ebc->timing.vactive.typ;
 	if (ebc->width % 8 || ebc->height % 2)
 		return dev_err_probe(dev, -EINVAL, "unsupported panel size\n");
+	if (!rk3026_ebc_display_mode(ebc, &scan))
+		return dev_err_probe(dev, -EINVAL,
+				     "panel-timing too long for a display mode\n");
 	/*
 	 * One panel's worth of DU-changed pixels spends the budget; a part
 	 * that changes half the panel takes the cleanup FULL then, and any

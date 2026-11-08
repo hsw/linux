@@ -1396,6 +1396,10 @@ int rk3026_ebc_drive(struct rk3026_ebc *ebc, const u8 *lut, u32 frames,
 int rk3026_ebc_wait_seq(struct rk3026_ebc *ebc, u32 seq,
 			enum rk3026_ebc_wait_for until,
 			unsigned int timeout_ms, bool interruptible);
+bool rk3026_ebc_display_mode(const struct rk3026_ebc *ebc,
+			     struct drm_display_mode *mode);
+unsigned int rk3026_ebc_chunk_timeout_ms(const struct rk3026_ebc *ebc,
+					 u32 frames);
 unsigned int rk3026_ebc_part_max_ms(struct rk3026_ebc *ebc);
 unsigned int rk3026_ebc_wait_timeout_ms(struct rk3026_ebc *ebc);
 bool rk3026_ebc_plane_box(const struct drm_plane_state *old_state,

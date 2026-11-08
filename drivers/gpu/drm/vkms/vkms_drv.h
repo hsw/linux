@@ -241,7 +241,7 @@ struct vkms_config_plane;
  */
 struct vkms_device {
 	struct drm_device drm;
-	struct faux_device *faux_dev;
+	struct platform_device *faux_dev;
 	const struct vkms_config *config;
 };
 

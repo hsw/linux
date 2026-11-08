@@ -6,11 +6,14 @@
 #include <linux/module.h>
 #include <linux/platform_device.h>
 #include <linux/clk.h>
+#include <linux/delay.h>
 #include <linux/hw_bitfield.h>
+#include <linux/iopoll.h>
 #include <linux/mmc/host.h>
 #include <linux/of_address.h>
 #include <linux/mmc/slot-gpio.h>
 #include <linux/pm_runtime.h>
+#include <linux/reboot.h>
 #include <linux/slab.h>
 
 #include "dw_mmc.h"
@@ -528,6 +531,258 @@ static int dw_mci_rockchip_init(struct dw_mci *host)
 	return 0;
 }
 
+/*
+ * The RK3026 BootROM boots from the eMMC host at 0x1021c000 and, after a
+ * warm reset, reads the eMMC only with the boot operation (CMD held low,
+ * 1-bit, no boot acknowledge). It sends neither CMD0 nor an RST_n pulse,
+ * and the boot operation works only from the eMMC's pre-boot state, which
+ * a power-up, an RST_n pulse or CMD0 with the GO_PRE_IDLE argument enters.
+ * An eMMC left in Transfer state sends no boot data, and the ROM falls
+ * back to USB MaskROM mode: with no other boot medium the board does not
+ * come back until it is power cycled.
+ *
+ * So, before the SoC is reset: quiesce the host (DMA, then a host reset),
+ * let a program in progress end, pulse RST_n through the host's RST_N
+ * register, and send CMD0 GO_PRE_IDLE at 400 kHz. The RST_n pulse acts
+ * only if the eMMC's RST_n_FUNCTION (EXT_CSD[162]) is 1, while CMD0 works
+ * either way. The host is also left in its reset configuration (1-bit,
+ * CLKDIV 0, UHS_REG 0), since the ROM resets only its state machines and
+ * FIFO; a restart that resets the host module anyway, such as the RK3026
+ * core reset (SRST_EMMC) or a global reset, makes those writes redundant.
+ * No data is written to the eMMC; it is unusable until it is initialised
+ * again, so this runs only as a restart handler, in atomic context.
+ *
+ * The handler cannot switch a regulator, so it supports only a host whose
+ * card supplies are not described (always on, or switched by PWREN): a
+ * shutdown clears PWREN, and the handler sets it again.
+ */
+#define DW_MCI_RK_ARG_PRE_IDLE		0xf0f0f0f0
+#define DW_MCI_RK_PREBOOT_CLK_HZ	400000
+#define DW_MCI_RK_RST_LOW_MS		10
+#define DW_MCI_RK_POWER_UP_MS		10
+#define DW_MCI_RK_POLL_US		10000
+#define DW_MCI_RK_BUSY_US		500000
+#define DW_MCI_RK_PREBOOT_PRIO		(SYS_OFF_PRIO_HIGH + 1)
+
+static const struct dw_mci_rockchip_boot_host {
+	const char *compatible;
+	resource_size_t base;
+} dw_mci_rockchip_boot_hosts[] = {
+	/* the host the SoC's BootROM boots from */
+	{ .compatible = "rockchip,rk3026-dw-mshc", .base = 0x1021c000 },
+	{ }
+};
+
+static bool dw_mci_rockchip_cmd_wait(struct dw_mci *host)
+{
+	u32 status;
+
+	return !readl_poll_timeout_atomic(host->regs + SDMMC_CMD, status,
+					  !(status & SDMMC_CMD_START),
+					  1, DW_MCI_RK_POLL_US);
+}
+
+static void dw_mci_rockchip_update_clk(struct dw_mci *host)
+{
+	mci_writel(host, CMD, SDMMC_CMD_START | SDMMC_CMD_UPD_CLK |
+		   SDMMC_CMD_PRV_DAT_WAIT);
+	dw_mci_rockchip_cmd_wait(host);
+}
+
+/*
+ * Stop the host's DMA without the locks of the normal stop paths, which
+ * the interrupted context may hold. The internal DMAC (IDMAC) is stopped
+ * as dw_mci_idmac_stop_dma() does. An external channel moves data only on
+ * the host's DMA requests, which clearing DMA_ENABLE here and the DMA
+ * interface reset after it stop; the channel itself is left alone, since
+ * dmaengine_terminate_async() takes the channel's locks. The SoC reset
+ * that follows resets the DMA controller.
+ */
+static void dw_mci_rockchip_preboot_stop_dma(struct dw_mci *host)
+{
+	u32 val;
+
+	val = mci_readl(host, CTRL);
+	val &= ~(SDMMC_CTRL_DMA_ENABLE | SDMMC_CTRL_USE_IDMAC);
+	mci_writel(host, CTRL, val);
+
+	if (host->use_dma != TRANS_MODE_IDMAC)
+		return;
+
+	val = mci_readl(host, BMOD);
+	val &= ~(SDMMC_IDMAC_ENABLE | SDMMC_IDMAC_FB);
+	val |= SDMMC_IDMAC_SWRESET;
+	mci_writel(host, BMOD, val);
+	readl_poll_timeout_atomic(host->regs + SDMMC_BMOD, val,
+				  !(val & SDMMC_IDMAC_SWRESET),
+				  1, DW_MCI_RK_POLL_US);
+}
+
+static int dw_mci_rockchip_preboot(struct sys_off_data *data)
+{
+	struct dw_mci *host = data->cb_data;
+	u32 ctrl, status, rint = 0;
+	bool done;
+
+	/*
+	 * The clocks were prepared at probe. clk_enable() takes the clock
+	 * framework's enable lock; the current task may take it again, but
+	 * one held by another CPU when the restart stopped it would spin.
+	 */
+	if (clk_enable(host->biu_clk))
+		return NOTIFY_DONE;
+	if (clk_enable(host->ciu_clk))
+		return NOTIFY_DONE;
+
+	/* Stop whatever the host was doing; no interrupt is wanted now */
+	mci_writel(host, INTMASK, 0);
+	dw_mci_rockchip_preboot_stop_dma(host);
+	mci_writel(host, CTRL, SDMMC_CTRL_ALL_RESET_FLAGS);
+	readl_poll_timeout_atomic(host->regs + SDMMC_CTRL, ctrl,
+				  !(ctrl & SDMMC_CTRL_ALL_RESET_FLAGS),
+				  1, DW_MCI_RK_POLL_US);
+
+	if (mci_readl(host, PWREN) & BIT(0)) {
+		/*
+		 * A write cut off by the restart may have left the eMMC
+		 * programming a block (DAT0 low); let it finish before
+		 * RST_n aborts it. A transfer in mid-block is lost.
+		 */
+		if (readl_poll_timeout_atomic(host->regs + SDMMC_STATUS, status,
+					      !(status & SDMMC_STATUS_BUSY),
+					      10, DW_MCI_RK_BUSY_US))
+			dev_warn(host->dev, "eMMC still busy, resetting it\n");
+	} else {
+		/* Card power on: the shutdown turned it off */
+		mci_writel(host, PWREN, BIT(0));
+		mdelay(DW_MCI_RK_POWER_UP_MS);
+	}
+
+	mci_writel(host, CTYPE, SDMMC_CTYPE_1BIT);
+	mci_writel(host, UHS_REG, 0);
+
+	/* Hardware reset: JEDEC tRSTW >= 1 us, then tRSCA >= 200 us */
+	mci_writel(host, RST_N, 0);
+	mci_readl(host, RST_N);
+	mdelay(DW_MCI_RK_RST_LOW_MS);
+	mci_writel(host, RST_N, BIT(0));
+	mci_readl(host, RST_N);
+	mdelay(1);
+
+	/*
+	 * Identification clock for CMD0, running continuously. CLKDIV is
+	 * 8 bits: a ciu clock above 204 MHz would give more than 400 kHz.
+	 */
+	mci_writel(host, CLKENA, 0);
+	mci_writel(host, CLKSRC, 0);
+	dw_mci_rockchip_update_clk(host);
+	mci_writel(host, CLKDIV, min(DIV_ROUND_UP(host->bus_hz,
+						  2 * DW_MCI_RK_PREBOOT_CLK_HZ),
+				     0xffU));
+	dw_mci_rockchip_update_clk(host);
+	mci_writel(host, CLKENA, SDMMC_CLKEN_ENABLE);
+	dw_mci_rockchip_update_clk(host);
+
+	/* CMD0 GO_PRE_IDLE, no response */
+	mci_writel(host, RINTSTS, ~0);
+	mci_writel(host, CMDARG, DW_MCI_RK_ARG_PRE_IDLE);
+	mci_writel(host, CMD, SDMMC_CMD_START | SDMMC_CMD_USE_HOLD_REG |
+		   SDMMC_CMD_PRV_DAT_WAIT);
+	done = dw_mci_rockchip_cmd_wait(host) &&
+	       !readl_poll_timeout_atomic(host->regs + SDMMC_RINTSTS, rint,
+					  rint & (SDMMC_INT_CMD_DONE |
+						  SDMMC_INT_HLE),
+					  1, DW_MCI_RK_POLL_US) &&
+	       !(rint & SDMMC_INT_HLE);
+
+	/* The divider's reset value; the ROM programs and loads its own */
+	mci_writel(host, CLKDIV, 0);
+
+	if (done)
+		dev_dbg(host->dev, "eMMC in pre-boot state\n");
+	else
+		dev_warn(host->dev, "eMMC GO_PRE_IDLE not done (RINTSTS %#x)\n",
+			 rint);
+
+	return NOTIFY_DONE;
+}
+
+static void dw_mci_rockchip_clk_unprepare(void *data)
+{
+	clk_unprepare(data);
+}
+
+static int dw_mci_rockchip_register_preboot(struct dw_mci *host)
+{
+	const struct dw_mci_rockchip_boot_host *boot;
+	struct device *dev = host->dev;
+	struct mmc_host *mmc;
+	void *group;
+	int ret;
+
+	for (boot = dw_mci_rockchip_boot_hosts; boot->compatible; boot++)
+		if (of_device_is_compatible(dev->of_node, boot->compatible) &&
+		    host->phy_regs == boot->base)
+			break;
+	if (!boot->compatible)
+		return 0;
+
+	if (IS_ERR(host->biu_clk) || IS_ERR(host->ciu_clk))
+		return -ENODEV;
+
+	/* The handler can only set PWREN, see above */
+	mmc = host->mmc;
+	if (!IS_ERR(mmc->supply.vmmc) || !IS_ERR(mmc->supply.vqmmc)) {
+		dev_info(dev, "card supply described, no eMMC pre-boot restart\n");
+		return 0;
+	}
+
+	/* The host works without the handler: on failure, undo it all */
+	group = devres_open_group(dev, NULL, GFP_KERNEL);
+	if (!group)
+		return -ENOMEM;
+
+	/*
+	 * Runtime suspend unprepares both clocks; keep them prepared, not
+	 * enabled, so that the restart handler can enable them.
+	 */
+	ret = clk_prepare(host->biu_clk);
+	if (ret)
+		goto err;
+	ret = devm_add_action_or_reset(dev, dw_mci_rockchip_clk_unprepare,
+				       host->biu_clk);
+	if (ret)
+		goto err;
+	ret = clk_prepare(host->ciu_clk);
+	if (ret)
+		goto err;
+	ret = devm_add_action_or_reset(dev, dw_mci_rockchip_clk_unprepare,
+				       host->ciu_clk);
+	if (ret)
+		goto err;
+
+	/*
+	 * Restart priorities are unique. The handlers that reset the SoC or
+	 * the board sit at SYS_OFF_PRIO_HIGH and below (a core reset, a PMIC,
+	 * the CRU and the watchdog) and do not return, so run just above them.
+	 * The handler is unregistered only after dw_mci_rockchip_remove(),
+	 * which leaves the host in reset: a restart in that window gets no
+	 * pre-boot state, but every wait in the handler is bounded.
+	 */
+	ret = devm_register_sys_off_handler(dev, SYS_OFF_MODE_RESTART,
+					    DW_MCI_RK_PREBOOT_PRIO,
+					    dw_mci_rockchip_preboot, host);
+	if (ret)
+		goto err;
+
+	devres_remove_group(dev, group);
+	return 0;
+
+err:
+	devres_release_group(dev, group);
+	return ret;
+}
+
 static const struct dw_mci_drv_data rk2928_drv_data = {
 	.init			= dw_mci_rockchip_init,
 	.parse_dt		= dw_mci_rk2928_parse_dt,
@@ -585,6 +840,11 @@ static int dw_mci_rockchip_probe(struct platform_device *pdev)
 		pm_runtime_put_noidle(&pdev->dev);
 		return ret;
 	}
+
+	ret = dw_mci_rockchip_register_preboot(platform_get_drvdata(pdev));
+	if (ret)
+		dev_warn(&pdev->dev, "no eMMC pre-boot restart handler: %pe\n",
+			 ERR_PTR(ret));
 
 	pm_runtime_put_autosuspend(&pdev->dev);
 

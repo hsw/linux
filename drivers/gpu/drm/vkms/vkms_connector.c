@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0+
 
+#include <linux/moduleparam.h>
+
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_edid.h>
 #include <drm/drm_managed.h>
@@ -42,12 +44,26 @@ static const struct drm_connector_funcs vkms_connector_funcs = {
 	.atomic_destroy_state = drm_atomic_helper_connector_destroy_state,
 };
 
+/* test hack: an extra CVT mode, made the preferred one (0 = upstream behaviour) */
+static int pref_xres, pref_yres;
+module_param(pref_xres, int, 0444);
+module_param(pref_yres, int, 0444);
+
 static int vkms_conn_get_modes(struct drm_connector *connector)
 {
+	struct drm_display_mode *mode;
 	int count;
 
 	/* Use the default modes list from DRM */
 	count = drm_add_modes_noedid(connector, XRES_MAX, YRES_MAX);
+	if (pref_xres > 0 && pref_yres > 0) {
+		mode = drm_cvt_mode(connector->dev, pref_xres, pref_yres, 60, false, false, false);
+		if (mode) {
+			mode->type |= DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED;
+			drm_mode_probed_add(connector, mode);
+			return count + 1;
+		}
+	}
 	drm_set_preferred_mode(connector, XRES_DEF, YRES_DEF);
 
 	return count;

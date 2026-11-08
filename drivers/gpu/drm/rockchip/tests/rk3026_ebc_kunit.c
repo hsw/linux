@@ -14019,6 +14019,69 @@ fail:
 }
 
 /*
+ * The connector's modes as userspace probes them, under the mode_config
+ * lock: one, of the panel's T_W x T_H dots, preferred, the panel's scan
+ * (rk3026_ebc_display_mode()). Returns it.
+ */
+static struct drm_display_mode *t_fill_modes(struct kunit *test,
+					     struct rk3026_ebc *ebc)
+{
+	struct drm_connector *connector = &ebc->connector;
+	struct drm_display_mode *mode, scan = {};
+	int n;
+
+	mutex_lock(&ebc->drm.mode_config.mutex);
+	n = connector->funcs->fill_modes(connector, T_W, T_H);
+	mutex_unlock(&ebc->drm.mode_config.mutex);
+	KUNIT_ASSERT_EQ(test, n, 1);
+	mode = list_first_entry_or_null(&connector->modes,
+					struct drm_display_mode, head);
+	KUNIT_ASSERT_NOT_NULL(test, mode);
+	KUNIT_EXPECT_EQ(test, mode->hdisplay, T_W);
+	KUNIT_EXPECT_EQ(test, mode->vdisplay, T_H);
+	KUNIT_EXPECT_TRUE(test, mode->type & DRM_MODE_TYPE_PREFERRED);
+	KUNIT_ASSERT_TRUE(test, rk3026_ebc_display_mode(ebc, &scan));
+	KUNIT_EXPECT_TRUE(test, drm_mode_match(mode, &scan,
+					       DRM_MODE_MATCH_TIMINGS |
+					       DRM_MODE_MATCH_CLOCK));
+	return mode;
+}
+
+/*
+ * The panel's size from the DT's width-mm and height-mm is the
+ * connector's: userspace and fbdev take the panel's DPI from it. The case
+ * has no DT and does not run probe's of_property_read_u32() reads: it sets
+ * the fields they fill, here to the RC2 panel's 122 x 91 mm.
+ */
+static void ebc_test_glue_kms_size(struct kunit *test)
+{
+	struct rk3026_ebc *ebc = t_kms_ebc(test);
+
+	ebc->width_mm = 122;
+	ebc->height_mm = 91;
+	t_fill_modes(test, ebc);
+	KUNIT_EXPECT_EQ(test, ebc->connector.display_info.width_mm, 122);
+	KUNIT_EXPECT_EQ(test, ebc->connector.display_info.height_mm, 91);
+}
+
+/*
+ * Without width-mm and height-mm in the DT the size is 0 by 0, unknown,
+ * whatever the connector held before: each probe of the modes sets it.
+ */
+static void ebc_test_glue_kms_size_none(struct kunit *test)
+{
+	struct rk3026_ebc *ebc = t_kms_ebc(test);
+
+	KUNIT_EXPECT_EQ(test, ebc->width_mm, 0);
+	KUNIT_EXPECT_EQ(test, ebc->height_mm, 0);
+	ebc->connector.display_info.width_mm = 1;
+	ebc->connector.display_info.height_mm = 1;
+	t_fill_modes(test, ebc);
+	KUNIT_EXPECT_EQ(test, ebc->connector.display_info.width_mm, 0);
+	KUNIT_EXPECT_EQ(test, ebc->connector.display_info.height_mm, 0);
+}
+
+/*
  * A GAMMA_LUT is the C8 palette, of exactly 256 entries. A commit that
  * changes it alone, the console's FBIOPUTCMAP, takes the primary plane in
  * with no damage clips, so the plane redraws the whole panel; the CRTC's
@@ -14351,6 +14414,8 @@ static struct kunit_case rk3026_ebc_glue_test_cases[] = {
 	KUNIT_CASE(ebc_test_glue_kms_init),
 	KUNIT_CASE(ebc_test_glue_plane_formats),
 	KUNIT_CASE(ebc_test_glue_kms_palette),
+	KUNIT_CASE(ebc_test_glue_kms_size),
+	KUNIT_CASE(ebc_test_glue_kms_size_none),
 	{}
 };
 

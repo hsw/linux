@@ -1011,6 +1011,9 @@ struct rk3026_ebc {
 	u32			gdck_sta;
 	u32			lgonl;
 	enum drm_panel_orientation rotation;
+	/* The panel's active area in mm, 0 when the DT does not give it. */
+	u32			width_mm;
+	u32			height_mm;
 
 	/*
 	 * The two 4bpp images the EBC scans, the halves of one allocation

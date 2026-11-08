@@ -3185,6 +3185,10 @@ static int ebc_connector_get_modes(struct drm_connector *connector)
 	drm_mode_set_name(mode);
 	drm_mode_probed_add(connector, mode);
 
+	/* The DT's width-mm and height-mm; 0 (unknown) without them. */
+	connector->display_info.width_mm = ebc->width_mm;
+	connector->display_info.height_mm = ebc->height_mm;
+
 	return 1;
 }
 
@@ -4028,6 +4032,14 @@ static int ebc_probe(struct platform_device *pdev)
 		dev_warn(dev, "ignoring rotation (%d)\n", ret);
 		ebc->rotation = DRM_MODE_PANEL_ORIENTATION_UNKNOWN;
 	}
+
+	/*
+	 * The panel's active area in mm, as panel-common's width-mm and
+	 * height-mm, for the connector. Optional: without them the size
+	 * stays 0, unknown (the read leaves the zeroed field alone).
+	 */
+	of_property_read_u32(dev->of_node, "width-mm", &ebc->width_mm);
+	of_property_read_u32(dev->of_node, "height-mm", &ebc->height_mm);
 
 	/*
 	 * Panel thermometer, in the EPD PMIC. The waveform LUT is selected by

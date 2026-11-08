@@ -556,7 +556,7 @@ static u32 ebc_us_since(ktime_t start)
  *
  * The panel is 4bpp with two pixels per byte, low nibble first. The clip is
  * widened to an even pixel boundary so byte writes stay whole, and clamped
- * to the panel. The 32-bit formats and R8 go through
+ * to the panel. The 32- and 16-bit formats and R8 go through
  * rk3026_ebc_blit_convert() with their format: the top four bits of the
  * luma, the nearest of the 16 levels; C8 through rk3026_ebc_blit_c8_rows(),
  * a byte lookup in @c8_levels, the levels of the palette. A format with no
@@ -600,6 +600,8 @@ u32 rk3026_ebc_blit(struct rk3026_ebc *ebc, const void *src,
 	case DRM_FORMAT_ARGB8888:
 	case DRM_FORMAT_XBGR8888:
 	case DRM_FORMAT_ABGR8888:
+	case DRM_FORMAT_RGB565:
+	case DRM_FORMAT_BGR565:
 		rk3026_ebc_blit_convert(ebc->next_shadow, src, src_pitch,
 					format, r.x1, r.x2, r.y1, r.y2,
 					ebc->width);
@@ -2385,6 +2387,11 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_wait_marker);
  * as ABGR8888, XBGR8888 and ARGB8888): each colour shows as it would in
  * XRGB8888, and the alpha byte is ignored, as the plane has nothing below
  * it (a premultiplied colour without its alpha is that colour over black).
+ * RGB565 and BGR565 are the 16-bit layouts of Android's RGB_565 buffers
+ * (one order or the other, depending on the allocator and the composer):
+ * the luma comes straight from the fields, within one level of the same
+ * colour in XRGB8888. RGB565 is also the 16-bit fbdev format of
+ * "video=<connector>:<width>x<height>-16"; an mxcfb send refuses it.
  * C8 is indexed through the CRTC's GAMMA_LUT as its palette, each colour
  * shown as the nearest level to its luma (rk3026_ebc_load_palette()); it
  * is also the 8-bit fbdev format of "video=<connector>:<width>x<height>-8"
@@ -2399,6 +2406,8 @@ static const u32 ebc_plane_formats[] = {
 	DRM_FORMAT_ARGB8888,
 	DRM_FORMAT_XBGR8888,
 	DRM_FORMAT_ABGR8888,
+	DRM_FORMAT_RGB565,
+	DRM_FORMAT_BGR565,
 	DRM_FORMAT_C8,
 	DRM_FORMAT_R8,
 };

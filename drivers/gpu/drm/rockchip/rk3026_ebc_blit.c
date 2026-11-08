@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Rockchip RK3026 EBC: 32-bit RGB and 8-bit grey to the panel's packed
- * 4bpp grey.
+ * Rockchip RK3026 EBC: 32- and 16-bit RGB and 8-bit grey to the panel's
+ * packed 4bpp grey.
  *
  * Every plane and mxcfb update converts its damage here, under @image_lock,
  * so this loop is most of the CPU time of a refresh. It is a pure function
@@ -17,6 +17,12 @@
  * a colour gives the same nibble in all four, at the same cost. The alpha
  * byte is ignored: the plane has nothing below it, and a premultiplied
  * colour without its alpha is that colour over black.
+ *
+ * RGB565 and BGR565 take the luma straight from the 5-, 6- and 5-bit
+ * fields with the BT.601 weights scaled to them (EBC_565_WR, EBC_565_WG,
+ * EBC_565_WB), two pixels per 32-bit word: no expansion to 8 bits, no
+ * table. The nibble is the one the colour expanded by bit replication
+ * gets in XRGB8888, or one level off it for 852 of the 65536 values.
  *
  * With CONFIG_DRM_RK3026_EBC_NEON, rk3026_ebc_blit_convert() runs the NEON
  * rows of rk3026_ebc_blit_neon.c instead where it can, and these rows
@@ -64,6 +70,8 @@ static_assert(EBC_NEON_XRGB8888 == DRM_FORMAT_XRGB8888);
 static_assert(EBC_NEON_ARGB8888 == DRM_FORMAT_ARGB8888);
 static_assert(EBC_NEON_XBGR8888 == DRM_FORMAT_XBGR8888);
 static_assert(EBC_NEON_ABGR8888 == DRM_FORMAT_ABGR8888);
+static_assert(EBC_NEON_RGB565 == DRM_FORMAT_RGB565);
+static_assert(EBC_NEON_BGR565 == DRM_FORMAT_BGR565);
 static_assert(EBC_NEON_R8 == DRM_FORMAT_R8);
 
 /*
@@ -134,6 +142,79 @@ static __always_inline void ebc_rgb32_rows(u8 *dst, const void *src,
 	}
 }
 
+/*
+ * The nibbles of the two 16-bit pixels of @p, pixel 0 in the low half,
+ * as one byte, pixel 0 in the low nibble: each half of @p split into its
+ * fields in place, @wt weighing the field in bits 15:11, EBC_565_WG the
+ * one in 10:5 and @wl the one in 4:0, so a multiply weighs a field of both
+ * pixels. Each half's sum stays below 2^14 (EBC_565_SHIFT + 8 bits), so
+ * neither carries into the other, and the high half's nibble is all of
+ * bits 26 and up.
+ */
+static __always_inline u32 ebc_565_pack2(u32 p, u32 wt, u32 wl)
+{
+	u32 y = ((p >> 11) & 0x001f001f) * wt +
+		((p >> 5) & 0x003f003f) * EBC_565_WG +
+		(p & 0x001f001f) * wl;
+
+	return ((y >> (EBC_565_SHIFT + 4)) & 0x0f) |
+	       (y >> (EBC_565_SHIFT + 20)) << 4;
+}
+
+/*
+ * One row of @n (even) 16-bit pixels from @s to @d, @wt and @wl as for
+ * ebc_565_pack2(): four pixels per 16-bit store, with the source
+ * prefetched 128 bytes ahead; the row's last two pixels, if any, into one
+ * byte.
+ */
+static __always_inline void ebc_565_row(u8 *d, const u8 *s, int n, u32 wt,
+					u32 wl)
+{
+	for (; n >= 4; n -= 4, s += 8, d += 2) {
+		prefetch(s + 128);
+		put_unaligned_le16(ebc_565_pack2(get_unaligned_le32(s), wt, wl) |
+				   ebc_565_pack2(get_unaligned_le32(s + 4), wt,
+						 wl) << 8,
+				   d);
+	}
+	for (; n > 0; n -= 2, s += 4, d++)
+		*d = ebc_565_pack2(get_unaligned_le32(s), wt, wl);
+}
+
+/*
+ * A row of each field order, each a function of its own: inlined into the
+ * row loop, the weights and the loop's own values outgrow the registers
+ * at -Os and the 4-pixel body spills.
+ */
+static noinline void ebc_rgb565_row(u8 *d, const u8 *s, int n)
+{
+	ebc_565_row(d, s, n, EBC_565_WR, EBC_565_WB);
+}
+
+static noinline void ebc_bgr565_row(u8 *d, const u8 *s, int n)
+{
+	ebc_565_row(d, s, n, EBC_565_WB, EBC_565_WR);
+}
+
+/* The 16-bit rows: RGB565, or BGR565 with @bgr. */
+static __always_inline void ebc_565_rows(u8 *dst, const void *src,
+					 unsigned int src_pitch, int x1,
+					 int x2, int y1, int y2,
+					 unsigned int width, bool bgr)
+{
+	int y;
+
+	for (y = y1; y < y2; y++) {
+		const u8 *s = (const u8 *)src + (size_t)y * src_pitch + x1 * 2;
+		u8 *d = dst + ((size_t)y * width + x1) / 2;
+
+		if (bgr)
+			ebc_bgr565_row(d, s, x2 - x1);
+		else
+			ebc_rgb565_row(d, s, x2 - x1);
+	}
+}
+
 /* The luma of an XRGB8888 pixel, as ebc_luma_k() computes it. */
 static __always_inline u32 ebc_luma(u32 p)
 {
@@ -191,7 +272,8 @@ static __always_inline void ebc_r8_rows(u8 *dst, const void *src,
  * @src: source, top-left of the whole framebuffer
  * @src_pitch: source stride in bytes
  * @format: source format: DRM_FORMAT_XRGB8888, DRM_FORMAT_ARGB8888,
- *	DRM_FORMAT_XBGR8888, DRM_FORMAT_ABGR8888 or DRM_FORMAT_R8
+ *	DRM_FORMAT_XBGR8888, DRM_FORMAT_ABGR8888, DRM_FORMAT_RGB565,
+ *	DRM_FORMAT_BGR565 or DRM_FORMAT_R8
  * @x1: first column, even
  * @x2: end column, even, at most @width, above @x1
  * @y1: first row
@@ -199,8 +281,9 @@ static __always_inline void ebc_r8_rows(u8 *dst, const void *src,
  * @width: image width in pixels
  *
  * Writes bytes @x1 / 2 to @x2 / 2 of rows @y1 to @y2 of @dst, nothing else:
- * the top four bits of the luma of a 32-bit pixel, alpha ignored, the
- * rk3026_ebc_grey_level() of an R8 one. Any other format writes nothing.
+ * the top four bits of the luma of a 32-bit pixel, alpha ignored, or of a
+ * 16-bit one from its fields, the rk3026_ebc_grey_level() of an R8 one.
+ * Any other format writes nothing.
  */
 void rk3026_ebc_blit_rows(u8 *dst, const void *src, unsigned int src_pitch,
 			  u32 format, int x1, int x2, int y1, int y2,
@@ -216,6 +299,12 @@ void rk3026_ebc_blit_rows(u8 *dst, const void *src, unsigned int src_pitch,
 	case DRM_FORMAT_ABGR8888:
 		ebc_rgb32_rows(dst, src, src_pitch, x1, x2, y1, y2, width,
 			       EBC_LUMA_XBGR);
+		break;
+	case DRM_FORMAT_RGB565:
+		ebc_565_rows(dst, src, src_pitch, x1, x2, y1, y2, width, false);
+		break;
+	case DRM_FORMAT_BGR565:
+		ebc_565_rows(dst, src, src_pitch, x1, x2, y1, y2, width, true);
 		break;
 	case DRM_FORMAT_R8:
 		ebc_r8_rows(dst, src, src_pitch, x1, x2, y1, y2, width);
@@ -616,9 +705,9 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_blit_dither);
  * rk3026_ebc_blit_impl - the XRGB8888 conversion rk3026_ebc_blit() runs
  *
  * For the probe line and debugfs "timing", so a measured blit time says
- * which loop it is from. The other 32-bit formats, R8 and the dither take
- * NEON under the same conditions; C8 always takes the scalar table rows
- * (rk3026_ebc_blit_c8_rows()), whatever this says.
+ * which loop it is from. The other 32-bit formats, the 16-bit ones, R8 and
+ * the dither take NEON under the same conditions; C8 always takes the
+ * scalar table rows (rk3026_ebc_blit_c8_rows()), whatever this says.
  *
  * Returns "neon" if rk3026_ebc_blit_convert() takes the NEON rows for a
  * clip of 16 pixels or more in process context, else "scalar".

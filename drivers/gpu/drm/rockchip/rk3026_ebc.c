@@ -176,20 +176,67 @@ static void ebc_config_done(struct rk3026_ebc *ebc)
  * pixels per clock, which is the same x4 the vendor applies before its own
  * clk_set_rate.
  */
-static unsigned long ebc_pixel_rate(struct rk3026_ebc *ebc)
+static unsigned long ebc_pixel_rate(const struct rk3026_ebc *ebc)
 {
 	unsigned long hz = ebc->timing.pixelclock.typ;
 
 	return hz ? hz : EBC_PIXEL_RATE_FALLBACK;
 }
 
-static unsigned long ebc_dclk_rate(struct rk3026_ebc *ebc)
+static unsigned long ebc_dclk_rate(const struct rk3026_ebc *ebc)
 {
 	return ebc_pixel_rate(ebc) * 4;
 }
 
 /**
- * ebc_chunk_timeout_ms - frame budget for one chunk, DERIVED from the timings
+ * rk3026_ebc_display_mode - the panel's scan as a display mode
+ * @ebc: controller, its panel-timing parsed
+ * @mode: gets the clock and the horizontal and vertical timings
+ *
+ * The scan, not the panel-timing read as a videomode. Each line is the
+ * active dots and then the front porch, the sync and the back porch, which
+ * panel-timing gives in source clocks, four dots each: the 8-bit source
+ * bus carries four 2-bit pixels a clock. The mode counts them all in dots
+ * at the dot clock, dclk, so its refresh rate is the scan's frame rate
+ * (RC2: 160 MHz / (1768 x 1082), 83.6 Hz). The videomode helpers count the
+ * porches as dots at the source clock: 24 Hz on RC2.
+ *
+ * The mode only reports the rate; nothing programs the controller from
+ * it. The frame budget (rk3026_ebc_chunk_timeout_ms()) counts the same
+ * scan.
+ *
+ * Returns false when a total does not fit DRM's 16-bit timings; @mode is
+ * then left alone.
+ */
+VISIBLE_IF_KUNIT bool rk3026_ebc_display_mode(const struct rk3026_ebc *ebc,
+					      struct drm_display_mode *mode)
+{
+	const struct display_timing *t = &ebc->timing;
+	u64 hfp = 4ULL * t->hfront_porch.typ, hsync = 4ULL * t->hsync_len.typ;
+	u64 hbp = 4ULL * t->hback_porch.typ;
+	u64 vfp = t->vfront_porch.typ, vsync = t->vsync_len.typ;
+	u64 vbp = t->vback_porch.typ;
+
+	if ((u64)ebc->width + hfp + hsync + hbp > U16_MAX ||
+	    (u64)ebc->height + vfp + vsync + vbp > U16_MAX)
+		return false;
+
+	mode->clock = div_u64(4ULL * ebc_pixel_rate(ebc), 1000);
+	mode->hdisplay = ebc->width;
+	mode->hsync_start = mode->hdisplay + hfp;
+	mode->hsync_end = mode->hsync_start + hsync;
+	mode->htotal = mode->hsync_end + hbp;
+	mode->vdisplay = ebc->height;
+	mode->vsync_start = mode->vdisplay + vfp;
+	mode->vsync_end = mode->vsync_start + vsync;
+	mode->vtotal = mode->vsync_end + vbp;
+
+	return true;
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_display_mode);
+
+/**
+ * rk3026_ebc_chunk_timeout_ms - frame budget of a chunk, DERIVED from timings
  * @ebc: controller
  * @frames: frames in this chunk
  *
@@ -200,9 +247,10 @@ static unsigned long ebc_dclk_rate(struct rk3026_ebc *ebc)
  * 40 ms over, broke out of the frame loop and drove 0 of 101 frames. The panel
  * came up holding whatever was on it, and nothing in the log said "too slow".
  *
- * So compute it. One frame is htotal source clocks x vtotal lines, at the source
- * clock; the x4 between dclk and the source clock cancels out because both come
- * from the same DT property.
+ * So compute it. One frame is the scan of rk3026_ebc_display_mode(), the
+ * mode's own: vtotal lines of htotal / 4 source clocks, at the source clock;
+ * the x4 between dclk and the source clock cancels out because both come from
+ * the same DT property.
  *
  * The margin is deliberately large. This timeout exists only so a wedged
  * controller cannot hang the thread forever -- it is not a tuning knob, and
@@ -210,27 +258,29 @@ static unsigned long ebc_dclk_rate(struct rk3026_ebc *ebc)
  * panel part-driven and accumulates ghosting that survives into the next boot.
  * Erring generous costs a few seconds once; erring tight corrupts the display.
  */
-static unsigned int ebc_chunk_timeout_ms(struct rk3026_ebc *ebc, u32 frames)
+VISIBLE_IF_KUNIT unsigned int
+rk3026_ebc_chunk_timeout_ms(const struct rk3026_ebc *ebc, u32 frames)
 {
-	const struct display_timing *t = &ebc->timing;
-	u32 hclks = t->hsync_len.typ + ebc->width / 4 +
-		    t->hback_porch.typ + t->hfront_porch.typ;
-	u32 vlines = t->vsync_len.typ + ebc->height +
-		     t->vback_porch.typ + t->vfront_porch.typ;
-	u64 us = div_u64((u64)hclks * vlines * USEC_PER_SEC,
-			 ebc_pixel_rate(ebc));
-	u64 ms = div_u64(us * frames * EBC_FRAME_TIMEOUT_MARGIN, USEC_PER_MSEC);
+	struct drm_display_mode scan = {};
+	u64 us, ms;
+
+	/* It fits: the probe refuses a panel-timing that does not. */
+	rk3026_ebc_display_mode(ebc, &scan);
+	us = div_u64((u64)(scan.htotal / 4) * scan.vtotal * USEC_PER_SEC,
+		     ebc_pixel_rate(ebc));
+	ms = div_u64(us * frames * EBC_FRAME_TIMEOUT_MARGIN, USEC_PER_MSEC);
 
 	return max_t(u64, ms, EBC_FRAME_TIMEOUT_MIN_MS);
 }
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_chunk_timeout_ms);
 
 /*
  * The longest one part takes while the refresh thread works: the setup
  * (EBC_PART_SETUP_MS), then at most two waveforms, a repair RESET and the
  * part's own, of at most EBC_WAVEFORM_MAX_FRAMES frames each. A chunk ends
- * within its budget (ebc_chunk_timeout_ms()) or ends the part, so every
- * chunk counts at its budget. Derived from the timings like the budget: at
- * a lower dot clock a part takes longer.
+ * within its budget (rk3026_ebc_chunk_timeout_ms()) or ends the part, so
+ * every chunk counts at its budget. Derived from the timings like the
+ * budget: at a lower dot clock a part takes longer.
  */
 VISIBLE_IF_KUNIT unsigned int rk3026_ebc_part_max_ms(struct rk3026_ebc *ebc)
 {
@@ -238,7 +288,7 @@ VISIBLE_IF_KUNIT unsigned int rk3026_ebc_part_max_ms(struct rk3026_ebc *ebc)
 				      EBC_LUT_MAX_FRAMES);
 
 	return EBC_PART_SETUP_MS +
-	       chunks * ebc_chunk_timeout_ms(ebc, EBC_LUT_MAX_FRAMES);
+	       chunks * rk3026_ebc_chunk_timeout_ms(ebc, EBC_LUT_MAX_FRAMES);
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_part_max_ms);
 
@@ -556,16 +606,17 @@ static u32 ebc_us_since(ktime_t start)
  *
  * The panel is 4bpp with two pixels per byte, low nibble first. The clip is
  * widened to an even pixel boundary so byte writes stay whole, and clamped
- * to the panel. XRGB8888 goes through rk3026_ebc_blit_convert(), the top
- * four bits of the luma; R8 through rk3026_ebc_blit_r8_convert(), the
- * nearest of the 16 levels; C8 through rk3026_ebc_blit_c8_rows(), a byte
- * lookup in @c8_levels, the levels of the palette. A format with no
+ * to the panel. The 32- and 16-bit formats and R8 go through
+ * rk3026_ebc_blit_convert() with their format: the top four bits of the
+ * luma, the nearest of the 16 levels; C8 through rk3026_ebc_blit_c8_rows(),
+ * a byte lookup in @c8_levels, the levels of the palette. A format with no
  * conversion here is a driver bug: it warns once and writes nothing.
  *
  * With @dither other than EBC_DITHER_NONE, XRGB8888 and R8 go through
- * rk3026_ebc_blit_dither() instead. C8 takes no dither: only the plane,
- * which never asks for one, blits indices, and an mxcfb send blits a C8
- * framebuffer as R8.
+ * rk3026_ebc_blit_dither() instead. The other formats take no dither and
+ * convert plainly: an mxcfb send, the only sender that asks, blits the
+ * fbdev's XRGB8888, or its C8 as R8, and only the plane, which never asks,
+ * blits the others.
  *
  * Writes @next_shadow. Called under @image_lock, in the same section that
  * queues the update, so no snapshot sees the pixels without their update.
@@ -588,24 +639,22 @@ u32 rk3026_ebc_blit(struct rk3026_ebc *ebc, const void *src,
 	start = ktime_get();
 	switch (format) {
 	case DRM_FORMAT_XRGB8888:
-		if (dither != EBC_DITHER_NONE)
-			rk3026_ebc_blit_dither(ebc->next_shadow, src,
-					       src_pitch, 4, r.x1, r.x2, r.y1,
-					       r.y2, ebc->width, dither);
-		else
-			rk3026_ebc_blit_convert(ebc->next_shadow, src,
-						src_pitch, r.x1, r.x2, r.y1,
-						r.y2, ebc->width);
-		break;
 	case DRM_FORMAT_R8:
-		if (dither != EBC_DITHER_NONE)
+		if (dither != EBC_DITHER_NONE) {
 			rk3026_ebc_blit_dither(ebc->next_shadow, src,
-					       src_pitch, 1, r.x1, r.x2, r.y1,
-					       r.y2, ebc->width, dither);
-		else
-			rk3026_ebc_blit_r8_convert(ebc->next_shadow, src,
-						   src_pitch, r.x1, r.x2, r.y1,
-						   r.y2, ebc->width);
+					       src_pitch, format, r.x1, r.x2,
+					       r.y1, r.y2, ebc->width, dither);
+			break;
+		}
+		fallthrough;
+	case DRM_FORMAT_ARGB8888:
+	case DRM_FORMAT_XBGR8888:
+	case DRM_FORMAT_ABGR8888:
+	case DRM_FORMAT_RGB565:
+	case DRM_FORMAT_BGR565:
+		rk3026_ebc_blit_convert(ebc->next_shadow, src, src_pitch,
+					format, r.x1, r.x2, r.y1, r.y2,
+					ebc->width);
 		break;
 	case DRM_FORMAT_C8:
 		rk3026_ebc_blit_c8_rows(ebc->next_shadow, src, src_pitch,
@@ -740,7 +789,7 @@ VISIBLE_IF_KUNIT int rk3026_ebc_drive(struct rk3026_ebc *ebc, const u8 *lut,
 
 	while (done < frames) {
 		u32 n = min_t(u32, frames - done, EBC_LUT_MAX_FRAMES);
-		unsigned int budget = ebc_chunk_timeout_ms(ebc, n);
+		unsigned int budget = rk3026_ebc_chunk_timeout_ms(ebc, n);
 		bool ok;
 
 		if (!ebc_rails_up(ebc)) {
@@ -2383,6 +2432,16 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_wait_marker);
 
 /*
  * XRGB8888 first, the format of the fbdev emulation and of most clients.
+ * ARGB8888, XBGR8888 and ABGR8888 are the other 32-bit layouts a client
+ * may render in (Android's composer hands its target and its layers over
+ * as ABGR8888, XBGR8888 and ARGB8888): each colour shows as it would in
+ * XRGB8888, and the alpha byte is ignored, as the plane has nothing below
+ * it (a premultiplied colour without its alpha is that colour over black).
+ * RGB565 and BGR565 are the 16-bit layouts of Android's RGB_565 buffers
+ * (one order or the other, depending on the allocator and the composer):
+ * the luma comes straight from the fields, within one level of the same
+ * colour in XRGB8888. RGB565 is also the 16-bit fbdev format of
+ * "video=<connector>:<width>x<height>-16"; an mxcfb send refuses it.
  * C8 is indexed through the CRTC's GAMMA_LUT as its palette, each colour
  * shown as the nearest level to its luma (rk3026_ebc_load_palette()); it
  * is also the 8-bit fbdev format of "video=<connector>:<width>x<height>-8"
@@ -2394,6 +2453,11 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_wait_marker);
  */
 static const u32 ebc_plane_formats[] = {
 	DRM_FORMAT_XRGB8888,
+	DRM_FORMAT_ARGB8888,
+	DRM_FORMAT_XBGR8888,
+	DRM_FORMAT_ABGR8888,
+	DRM_FORMAT_RGB565,
+	DRM_FORMAT_BGR565,
 	DRM_FORMAT_C8,
 	DRM_FORMAT_R8,
 };
@@ -2549,7 +2613,7 @@ static void ebc_set_palette_entry(struct drm_crtc *crtc, unsigned int index,
  * section, so a blit sees the old table or the new one, never part of
  * each.
  *
- * Only C8 reads the table. XRGB8888 and R8 pass the GAMMA_LUT by: the
+ * Only C8 reads the table. The other formats pass the GAMMA_LUT by: the
  * panel has no colour to correct, a tone curve for them is a feature of
  * its own, and the palette a C8 fbdev leaves in the CRTC state (the
  * console's 16 colours) would garble a client that takes the CRTC over in
@@ -3113,18 +3177,17 @@ static int ebc_connector_get_modes(struct drm_connector *connector)
 	if (!mode)
 		return 0;
 
+	if (!rk3026_ebc_display_mode(ebc, mode)) {
+		drm_mode_destroy(connector->dev, mode);
+		return 0;
+	}
 	mode->type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED;
-	mode->clock = ebc_pixel_rate(ebc) / 1000;
-	mode->hdisplay = ebc->width;
-	mode->hsync_start = ebc->width;
-	mode->hsync_end = ebc->width;
-	mode->htotal = ebc->width;
-	mode->vdisplay = ebc->height;
-	mode->vsync_start = ebc->height;
-	mode->vsync_end = ebc->height;
-	mode->vtotal = ebc->height;
 	drm_mode_set_name(mode);
 	drm_mode_probed_add(connector, mode);
+
+	/* The DT's width-mm and height-mm; 0 (unknown) without them. */
+	connector->display_info.width_mm = ebc->width_mm;
+	connector->display_info.height_mm = ebc->height_mm;
 
 	return 1;
 }
@@ -3146,10 +3209,10 @@ static const struct drm_connector_helper_funcs ebc_connector_helper_funcs = {
  * CRTC alone. Its planes join the commit before the helper checks them,
  * so they are checked like any other, and a C8 plane redraws the whole
  * panel with the new table, whatever damage clips a client sent in the
- * same commit (ebc_plane_atomic_check()). An XRGB8888 or R8
- * plane redraws the same pixels, a part skipped as identical: those
- * formats do not apply the LUT (rk3026_ebc_load_palette()), which the
- * atomic debug log says.
+ * same commit (ebc_plane_atomic_check()). A plane of any other format
+ * redraws the same pixels, a part skipped as identical: those formats do
+ * not apply the LUT (rk3026_ebc_load_palette()), which the atomic debug
+ * log says.
  */
 static int ebc_atomic_check(struct drm_device *drm,
 			    struct drm_atomic_state *state)
@@ -3835,6 +3898,7 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_kms_init);
 static int ebc_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
+	struct drm_display_mode scan = {};
 	struct rk3026_ebc *ebc;
 	struct drm_device *drm;
 	int ret;
@@ -3920,6 +3984,9 @@ static int ebc_probe(struct platform_device *pdev)
 	ebc->height = ebc->timing.vactive.typ;
 	if (ebc->width % 8 || ebc->height % 2)
 		return dev_err_probe(dev, -EINVAL, "unsupported panel size\n");
+	if (!rk3026_ebc_display_mode(ebc, &scan))
+		return dev_err_probe(dev, -EINVAL,
+				     "panel-timing too long for a display mode\n");
 	/*
 	 * One panel's worth of DU-changed pixels spends the budget; a part
 	 * that changes half the panel takes the cleanup FULL then, and any
@@ -3965,6 +4032,14 @@ static int ebc_probe(struct platform_device *pdev)
 		dev_warn(dev, "ignoring rotation (%d)\n", ret);
 		ebc->rotation = DRM_MODE_PANEL_ORIENTATION_UNKNOWN;
 	}
+
+	/*
+	 * The panel's active area in mm, as panel-common's width-mm and
+	 * height-mm, for the connector. Optional: without them the size
+	 * stays 0, unknown (the read leaves the zeroed field alone).
+	 */
+	of_property_read_u32(dev->of_node, "width-mm", &ebc->width_mm);
+	of_property_read_u32(dev->of_node, "height-mm", &ebc->height_mm);
 
 	/*
 	 * Panel thermometer, in the EPD PMIC. The waveform LUT is selected by

@@ -1011,6 +1011,9 @@ struct rk3026_ebc {
 	u32			gdck_sta;
 	u32			lgonl;
 	enum drm_panel_orientation rotation;
+	/* The panel's active area in mm, 0 when the DT does not give it. */
+	u32			width_mm;
+	u32			height_mm;
 
 	/*
 	 * The two 4bpp images the EBC scans, the halves of one allocation
@@ -1396,6 +1399,10 @@ int rk3026_ebc_drive(struct rk3026_ebc *ebc, const u8 *lut, u32 frames,
 int rk3026_ebc_wait_seq(struct rk3026_ebc *ebc, u32 seq,
 			enum rk3026_ebc_wait_for until,
 			unsigned int timeout_ms, bool interruptible);
+bool rk3026_ebc_display_mode(const struct rk3026_ebc *ebc,
+			     struct drm_display_mode *mode);
+unsigned int rk3026_ebc_chunk_timeout_ms(const struct rk3026_ebc *ebc,
+					 u32 frames);
 unsigned int rk3026_ebc_part_max_ms(struct rk3026_ebc *ebc);
 unsigned int rk3026_ebc_wait_timeout_ms(struct rk3026_ebc *ebc);
 bool rk3026_ebc_plane_box(const struct drm_plane_state *old_state,
@@ -1443,27 +1450,22 @@ bool rk3026_ebc_fbdev_held(const struct rk3026_ebc *ebc, u32 taken);
 
 /* rk3026_ebc_blit.c */
 void rk3026_ebc_blit_rows(u8 *dst, const void *src, unsigned int src_pitch,
-			  int x1, int x2, int y1, int y2, unsigned int width);
-void rk3026_ebc_blit_convert(u8 *dst, const void *src, unsigned int src_pitch,
-			     int x1, int x2, int y1, int y2,
+			  u32 format, int x1, int x2, int y1, int y2,
+			  unsigned int width);
+bool rk3026_ebc_blit_convert(u8 *dst, const void *src, unsigned int src_pitch,
+			     u32 format, int x1, int x2, int y1, int y2,
 			     unsigned int width);
 const char *rk3026_ebc_blit_impl(void);
-void rk3026_ebc_blit_r8_rows(u8 *dst, const void *src, unsigned int src_pitch,
-			     int x1, int x2, int y1, int y2,
-			     unsigned int width);
-bool rk3026_ebc_blit_r8_convert(u8 *dst, const void *src,
-				unsigned int src_pitch, int x1, int x2, int y1,
-				int y2, unsigned int width);
 void rk3026_ebc_blit_c8_rows(u8 *dst, const void *src, unsigned int src_pitch,
 			     int x1, int x2, int y1, int y2,
 			     unsigned int width, const u8 *levels);
 u8 rk3026_ebc_palette_level(u16 red, u16 green, u16 blue);
 void rk3026_ebc_blit_rows_dither(u8 *dst, const void *src,
-				 unsigned int src_pitch, int x1, int x2,
-				 int y1, int y2, unsigned int width,
-				 unsigned int cpp, unsigned int steps);
+				 unsigned int src_pitch, u32 format, int x1,
+				 int x2, int y1, int y2, unsigned int width,
+				 unsigned int steps);
 bool rk3026_ebc_blit_dither(u8 *dst, const void *src, unsigned int src_pitch,
-			    unsigned int cpp, int x1, int x2, int y1, int y2,
+			    u32 format, int x1, int x2, int y1, int y2,
 			    unsigned int width, enum rk3026_ebc_dither dither);
 
 /**

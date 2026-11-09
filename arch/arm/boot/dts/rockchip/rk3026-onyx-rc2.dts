@@ -454,6 +454,9 @@
 	rockchip,gdck-sta = <100>;
 	rockchip,lgonl = <281>;
 	rotation = <270>;
+	/* Active area 122.356 x 90.584 mm: 1448 x 1072 at an 84.5 um pitch. */
+	width-mm = <122>;
+	height-mm = <91>;
 	status = "okay";
 
 	panel-timing {

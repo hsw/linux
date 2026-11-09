@@ -267,6 +267,12 @@ VISIBLE_IF_KUNIT int rk3026_ebc_mxcfb_send(struct rk3026_ebc *ebc,
 	bool auto_mode;
 	u32 mode;
 
+	/*
+	 * The two fbdev formats mxcfb converts, each with the dither the
+	 * flags may ask for (rk3026_ebc_blit_dither()). Any other is
+	 * refused: the RGB565 fbdev of "video=<connector>:<mode>-16" gets
+	 * -EINVAL.
+	 */
 	switch (format) {
 	case DRM_FORMAT_XRGB8888:
 		blit_format = format;

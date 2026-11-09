@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Rockchip RK3026 EBC: XRGB8888 and R8 to packed 4bpp grey with NEON.
+ * Rockchip RK3026 EBC: 32- and 16-bit RGB and R8 to packed 4bpp grey with
+ * NEON.
  *
  * Built with CC_FLAGS_FPU, so the compiler may use NEON anywhere in this
  * unit: nothing here may run outside a kernel-mode NEON section.
@@ -9,22 +10,32 @@
  * <stdint.h> types, which clash with <linux/types.h> on ARM, so this unit
  * includes no kernel header (as lib/raid6/recov_neon_inner.c).
  *
- * The bytes are those of rk3026_ebc_blit_rows(): the nibble is the top four
- * bits of the BT.601 luma, (77 R + 150 G + 29 B) / 256 rounded down. Per 16
- * pixels: vld4.8 splits B, G, R and X into planes, vmull.u8/vmlal.u8 sum the
- * luma into u16 lanes, vshrn #8 narrows it to a byte, vuzp.8 separates the
- * even and the odd pixels, and vsri.8 #4 packs each pair into one byte with
- * the even pixel in the low nibble. The source is read once and nothing is
- * tested, so every page costs about the same; on the RK3026 (Cortex-A9 at
- * 600 MHz, with the L2 cache controller's prefetch and line-fill options
- * set as the vendor firmware sets them) that is the memory floor.
+ * rk3026_ebc_blit_rows_neon() takes the DRM format of the source, as
+ * rk3026_ebc_blit_rows() does, and writes its bytes. For XRGB8888 the
+ * nibble is the top four bits of the BT.601 luma, (77 R + 150 G + 29 B) /
+ * 256 rounded down. Per 16 pixels: vld4.8 splits B, G, R and X into
+ * planes, vmull.u8/vmlal.u8 sum the luma into u16 lanes, vshrn #8 narrows
+ * it to a byte, vuzp.8 separates the even and the odd pixels, and vsri.8
+ * #4 packs each pair into one byte with the even pixel in the low nibble.
+ * The source is read once and nothing is tested, so every page costs about
+ * the same; on the RK3026 (Cortex-A9 at 600 MHz, with the L2 cache
+ * controller's prefetch and line-fill options set as the vendor firmware
+ * sets them) that is the memory floor. ARGB8888 takes the same rows;
+ * XBGR8888 and ABGR8888 the same with the planes of R and B exchanged at
+ * the multiplies, which costs nothing.
  *
- * The R8 rows give the levels of rk3026_ebc_blit_r8_rows(), each grey rounded
- * to the nearest level as (g * 15 + 135) >> 8 (rk3026_ebc_grey_level()).
- * Per 32 pixels: vld2.8 splits the even and the odd pixels at the load,
- * vmull.u8 by 15 and vaddhn.u16 with 135 give the levels of 8 pixels in
- * two instructions, and vsli.8 #4 packs each pair into one byte with the
- * even pixel in the low nibble; one 16-byte store.
+ * RGB565 and BGR565 take the luma from the fields with the weights of the
+ * scalar rows (EBC_565_WR, EBC_565_WG, EBC_565_WB). Per 16 pixels: vld2.16
+ * splits the even and the odd pixels at the load, vshrn/vmovn and a mask
+ * narrow each field to bytes, vmull.u8/vmlal.u8 weigh them, vshrn
+ * #EBC_565_SHIFT narrows the luma, and vsri.8 #4 packs each pair. Both
+ * field orders cost the same: only the weights of the outer fields swap.
+ *
+ * For R8 each grey is rounded to the nearest level as (g * 15 + 135) >> 8
+ * (rk3026_ebc_grey_level()). Per 32 pixels: vld2.8 splits the even and the
+ * odd pixels at the load, vmull.u8 by 15 and vaddhn.u16 with 135 give the
+ * levels of 8 pixels in two instructions, and vsli.8 #4 packs each pair
+ * into one byte with the even pixel in the low nibble; one 16-byte store.
  *
  * rk3026_ebc_blit_rows_dither_neon() writes the bytes of
  * rk3026_ebc_blit_rows_dither() the same way: the grey of 16 pixels in two
@@ -37,53 +48,51 @@
 
 #include "rk3026_ebc_blit_neon.h"
 
-/* The grey nibble of the XRGB8888 pixel at @s (B, G, R, X in memory). */
-static __always_inline unsigned char ebc_neon_nibble(const unsigned char *s)
+/*
+ * The grey nibble of the 32-bit pixel at @s whose byte @r is R and byte
+ * 2 - @r is B: @r = 2 for XRGB8888 (B, G, R, X in memory), 0 for XBGR8888
+ * (R, G, B, X).
+ */
+static __always_inline unsigned char ebc_neon_nibble(const unsigned char *s,
+						     int r)
 {
-	return (77 * s[2] + 150 * s[1] + 29 * s[0]) >> 12;
+	return (77 * s[r] + 150 * s[1] + 29 * s[2 - r]) >> 12;
 }
 
-/* Sixteen pixels at @s into eight bytes, pixel 0 in the low nibble. */
-static __always_inline uint8x8_t ebc_neon_pack16(const unsigned char *s)
+/*
+ * Sixteen 32-bit pixels at @s into eight bytes, pixel 0 in the low nibble;
+ * @r as for ebc_neon_nibble(), the plane of R after vld4.8.
+ */
+static __always_inline uint8x8_t ebc_neon_pack16(const unsigned char *s,
+						 int r)
 {
 	const uint8x8_t k77 = vdup_n_u8(77);
 	const uint8x8_t k150 = vdup_n_u8(150);
 	const uint8x8_t k29 = vdup_n_u8(29);
-	uint8x16x4_t v = vld4q_u8(s);	/* val[0] B, [1] G, [2] R, [3] X */
+	uint8x16x4_t v = vld4q_u8(s);	/* the bytes of a pixel, G in val[1] */
 	uint16x8_t lo, hi;
 	uint8x8x2_t eo;
 
-	lo = vmull_u8(vget_low_u8(v.val[2]), k77);
-	hi = vmull_u8(vget_high_u8(v.val[2]), k77);
+	lo = vmull_u8(vget_low_u8(v.val[r]), k77);
+	hi = vmull_u8(vget_high_u8(v.val[r]), k77);
 	lo = vmlal_u8(lo, vget_low_u8(v.val[1]), k150);
 	hi = vmlal_u8(hi, vget_high_u8(v.val[1]), k150);
-	lo = vmlal_u8(lo, vget_low_u8(v.val[0]), k29);
-	hi = vmlal_u8(hi, vget_high_u8(v.val[0]), k29);
+	lo = vmlal_u8(lo, vget_low_u8(v.val[2 - r]), k29);
+	hi = vmlal_u8(hi, vget_high_u8(v.val[2 - r]), k29);
 	eo = vuzp_u8(vshrn_n_u16(lo, 8), vshrn_n_u16(hi, 8));	/* even, odd */
 	return vsri_n_u8(eo.val[1], eo.val[0], 4);
 }
 
-/**
- * rk3026_ebc_blit_rows_neon - rk3026_ebc_blit_rows() with NEON
- * @dst: target image, @width / 2 bytes per row, low nibble first
- * @src: XRGB8888 source, top-left of the whole framebuffer
- * @src_pitch: source stride in bytes
- * @x1: first column, even
- * @x2: end column, even, at most @width, above @x1
- * @y1: first row
- * @y2: end row, above @y1
- * @width: image width in pixels
- *
- * Writes the same bytes as rk3026_ebc_blit_rows(), and only those. Sixteen
- * pixels at a time, with the source read 256 bytes ahead (pld, as
- * prefetch()); a row's last 2 to 14 pixels take the luma two at a time. No
- * alignment is needed.
- *
- * Call only between kernel_neon_begin() and kernel_neon_end().
+/*
+ * The 32-bit rows, @r as for ebc_neon_nibble(): sixteen pixels at a time,
+ * with the source read 256 bytes ahead (pld, as prefetch()); a row's last
+ * 2 to 14 pixels take the luma two at a time.
  */
-void rk3026_ebc_blit_rows_neon(unsigned char *dst, const void *src,
-			       unsigned int src_pitch, int x1, int x2,
-			       int y1, int y2, unsigned int width)
+static __always_inline void ebc_neon_rgb32_rows(unsigned char *dst,
+						const void *src,
+						unsigned int src_pitch, int x1,
+						int x2, int y1, int y2,
+						unsigned int width, int r)
 {
 	int y;
 
@@ -96,10 +105,99 @@ void rk3026_ebc_blit_rows_neon(unsigned char *dst, const void *src,
 		for (; n >= 16; n -= 16, s += 64, d += 8) {
 			__builtin_prefetch(s + 256);
 			__builtin_prefetch(s + 256 + 32);
-			vst1_u8(d, ebc_neon_pack16(s));
+			vst1_u8(d, ebc_neon_pack16(s, r));
 		}
 		for (; n > 0; n -= 2, s += 8, d++)
-			*d = ebc_neon_nibble(s) | ebc_neon_nibble(s + 4) << 4;
+			*d = ebc_neon_nibble(s, r) |
+			     ebc_neon_nibble(s + 4, r) << 4;
+	}
+}
+
+/*
+ * The nibble of the 16-bit pixel at @s from its fields, @wt weighing the
+ * one in bits 15:11 and @wl the one in 4:0, as rk3026_ebc_blit_rows()
+ * takes it.
+ */
+static __always_inline unsigned char ebc_neon_565_nibble(const unsigned char *s,
+							 unsigned int wt,
+							 unsigned int wl)
+{
+	unsigned int q = s[0] | s[1] << 8;
+
+	return ((q >> 11) * wt + ((q >> 5) & 0x3f) * EBC_565_WG +
+		(q & 0x1f) * wl) >> (EBC_565_SHIFT + 4);
+}
+
+/*
+ * Sixteen 16-bit pixels, @v as vld2.16 loads them (val[0] the eight even
+ * pixels, val[1] the eight odd ones), into eight bytes, pixel 0 in the low
+ * nibble; @wt and @wl as for ebc_neon_565_nibble(). The fields are
+ * narrowed to bytes, so vmull.u8/vmlal.u8 weigh them as in the 32-bit
+ * rows. The two halves go through each step side by side: GCC at -Os
+ * keeps this order, and one half after the other leaves each multiply
+ * waiting for the one before it.
+ */
+static __always_inline uint8x8_t ebc_neon_565_pack16(uint16x8x2_t v,
+						     unsigned int wt,
+						     unsigned int wl)
+{
+	const uint16x8_t pe = v.val[0], po = v.val[1];
+	uint8x8_t te, to, me, mo, le, lo;
+	uint16x8_t se, so;
+
+	te = vshrn_n_u16(pe, 8);		/* the top field, then 3 bits */
+	to = vshrn_n_u16(po, 8);
+	me = vshrn_n_u16(pe, 5);		/* the middle field, then 2 bits */
+	mo = vshrn_n_u16(po, 5);
+	le = vmovn_u16(pe);			/* 3 bits, then the low field */
+	lo = vmovn_u16(po);
+	te = vshr_n_u8(te, 3);
+	to = vshr_n_u8(to, 3);
+	me = vand_u8(me, vdup_n_u8(0x3f));
+	mo = vand_u8(mo, vdup_n_u8(0x3f));
+	le = vand_u8(le, vdup_n_u8(0x1f));
+	lo = vand_u8(lo, vdup_n_u8(0x1f));
+	se = vmull_u8(te, vdup_n_u8(wt));
+	so = vmull_u8(to, vdup_n_u8(wt));
+	se = vmlal_u8(se, me, vdup_n_u8(EBC_565_WG));
+	so = vmlal_u8(so, mo, vdup_n_u8(EBC_565_WG));
+	se = vmlal_u8(se, le, vdup_n_u8(wl));
+	so = vmlal_u8(so, lo, vdup_n_u8(wl));
+	return vsri_n_u8(vshrn_n_u16(so, EBC_565_SHIFT),
+			 vshrn_n_u16(se, EBC_565_SHIFT), 4);
+}
+
+/*
+ * The 16-bit rows, @wt and @wl as for ebc_neon_565_nibble(): sixteen
+ * pixels at a time, with the source read 256 bytes ahead, one prefetch
+ * per 32-byte step; a row's last 2 to 14 pixels two at a time.
+ */
+static __always_inline void ebc_neon_565_rows(unsigned char *dst,
+					      const void *src,
+					      unsigned int src_pitch, int x1,
+					      int x2, int y1, int y2,
+					      unsigned int width,
+					      unsigned int wt,
+					      unsigned int wl)
+{
+	int y;
+
+	for (y = y1; y < y2; y++) {
+		const unsigned char *s = (const unsigned char *)src +
+				   (size_t)y * src_pitch + x1 * 2;
+		unsigned char *d = dst + ((size_t)y * width + x1) / 2;
+		int n = x2 - x1;
+
+		for (; n >= 16; n -= 16, s += 32, d += 8) {
+			/* val[0] the even pixels, val[1] the odd */
+			uint16x8x2_t v = vld2q_u16((const uint16_t *)s);
+
+			__builtin_prefetch(s + 256);
+			vst1_u8(d, ebc_neon_565_pack16(v, wt, wl));
+		}
+		for (; n > 0; n -= 2, s += 4, d++)
+			*d = ebc_neon_565_nibble(s, wt, wl) |
+			     ebc_neon_565_nibble(s + 2, wt, wl) << 4;
 	}
 }
 
@@ -115,27 +213,16 @@ static __always_inline uint8x8_t ebc_neon_grey8(uint8x8_t g)
 	return vaddhn_u16(vmull_u8(g, vdup_n_u8(15)), vdupq_n_u16(135));
 }
 
-/**
- * rk3026_ebc_blit_r8_rows_neon - rk3026_ebc_blit_r8_rows() with NEON
- * @dst: target image, @width / 2 bytes per row, low nibble first
- * @src: R8 source, one grey byte per pixel, top-left of the framebuffer
- * @src_pitch: source stride in bytes
- * @x1: first column, even
- * @x2: end column, even, at most @width, above @x1
- * @y1: first row
- * @y2: end row, above @y1
- * @width: image width in pixels
- *
- * Writes the bytes rk3026_ebc_blit_r8_rows() writes, and only those.
- * Thirty-two pixels at a time, with the source read 256 bytes ahead, one
- * prefetch per 32-byte line; then 16 if as many are left, and a row's last
- * 2 to 14 pixels two at a time. No alignment is needed.
- *
- * Call only between kernel_neon_begin() and kernel_neon_end().
+/*
+ * The R8 rows: thirty-two pixels at a time, with the source read 256 bytes
+ * ahead, one prefetch per 32-byte line; then 16 if as many are left, and a
+ * row's last 2 to 14 pixels two at a time.
  */
-void rk3026_ebc_blit_r8_rows_neon(unsigned char *dst, const void *src,
-				  unsigned int src_pitch, int x1, int x2,
-				  int y1, int y2, unsigned int width)
+static __always_inline void ebc_neon_r8_rows(unsigned char *dst,
+					     const void *src,
+					     unsigned int src_pitch, int x1,
+					     int x2, int y1, int y2,
+					     unsigned int width)
 {
 	int y;
 
@@ -171,14 +258,70 @@ void rk3026_ebc_blit_r8_rows_neon(unsigned char *dst, const void *src,
 	}
 }
 
+/**
+ * rk3026_ebc_blit_rows_neon - rk3026_ebc_blit_rows() with NEON
+ * @dst: target image, @width / 2 bytes per row, low nibble first
+ * @src: source, top-left of the whole framebuffer
+ * @src_pitch: source stride in bytes
+ * @format: source format: EBC_NEON_XRGB8888, EBC_NEON_ARGB8888,
+ *	EBC_NEON_XBGR8888, EBC_NEON_ABGR8888, EBC_NEON_RGB565,
+ *	EBC_NEON_BGR565 or EBC_NEON_R8
+ * @x1: first column, even
+ * @x2: end column, even, at most @width, above @x1
+ * @y1: first row
+ * @y2: end row, above @y1
+ * @width: image width in pixels
+ *
+ * Writes the same bytes as rk3026_ebc_blit_rows() for @format, and only
+ * those; any other format writes nothing. No alignment is needed.
+ *
+ * Call only between kernel_neon_begin() and kernel_neon_end().
+ */
+void rk3026_ebc_blit_rows_neon(unsigned char *dst, const void *src,
+			       unsigned int src_pitch, unsigned int format,
+			       int x1, int x2, int y1, int y2,
+			       unsigned int width)
+{
+	switch (format) {
+	case EBC_NEON_XRGB8888:
+	case EBC_NEON_ARGB8888:
+		ebc_neon_rgb32_rows(dst, src, src_pitch, x1, x2, y1, y2, width,
+				    2);
+		break;
+	case EBC_NEON_XBGR8888:
+	case EBC_NEON_ABGR8888:
+		ebc_neon_rgb32_rows(dst, src, src_pitch, x1, x2, y1, y2, width,
+				    0);
+		break;
+	case EBC_NEON_RGB565:
+		ebc_neon_565_rows(dst, src, src_pitch, x1, x2, y1, y2, width,
+				  EBC_565_WR, EBC_565_WB);
+		break;
+	case EBC_NEON_BGR565:
+		ebc_neon_565_rows(dst, src, src_pitch, x1, x2, y1, y2, width,
+				  EBC_565_WB, EBC_565_WR);
+		break;
+	case EBC_NEON_R8:
+		ebc_neon_r8_rows(dst, src, src_pitch, x1, x2, y1, y2, width);
+		break;
+	}
+}
+
+/* The bytes per pixel of a dither source @format: XRGB8888 or R8. */
+static __always_inline unsigned int ebc_neon_dither_cpp(unsigned int format)
+{
+	return format == EBC_NEON_XRGB8888 ? 4 : 1;
+}
+
 /*
  * The 8-bit grey of the pixel at @s, as rk3026_ebc_blit_rows_dither()
- * takes it: the luma of an XRGB8888 pixel for @cpp 4, the R8 byte for 1.
+ * takes it: the luma of an XRGB8888 pixel, the byte of an R8 one.
  */
 static __always_inline unsigned int ebc_neon_grey_of(const unsigned char *s,
-						     unsigned int cpp)
+						     unsigned int format)
 {
-	return cpp == 4 ? (77 * s[2] + 150 * s[1] + 29 * s[0]) >> 8 : s[0];
+	return format == EBC_NEON_XRGB8888 ?
+	       (77 * s[2] + 150 * s[1] + 29 * s[0]) >> 8 : s[0];
 }
 
 /* One dithered nibble: (@l * @steps + @t) / 255, times 15 / @steps. */
@@ -201,7 +344,7 @@ static __always_inline unsigned char ebc_neon_dither1(unsigned int l,
  */
 static __always_inline uint8x8_t ebc_neon_dither16(const unsigned char *s,
 						   uint8x16_t t,
-						   unsigned int cpp,
+						   unsigned int format,
 						   unsigned int steps)
 {
 	const uint16x8_t one = vdupq_n_u16(1);
@@ -209,7 +352,7 @@ static __always_inline uint8x8_t ebc_neon_dither16(const unsigned char *s,
 	uint8x8_t llo, lhi;
 	uint8x8x2_t eo;
 
-	if (cpp == 4) {
+	if (format == EBC_NEON_XRGB8888) {
 		uint8x16x4_t v = vld4q_u8(s);	/* B, G, R, X */
 
 		lo = vmull_u8(vget_low_u8(v.val[2]), vdup_n_u8(77));
@@ -245,16 +388,17 @@ static __always_inline uint8x8_t ebc_neon_dither16(const unsigned char *s,
 	return vsli_n_u8(eo.val[0], eo.val[1], 4);
 }
 
-/* rk3026_ebc_blit_rows_dither_neon() for a constant @cpp and @steps. */
+/* rk3026_ebc_blit_rows_dither_neon() for a constant @format and @steps. */
 static __always_inline void ebc_neon_dither_rows(unsigned char *dst,
 						 const void *src,
 						 unsigned int src_pitch,
+						 unsigned int format,
 						 int x1, int x2, int y1,
 						 int y2, unsigned int width,
 						 const unsigned char *thr,
-						 unsigned int cpp,
 						 unsigned int steps)
 {
+	const unsigned int cpp = ebc_neon_dither_cpp(format);
 	const uint8x8_t lanes = vcreate_u8(0x0706050403020100ULL);
 	/* Lane j takes column (x1 + j) mod 8 of a threshold row. */
 	const uint8x8_t idx = vand_u8(vadd_u8(vdup_n_u8(x1 & 7), lanes),
@@ -274,12 +418,12 @@ static __always_inline void ebc_neon_dither_rows(unsigned char *dst,
 			__builtin_prefetch(s + 256);
 			if (cpp == 4)
 				__builtin_prefetch(s + 256 + 32);
-			vst1_u8(d, ebc_neon_dither16(s, t16, cpp, steps));
+			vst1_u8(d, ebc_neon_dither16(s, t16, format, steps));
 		}
 		for (; x < x2; x += 2, s += 2 * cpp, d++)
-			*d = ebc_neon_dither1(ebc_neon_grey_of(s, cpp),
+			*d = ebc_neon_dither1(ebc_neon_grey_of(s, format),
 					      t[x & 7], steps) |
-			     ebc_neon_dither1(ebc_neon_grey_of(s + cpp, cpp),
+			     ebc_neon_dither1(ebc_neon_grey_of(s + cpp, format),
 					      t[(x + 1) & 7], steps) << 4;
 	}
 }
@@ -289,38 +433,47 @@ static __always_inline void ebc_neon_dither_rows(unsigned char *dst,
  * @dst: target image, @width / 2 bytes per row, low nibble first
  * @src: source, top-left of the whole framebuffer
  * @src_pitch: source stride in bytes
+ * @format: source format, EBC_NEON_XRGB8888 or EBC_NEON_R8
  * @x1: first column, even
  * @x2: end column, even, at most @width, above @x1
  * @y1: first row
  * @y2: end row, above @y1
  * @width: image width in pixels
  * @thr: the 8x8 threshold matrix, row-major
- * @cpp: bytes per source pixel, 4 for XRGB8888, 1 for R8
  * @steps: 15 to dither to the 16 levels, 1 to black and white
  *
  * Writes the same bytes as rk3026_ebc_blit_rows_dither() with the same
- * thresholds, and only those. Sixteen pixels at a time, with the source
- * read 256 bytes ahead; a row's last 2 to 14 pixels two at a time. No
- * alignment is needed.
+ * thresholds, and only those; any other format writes nothing. Sixteen
+ * pixels at a time, with the source read 256 bytes ahead; a row's last 2
+ * to 14 pixels two at a time. No alignment is needed.
  *
  * Call only between kernel_neon_begin() and kernel_neon_end().
  */
 void rk3026_ebc_blit_rows_dither_neon(unsigned char *dst, const void *src,
-				      unsigned int src_pitch, int x1, int x2,
+				      unsigned int src_pitch,
+				      unsigned int format, int x1, int x2,
 				      int y1, int y2, unsigned int width,
 				      const unsigned char *thr,
-				      unsigned int cpp, unsigned int steps)
+				      unsigned int steps)
 {
-	if (cpp == 4 && steps == 1)
-		ebc_neon_dither_rows(dst, src, src_pitch, x1, x2, y1, y2, width,
-				     thr, 4, 1);
-	else if (cpp == 4)
-		ebc_neon_dither_rows(dst, src, src_pitch, x1, x2, y1, y2, width,
-				     thr, 4, 15);
-	else if (steps == 1)
-		ebc_neon_dither_rows(dst, src, src_pitch, x1, x2, y1, y2, width,
-				     thr, 1, 1);
-	else
-		ebc_neon_dither_rows(dst, src, src_pitch, x1, x2, y1, y2, width,
-				     thr, 1, 15);
+	switch (format) {
+	case EBC_NEON_XRGB8888:
+		if (steps == 1)
+			ebc_neon_dither_rows(dst, src, src_pitch,
+					     EBC_NEON_XRGB8888, x1, x2, y1, y2,
+					     width, thr, 1);
+		else
+			ebc_neon_dither_rows(dst, src, src_pitch,
+					     EBC_NEON_XRGB8888, x1, x2, y1, y2,
+					     width, thr, 15);
+		break;
+	case EBC_NEON_R8:
+		if (steps == 1)
+			ebc_neon_dither_rows(dst, src, src_pitch, EBC_NEON_R8,
+					     x1, x2, y1, y2, width, thr, 1);
+		else
+			ebc_neon_dither_rows(dst, src, src_pitch, EBC_NEON_R8,
+					     x1, x2, y1, y2, width, thr, 15);
+		break;
+	}
 }

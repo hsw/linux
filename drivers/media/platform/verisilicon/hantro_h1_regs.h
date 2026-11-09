@@ -11,6 +11,10 @@
 
 /* Encoder registers. */
 #define H1_REG_INTERRUPT				0x004
+#define     H1_REG_INTERRUPT_TIMEOUT			BIT(6)
+#define     H1_REG_INTERRUPT_BUFFER_FULL		BIT(5)
+#define     H1_REG_INTERRUPT_RESET			BIT(4)
+#define     H1_REG_INTERRUPT_BUS_ERROR			BIT(3)
 #define     H1_REG_INTERRUPT_FRAME_RDY			BIT(2)
 #define     H1_REG_INTERRUPT_DIS_BIT			BIT(1)
 #define     H1_REG_INTERRUPT_BIT			BIT(0)

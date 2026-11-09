@@ -376,6 +376,24 @@ static irqreturn_t rockchip_vpu1_vepu_irq(int irq, void *dev_id)
 	state = (status & H1_REG_INTERRUPT_FRAME_RDY) ?
 		VB2_BUF_STATE_DONE : VB2_BUF_STATE_ERROR;
 
+	if (status & H1_REG_INTERRUPT_BUFFER_FULL)
+		dev_warn_ratelimited(vpu->dev, "stream buffer full\n");
+	if (status & H1_REG_INTERRUPT_BUS_ERROR)
+		dev_warn_ratelimited(vpu->dev, "bus error detected\n");
+	if (status & H1_REG_INTERRUPT_TIMEOUT)
+		dev_warn_ratelimited(vpu->dev, "frame encode timed out\n");
+	if (status & H1_REG_INTERRUPT_RESET)
+		dev_warn_ratelimited(vpu->dev, "encoder reset\n");
+
+	/* After a buffer full the encoder pauses, still enabled: stop it. */
+	if (!(status & H1_REG_INTERRUPT_FRAME_RDY)) {
+		u32 ctrl = vepu_read(vpu, H1_REG_ENC_CTRL);
+
+		if (ctrl & H1_REG_ENC_CTRL_EN_BIT)
+			vepu_write(vpu, ctrl & ~H1_REG_ENC_CTRL_EN_BIT,
+				   H1_REG_ENC_CTRL);
+	}
+
 	vepu_write(vpu, 0, H1_REG_INTERRUPT);
 	vepu_write(vpu, 0, H1_REG_AXI_CTRL);
 

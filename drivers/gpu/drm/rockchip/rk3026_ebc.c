@@ -2647,7 +2647,9 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_load_palette);
  * Test trace, not for upstream: which buffers the plane scans out and
  * whether a 16-bit blit returns. printk rather than a tracepoint, so the
  * lines reach a persistent console (pstore) at once and survive a hang
- * that stops the whole SoC.
+ * that stops the whole SoC. KERN_EMERG, as is the plane_565=N line, so
+ * they pass a console loglevel of 1 (what an Android test boot sets to
+ * keep its own kmsg off the consoles).
  *
  * One line for a framebuffer whose format, pitch and id are none of the
  * last ARRAY_SIZE(dbg_fbs) logged (a composer's buffer queue rotates
@@ -2681,12 +2683,12 @@ static void ebc_dbg_plane_fb(struct rk3026_ebc *ebc,
 	ebc->dbg_fbs[i].id = fb->base.id;
 	ebc->dbg_fb_lines++;
 	last = ebc->dbg_fb_lines == EBC_DBG_FB_LINES;
-	dev_info(ebc->dev,
-		 "fb %u %p4cc pitch %u off %u %ux%u size %zu %s vaddr %px box=" DRM_RECT_FMT "%s\n",
-		 fb->base.id, &fb->format->format, fb->pitches[0],
-		 fb->offsets[0], fb->width, fb->height, obj ? obj->size : 0,
-		 obj && drm_gem_is_imported(obj) ? "imported" : "native",
-		 vaddr, DRM_RECT_ARG(box), last ? " (last fb line)" : "");
+	dev_emerg(ebc->dev,
+		  "fb %u %p4cc pitch %u off %u %ux%u size %zu %s va %px box=" DRM_RECT_FMT "%s\n",
+		  fb->base.id, &fb->format->format, fb->pitches[0],
+		  fb->offsets[0], fb->width, fb->height, obj ? obj->size : 0,
+		  obj && drm_gem_is_imported(obj) ? "imported" : "native",
+		  vaddr, DRM_RECT_ARG(box), last ? " (last fb line)" : "");
 }
 
 /* Returns the blit's number for its end line, 0 when it is not logged. */
@@ -2701,8 +2703,8 @@ static unsigned int ebc_dbg_565_begin(struct rk3026_ebc *ebc,
 	if (ebc->dbg_565_blits >= EBC_DBG_565_BLITS)
 		return 0;
 	ebc->dbg_565_blits++;
-	dev_info(ebc->dev, "565 blit begin n=%u box=" DRM_RECT_FMT "\n",
-		 ebc->dbg_565_blits, DRM_RECT_ARG(box));
+	dev_emerg(ebc->dev, "565 blit begin n=%u box=" DRM_RECT_FMT "\n",
+		  ebc->dbg_565_blits, DRM_RECT_ARG(box));
 	return ebc->dbg_565_blits;
 }
 
@@ -2766,7 +2768,7 @@ static void ebc_plane_atomic_update(struct drm_plane *plane,
 					 fb->pitches[0], fb->format->format,
 					 &box);
 	if (n)
-		dev_info(ebc->dev, "565 blit end n=%u queued=%d\n", n, queued);
+		dev_emerg(ebc->dev, "565 blit end n=%u queued=%d\n", n, queued);
 
 	drm_gem_fb_end_cpu_access(new_state->fb, DMA_FROM_DEVICE);
 out_exit:
@@ -3941,7 +3943,7 @@ VISIBLE_IF_KUNIT int rk3026_ebc_kms_init(struct rk3026_ebc *ebc)
 		formats[nformats++] = format;
 	}
 	if (!plane_565)
-		dev_info(ebc->dev, "plane_565=N: plane without RGB565 and BGR565\n");
+		dev_emerg(ebc->dev, "plane_565=N: plane without RGB565 and BGR565\n");
 
 	ret = drm_universal_plane_init(drm, &ebc->plane, 1, &ebc_plane_funcs,
 				       formats, nformats,

@@ -2631,6 +2631,69 @@ VISIBLE_IF_KUNIT void rk3026_ebc_load_palette(struct rk3026_ebc *ebc,
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_load_palette);
 
+/*
+ * Test trace, not for upstream: which buffers the plane scans out and
+ * whether a 16-bit blit returns. printk rather than a tracepoint, so the
+ * lines reach a persistent console (pstore) at once and survive a hang
+ * that stops the whole SoC.
+ *
+ * One line for a framebuffer whose format, pitch and id are none of the
+ * last ARRAY_SIZE(dbg_fbs) logged (a composer's buffer queue rotates
+ * through a few), at most EBC_DBG_FB_LINES of them, and a begin and an
+ * end line around each of the first EBC_DBG_565_BLITS blits of an RGB565
+ * or BGR565 framebuffer: a hang inside the blit shows as a begin without
+ * its end. Nothing more per frame.
+ */
+#define EBC_DBG_FB_LINES	64
+#define EBC_DBG_565_BLITS	64
+
+static void ebc_dbg_plane_fb(struct rk3026_ebc *ebc,
+			     const struct drm_framebuffer *fb,
+			     const void *vaddr, const struct drm_rect *box)
+{
+	const struct drm_gem_object *obj = fb->obj[0];
+	unsigned int i;
+	bool last;
+
+	for (i = 0; i < ARRAY_SIZE(ebc->dbg_fbs); i++)
+		if (ebc->dbg_fbs[i].format == fb->format->format &&
+		    ebc->dbg_fbs[i].pitch == fb->pitches[0] &&
+		    ebc->dbg_fbs[i].id == fb->base.id)
+			return;
+	if (ebc->dbg_fb_lines >= EBC_DBG_FB_LINES)
+		return;
+	i = ebc->dbg_fb_next;
+	ebc->dbg_fb_next = (i + 1) % ARRAY_SIZE(ebc->dbg_fbs);
+	ebc->dbg_fbs[i].format = fb->format->format;
+	ebc->dbg_fbs[i].pitch = fb->pitches[0];
+	ebc->dbg_fbs[i].id = fb->base.id;
+	ebc->dbg_fb_lines++;
+	last = ebc->dbg_fb_lines == EBC_DBG_FB_LINES;
+	dev_info(ebc->dev,
+		 "fb %u %p4cc pitch %u off %u %ux%u size %zu %s vaddr %px box=" DRM_RECT_FMT "%s\n",
+		 fb->base.id, &fb->format->format, fb->pitches[0],
+		 fb->offsets[0], fb->width, fb->height, obj ? obj->size : 0,
+		 obj && drm_gem_is_imported(obj) ? "imported" : "native",
+		 vaddr, DRM_RECT_ARG(box), last ? " (last fb line)" : "");
+}
+
+/* Returns the blit's number for its end line, 0 when it is not logged. */
+static unsigned int ebc_dbg_565_begin(struct rk3026_ebc *ebc,
+				      const struct drm_framebuffer *fb,
+				      const struct drm_rect *box)
+{
+	u32 format = fb->format->format;
+
+	if (format != DRM_FORMAT_RGB565 && format != DRM_FORMAT_BGR565)
+		return 0;
+	if (ebc->dbg_565_blits >= EBC_DBG_565_BLITS)
+		return 0;
+	ebc->dbg_565_blits++;
+	dev_info(ebc->dev, "565 blit begin n=%u box=" DRM_RECT_FMT "\n",
+		 ebc->dbg_565_blits, DRM_RECT_ARG(box));
+	return ebc->dbg_565_blits;
+}
+
 static void ebc_plane_atomic_update(struct drm_plane *plane,
 				    struct drm_atomic_state *state)
 {
@@ -2641,7 +2704,10 @@ static void ebc_plane_atomic_update(struct drm_plane *plane,
 	struct drm_shadow_plane_state *shadow =
 		to_drm_shadow_plane_state(new_state);
 	struct rk3026_ebc *ebc = drm_to_ebc(plane->dev);
+	struct drm_framebuffer *fb = new_state->fb;
 	struct drm_rect box;
+	unsigned int n;
+	bool queued;
 	int idx, ret;
 
 	if (!new_state->fb || !new_state->visible)
@@ -2664,6 +2730,8 @@ static void ebc_plane_atomic_update(struct drm_plane *plane,
 	if (!drm_dev_enter(plane->dev, &idx))
 		return;
 
+	ebc_dbg_plane_fb(ebc, fb, shadow->data[0].vaddr, &box);
+
 	/*
 	 * The blit reads the buffer with the CPU. For an imported buffer
 	 * (PRIME, a GPU's render target) the exporter's caches have to be
@@ -2681,9 +2749,12 @@ static void ebc_plane_atomic_update(struct drm_plane *plane,
 		goto out_exit;
 	}
 
-	rk3026_ebc_plane_update(ebc, shadow->data[0].vaddr,
-				new_state->fb->pitches[0],
-				new_state->fb->format->format, &box);
+	n = ebc_dbg_565_begin(ebc, fb, &box);
+	queued = rk3026_ebc_plane_update(ebc, shadow->data[0].vaddr,
+					 fb->pitches[0], fb->format->format,
+					 &box);
+	if (n)
+		dev_info(ebc->dev, "565 blit end n=%u queued=%d\n", n, queued);
 
 	drm_gem_fb_end_cpu_access(new_state->fb, DMA_FROM_DEVICE);
 out_exit:

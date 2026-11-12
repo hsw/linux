@@ -2462,6 +2462,18 @@ static const u32 ebc_plane_formats[] = {
 	DRM_FORMAT_R8,
 };
 
+/*
+ * Test parameter, not for upstream: plane_565=N leaves RGB565 and BGR565
+ * out of the plane's formats (rk3026_ebc_kms_init()), so a client that
+ * would scan out a 16-bit buffer cannot add it as a framebuffer for this
+ * device. Splits a fault of the 16-bit plane path from one of whatever
+ * rendered the buffer. The fbdev emulation's "-16" falls back to
+ * XRGB8888 then, as for any format the plane lacks.
+ */
+static bool plane_565 = true;
+module_param(plane_565, bool, 0444);
+MODULE_PARM_DESC(plane_565, "offer RGB565 and BGR565 on the plane (test, default Y)");
+
 static const u64 ebc_plane_modifiers[] = {
 	DRM_FORMAT_MOD_LINEAR,
 	DRM_FORMAT_MOD_INVALID,
@@ -3909,6 +3921,8 @@ static int ebc_load_waveform(struct rk3026_ebc *ebc)
 VISIBLE_IF_KUNIT int rk3026_ebc_kms_init(struct rk3026_ebc *ebc)
 {
 	struct drm_device *drm = &ebc->drm;
+	u32 formats[ARRAY_SIZE(ebc_plane_formats)];
+	unsigned int i, nformats = 0;
 	int ret;
 
 	drm->mode_config.funcs = &ebc_mode_config_funcs;
@@ -3918,9 +3932,19 @@ VISIBLE_IF_KUNIT int rk3026_ebc_kms_init(struct rk3026_ebc *ebc)
 	drm->mode_config.min_height = ebc->height;
 	drm->mode_config.max_height = ebc->height;
 
+	for (i = 0; i < ARRAY_SIZE(ebc_plane_formats); i++) {
+		u32 format = ebc_plane_formats[i];
+
+		if (!plane_565 && (format == DRM_FORMAT_RGB565 ||
+				   format == DRM_FORMAT_BGR565))
+			continue;
+		formats[nformats++] = format;
+	}
+	if (!plane_565)
+		dev_info(ebc->dev, "plane_565=N: plane without RGB565 and BGR565\n");
+
 	ret = drm_universal_plane_init(drm, &ebc->plane, 1, &ebc_plane_funcs,
-				       ebc_plane_formats,
-				       ARRAY_SIZE(ebc_plane_formats),
+				       formats, nformats,
 				       ebc_plane_modifiers,
 				       DRM_PLANE_TYPE_PRIMARY, NULL);
 	if (ret)

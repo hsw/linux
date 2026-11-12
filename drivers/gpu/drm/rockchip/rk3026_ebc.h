@@ -1320,6 +1320,22 @@ struct rk3026_ebc {
 	int			commit_err;
 
 	/*
+	 * Test trace of the plane's buffers (ebc_dbg_plane_fb()): the format,
+	 * pitch and id of the last eight framebuffers logged, a ring
+	 * whose next slot is @dbg_fb_next, the count of framebuffer lines and
+	 * of 16-bit blits logged so far. Commit tail only, one commit at a
+	 * time, as @commit_seq.
+	 */
+	struct {
+		u32		format;
+		unsigned int	pitch;
+		u32		id;
+	}			dbg_fbs[8];
+	unsigned int		dbg_fb_next;
+	unsigned int		dbg_fb_lines;
+	unsigned int		dbg_565_blits;
+
+	/*
 	 * The commit event held until its part has finished, or is taken
 	 * (rk3026_ebc_flip_hold()), and @flip_seq, the seq of the update its
 	 * commit queued. One slot: the core holds a second commit back until

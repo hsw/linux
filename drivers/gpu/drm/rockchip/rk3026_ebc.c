@@ -2520,6 +2520,38 @@ static bool plane_565 = true;
 module_param(plane_565, bool, 0444);
 MODULE_PARM_DESC(plane_565, "offer RGB565 and BGR565 on the plane (test, default Y)");
 
+/*
+ * Test parameter, not for upstream: dbg_565=N splits a whole-SoC hang seen
+ * when the plane takes 16-bit frames a GPU rendered, between the CPU's
+ * read of such a buffer and the controller's work for it. For an RGB565
+ * or BGR565 framebuffer alone; every other format is handled as usual.
+ *
+ *  0  as usual.
+ *  1  read, no scan: the damage is blitted into a scratch image of the
+ *     panel's size, not into @next_shadow, and nothing is queued; the
+ *     commit's event goes out at once, and the idle cleanup is disarmed,
+ *     so the controller and the panel rails stay idle once only 16-bit
+ *     frames come (ebc_dbg_565_read()).
+ *  2  scan, no read: the buffer is not touched (nor its CPU access
+ *     bracket); a kernel-made pattern over the whole panel, one of two
+ *     that differ in every pixel and alternate per commit, is written to
+ *     @next_shadow and queued as a plane update (ebc_dbg_565_pattern()).
+ *
+ * Any other value is taken as 0. Read once at probe, which logs it.
+ */
+static int dbg_565;
+module_param(dbg_565, int, 0444);
+MODULE_PARM_DESC(dbg_565, "16-bit frames: 0 as usual, 1 read only, 2 pattern only (test, default 0)");
+
+static int ebc_dbg_565_mode(const struct drm_framebuffer *fb)
+{
+	u32 format = fb->format->format;
+
+	if (format != DRM_FORMAT_RGB565 && format != DRM_FORMAT_BGR565)
+		return 0;
+	return dbg_565 == 1 || dbg_565 == 2 ? dbg_565 : 0;
+}
+
 static const u64 ebc_plane_modifiers[] = {
 	DRM_FORMAT_MOD_LINEAR,
 	DRM_FORMAT_MOD_INVALID,
@@ -2754,6 +2786,63 @@ static unsigned int ebc_dbg_565_begin(struct rk3026_ebc *ebc,
 	return ebc->dbg_565_blits;
 }
 
+/*
+ * dbg_565=1: the blit of rk3026_ebc_plane_update() into the scratch image
+ * instead of @next_shadow, @box already widened (rk3026_ebc_plane_box()),
+ * and no update queued. The idle cleanup is disarmed, so an earlier
+ * plane part does not bring the panel up for a FULL either.
+ */
+static void ebc_dbg_565_read(struct rk3026_ebc *ebc, const void *src,
+			     unsigned int src_pitch, u32 format,
+			     const struct drm_rect *box)
+{
+	rk3026_ebc_blit_convert(ebc->dbg_scratch, src, src_pitch, format,
+				box->x1, box->x2, box->y1, box->y2, ebc->width);
+	mutex_lock(&ebc->image_lock);
+	WRITE_ONCE(ebc->idle_armed, false);
+	mutex_unlock(&ebc->image_lock);
+}
+
+/*
+ * dbg_565=2: rk3026_ebc_plane_update() with a kernel-made image in place
+ * of the framebuffer's. Bands of 64 rows step through the 16 levels; the
+ * two patterns are 8 levels apart in every pixel, so each commit changes
+ * the whole panel, in greys (an auto update then resolves to PART, or to
+ * the cleanup FULL, as a grey frame would). Returns true if queued.
+ */
+static bool ebc_dbg_565_pattern(struct rk3026_ebc *ebc, unsigned int *phase)
+{
+	struct rk3026_ebc_update upd = {
+		.clip		= DRM_RECT_INIT(0, 0, ebc->width, ebc->height),
+		.mode		= EBC_MODE_DEFAULT,
+		.auto_mode	= true,
+		.source		= EBC_SOURCE_PLANE,
+	};
+	unsigned int pitch = ebc->width / 2, y;
+	bool queue;
+
+	*phase = ebc->dbg_phase;
+	ebc->dbg_phase ^= 1;
+	mutex_lock(&ebc->image_lock);
+	queue = !ebc->mxcfb_active;
+	if (queue) {
+		ebc->plane_resync = false;
+		for (y = 0; y < ebc->height; y++) {
+			u8 level = (y / 64 + 8 * *phase) & 0xf;
+
+			memset(ebc->next_shadow + y * pitch, level | level << 4,
+			       pitch);
+		}
+		WRITE_ONCE(ebc->idle_last_plane, jiffies);
+		WRITE_ONCE(ebc->idle_armed, true);
+		ebc->commit_seq = rk3026_ebc_add_update(ebc, &upd);
+		ebc->commit_queued = true;
+		ebc->commit_err = 0;
+	}
+	mutex_unlock(&ebc->image_lock);
+	return queue;
+}
+
 static void ebc_plane_atomic_update(struct drm_plane *plane,
 				    struct drm_atomic_state *state)
 {
@@ -2766,9 +2855,9 @@ static void ebc_plane_atomic_update(struct drm_plane *plane,
 	struct rk3026_ebc *ebc = drm_to_ebc(plane->dev);
 	struct drm_framebuffer *fb = new_state->fb;
 	struct drm_rect box;
-	unsigned int n;
+	unsigned int n, phase;
 	bool queued;
-	int idx, ret;
+	int idx, ret, dbg;
 
 	if (!new_state->fb || !new_state->visible)
 		return;
@@ -2792,6 +2881,14 @@ static void ebc_plane_atomic_update(struct drm_plane *plane,
 
 	ebc_dbg_plane_fb(ebc, fb, shadow->data[0].vaddr, &box);
 
+	dbg = ebc_dbg_565_mode(fb);
+	if (dbg == 2) {
+		queued = ebc_dbg_565_pattern(ebc, &phase);
+		dev_emerg(ebc->dev, "565 pattern n=%u phase=%u queued=%d\n",
+			  ++ebc->dbg_565_blits, phase, queued);
+		goto out_exit;
+	}
+
 	/*
 	 * The blit reads the buffer with the CPU. For an imported buffer
 	 * (PRIME, a GPU's render target) the exporter's caches have to be
@@ -2810,9 +2907,15 @@ static void ebc_plane_atomic_update(struct drm_plane *plane,
 	}
 
 	n = ebc_dbg_565_begin(ebc, fb, &box);
-	queued = rk3026_ebc_plane_update(ebc, shadow->data[0].vaddr,
-					 fb->pitches[0], fb->format->format,
-					 &box);
+	if (dbg == 1) {
+		ebc_dbg_565_read(ebc, shadow->data[0].vaddr, fb->pitches[0],
+				 fb->format->format, &box);
+		queued = false;
+	} else {
+		queued = rk3026_ebc_plane_update(ebc, shadow->data[0].vaddr,
+						 fb->pitches[0],
+						 fb->format->format, &box);
+	}
 	if (n)
 		dev_emerg(ebc->dev, "565 blit end n=%u queued=%d\n", n, queued);
 
@@ -4304,6 +4407,15 @@ static int ebc_probe(struct platform_device *pdev)
 	ret = devm_add_action_or_reset(dev, ebc_dbg_hb_stop, ebc);
 	if (ret)
 		return ret;
+
+	/* Test split: the scratch image of dbg_565=1. */
+	dev_emerg(dev, "dbg_565=%d%s\n", dbg_565,
+		  dbg_565 < 0 || dbg_565 > 2 ? " (unknown, as 0)" : "");
+	if (dbg_565 == 1) {
+		ret = ebc_alloc_shadow(ebc, &ebc->dbg_scratch);
+		if (ret)
+			return ret;
+	}
 
 	rk3026_ebc_debugfs_init(ebc);
 	ret = devm_add_action_or_reset(dev, ebc_debugfs_fini, ebc);

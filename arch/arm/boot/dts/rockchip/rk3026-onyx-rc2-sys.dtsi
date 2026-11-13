@@ -122,7 +122,7 @@
 			};
 
 			vdd_arm: REG_DCDC3 {	/* ARM, 0x1c at boot */
-				regulator-min-microvolt = <RC2_OPP_UV_312>;
+				regulator-min-microvolt = <RC2_OPP_UV_816>;
 				regulator-max-microvolt = <1400000>;
 				regulator-ramp-delay = <RC2_VDD_ARM_RAMP>;
 				regulator-always-on;

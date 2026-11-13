@@ -1065,7 +1065,6 @@
 
 &gpu {
 	status = "okay";
-	mali-supply = <&vcc_io>;
 };
 
 &pinctrl {

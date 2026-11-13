@@ -21,6 +21,7 @@ int lima_sched_timeout_ms;
 uint lima_heap_init_nr_pages = 8;
 uint lima_max_error_tasks;
 uint lima_job_hang_limit;
+bool lima_dbg_jobs;
 
 MODULE_PARM_DESC(sched_timeout_ms, "task run timeout in ms");
 module_param_named(sched_timeout_ms, lima_sched_timeout_ms, int, 0444);
@@ -33,6 +34,16 @@ module_param_named(max_error_tasks, lima_max_error_tasks, uint, 0644);
 
 MODULE_PARM_DESC(job_hang_limit, "number of times to allow a job to hang before dropping it (default 0)");
 module_param_named(job_hang_limit, lima_job_hang_limit, uint, 0444);
+
+/*
+ * Test parameter, not for upstream: dbg_jobs=1 prints the start and the
+ * end of every GP and PP job at KERN_EMERG (lima_sched.c). Off by
+ * default: a busy GPU runs dozens of jobs a second, and that load on the
+ * console may change the timing being looked at. Faults, timeouts and
+ * the clock changes print in any case.
+ */
+MODULE_PARM_DESC(dbg_jobs, "log each GP/PP job's run and done (test, default N)");
+module_param_named(dbg_jobs, lima_dbg_jobs, bool, 0644);
 
 static int lima_ioctl_get_param(struct drm_device *dev, void *data, struct drm_file *file)
 {

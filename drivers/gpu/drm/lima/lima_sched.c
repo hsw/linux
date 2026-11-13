@@ -264,14 +264,16 @@ static struct dma_fence *lima_sched_run_job(struct drm_sched_job *job)
 
 	trace_lima_task_run(task);
 	/*
-	 * Test trace, not for upstream: each job's start, done and timeout
-	 * at KERN_EMERG, so they reach a persistent console (pstore) at once
-	 * and pass a console loglevel of 1. The job's number is its fence's
-	 * seqno, per pipe. This runs in the scheduler's work item (process
-	 * context); the done line in the pipe's interrupt handler.
+	 * Test trace, not for upstream: a job's start and done with
+	 * dbg_jobs=1, its fault and timeout always, at KERN_EMERG, so they
+	 * reach a persistent console (pstore) at once and pass a console
+	 * loglevel of 1. The job's number is its fence's seqno, per pipe.
+	 * This runs in the scheduler's work item (process context); the done
+	 * and fault line in the pipe's interrupt handler.
 	 */
-	dev_emerg(ldev->dev, "%s run %llu\n", pipe->base.name,
-		  task->fence->seqno);
+	if (READ_ONCE(lima_dbg_jobs))
+		dev_emerg(ldev->dev, "%s run %llu\n", pipe->base.name,
+			  task->fence->seqno);
 
 	pipe->error = false;
 	pipe->task_run(pipe, task);
@@ -560,9 +562,10 @@ void lima_sched_pipe_task_done(struct lima_sched_pipe *pipe)
 	struct lima_device *ldev = pipe->ldev;
 
 	/* Test trace: hard interrupt context (the GP or PP handler). */
-	dev_emerg(ldev->dev, "%s %s %llu\n", pipe->base.name,
-		  pipe->error ? "fault" : "done",
-		  task ? task->fence->seqno : 0ULL);
+	if (pipe->error || READ_ONCE(lima_dbg_jobs))
+		dev_emerg(ldev->dev, "%s %s %llu\n", pipe->base.name,
+			  pipe->error ? "fault" : "done",
+			  task ? task->fence->seqno : 0ULL);
 
 	if (pipe->error) {
 		if (task && task->recoverable)

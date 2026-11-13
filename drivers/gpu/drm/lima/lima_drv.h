@@ -12,6 +12,7 @@
 extern int lima_sched_timeout_ms;
 extern uint lima_heap_init_nr_pages;
 extern uint lima_max_error_tasks;
+extern bool lima_dbg_jobs;
 extern uint lima_job_hang_limit;
 
 struct lima_vm;

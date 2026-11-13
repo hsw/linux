@@ -3908,6 +3908,40 @@ static void ebc_hw_fini(void *data)
 		ebc_clks_off(ebc);
 }
 
+/*
+ * Test trace, not for upstream: a heartbeat line every EBC_DBG_HB_MS at
+ * KERN_EMERG, for the pstore console, so the time a whole-SoC hang stopped
+ * the CPUs is known even when nothing else prints: the last "hb" line is
+ * at most one period before the stop. With the CPU it ran on, whether the
+ * panel rails are up and whether a part is in flight.
+ *
+ * An hrtimer in hard interrupt context (HRTIMER_MODE_REL_HARD), not a
+ * delayed work: it fires while a CPU spins with preemption or softirqs
+ * off or the workqueues are stuck, and stops only when the timer
+ * interrupt is no longer taken, which is the stop wanted. printk is safe
+ * there; the consoles of a test boot (pstore, the USB gadget serial, a
+ * VT without fbcon) only copy the line into a buffer.
+ */
+#define EBC_DBG_HB_MS	250
+
+static enum hrtimer_restart ebc_dbg_hb(struct hrtimer *t)
+{
+	struct rk3026_ebc *ebc = container_of(t, struct rk3026_ebc, dbg_hb);
+
+	dev_emerg(ebc->dev, "hb %u cpu%d rails=%d flight=%d\n",
+		  ++ebc->dbg_hb_n, raw_smp_processor_id(),
+		  READ_ONCE(ebc->rails_on), READ_ONCE(ebc->in_flight));
+	hrtimer_forward_now(t, ms_to_ktime(EBC_DBG_HB_MS));
+	return HRTIMER_RESTART;
+}
+
+static void ebc_dbg_hb_stop(void *data)
+{
+	struct rk3026_ebc *ebc = data;
+
+	hrtimer_cancel(&ebc->dbg_hb);
+}
+
 static void ebc_stop_thread(void *data)
 {
 	struct rk3026_ebc *ebc = data;
@@ -4259,6 +4293,15 @@ static int ebc_probe(struct platform_device *pdev)
 	if (IS_ERR(ebc->refresh_thread))
 		return PTR_ERR(ebc->refresh_thread);
 	ret = devm_add_action_or_reset(dev, ebc_stop_thread, ebc);
+	if (ret)
+		return ret;
+
+	/* Test trace: the heartbeat, from here to the remove. */
+	hrtimer_setup(&ebc->dbg_hb, ebc_dbg_hb, CLOCK_MONOTONIC,
+		      HRTIMER_MODE_REL_HARD);
+	hrtimer_start(&ebc->dbg_hb, ms_to_ktime(EBC_DBG_HB_MS),
+		      HRTIMER_MODE_REL_HARD);
+	ret = devm_add_action_or_reset(dev, ebc_dbg_hb_stop, ebc);
 	if (ret)
 		return ret;
 

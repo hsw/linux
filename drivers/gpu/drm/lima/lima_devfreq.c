@@ -36,6 +36,7 @@ static int lima_devfreq_target(struct device *dev, unsigned long *freq,
 {
 	struct lima_device *ldev = dev_get_drvdata(dev);
 	struct lima_devfreq *ldevfreq = &ldev->devfreq;
+	unsigned long old = clk_get_rate(ldev->clk_gpu);
 	struct dev_pm_opp *opp;
 	int ret;
 
@@ -44,8 +45,10 @@ static int lima_devfreq_target(struct device *dev, unsigned long *freq,
 		return PTR_ERR(opp);
 	dev_pm_opp_put(opp);
 
-	if (!(ldev->pm_features & BIT(LIMA_PM_OPP_OFF)))
-		return dev_pm_opp_set_rate(dev, *freq);
+	if (!(ldev->pm_features & BIT(LIMA_PM_OPP_OFF))) {
+		ret = dev_pm_opp_set_rate(dev, *freq);
+		goto out;
+	}
 
 	/*
 	 * Called with devfreq->lock held, which serializes this with
@@ -54,6 +57,8 @@ static int lima_devfreq_target(struct device *dev, unsigned long *freq,
 	 * votes dropped and only record the frequency for the next power on.
 	 */
 	if (ldevfreq->opp_off) {
+		if (ldevfreq->opp_freq != *freq)
+			dev_emerg(dev, "devfreq off %lu -> %lu\n", ldevfreq->opp_freq, *freq);
 		ldevfreq->opp_freq = *freq;
 		return 0;
 	}
@@ -62,6 +67,16 @@ static int lima_devfreq_target(struct device *dev, unsigned long *freq,
 	if (!ret)
 		ldevfreq->opp_freq = *freq;
 
+out:
+	/*
+	 * Test trace, not for upstream: each change of the GPU clock at
+	 * KERN_EMERG, for a persistent console (pstore). The devfreq core
+	 * calls this every polling interval, also when the rate stays, so
+	 * only a change or a failure prints. Process context (the devfreq
+	 * monitor's work item, or a sysfs write).
+	 */
+	if (ret || old != *freq)
+		dev_emerg(dev, "devfreq %lu -> %lu ret=%d\n", old, *freq, ret);
 	return ret;
 }
 

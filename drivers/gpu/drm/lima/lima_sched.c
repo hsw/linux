@@ -263,6 +263,15 @@ static struct dma_fence *lima_sched_run_job(struct drm_sched_job *job)
 	}
 
 	trace_lima_task_run(task);
+	/*
+	 * Test trace, not for upstream: each job's start, done and timeout
+	 * at KERN_EMERG, so they reach a persistent console (pstore) at once
+	 * and pass a console loglevel of 1. The job's number is its fence's
+	 * seqno, per pipe. This runs in the scheduler's work item (process
+	 * context); the done line in the pipe's interrupt handler.
+	 */
+	dev_emerg(ldev->dev, "%s run %llu\n", pipe->base.name,
+		  task->fence->seqno);
 
 	pipe->error = false;
 	pipe->task_run(pipe, task);
@@ -408,6 +417,9 @@ static enum drm_gpu_sched_stat lima_sched_timedout_job(struct drm_sched_job *job
 	struct lima_ip *ip = pipe->processor[0];
 	int i;
 
+	dev_emerg(ldev->dev, "%s timeout %llu\n", pipe->base.name,
+		  task->fence->seqno);
+
 	/*
 	 * If the GPU managed to complete this jobs fence, the timeout is
 	 * spurious. Bail out.
@@ -546,6 +558,11 @@ void lima_sched_pipe_task_done(struct lima_sched_pipe *pipe)
 {
 	struct lima_sched_task *task = pipe->current_task;
 	struct lima_device *ldev = pipe->ldev;
+
+	/* Test trace: hard interrupt context (the GP or PP handler). */
+	dev_emerg(ldev->dev, "%s %s %llu\n", pipe->base.name,
+		  pipe->error ? "fault" : "done",
+		  task ? task->fence->seqno : 0ULL);
 
 	if (pipe->error) {
 		if (task && task->recoverable)

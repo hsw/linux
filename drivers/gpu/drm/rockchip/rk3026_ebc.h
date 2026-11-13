@@ -17,6 +17,7 @@
 #include <linux/math.h>
 #include <linux/minmax.h>
 #include <linux/mutex.h>
+#include <linux/notifier.h>
 #include <linux/types.h>
 #include <linux/wait.h>
 #include <linux/workqueue.h>
@@ -1346,6 +1347,24 @@ struct rk3026_ebc {
 	 */
 	struct hrtimer		dbg_hb;
 	unsigned int		dbg_hb_n;
+	/*
+	 * Test trace: CPU DVFS (ebc_dbg_dvfs_start()). The cpufreq
+	 * transition notifier (@dbg_cpufreq_on once registered), the
+	 * notifier on CPU0's supply and the consumer it hangs on (NULL until
+	 * found), the work item that looks the supply up again while
+	 * @dbg_varm_wait (the heartbeat queues it), whether the wait has been
+	 * logged, and the last CPU0 rate and supply voltage seen, 0 while
+	 * unknown, for the heartbeat line.
+	 */
+	struct notifier_block	dbg_cpufreq_nb;
+	struct notifier_block	dbg_varm_nb;
+	struct regulator	*dbg_varm;
+	struct work_struct	dbg_varm_work;
+	bool			dbg_cpufreq_on;
+	bool			dbg_varm_wait;
+	bool			dbg_varm_said;
+	unsigned int		dbg_cpu_khz;
+	int			dbg_varm_uv;
 	/*
 	 * Test split (dbg_565=N): with 1, the image a 16-bit framebuffer is
 	 * blitted into instead of @next_shadow (ebc_dbg_565_read()); with 2,

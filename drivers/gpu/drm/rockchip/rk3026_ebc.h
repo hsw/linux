@@ -1346,6 +1346,14 @@ struct rk3026_ebc {
 	 */
 	struct hrtimer		dbg_hb;
 	unsigned int		dbg_hb_n;
+	/*
+	 * Test split (dbg_565=N): with 1, the image a 16-bit framebuffer is
+	 * blitted into instead of @next_shadow (ebc_dbg_565_read()); with 2,
+	 * which of the two patterns the next 16-bit commit queues
+	 * (ebc_dbg_565_pattern()). Commit tail only.
+	 */
+	u8			*dbg_scratch;
+	unsigned int		dbg_phase;
 
 	/*
 	 * The commit event held until its part has finished, or is taken

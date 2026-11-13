@@ -34,14 +34,27 @@ static void lima_devfreq_update_utilization(struct lima_devfreq *devfreq)
 static int lima_devfreq_target(struct device *dev, unsigned long *freq,
 			       u32 flags)
 {
+	struct lima_device *ldev = dev_get_drvdata(dev);
+	unsigned long old = clk_get_rate(ldev->clk_gpu);
 	struct dev_pm_opp *opp;
+	int ret;
 
 	opp = devfreq_recommended_opp(dev, freq, flags);
 	if (IS_ERR(opp))
 		return PTR_ERR(opp);
 	dev_pm_opp_put(opp);
 
-	return dev_pm_opp_set_rate(dev, *freq);
+	ret = dev_pm_opp_set_rate(dev, *freq);
+	/*
+	 * Test trace, not for upstream: each change of the GPU clock at
+	 * KERN_EMERG, for a persistent console (pstore). The devfreq core
+	 * calls this every polling interval, also when the rate stays, so
+	 * only a change or a failure prints. Process context (the devfreq
+	 * monitor's work item, or a sysfs write).
+	 */
+	if (ret || old != *freq)
+		dev_emerg(dev, "devfreq %lu -> %lu ret=%d\n", old, *freq, ret);
+	return ret;
 }
 
 static void lima_devfreq_reset(struct lima_devfreq *devfreq)

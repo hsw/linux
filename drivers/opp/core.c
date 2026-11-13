@@ -1263,7 +1263,7 @@ static void _find_current_opp(struct device *dev, struct opp_table *opp_table)
 
 static int _disable_opp_table(struct device *dev, struct opp_table *opp_table)
 {
-	int ret;
+	int ret, i;
 
 	if (!opp_table->enabled)
 		return 0;
@@ -1280,8 +1280,21 @@ static int _disable_opp_table(struct device *dev, struct opp_table *opp_table)
 	if (ret)
 		return ret;
 
-	if (opp_table->regulators)
+	if (opp_table->regulators) {
 		regulator_disable(opp_table->regulators[0]);
+
+		/*
+		 * A supply may be shared with other devices: drop the voltage
+		 * requests too, so that they no longer hold the supply up.
+		 */
+		for (i = 0; i < opp_table->regulator_count; i++) {
+			ret = regulator_set_voltage(opp_table->regulators[i], 0,
+						    INT_MAX);
+			if (ret)
+				dev_warn(dev, "Failed to remove voltage request %d: %d\n",
+					 i, ret);
+		}
+	}
 
 	ret = _set_opp_level(dev, NULL);
 	if (ret)

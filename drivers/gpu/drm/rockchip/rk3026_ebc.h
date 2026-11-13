@@ -12,6 +12,7 @@
 #include <linux/bitfield.h>
 #include <linux/bits.h>
 #include <linux/completion.h>
+#include <linux/hrtimer.h>
 #include <linux/ktime.h>
 #include <linux/math.h>
 #include <linux/minmax.h>
@@ -1339,6 +1340,12 @@ struct rk3026_ebc {
 	 * (ebc_take_roles()), 0/0 in fixed roles. Refresh thread only.
 	 */
 	u32			dbg_mst[2];
+	/*
+	 * Test trace: the heartbeat (ebc_dbg_hb()), a hard-IRQ hrtimer
+	 * started at probe, and its count.
+	 */
+	struct hrtimer		dbg_hb;
+	unsigned int		dbg_hb_n;
 
 	/*
 	 * The commit event held until its part has finished, or is taken

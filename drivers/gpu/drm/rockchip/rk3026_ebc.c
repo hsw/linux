@@ -442,6 +442,8 @@ static struct rk3026_ebc_roles ebc_take_roles(struct rk3026_ebc *ebc)
 	u32 base[EBC_HALVES], mst[2];
 	unsigned int i;
 
+	ebc->dbg_mst[0] = 0;
+	ebc->dbg_mst[1] = 0;
 	if (!ebc->rotate)
 		return roles;
 
@@ -449,6 +451,9 @@ static struct rk3026_ebc_roles ebc_take_roles(struct rk3026_ebc *ebc)
 		base[i] = lower_32_bits(ebc->half_phys[i]);
 	mst[0] = ebc_read(ebc, EBC_WIN_MST0);
 	mst[1] = ebc_read(ebc, EBC_WIN_MST1);
+	/* Test trace: the readback, for the take's line. */
+	ebc->dbg_mst[0] = mst[0];
+	ebc->dbg_mst[1] = mst[1];
 	if (rk3026_ebc_rotate_roles(&ebc->shadows,
 				    ebc->mst_explicit ? NULL : mst, base,
 				    &roles) == EBC_MST_FOREIGN)
@@ -721,6 +726,25 @@ static void ebc_stop_scan(struct rk3026_ebc *ebc)
 }
 
 /*
+ * Test trace, not for upstream: the life of a part at KERN_EMERG, so it
+ * reaches the pstore console at once and passes an Android test boot's
+ * console loglevel of 1. One line each for the take ("take"), the panel
+ * rails switching ("rails"), the start and end of each waveform ("scan"),
+ * the idle power-off and the part's finish ("done"), next to the
+ * tracepoints of the same events. No cap: the pstore console is a ring
+ * that keeps the newest lines, which are the ones a whole-SoC hang needs.
+ * All of them print from process context: the refresh thread, or for the
+ * rails also a CRTC disable or a suspend, under @image_lock or
+ * @rails_lock (both mutexes); none from the interrupt handler or under a
+ * spinlock.
+ */
+static void ebc_dbg_rails(struct rk3026_ebc *ebc, bool on, int ret)
+{
+	dev_emerg(ebc->dev, "rails %s epd=%d vcom=%d ret=%d\n",
+		  on ? "on" : "off", ebc->epd_on, ebc->vcom_on, ret);
+}
+
+/*
  * The time from the take of @last's part to now (rk3026_ebc_clock()), for
  * the scan_start event of each of its waveforms: the snapshot, and a repair
  * RESET in front of the part.
@@ -778,6 +802,9 @@ VISIBLE_IF_KUNIT int rk3026_ebc_drive(struct rk3026_ebc *ebc, const u8 *lut,
 	trace_rk3026_ebc_scan_start(last, mode, lut_mode, frames,
 				    last->repaired && !last->scans,
 				    rk3026_ebc_setup_us(ebc, last));
+	dev_emerg(ebc->dev, "scan start seq=%u mode=%u lut=%u frames=%u%s\n",
+		  last->seq, mode, lut_mode, frames,
+		  last->repaired && !last->scans ? " repair" : "");
 
 	WRITE_ONCE(ebc->shadows.prev_unknown, true);
 	last->scans++;
@@ -835,6 +862,8 @@ out:
 	last->scan_ms = ktime_ms_delta(ktime_get(), start);
 	trace_rk3026_ebc_scan_end(mode, frames, done, last->scan_ms, ret,
 				  last->seq);
+	dev_emerg(ebc->dev, "scan end seq=%u frames=%u/%u ms=%u ret=%d\n",
+		  last->seq, done, frames, last->scan_ms, ret);
 	return ret;
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_drive);
@@ -911,6 +940,7 @@ static int ebc_rails_on(struct rk3026_ebc *ebc)
 		if (ret) {
 			dev_err_ratelimited(ebc->dev, "failed to enable EPD rails: %d\n", ret);
 			trace_rk3026_ebc_rails(true, ebc->epd_on, ebc->vcom_on, ret);
+			ebc_dbg_rails(ebc, true, ret);
 			return ret;
 		}
 		changed = true;
@@ -924,6 +954,7 @@ static int ebc_rails_on(struct rk3026_ebc *ebc)
 		if (ret) {
 			dev_err_ratelimited(ebc->dev, "failed to enable VCOM: %d\n", ret);
 			trace_rk3026_ebc_rails(true, ebc->epd_on, ebc->vcom_on, ret);
+			ebc_dbg_rails(ebc, true, ret);
 			/*
 			 * No waveform without VCOM: take the high-voltage rails
 			 * down again. If that fails too, @epd_on stays set and
@@ -937,8 +968,10 @@ static int ebc_rails_on(struct rk3026_ebc *ebc)
 	}
 	/* dev_dbg only: a console line would itself queue a refresh. */
 	dev_dbg(ebc->dev, "rails on\n");
-	if (changed)
+	if (changed) {
 		trace_rk3026_ebc_rails(true, ebc->epd_on, ebc->vcom_on, 0);
+		ebc_dbg_rails(ebc, true, 0);
+	}
 	return 0;
 }
 
@@ -970,12 +1003,14 @@ static int ebc_rails_off(struct rk3026_ebc *ebc)
 	if (ebc->rails_on) {
 		dev_dbg(ebc->dev, "rails off\n");
 		trace_rk3026_ebc_rails(false, ebc->epd_on, ebc->vcom_on, 0);
+		ebc_dbg_rails(ebc, false, 0);
 	}
 	WRITE_ONCE(ebc->rails_on, false);
 	return 0;
 
 err:
 	trace_rk3026_ebc_rails(false, ebc->epd_on, ebc->vcom_on, ret);
+	ebc_dbg_rails(ebc, false, ret);
 	dev_err_ratelimited(ebc->dev,
 			    "failed to switch the panel rails off (%d), will retry\n",
 			    ret);
@@ -1688,6 +1723,14 @@ VISIBLE_IF_KUNIT void rk3026_ebc_do_refresh(struct rk3026_ebc *ebc,
 	mode = forced >= 0 && forced <= EBC_MODE_MAX ? forced : resolved;
 	last->mode = mode;
 	roles = ebc_take_roles(ebc);
+	dev_emerg(ebc->dev,
+		  "take seq=%u src=%u mode=%u/%u n=%u clip=" DRM_RECT_FMT
+		  " area=%u mst=%x/%x%s roles=%u/%u\n",
+		  part.seq, part.source, part.mode, mode, part.merged,
+		  DRM_RECT_ARG(&part.box),
+		  drm_rect_width(&part.box) * drm_rect_height(&part.box),
+		  ebc->dbg_mst[0], ebc->dbg_mst[1],
+		  ebc->rotate ? "" : "(fixed)", roles.prev, roles.next);
 	mutex_unlock(&ebc->image_lock);
 
 	/*
@@ -1849,6 +1892,8 @@ finish:
 	WRITE_ONCE(ebc->in_flight, false);
 	ebc_publish(ebc, last, start);
 	trace_rk3026_ebc_part_done(last, ebc->du_area);
+	dev_emerg(ebc->dev, "done seq=%u out=%u scans=%u ms=%u\n",
+		  last->seq, last->outcome, last->scans, last->ms);
 	/* After the move of @pending.done_seq: see rk3026_ebc_flip_hold(). */
 	ebc_flip_check(ebc);
 	mutex_unlock(&ebc->image_lock);
@@ -1876,6 +1921,7 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_do_refresh);
  */
 static void ebc_idle_rails_off(struct rk3026_ebc *ebc)
 {
+	dev_emerg(ebc->dev, "idle rails off\n");
 	mutex_lock(&ebc->rails_lock);
 	ebc_rails_off(ebc);
 	mutex_unlock(&ebc->rails_lock);
@@ -2654,12 +2700,12 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_load_palette);
  * One line for a framebuffer whose format, pitch and id are none of the
  * last ARRAY_SIZE(dbg_fbs) logged (a composer's buffer queue rotates
  * through a few), at most EBC_DBG_FB_LINES of them, and a begin and an
- * end line around each of the first EBC_DBG_565_BLITS blits of an RGB565
- * or BGR565 framebuffer: a hang inside the blit shows as a begin without
- * its end. Nothing more per frame.
+ * end line around every blit of an RGB565 or BGR565 framebuffer: a hang
+ * inside the blit shows as a begin without its end. The begin and end
+ * lines have no cap: the pstore console is a ring that keeps the newest
+ * lines, and the newest are the ones a hang needs.
  */
 #define EBC_DBG_FB_LINES	64
-#define EBC_DBG_565_BLITS	64
 
 static void ebc_dbg_plane_fb(struct rk3026_ebc *ebc,
 			     const struct drm_framebuffer *fb,
@@ -2700,9 +2746,9 @@ static unsigned int ebc_dbg_565_begin(struct rk3026_ebc *ebc,
 
 	if (format != DRM_FORMAT_RGB565 && format != DRM_FORMAT_BGR565)
 		return 0;
-	if (ebc->dbg_565_blits >= EBC_DBG_565_BLITS)
-		return 0;
-	ebc->dbg_565_blits++;
+	/* Never 0 (the "not logged" return), also after a wrap. */
+	if (!++ebc->dbg_565_blits)
+		ebc->dbg_565_blits = 1;
 	dev_emerg(ebc->dev, "565 blit begin n=%u box=" DRM_RECT_FMT "\n",
 		  ebc->dbg_565_blits, DRM_RECT_ARG(box));
 	return ebc->dbg_565_blits;

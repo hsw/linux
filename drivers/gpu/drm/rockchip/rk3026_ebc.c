@@ -4039,7 +4039,10 @@ static void ebc_hw_fini(void *data)
  * KERN_EMERG, for the pstore console, so the time a whole-SoC hang stopped
  * the CPUs is known even when nothing else prints: the last "hb" line is
  * at most one period before the stop. With the CPU it ran on, whether the
- * panel rails are up and whether a part is in flight.
+ * panel rails are up, whether a part is in flight, and CPU0's rate (kHz)
+ * and supply voltage (uV) as the DVFS notifiers last saw them, 0 while
+ * unknown: cached values, as cpufreq and the regulator core may sleep and
+ * this is hard interrupt context.
  *
  * An hrtimer in hard interrupt context (HRTIMER_MODE_REL_HARD), not a
  * delayed work: it fires while a CPU spins with preemption or softirqs
@@ -4054,9 +4057,10 @@ static enum hrtimer_restart ebc_dbg_hb(struct hrtimer *t)
 {
 	struct rk3026_ebc *ebc = container_of(t, struct rk3026_ebc, dbg_hb);
 
-	dev_emerg(ebc->dev, "hb %u cpu%d rails=%d flight=%d\n",
+	dev_emerg(ebc->dev, "hb %u cpu%d rails=%d flight=%d cpu=%u varm=%d\n",
 		  ++ebc->dbg_hb_n, raw_smp_processor_id(),
-		  READ_ONCE(ebc->rails_on), READ_ONCE(ebc->in_flight));
+		  READ_ONCE(ebc->rails_on), READ_ONCE(ebc->in_flight),
+		  READ_ONCE(ebc->dbg_cpu_khz), READ_ONCE(ebc->dbg_varm_uv));
 	/* Every fourth beat, while CPU0's rate or supply is still unknown. */
 	if (!(ebc->dbg_hb_n % 4) &&
 	    (READ_ONCE(ebc->dbg_varm_wait) || !READ_ONCE(ebc->dbg_cpu_khz)))

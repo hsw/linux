@@ -1334,6 +1334,11 @@ struct rk3026_ebc {
 	unsigned int		dbg_fb_next;
 	unsigned int		dbg_fb_lines;
 	unsigned int		dbg_565_blits;
+	/*
+	 * Test trace: the WIN_MST0/1 readback of the last take
+	 * (ebc_take_roles()), 0/0 in fixed roles. Refresh thread only.
+	 */
+	u32			dbg_mst[2];
 
 	/*
 	 * The commit event held until its part has finished, or is taken

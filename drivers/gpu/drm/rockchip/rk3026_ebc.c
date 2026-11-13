@@ -18,6 +18,8 @@
 
 #include <linux/clk.h>
 #include <linux/console.h>
+#include <linux/cpu.h>
+#include <linux/cpufreq.h>
 #include <linux/delay.h>
 #include <linux/dma-fence.h>
 #include <linux/dma-mapping.h>
@@ -4055,8 +4057,173 @@ static enum hrtimer_restart ebc_dbg_hb(struct hrtimer *t)
 	dev_emerg(ebc->dev, "hb %u cpu%d rails=%d flight=%d\n",
 		  ++ebc->dbg_hb_n, raw_smp_processor_id(),
 		  READ_ONCE(ebc->rails_on), READ_ONCE(ebc->in_flight));
+	/* Every fourth beat, while CPU0's rate or supply is still unknown. */
+	if (!(ebc->dbg_hb_n % 4) &&
+	    (READ_ONCE(ebc->dbg_varm_wait) || !READ_ONCE(ebc->dbg_cpu_khz)))
+		schedule_work(&ebc->dbg_varm_work);
 	hrtimer_forward_now(t, ms_to_ktime(EBC_DBG_HB_MS));
 	return HRTIMER_RESTART;
+}
+
+/*
+ * Test trace, not for upstream: CPU DVFS at KERN_EMERG, because the CPU's
+ * supply (vdd_arm) very probably feeds the SoC's logic as well, the GPU,
+ * the DDR controller and the buses with it, so a CPU rate change moves
+ * their voltage too.
+ *
+ *   cpufreq <old> -> <new> kHz              CPU0's policy, POSTCHANGE
+ *   vdd_arm pre <old> -> <min>..<max> uV    before the supply is set
+ *   vdd_arm <uV> uV                         after it is set and settled
+ *   vdd_arm abort, back at <uV> uV          the setting failed
+ *
+ * Both notifiers run in process context: cpufreq's transition chain is an
+ * SRCU chain called around the driver's target (cpufreq-dt has no fast
+ * switch, so schedutil's kthread or a sysfs write), the regulator's a
+ * blocking chain called by regulator_set_voltage()'s caller with the
+ * regulator's lock held. printk is safe in both; neither callback calls
+ * back into cpufreq or the regulator.
+ *
+ * The supply is CPU0's "cpu" supply from its device-tree node, taken as a
+ * consumer of this device that never enables it nor sets a voltage, a
+ * current or a mode, so it puts no constraint on the rail (the regulator
+ * core skips consumers that asked for nothing). Its driver may be a
+ * module that loads after this one: then the lookup says -EPROBE_DEFER
+ * and the heartbeat queues it again every second until it succeeds or
+ * fails otherwise.
+ */
+static int ebc_dbg_cpufreq_cb(struct notifier_block *nb, unsigned long event,
+			      void *data)
+{
+	struct rk3026_ebc *ebc = container_of(nb, struct rk3026_ebc,
+					      dbg_cpufreq_nb);
+	struct cpufreq_freqs *freqs = data;
+
+	if (event != CPUFREQ_POSTCHANGE ||
+	    !cpumask_test_cpu(0, freqs->policy->cpus))
+		return NOTIFY_DONE;
+	WRITE_ONCE(ebc->dbg_cpu_khz, freqs->new);
+	dev_emerg(ebc->dev, "cpufreq %u -> %u kHz\n", freqs->old, freqs->new);
+	return NOTIFY_OK;
+}
+
+static int ebc_dbg_varm_cb(struct notifier_block *nb, unsigned long event,
+			   void *data)
+{
+	struct rk3026_ebc *ebc = container_of(nb, struct rk3026_ebc,
+					      dbg_varm_nb);
+	const struct pre_voltage_change_data *pre = data;
+	long uv = (long)data;
+
+	switch (event) {
+	case REGULATOR_EVENT_PRE_VOLTAGE_CHANGE:
+		dev_emerg(ebc->dev, "vdd_arm pre %ld -> %lu..%lu uV\n",
+			  (long)pre->old_uV, pre->min_uV, pre->max_uV);
+		break;
+	case REGULATOR_EVENT_VOLTAGE_CHANGE:
+		WRITE_ONCE(ebc->dbg_varm_uv, uv);
+		dev_emerg(ebc->dev, "vdd_arm %ld uV\n", uv);
+		break;
+	case REGULATOR_EVENT_ABORT_VOLTAGE_CHANGE:
+		dev_emerg(ebc->dev, "vdd_arm abort, back at %ld uV\n", uv);
+		break;
+	default:
+		return NOTIFY_DONE;
+	}
+	return NOTIFY_OK;
+}
+
+/* Process context: the probe, or the work item the heartbeat queues. */
+static void ebc_dbg_varm_lookup(struct rk3026_ebc *ebc)
+{
+	struct device *cpu_dev = get_cpu_device(0);
+	struct regulator *reg;
+	unsigned int khz;
+	int ret, uv;
+
+	if (!READ_ONCE(ebc->dbg_cpu_khz)) {
+		khz = cpufreq_quick_get(0);
+		if (khz)
+			WRITE_ONCE(ebc->dbg_cpu_khz, khz);
+	}
+	if (!READ_ONCE(ebc->dbg_varm_wait))
+		return;
+
+	if (!cpu_dev || !cpu_dev->of_node) {
+		dev_emerg(ebc->dev, "vdd_arm: no CPU0 node, not watched\n");
+		WRITE_ONCE(ebc->dbg_varm_wait, false);
+		return;
+	}
+	reg = of_regulator_get_optional(ebc->dev, cpu_dev->of_node, "cpu");
+	if (IS_ERR(reg)) {
+		ret = PTR_ERR(reg);
+		if (ret == -EPROBE_DEFER) {
+			if (!ebc->dbg_varm_said)
+				dev_emerg(ebc->dev,
+					  "vdd_arm: waiting for CPU0's supply\n");
+			ebc->dbg_varm_said = true;
+			return;
+		}
+		dev_emerg(ebc->dev, "vdd_arm: CPU0's supply: %pe, not watched\n",
+			  reg);
+		WRITE_ONCE(ebc->dbg_varm_wait, false);
+		return;
+	}
+
+	ebc->dbg_varm_nb.notifier_call = ebc_dbg_varm_cb;
+	ret = regulator_register_notifier(reg, &ebc->dbg_varm_nb);
+	if (ret) {
+		regulator_put(reg);
+		dev_emerg(ebc->dev, "vdd_arm: notifier: %d, not watched\n", ret);
+		WRITE_ONCE(ebc->dbg_varm_wait, false);
+		return;
+	}
+	/*
+	 * After the notifier: a change that completes from here on is
+	 * written by the callback, and this read takes the regulator's lock,
+	 * so it sees any change that completed before.
+	 */
+	uv = regulator_get_voltage(reg);
+	if (uv > 0)
+		WRITE_ONCE(ebc->dbg_varm_uv, uv);
+	ebc->dbg_varm = reg;
+	WRITE_ONCE(ebc->dbg_varm_wait, false);
+	dev_emerg(ebc->dev, "vdd_arm: CPU0's supply at %d uV, watched\n", uv);
+}
+
+static void ebc_dbg_varm_work(struct work_struct *work)
+{
+	ebc_dbg_varm_lookup(container_of(work, struct rk3026_ebc,
+					 dbg_varm_work));
+}
+
+/* After the heartbeat has stopped, so nothing queues the work again. */
+static void ebc_dbg_dvfs_stop(void *data)
+{
+	struct rk3026_ebc *ebc = data;
+
+	cancel_work_sync(&ebc->dbg_varm_work);
+	if (ebc->dbg_varm) {
+		regulator_unregister_notifier(ebc->dbg_varm, &ebc->dbg_varm_nb);
+		regulator_put(ebc->dbg_varm);
+	}
+	if (ebc->dbg_cpufreq_on)
+		cpufreq_unregister_notifier(&ebc->dbg_cpufreq_nb,
+					    CPUFREQ_TRANSITION_NOTIFIER);
+}
+
+static void ebc_dbg_dvfs_start(struct rk3026_ebc *ebc)
+{
+	int ret;
+
+	INIT_WORK(&ebc->dbg_varm_work, ebc_dbg_varm_work);
+	ebc->dbg_cpufreq_nb.notifier_call = ebc_dbg_cpufreq_cb;
+	ret = cpufreq_register_notifier(&ebc->dbg_cpufreq_nb,
+					CPUFREQ_TRANSITION_NOTIFIER);
+	if (ret)
+		dev_emerg(ebc->dev, "cpufreq: notifier: %d, not watched\n", ret);
+	ebc->dbg_cpufreq_on = !ret;
+	ebc->dbg_varm_wait = true;
+	ebc_dbg_varm_lookup(ebc);
 }
 
 static void ebc_dbg_hb_stop(void *data)
@@ -4420,7 +4587,14 @@ static int ebc_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	/* Test trace: the heartbeat, from here to the remove. */
+	/*
+	 * Test trace: the DVFS lines, then the heartbeat, from here to the
+	 * remove; the heartbeat stops first, as it queues the lookup.
+	 */
+	ebc_dbg_dvfs_start(ebc);
+	ret = devm_add_action_or_reset(dev, ebc_dbg_dvfs_stop, ebc);
+	if (ret)
+		return ret;
 	hrtimer_setup(&ebc->dbg_hb, ebc_dbg_hb, CLOCK_MONOTONIC,
 		      HRTIMER_MODE_REL_HARD);
 	hrtimer_start(&ebc->dbg_hb, ms_to_ktime(EBC_DBG_HB_MS),

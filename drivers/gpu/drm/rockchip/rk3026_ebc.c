@@ -729,15 +729,28 @@ static void ebc_stop_scan(struct rk3026_ebc *ebc)
  * Test trace, not for upstream: the life of a part at KERN_EMERG, so it
  * reaches the pstore console at once and passes an Android test boot's
  * console loglevel of 1. One line each for the take ("take"), the panel
- * rails switching ("rails"), the start and end of each waveform ("scan"),
- * the idle power-off and the part's finish ("done"), next to the
- * tracepoints of the same events. No cap: the pstore console is a ring
- * that keeps the newest lines, which are the ones a whole-SoC hang needs.
- * All of them print from process context: the refresh thread, or for the
- * rails also a CRTC disable or a suspend, under @image_lock or
- * @rails_lock (both mutexes); none from the interrupt handler or under a
- * spinlock.
+ * rails switching ("rails"), the end of each waveform ("scan end") and
+ * the idle power-off, next to the tracepoints of the same events; with
+ * dbg_blit=1 also the start of each waveform ("scan start") and the
+ * part's finish ("done"). No cap: the pstore console is a ring that keeps
+ * the newest lines, which are the ones a whole-SoC hang needs. All of
+ * them print from process context: the refresh thread, or for the rails
+ * also a CRTC disable or a suspend, under @image_lock or @rails_lock
+ * (both mutexes); none from the interrupt handler or under a spinlock.
  */
+
+/*
+ * Test parameter, not for upstream: dbg_blit=1 adds the heavy lines, the
+ * begin and end of every 16-bit blit (and dbg_565=2's pattern line), the
+ * start of every waveform and the finish of every part. Off by default,
+ * so the console of a test boot carries a few lines a second and the
+ * printing itself does not change the timing being looked at. Read at
+ * each line, so a write to the sysfs file takes effect at once.
+ */
+static bool dbg_blit;
+module_param(dbg_blit, bool, 0644);
+MODULE_PARM_DESC(dbg_blit, "log each 16-bit blit, scan start and part finish (test, default N)");
+
 static void ebc_dbg_rails(struct rk3026_ebc *ebc, bool on, int ret)
 {
 	dev_emerg(ebc->dev, "rails %s epd=%d vcom=%d ret=%d\n",
@@ -802,9 +815,11 @@ VISIBLE_IF_KUNIT int rk3026_ebc_drive(struct rk3026_ebc *ebc, const u8 *lut,
 	trace_rk3026_ebc_scan_start(last, mode, lut_mode, frames,
 				    last->repaired && !last->scans,
 				    rk3026_ebc_setup_us(ebc, last));
-	dev_emerg(ebc->dev, "scan start seq=%u mode=%u lut=%u frames=%u%s\n",
-		  last->seq, mode, lut_mode, frames,
-		  last->repaired && !last->scans ? " repair" : "");
+	if (READ_ONCE(dbg_blit))
+		dev_emerg(ebc->dev,
+			  "scan start seq=%u mode=%u lut=%u frames=%u%s\n",
+			  last->seq, mode, lut_mode, frames,
+			  last->repaired && !last->scans ? " repair" : "");
 
 	WRITE_ONCE(ebc->shadows.prev_unknown, true);
 	last->scans++;
@@ -1892,8 +1907,9 @@ finish:
 	WRITE_ONCE(ebc->in_flight, false);
 	ebc_publish(ebc, last, start);
 	trace_rk3026_ebc_part_done(last, ebc->du_area);
-	dev_emerg(ebc->dev, "done seq=%u out=%u scans=%u ms=%u\n",
-		  last->seq, last->outcome, last->scans, last->ms);
+	if (READ_ONCE(dbg_blit))
+		dev_emerg(ebc->dev, "done seq=%u out=%u scans=%u ms=%u\n",
+			  last->seq, last->outcome, last->scans, last->ms);
 	/* After the move of @pending.done_seq: see rk3026_ebc_flip_hold(). */
 	ebc_flip_check(ebc);
 	mutex_unlock(&ebc->image_lock);
@@ -2731,11 +2747,11 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_load_palette);
  *
  * One line for a framebuffer whose format, pitch and id are none of the
  * last ARRAY_SIZE(dbg_fbs) logged (a composer's buffer queue rotates
- * through a few), at most EBC_DBG_FB_LINES of them, and a begin and an
- * end line around every blit of an RGB565 or BGR565 framebuffer: a hang
- * inside the blit shows as a begin without its end. The begin and end
- * lines have no cap: the pstore console is a ring that keeps the newest
- * lines, and the newest are the ones a hang needs.
+ * through a few), at most EBC_DBG_FB_LINES of them, and with dbg_blit=1 a
+ * begin and an end line around every blit of an RGB565 or BGR565
+ * framebuffer: a hang inside the blit shows as a begin without its end.
+ * The begin and end lines have no cap: the pstore console is a ring that
+ * keeps the newest lines, and the newest are the ones a hang needs.
  */
 #define EBC_DBG_FB_LINES	64
 
@@ -2777,6 +2793,8 @@ static unsigned int ebc_dbg_565_begin(struct rk3026_ebc *ebc,
 	u32 format = fb->format->format;
 
 	if (format != DRM_FORMAT_RGB565 && format != DRM_FORMAT_BGR565)
+		return 0;
+	if (!READ_ONCE(dbg_blit))
 		return 0;
 	/* Never 0 (the "not logged" return), also after a wrap. */
 	if (!++ebc->dbg_565_blits)
@@ -2884,8 +2902,11 @@ static void ebc_plane_atomic_update(struct drm_plane *plane,
 	dbg = ebc_dbg_565_mode(fb);
 	if (dbg == 2) {
 		queued = ebc_dbg_565_pattern(ebc, &phase);
-		dev_emerg(ebc->dev, "565 pattern n=%u phase=%u queued=%d\n",
-			  ++ebc->dbg_565_blits, phase, queued);
+		++ebc->dbg_565_blits;
+		if (READ_ONCE(dbg_blit))
+			dev_emerg(ebc->dev,
+				  "565 pattern n=%u phase=%u queued=%d\n",
+				  ebc->dbg_565_blits, phase, queued);
 		goto out_exit;
 	}
 
@@ -4409,8 +4430,9 @@ static int ebc_probe(struct platform_device *pdev)
 		return ret;
 
 	/* Test split: the scratch image of dbg_565=1. */
-	dev_emerg(dev, "dbg_565=%d%s\n", dbg_565,
-		  dbg_565 < 0 || dbg_565 > 2 ? " (unknown, as 0)" : "");
+	dev_emerg(dev, "dbg_565=%d%s dbg_blit=%d\n", dbg_565,
+		  dbg_565 < 0 || dbg_565 > 2 ? " (unknown, as 0)" : "",
+		  READ_ONCE(dbg_blit));
 	if (dbg_565 == 1) {
 		ret = ebc_alloc_shadow(ebc, &ebc->dbg_scratch);
 		if (ret)

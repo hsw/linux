@@ -34,14 +34,35 @@ static void lima_devfreq_update_utilization(struct lima_devfreq *devfreq)
 static int lima_devfreq_target(struct device *dev, unsigned long *freq,
 			       u32 flags)
 {
+	struct lima_device *ldev = dev_get_drvdata(dev);
+	struct lima_devfreq *ldevfreq = &ldev->devfreq;
 	struct dev_pm_opp *opp;
+	int ret;
 
 	opp = devfreq_recommended_opp(dev, freq, flags);
 	if (IS_ERR(opp))
 		return PTR_ERR(opp);
 	dev_pm_opp_put(opp);
 
-	return dev_pm_opp_set_rate(dev, *freq);
+	if (!(ldev->pm_features & BIT(LIMA_PM_OPP_OFF)))
+		return dev_pm_opp_set_rate(dev, *freq);
+
+	/*
+	 * Called with devfreq->lock held, which serializes this with
+	 * lima_devfreq_power_on() and lima_devfreq_power_off(). While the GPU
+	 * is off (a sysfs or a cooling update can still get here), keep the
+	 * votes dropped and only record the frequency for the next power on.
+	 */
+	if (ldevfreq->opp_off) {
+		ldevfreq->opp_freq = *freq;
+		return 0;
+	}
+
+	ret = dev_pm_opp_set_rate(dev, *freq);
+	if (!ret)
+		ldevfreq->opp_freq = *freq;
+
+	return ret;
 }
 
 static void lima_devfreq_reset(struct lima_devfreq *devfreq)
@@ -147,6 +168,21 @@ int lima_devfreq_init(struct lima_device *ldev)
 		return PTR_ERR(opp);
 
 	lima_devfreq_profile.initial_freq = cur_freq;
+
+	if (ldev->pm_features & BIT(LIMA_PM_OPP_OFF)) {
+		/*
+		 * Set the recommended OPP: this sets the voltage of the
+		 * regulator, if any, and enables it before the GPU takes its
+		 * first job.
+		 */
+		ret = dev_pm_opp_set_opp(dev, opp);
+		if (ret) {
+			dev_pm_opp_put(opp);
+			return ret;
+		}
+		ldevfreq->opp_freq = cur_freq;
+		ldevfreq->opp_off = false;
+	}
 	dev_pm_opp_put(opp);
 
 	/*
@@ -229,4 +265,52 @@ int lima_devfreq_suspend(struct lima_devfreq *devfreq)
 		return 0;
 
 	return devfreq_suspend_device(devfreq->devfreq);
+}
+
+/*
+ * With LIMA_PM_OPP_OFF, the GPU's supply may be shared with other devices,
+ * and the OPP holds a voltage request on it: drop it while the GPU is off,
+ * and set it again before the GPU is clocked.
+ *
+ * Both run from the runtime PM callbacks, outside lima_devfreq_suspend()
+ * and lima_devfreq_resume(): devfreq_suspend_device() and
+ * devfreq_resume_device() take devfreq->lock themselves, and the governor
+ * suspend waits for the monitor work, which takes it too, so it is never
+ * held here on entry. devfreq->lock holders that reach
+ * lima_devfreq_target() do not wait for the GPU's runtime PM, and both
+ * paths take the OPP and regulator locks under devfreq->lock.
+ */
+int lima_devfreq_power_on(struct lima_device *ldev)
+{
+	struct lima_devfreq *ldevfreq = &ldev->devfreq;
+	struct devfreq *devfreq = ldevfreq->devfreq;
+	int ret;
+
+	if (!devfreq || !(ldev->pm_features & BIT(LIMA_PM_OPP_OFF)))
+		return 0;
+
+	mutex_lock(&devfreq->lock);
+	ret = dev_pm_opp_set_rate(ldev->dev, ldevfreq->opp_freq);
+	if (!ret)
+		ldevfreq->opp_off = false;
+	mutex_unlock(&devfreq->lock);
+
+	return ret;
+}
+
+void lima_devfreq_power_off(struct lima_device *ldev)
+{
+	struct lima_devfreq *ldevfreq = &ldev->devfreq;
+	struct devfreq *devfreq = ldevfreq->devfreq;
+	int ret;
+
+	if (!devfreq || !(ldev->pm_features & BIT(LIMA_PM_OPP_OFF)))
+		return;
+
+	mutex_lock(&devfreq->lock);
+	ret = dev_pm_opp_set_rate(ldev->dev, 0);
+	if (ret)
+		dev_warn(ldev->dev, "failed to drop the OPP votes: %d\n", ret);
+	ldevfreq->opp_off = true;
+	mutex_unlock(&devfreq->lock);
 }

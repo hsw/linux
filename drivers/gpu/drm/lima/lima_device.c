@@ -470,10 +470,16 @@ int lima_device_resume(struct device *dev)
 	struct lima_device *ldev = dev_get_drvdata(dev);
 	int i, err;
 
+	err = lima_devfreq_power_on(ldev);
+	if (err) {
+		dev_err(dev, "resume opp fail %d\n", err);
+		return err;
+	}
+
 	err = lima_clk_enable(ldev);
 	if (err) {
 		dev_err(dev, "resume clk fail %d\n", err);
-		return err;
+		goto err_out_opp;
 	}
 
 	err = lima_regulator_enable(ldev);
@@ -504,6 +510,8 @@ err_out1:
 	lima_regulator_disable(ldev);
 err_out0:
 	lima_clk_disable(ldev);
+err_out_opp:
+	lima_devfreq_power_off(ldev);
 	return err;
 }
 
@@ -530,6 +538,8 @@ int lima_device_suspend(struct device *dev)
 	lima_regulator_disable(ldev);
 
 	lima_clk_disable(ldev);
+
+	lima_devfreq_power_off(ldev);
 
 	return 0;
 }

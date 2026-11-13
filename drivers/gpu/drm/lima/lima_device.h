@@ -19,6 +19,15 @@ enum lima_gpu_id {
 	lima_gpu_num,
 };
 
+/**
+ * enum lima_gpu_pm - Optional power management features
+ * @LIMA_PM_OPP_OFF: Set the OPP at devfreq init and drop its votes (the
+ *  voltage requests on the supply among them) while runtime suspended
+ */
+enum lima_gpu_pm {
+	LIMA_PM_OPP_OFF,
+};
+
 enum lima_ip_id {
 	lima_ip_pmu,
 	lima_ip_gpmmu,
@@ -80,6 +89,7 @@ struct lima_device {
 	struct drm_device *ddev;
 
 	enum lima_gpu_id id;
+	u8 pm_features;
 	u32 gp_version;
 	u32 pp_version;
 	int num_pp;

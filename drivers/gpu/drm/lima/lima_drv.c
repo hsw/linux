@@ -391,6 +391,7 @@ static int lima_pdev_probe(struct platform_device *pdev)
 	}
 
 	ldev->id = comp->id;
+	ldev->pm_features = comp->pm_features;
 
 	platform_set_drvdata(pdev, ldev);
 
@@ -473,7 +474,14 @@ static const struct lima_compatible lima_mali450_data = {
 	.id = lima_gpu_mali450,
 };
 
+/* The RK3026's GPU may share its supply with the CPUs. */
+static const struct lima_compatible lima_rk3026_data = {
+	.id = lima_gpu_mali400,
+	.pm_features = BIT(LIMA_PM_OPP_OFF),
+};
+
 static const struct of_device_id dt_match[] = {
+	{ .compatible = "rockchip,rk3026-mali", .data = &lima_rk3026_data },
 	{ .compatible = "arm,mali-400", .data = &lima_mali400_data },
 	{ .compatible = "arm,mali-450", .data = &lima_mali450_data },
 	{}

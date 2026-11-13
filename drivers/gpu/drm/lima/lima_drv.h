@@ -42,6 +42,7 @@ struct lima_submit {
 
 struct lima_compatible {
 	enum lima_gpu_id id;
+	u8 pm_features;
 };
 
 static inline struct lima_drm_priv *

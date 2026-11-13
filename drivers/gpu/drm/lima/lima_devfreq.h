@@ -28,6 +28,14 @@ struct lima_devfreq {
 	 * and PP interrupts.
 	 */
 	spinlock_t lock;
+
+	/*
+	 * With LIMA_PM_OPP_OFF: the OPP votes are dropped while opp_off is set,
+	 * and opp_freq is the frequency to set at the next power on. Both are
+	 * protected by devfreq->lock.
+	 */
+	bool opp_off;
+	unsigned long opp_freq;
 };
 
 int lima_devfreq_init(struct lima_device *ldev);
@@ -38,5 +46,8 @@ void lima_devfreq_record_idle(struct lima_devfreq *devfreq);
 
 int lima_devfreq_resume(struct lima_devfreq *devfreq);
 int lima_devfreq_suspend(struct lima_devfreq *devfreq);
+
+int lima_devfreq_power_on(struct lima_device *ldev);
+void lima_devfreq_power_off(struct lima_device *ldev);
 
 #endif

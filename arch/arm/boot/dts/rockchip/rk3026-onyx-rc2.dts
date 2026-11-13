@@ -30,7 +30,8 @@
  * on only around refreshes. The touch controller shares i2c2 with it.
  *
  * cpufreq scales voltage and frequency: the CPUs' supply is ACT8931 DCDC3,
- * and cpufreq-dt probes once the ACT8931 module has bound it.
+ * and cpufreq-dt probes once the ACT8931 module has bound it. The GPU
+ * shares that supply, and its driver also waits for it.
  *
  * System devices (fuel gauge and charger presence, RTC, front light, cover
  * switch, vibrator, Wi-Fi power and the USB host port) are described in
@@ -43,7 +44,7 @@
 
 /*
  * CPU operating point voltages, the one place to change them (target =
- * minimum = maximum in each opp-microvolt). The Rockchip RK3026 SDK table
+ * minimum in each opp-microvolt). The Rockchip RK3026 SDK table
  * (rk3026-tb): 312 MHz 0.95 V, 504 MHz 1.00 V, 816 MHz 1.20 V, 912 MHz
  * 1.25 V, 1008 MHz 1.35 V. Every value must be an ACT8931 DCDC3 step:
  * 0.6 V + 25 mV up to 1.175 V, 1.2 V + 50 mV from there (0.95 V = 0x0e,
@@ -60,6 +61,14 @@
  */
 #define RC2_OPP_UV_912		1300000
 #define RC2_OPP_UV_1008		1350000
+/*
+ * The maximum of every CPU operating point: DCDC3 also feeds the core
+ * logic, CVDD, and so the GPU, whose operating points (rk3026.dtsi) ask
+ * for at least 1.00 V up to this same 1.35 V. The regulator core sets the
+ * lowest voltage inside every consumer's range, so a CPU point below the
+ * GPU's minimum gets the GPU's minimum while the GPU is powered.
+ */
+#define RC2_OPP_UV_MAX		1350000
 /*
  * DCDC3 ramp for a raise, uV/us: the ACT8931 datasheet gives no slew rate
  * for a VSET change, so a conservative 0.5 mV/us (0.95 -> 1.30 V: 700 us).
@@ -163,28 +172,28 @@
 
 		opp-312000000 {
 			opp-hz = /bits/ 64 <312000000>;
-			opp-microvolt = <RC2_OPP_UV_312 RC2_OPP_UV_312 RC2_OPP_UV_312>;
+			opp-microvolt = <RC2_OPP_UV_312 RC2_OPP_UV_312 RC2_OPP_UV_MAX>;
 		};
 
 		opp-504000000 {
 			opp-hz = /bits/ 64 <504000000>;
-			opp-microvolt = <RC2_OPP_UV_504 RC2_OPP_UV_504 RC2_OPP_UV_504>;
+			opp-microvolt = <RC2_OPP_UV_504 RC2_OPP_UV_504 RC2_OPP_UV_MAX>;
 		};
 
 		opp-816000000 {
 			opp-hz = /bits/ 64 <816000000>;
-			opp-microvolt = <RC2_OPP_UV_816 RC2_OPP_UV_816 RC2_OPP_UV_816>;
+			opp-microvolt = <RC2_OPP_UV_816 RC2_OPP_UV_816 RC2_OPP_UV_MAX>;
 			opp-suspend;
 		};
 
 		opp-912000000 {
 			opp-hz = /bits/ 64 <912000000>;
-			opp-microvolt = <RC2_OPP_UV_912 RC2_OPP_UV_912 RC2_OPP_UV_912>;
+			opp-microvolt = <RC2_OPP_UV_912 RC2_OPP_UV_912 RC2_OPP_UV_MAX>;
 		};
 
 		opp-1008000000 {
 			opp-hz = /bits/ 64 <1008000000>;
-			opp-microvolt = <RC2_OPP_UV_1008 RC2_OPP_UV_1008 RC2_OPP_UV_1008>;
+			opp-microvolt = <RC2_OPP_UV_1008 RC2_OPP_UV_1008 RC2_OPP_UV_MAX>;
 			turbo-mode;
 		};
 	};
@@ -472,7 +481,13 @@
 	};
 };
 
+/*
+ * The GPU is part of the core logic, CVDD, which this board feeds from
+ * DCDC3 with the CPUs (the ACT8931 has no fourth buck): while the GPU is
+ * powered, its operating points keep DCDC3 at 1.00 V or more.
+ */
 &gpu {
+	mali-supply = <&vdd_arm>;
 	status = "okay";
 };
 

@@ -150,20 +150,24 @@
 
 		/*
 		 * The vendor's GPU levels, 200, 266 and 400 MHz nominal, as
-		 * the 768 MHz GPLL divides them. No voltages: the vendor runs
-		 * every GPU level at one logic rail voltage, which belongs to
-		 * the board's regulator.
+		 * the 768 MHz GPLL divides them. The GPU is part of the core
+		 * logic, CVDD: each level asks for at least 1.00 V, and allows
+		 * up to the 1.35 V the datasheet gives as CVDD's maximum, so
+		 * that the supply can also serve a CPU sharing it.
 		 */
 		opp-192000000 {
 			opp-hz = /bits/ 64 <192000000>;
+			opp-microvolt = <1000000 1000000 1350000>;
 		};
 
 		opp-256000000 {
 			opp-hz = /bits/ 64 <256000000>;
+			opp-microvolt = <1000000 1000000 1350000>;
 		};
 
 		opp-384000000 {
 			opp-hz = /bits/ 64 <384000000>;
+			opp-microvolt = <1000000 1000000 1350000>;
 		};
 	};
 

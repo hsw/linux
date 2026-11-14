@@ -436,6 +436,8 @@ static irqreturn_t hym8563_irq(int irq, void *dev_id)
 			__func__, ret);
 	}
 
+	rtc_update_irq(hym8563->rtc, 1, RTC_IRQF | RTC_AF);
+
 out:
 	rtc_unlock(hym8563->rtc);
 	return IRQ_HANDLED;

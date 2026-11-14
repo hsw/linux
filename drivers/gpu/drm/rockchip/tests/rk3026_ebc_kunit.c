@@ -4842,6 +4842,49 @@ static void ebc_test_rkf_max_weights(struct kunit *test)
 	KUNIT_EXPECT_MEMEQ(test, lut, ones, EBC_LUT_FRAME_BYTES);
 }
 
+/*
+ * The same defect with a single weight at 0xffffffff and the other 255 left at
+ * 1: the table does not have to be saturated, and this is the sharpest form of
+ * it. A node of weight U32_MAX is never strictly below the sentinel, so it is
+ * never picked and survives every round; the last one, which is the only round
+ * left with two parentless nodes, then scans both without setting i2, and
+ * merges the running root with node 0 - already parented - instead. Replaying
+ * the pick loop puts the first bad round at 255 of 255, against 98 of 255 for
+ * the fuzzer input with 158 such weights.
+ *
+ * The intended build merges the heaviest leaf last, so leaf 255 sits one bit
+ * below the root: a stream of one bits is one symbol per bit, and the frame of
+ * 0xff decodes to 0xff.
+ */
+static void ebc_test_rkf_single_max_weight(struct kunit *test)
+{
+	static const u32 key[2] = { 0xaa55aa55, 0x55aa55aa };
+	static const u8 ones[EBC_LUT_FRAME_BYTES] = {
+		[0 ... EBC_LUT_FRAME_BYTES - 1] = 0xff,
+	};
+	struct device *dev = t_rkf_dev(test);
+	size_t size = T_RKF_PAYLOAD + T_RKF_SEG;
+	struct ebc_waveform *wf;
+	const u8 *lut;
+	u8 *buf;
+	u32 frames = 0;
+
+	buf = t_rkf_alloc(test, size, size + 4);
+	/* One weight at the sentinel, stored obfuscated as in a pristine file. */
+	put_unaligned_le32(U32_MAX ^ key[255 & 1], buf + 0x6d0 + 4 * 255);
+	put_unaligned_le32(T_RKF_PAYLOAD, buf + T_RKF_GRAY16);
+	buf[T_RKF_PAYLOAD] = 1;
+	memcpy(buf + T_RKF_PAYLOAD + 4, ones, EBC_LUT_FRAME_BYTES);
+	t_rkf_seal(buf, size);
+
+	wf = rk3026_ebc_waveform_parse(dev, buf, size + 4);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, wf);
+	lut = rk3026_ebc_waveform_lut(wf, EBC_MODE_PART, 25, &frames);
+	KUNIT_ASSERT_NOT_NULL(test, lut);
+	KUNIT_EXPECT_EQ(test, frames, 1);
+	KUNIT_EXPECT_MEMEQ(test, lut, ones, EBC_LUT_FRAME_BYTES);
+}
+
 /* Containers whose size field does not match the buffer are refused. */
 static void ebc_test_rkf_parse_bounds(struct kunit *test)
 {
@@ -4900,6 +4943,7 @@ static struct kunit_case rk3026_ebc_waveform_test_cases[] = {
 	KUNIT_CASE(ebc_test_rkf_fallbacks),
 	KUNIT_CASE(ebc_test_rkf_auto_overlay),
 	KUNIT_CASE(ebc_test_rkf_max_weights),
+	KUNIT_CASE(ebc_test_rkf_single_max_weight),
 	KUNIT_CASE(ebc_test_rkf_parse_bounds),
 	{}
 };

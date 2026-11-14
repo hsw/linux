@@ -30,6 +30,19 @@
 		charger-type = "usb-sdp";
 		gpios = <&usb_status 0 GPIO_ACTIVE_HIGH>;
 	};
+
+	/*
+	 * The cell is labelled 3.8 V, 11.4 Wh, so 3000 mAh. It charges from
+	 * the ACT8931, whose charger holds a fixed 4.20 V in its
+	 * constant-voltage phase, so a full cell reads 4.20 V. No discharge
+	 * floor is given: the cell's datasheet is not known.
+	 */
+	battery: battery {
+		compatible = "simple-battery";
+		charge-full-design-microamp-hours = <3000000>;
+		energy-full-design-microwatt-hours = <11400000>;
+		voltage-max-design-microvolt = <4200000>;
+	};
 };
 
 &grf {
@@ -48,13 +61,15 @@
  * driver clears the flag, refreshes the gauge and reports it. The line is
  * a wake source, so a suspended book wakes for it. With no battery profile
  * here the driver keeps the profile the gauge holds (the stock firmware
- * loaded it; it survives as long as the battery is connected).
+ * loaded it; it survives as long as the battery is connected). The
+ * monitored battery's design capacity gives the charge values.
  */
 &i2c0 {
 	battery@62 {
 		compatible = "cellwise,cw2015";
 		reg = <0x62>;
 		power-supplies = <&usb_charger>;
+		monitored-battery = <&battery>;
 		interrupt-parent = <&gpio1>;
 		interrupts = <RK_PB1 IRQ_TYPE_LEVEL_LOW>;
 		pinctrl-names = "default";

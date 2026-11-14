@@ -117,6 +117,14 @@ static u32 rkf_u32(const u8 *p)
 /*
  * Canonical Huffman build: repeatedly merge the two lightest parentless nodes.
  * Only nodes that already exist take part, and ties keep the lower index.
+ *
+ * The two picks are tracked by a flag rather than by a sentinel weight: a
+ * stored weight of U32_MAX is not strictly below a U32_MAX sentinel, so with
+ * the sentinel alone a round in which every candidate weighs U32_MAX selects
+ * nothing, leaves both indices at their initial 0, and merges node 0 into
+ * itself. Only the first round can meet that (an internal node's weight is a
+ * sum of two, which wraps below U32_MAX), and the 256 leaves mean a round
+ * always has at least two candidates.
  */
 static void rkf_build_tree(struct ebc_waveform *wf, const u32 *weights,
 			   u32 *w, s16 *parent)
@@ -132,20 +140,24 @@ static void rkf_build_tree(struct ebc_waveform *wf, const u32 *weights,
 	}
 
 	for (k = 0; k < RKF_NSYM - 1; k++) {
-		u32 m1 = U32_MAX, m2 = U32_MAX;
+		u32 m1 = 0, m2 = 0;
 		unsigned int i1 = 0, i2 = 0;
+		bool have1 = false, have2 = false;
 
 		for (i = 0; i < count; i++) {
 			if (parent[i] != -1)
 				continue;
-			if (w[i] < m1) {
+			if (!have1 || w[i] < m1) {
 				m2 = m1;
 				i2 = i1;
+				have2 = have1;
 				m1 = w[i];
 				i1 = i;
-			} else if (w[i] < m2) {
+				have1 = true;
+			} else if (!have2 || w[i] < m2) {
 				m2 = w[i];
 				i2 = i;
+				have2 = true;
 			}
 		}
 

@@ -4800,6 +4800,48 @@ static void ebc_test_rkf_auto_overlay(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, t_rkf_frames(wf, EBC_MODE_PART), 3);
 }
 
+/*
+ * Every weight 0xffffffff. The two lightest nodes must be picked by a flag,
+ * not by a U32_MAX sentinel: a weight equal to the sentinel is never strictly
+ * below it, so a first round in which every candidate weighs U32_MAX selects
+ * nothing, keeps both indices at 0 and merges node 0 into itself.
+ *
+ * Every merge of two equal weights wraps one below them, so the build is a
+ * comb: node 255+n takes leaf n on the right and the previous node on the
+ * left, and the root's right child is leaf 255. A stream of one bits is then
+ * one symbol - 255 - per bit, and a frame of 0xff decodes to 0xff.
+ */
+static void ebc_test_rkf_max_weights(struct kunit *test)
+{
+	static const u32 key[2] = { 0xaa55aa55, 0x55aa55aa };
+	static const u8 ones[EBC_LUT_FRAME_BYTES] = {
+		[0 ... EBC_LUT_FRAME_BYTES - 1] = 0xff,
+	};
+	struct device *dev = t_rkf_dev(test);
+	size_t size = T_RKF_PAYLOAD + T_RKF_SEG;
+	struct ebc_waveform *wf;
+	const u8 *lut;
+	u8 *buf;
+	u32 frames = 0;
+	int i;
+
+	buf = t_rkf_alloc(test, size, size + 4);
+	/* Stored obfuscated, as in a pristine file, so they read as U32_MAX. */
+	for (i = 0; i < 256; i++)
+		put_unaligned_le32(U32_MAX ^ key[i & 1], buf + 0x6d0 + 4 * i);
+	put_unaligned_le32(T_RKF_PAYLOAD, buf + T_RKF_GRAY16);
+	buf[T_RKF_PAYLOAD] = 1;
+	memcpy(buf + T_RKF_PAYLOAD + 4, ones, EBC_LUT_FRAME_BYTES);
+	t_rkf_seal(buf, size);
+
+	wf = rk3026_ebc_waveform_parse(dev, buf, size + 4);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, wf);
+	lut = rk3026_ebc_waveform_lut(wf, EBC_MODE_PART, 25, &frames);
+	KUNIT_ASSERT_NOT_NULL(test, lut);
+	KUNIT_EXPECT_EQ(test, frames, 1);
+	KUNIT_EXPECT_MEMEQ(test, lut, ones, EBC_LUT_FRAME_BYTES);
+}
+
 /* Containers whose size field does not match the buffer are refused. */
 static void ebc_test_rkf_parse_bounds(struct kunit *test)
 {
@@ -4857,6 +4899,7 @@ static struct kunit_case rk3026_ebc_waveform_test_cases[] = {
 	KUNIT_CASE(ebc_test_rkf_truncated_modes),
 	KUNIT_CASE(ebc_test_rkf_fallbacks),
 	KUNIT_CASE(ebc_test_rkf_auto_overlay),
+	KUNIT_CASE(ebc_test_rkf_max_weights),
 	KUNIT_CASE(ebc_test_rkf_parse_bounds),
 	{}
 };

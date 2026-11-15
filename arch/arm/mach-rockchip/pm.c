@@ -15,10 +15,13 @@
 #include <linux/regulator/machine.h>
 
 #include <asm/cacheflush.h>
+#include <asm/fncpy.h>
+#include <asm/outercache.h>
 #include <asm/tlbflush.h>
 #include <asm/suspend.h>
 
 #include "pm.h"
+#include "rk3026-suspend.h"
 
 /* These enum are option of low power mode */
 enum {
@@ -292,10 +295,207 @@ static const struct rockchip_pm_data rk3288_pm_data __initconst = {
 	.init = rk3288_suspend_init,
 };
 
+/*
+ * The RK3026 has no PMU: the cores, the buses and the DDR controller keep
+ * their power in system sleep, and the CPU clock, the PLLs and DDR
+ * self-refresh are all the CRU's and the DDR controller's business. CPU0
+ * enters and leaves the sleep through a routine in the internal SRAM
+ * (rk3026-suspend.S), which waits in wfi for a wake-up interrupt, so no
+ * resume path through the BootROM is needed and cpu_suspend() always
+ * returns through its finisher.
+ */
+#define RK3026_GRF_SOC_CON0		0x140
+#define RK3026_GRF_IMEM_REMAP		BIT(12)
+
+static void __iomem *rk3026_grf;
+static u32 *rk3026_sram_table;
+static u32 (*rk3026_sram_fn)(void);
+static u32 rk3026_pm_step;
+static bool rk3026_pm_slept;
+
+/*
+ * Load a TLB entry for every page the SRAM routine accesses: once DDR is
+ * in self-refresh a page table walk would read DDR, and with the L2 cache
+ * off nothing holds the tables.
+ */
+static void rk3026_pm_pretouch(void)
+{
+	u32 sram = rk3026_sram_table[RK3026_SUSPEND_SRAM];
+	int i;
+
+	for (i = 0; i < RK3026_SUSPEND_BASES; i++)
+		readl_relaxed((void __iomem *)rk3026_sram_table[i]);
+	readl_relaxed((void __iomem *)(sram + rk3026_suspend_sram_sz - 4));
+	readl_relaxed((void __iomem *)(rk3026_sram_table[RK3026_SUSPEND_STACK_TOP] - 4));
+}
+
+static int rk3026_pm_finish(unsigned long arg)
+{
+	rk3026_pm_pretouch();
+	/*
+	 * cpu_suspend() returns 1 for a finisher that returns, whatever it
+	 * returns: the routine's step code goes through a global instead.
+	 */
+	rk3026_pm_step = rk3026_sram_fn();
+
+	return 0;
+}
+
+static int rk3026_suspend_enter(suspend_state_t state)
+{
+	/* CPU1 is offline: the SRAM must not be mapped at address 0 */
+	if (num_online_cpus() > 1 ||
+	    readl_relaxed(rk3026_grf + RK3026_GRF_SOC_CON0) & RK3026_GRF_IMEM_REMAP)
+		return -EBUSY;
+
+	local_fiq_disable();
+
+	rk3026_pm_step = 0;
+	flush_cache_all();
+	outer_disable();
+
+	cpu_suspend(0, rk3026_pm_finish);
+
+	outer_resume();
+
+	local_fiq_enable();
+
+	if (rk3026_pm_step != RK3026_SUSPEND_DONE) {
+		pr_err("%s: the SRAM routine stopped at step %u\n", __func__,
+		       rk3026_pm_step);
+		return -EIO;
+	}
+
+	rk3026_pm_slept = true;
+
+	return 0;
+}
+
+/*
+ * Nothing filters what ends the wfi: with no PMU, any interrupt the GIC
+ * signals to CPU0 does. The suspend core masks every interrupt that is not
+ * a wake-up source (IRQCHIP_MASK_ON_SUSPEND), but leaves the per-CPU ones
+ * alone (IRQF_NO_SUSPEND): a local timer tick that latched at the GIC
+ * after interrupts were disabled but before the tick was suspended, or an
+ * IPI CPU0 sent to itself, ends the sleep at once. Such a wake-up reaches
+ * no wake-up source, so sleep again then.
+ */
+static bool rk3026_suspend_again(void)
+{
+	bool again = rk3026_pm_slept && !pm_wakeup_pending();
+
+	rk3026_pm_slept = false;
+	if (again)
+		pm_pr_dbg("RK3026: woken by no wake-up source, sleeping again\n");
+
+	return again;
+}
+
+static void __iomem * __init rk3026_suspend_iomap(const char *compatible)
+{
+	struct device_node *np;
+	void __iomem *base;
+
+	np = of_find_compatible_node(NULL, NULL, compatible);
+	if (!np)
+		return NULL;
+
+	base = of_iomap(np, 0);
+	of_node_put(np);
+
+	return base;
+}
+
+static int __init rk3026_suspend_init(struct device_node *np)
+{
+	struct device_node *sram_np;
+	void __iomem *cru, *sram;
+	struct resource res;
+	int ret;
+
+	/* mapped raw, not through the syscon: no regmap lock in .enter */
+	rk3026_grf = of_iomap(np, 0);
+	if (!rk3026_grf)
+		return -ENOMEM;
+
+	cru = rk3026_suspend_iomap("rockchip,rk3026-cru");
+	if (!cru) {
+		pr_err("%s: could not map the CRU\n", __func__);
+		ret = -ENODEV;
+		goto err_grf;
+	}
+
+	sram_np = of_find_compatible_node(NULL, NULL,
+					  "rockchip,rk3026-suspend-sram");
+	if (!sram_np) {
+		pr_err("%s: no suspend SRAM section\n", __func__);
+		ret = -ENODEV;
+		goto err_cru;
+	}
+	ret = of_address_to_resource(sram_np, 0, &res);
+	of_node_put(sram_np);
+	if (ret)
+		goto err_cru;
+
+	if (resource_size(&res) <
+	    rk3026_suspend_sram_sz + RK3026_SUSPEND_STACK_SIZE) {
+		pr_err("%s: SRAM section of 0x%llx bytes is too small for 0x%x\n",
+		       __func__, (u64)resource_size(&res),
+		       rk3026_suspend_sram_sz + RK3026_SUSPEND_STACK_SIZE);
+		ret = -EINVAL;
+		goto err_cru;
+	}
+
+	/*
+	 * Copied once, here, through a non-cacheable executable mapping:
+	 * the sram driver's pool is not there yet at init_machine time.
+	 */
+	sram = __arm_ioremap_exec(res.start, resource_size(&res), false);
+	if (!sram) {
+		ret = -ENOMEM;
+		goto err_cru;
+	}
+
+	rk3026_sram_fn = (void *)fncpy((void __force *)sram,
+				       &rk3026_suspend_sram,
+				       rk3026_suspend_sram_sz);
+
+	rk3026_sram_table = (u32 __force *)(sram + rk3026_suspend_sram_table_off);
+	rk3026_sram_table[RK3026_SUSPEND_SRAM] = (u32)sram;
+	rk3026_sram_table[RK3026_SUSPEND_CRU] = (u32)cru;
+	rk3026_sram_table[RK3026_SUSPEND_GRF] = (u32)rk3026_grf;
+	rk3026_sram_table[RK3026_SUSPEND_STACK_TOP] =
+		(u32)sram + resource_size(&res);
+
+	return 0;
+
+err_cru:
+	iounmap(cru);
+err_grf:
+	iounmap(rk3026_grf);
+	rk3026_grf = NULL;
+	return ret;
+}
+
+static const struct platform_suspend_ops rk3026_suspend_ops = {
+	.enter		= rk3026_suspend_enter,
+	.suspend_again	= rk3026_suspend_again,
+	.valid		= suspend_valid_only_mem,
+};
+
+static const struct rockchip_pm_data rk3026_pm_data __initconst = {
+	.ops = &rk3026_suspend_ops,
+	.init = rk3026_suspend_init,
+};
+
 static const struct of_device_id rockchip_pmu_of_device_ids[] __initconst = {
 	{
 		.compatible = "rockchip,rk3288-pmu",
 		.data = &rk3288_pm_data,
+	},
+	{
+		.compatible = "rockchip,rk3026-grf",
+		.data = &rk3026_pm_data,
 	},
 	{ /* sentinel */ },
 };

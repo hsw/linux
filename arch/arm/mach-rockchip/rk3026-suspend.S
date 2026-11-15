@@ -9,15 +9,18 @@
  * with the MMU on, the L2 cache off and interrupts masked. It moves the
  * stack into the SRAM, touches every page it reaches, puts the DRAM into
  * self-refresh, puts the DDR PHY into reset and stops its clock and the
- * DDR PLL, waits for a wake-up interrupt and brings it all back, with a
- * new data training of the PHY. Position independent: it reaches its
- * table PC-relative.
+ * DDR PLL, runs the CPU and its buses from the 24 MHz oscillator with the
+ * other PLLs powered down, waits for a wake-up interrupt and brings it all
+ * back, with a new data training of the PHY. Position independent: it
+ * reaches its table PC-relative.
  *
  * The DDR controller and PHY sequences follow Rockchip's RK2928/RK3026
  * vendor kernel (arch/arm/mach-rk2928/ddr.c, GPL-2.0, Copyright (C) 2012
  * Fuzhou Rockchip Electronics Co., Ltd), with every poll bounded and the
  * controller's and the PHY's configuration given back exactly as they
- * were found.
+ * were found. The PLL sequence follows the same vendor's RK3026 kernel
+ * (arch/arm/mach-rk3026/pm.c, rk_pm_soc_pll_suspend() and _resume(),
+ * GPL-2.0, same copyright), with the clock setup given back the same way.
  *
  * Returns a step code: RK3026_SUSPEND_DONE after a normal wake-up, or the
  * RK3026_SUSPEND_E_* code of the entry step that failed, after the DRAM
@@ -77,6 +80,25 @@
 #define CRU_DDR_SRC_GPLL	0x0100	/* CLKSEL_CON26: the DDR runs from GPLL */
 #define CRU_DDRPHY_GATE		0x0004	/* CLKGATE_CON0: dpll_ddr */
 
+/*
+ * CRU: the other PLLs. PLL n has its PLL_CON registers at n * 0x10 and its
+ * MODE_CON field at bits 4n+1:4n (1: normal; 0: slow, the 24 MHz
+ * oscillator); the DPLL is PLL 1.
+ */
+#define PLL_APLL		0
+#define PLL_CPLL		2
+#define PLL_GPLL		3
+#define CRU_PLL_CON1		RK3026_CRU_PLL_CON(1)
+#define CRU_PLL_MODE_MASK	0x3
+#define CRU_PLL_MODE_NORMAL	0x1
+/*
+ * In the sleep, as in the vendor code: the core and aclk_cpu dividers at
+ * /1 with aclk_cpu from APLL (CLKSEL_CON0), and the A9's PERIPHCLK,
+ * aclk_core, hclk_cpu and pclk_cpu at /1 (CLKSEL_CON1).
+ */
+#define CRU_CLKSEL0_SLEEP	0x3f1f0000
+#define CRU_CLKSEL1_SLEEP	0x737f0000
+
 /* GRF_OS_REG1, the boot loader's DRAM description: bit 11 set, two ranks */
 #define RK3026_GRF_OS_REG1	0x1cc
 #define GRF_DDR_TWO_RANKS	0x0800
@@ -106,15 +128,22 @@
  * says: fine with the DRAM refreshed, not while the training has the
  * auto refresh off. There the routine polls without waits where it can
  * (TRAIN_START_US only when the done bits still read set from the last
- * training) and sends the most refreshes DDR3 lets a controller postpone.
- * The DPLL gets as long to lock as the vendor code gives it.
+ * training) and sends the most refreshes DDR3 lets a controller postpone;
+ * the PLLs are back at their rates by then. Each PLL gets as long to lock
+ * as the vendor code gives it; APLL, CPLL and GPLL lock with the CPU on
+ * the oscillator, where a 1 us wait lasts some hundred times longer, so a
+ * PLL that never locks resets the SoC within a second or so.
  */
 #define DELAY_1US		1024
-#define DPLL_LOCK_US		1000
+#define PLL_LOCK_US		1000
 #define PHY_SETTLE_US		10
 #define TRAIN_START_US		6
 #define TRAIN_POLLS		0x10000
 #define REFRESHES		8
+
+/* r10: what the sleep stops besides the self-refresh */
+#define SLEEP_DDR_PHY		1	/* the DDR PHY and the DPLL */
+#define SLEEP_PLLS		2	/* APLL, CPLL and GPLL */
 
 	.arch	armv7-a
 	.arm
@@ -160,9 +189,10 @@ ENTRY(rk3026_suspend_sram)
 	str	r0, [r2, #RK3026_SUSPEND_PHY_REG264 * 4]
 
 	/*
-	 * r10 = 1: the DDR clock comes from the DPLL in normal mode, as the
+	 * r10 != 0: the DDR clock comes from the DPLL in normal mode, as the
 	 * boot loaders set it up, so the PHY and the DPLL can stop in the
-	 * sleep. Otherwise the DRAM only goes into self-refresh.
+	 * sleep, and none of the other PLLs feeds the DDR. Otherwise the DRAM
+	 * only goes into self-refresh.
 	 */
 	mov	r10, #0
 	ldr	r0, [r9, #RK3026_CRU_CLKSEL_CON(26)]
@@ -170,7 +200,7 @@ ENTRY(rk3026_suspend_sram)
 	bne	1f
 	ldr	r0, [r9, #RK3026_CRU_MODE_CON]
 	tst	r0, #CRU_DPLL_MODE_NORMAL
-	movne	r10, #1
+	movne	r10, #(SLEEP_DDR_PHY | SLEEP_PLLS)
 1:
 
 	/*
@@ -253,17 +283,87 @@ ENTRY(rk3026_suspend_sram)
 	mov	r0, #1
 	bl	.Ldelay
 
+	/*
+	 * The CPU, its buses and the other PLLs, as the vendor's
+	 * rk_pm_soc_pll_suspend(), each step only for a PLL that runs (in
+	 * normal mode and powered): APLL to slow mode and the CPU, its AXI,
+	 * AHB and APB clocks and the A9's PERIPHCLK onto it at /1, so all of
+	 * them run from the 24 MHz oscillator; CPLL and GPLL to slow mode;
+	 * then the three powered down. The peripheral bus keeps its dividers
+	 * and drops with GPLL to the oscillator divided by them.
+	 */
+	tst	r10, #SLEEP_PLLS
+	beq	.Lwfi
+	ldr	r0, [r9, #RK3026_CRU_MODE_CON]
+	str	r0, [r2, #RK3026_SUSPEND_MODE_CON * 4]
+	ldr	r0, [r9, #RK3026_CRU_CLKSEL_CON(0)]
+	str	r0, [r2, #RK3026_SUSPEND_CLKSEL0 * 4]
+	ldr	r0, [r9, #RK3026_CRU_CLKSEL_CON(1)]
+	str	r0, [r2, #RK3026_SUSPEND_CLKSEL1 * 4]
+	ldr	r0, [r9, #RK3026_CRU_CLKSEL_CON(10)]
+	str	r0, [r2, #RK3026_SUSPEND_CLKSEL10 * 4]
+	mov	r6, #0
+	mov	r1, #PLL_APLL
+	bl	.Lpll_slow
+	movw	r0, #(CRU_CLKSEL0_SLEEP & 0xffff)
+	movt	r0, #(CRU_CLKSEL0_SLEEP >> 16)
+	str	r0, [r9, #RK3026_CRU_CLKSEL_CON(0)]
+	movw	r0, #(CRU_CLKSEL1_SLEEP & 0xffff)
+	movt	r0, #(CRU_CLKSEL1_SLEEP >> 16)
+	str	r0, [r9, #RK3026_CRU_CLKSEL_CON(1)]
+	dsb
+	mov	r1, #PLL_CPLL
+	bl	.Lpll_slow
+	mov	r1, #PLL_GPLL
+	bl	.Lpll_slow
+	str	r6, [r2, #RK3026_SUSPEND_PLLS * 4]
+	mov	r1, #PLL_APLL
+	bl	.Lpll_down
+	mov	r1, #PLL_CPLL
+	bl	.Lpll_down
+	mov	r1, #PLL_GPLL
+	bl	.Lpll_down
+
 .Lwfi:
 	dsb
 	wfi
 
+	tst	r10, #SLEEP_PLLS
+	beq	1f
+	/*
+	 * The PLLs first, so the DDR and its training come back at full
+	 * speed; as the vendor's rk_pm_soc_pll_resume(): GPLL, CPLL, APLL,
+	 * each powered up and locked, then back in its mode. The CPU's
+	 * dividers go back before APLL leaves slow mode, so no bus clock ever
+	 * runs at APLL's rate through the sleep's /1.
+	 */
+	mov	r1, #PLL_GPLL
+	bl	.Lpll_up
+	ldr	r0, [r2, #RK3026_SUSPEND_CLKSEL10 * 4]
+	movt	r0, #0xffff
+	str	r0, [r9, #RK3026_CRU_CLKSEL_CON(10)]
+	bl	.Lpll_mode
+	mov	r1, #PLL_CPLL
+	bl	.Lpll_up
+	bl	.Lpll_mode
+	mov	r1, #PLL_APLL
+	bl	.Lpll_up
+	ldr	r0, [r2, #RK3026_SUSPEND_CLKSEL1 * 4]
+	movt	r0, #0xffff
+	str	r0, [r9, #RK3026_CRU_CLKSEL_CON(1)]
+	ldr	r0, [r2, #RK3026_SUSPEND_CLKSEL0 * 4]
+	movt	r0, #0xffff
+	str	r0, [r9, #RK3026_CRU_CLKSEL_CON(0)]
+	dsb
+	bl	.Lpll_mode
+1:
 	cmp	r10, #0
 	beq	.Lwakeup
 	/* the DPLL powered up, locked (bounded as in the vendor code), normal */
 	mov	r0, #(CRU_PLL_PWRDOWN << 16)
 	str	r0, [r9, #CRU_DPLL_CON1]
 	dsb
-	mov	r6, #DPLL_LOCK_US
+	mov	r6, #PLL_LOCK_US
 1:	mov	r0, #1
 	bl	.Ldelay
 	ldr	r0, [r9, #CRU_DPLL_CON1]
@@ -483,6 +583,89 @@ ENTRY(rk3026_suspend_sram)
 	bne	2b
 	subs	r0, r0, #1
 	bne	1b
+	bx	lr
+
+	/*
+	 * Put the PLL r1 into slow mode if it runs (normal mode, powered) and
+	 * set its bit in r6. Keeps r1; uses r0, r3, r12 and the flags.
+	 */
+.Lpll_slow:
+	ldr	r0, [r9, #RK3026_CRU_MODE_CON]
+	lsl	r3, r1, #2
+	lsr	r0, r0, r3
+	and	r0, r0, #CRU_PLL_MODE_MASK
+	cmp	r0, #CRU_PLL_MODE_NORMAL
+	bxne	lr
+	add	r12, r9, r1, lsl #4
+	ldr	r0, [r12, #CRU_PLL_CON1]
+	tst	r0, #CRU_PLL_PWRDOWN
+	bxne	lr
+	mov	r0, #(CRU_PLL_MODE_MASK << 16)
+	lsl	r0, r0, r3
+	str	r0, [r9, #RK3026_CRU_MODE_CON]
+	dsb
+	mov	r0, #1
+	orr	r6, r6, r0, lsl r1
+	bx	lr
+
+	/*
+	 * Power the PLL r1 down if its bit is set in r6. Keeps r1; uses r0,
+	 * r12 and the flags.
+	 */
+.Lpll_down:
+	lsr	r0, r6, r1
+	tst	r0, #1
+	bxeq	lr
+	add	r12, r9, r1, lsl #4
+	movw	r0, #CRU_PLL_PWRDOWN
+	movt	r0, #CRU_PLL_PWRDOWN
+	str	r0, [r12, #CRU_PLL_CON1]
+	dsb
+	bx	lr
+
+	/*
+	 * Power the PLL r1 up if the routine powered it down, and wait for
+	 * its lock, as long as the vendor code waits; a PLL that does not
+	 * lock resets the SoC. Keeps r1; uses r0, r3, r6, r12 and the flags.
+	 */
+.Lpll_up:
+	ldr	r0, [r2, #RK3026_SUSPEND_PLLS * 4]
+	lsr	r0, r0, r1
+	tst	r0, #1
+	bxeq	lr
+	push	{lr}
+	add	r3, r9, r1, lsl #4
+	mov	r0, #(CRU_PLL_PWRDOWN << 16)
+	str	r0, [r3, #CRU_PLL_CON1]
+	dsb
+	mov	r6, #PLL_LOCK_US
+1:	mov	r0, #1
+	bl	.Ldelay
+	ldr	r0, [r3, #CRU_PLL_CON1]
+	tst	r0, #CRU_PLL_LOCK
+	popne	{pc}
+	subs	r6, r6, #1
+	bne	1b
+	add	r0, r1, #RK3026_SUSPEND_R_APLL
+	b	.Lreset
+
+	/*
+	 * Give the PLL r1 the mode it had back, if the routine changed it.
+	 * Keeps r1; uses r0, r3, r12 and the flags.
+	 */
+.Lpll_mode:
+	ldr	r0, [r2, #RK3026_SUSPEND_PLLS * 4]
+	lsr	r0, r0, r1
+	tst	r0, #1
+	bxeq	lr
+	lsl	r3, r1, #2
+	mov	r12, #CRU_PLL_MODE_MASK
+	lsl	r12, r12, r3
+	ldr	r0, [r2, #RK3026_SUSPEND_MODE_CON * 4]
+	and	r0, r0, r12
+	orr	r0, r0, r12, lsl #16
+	str	r0, [r9, #RK3026_CRU_MODE_CON]
+	dsb
 	bx	lr
 
 	/* GRF_SOC_CON2 bit 0 back to its saved value; uses r0 */

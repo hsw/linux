@@ -26,7 +26,14 @@
 #define RK3026_SUSPEND_SOC_CON2		8
 #define RK3026_SUSPEND_PHY_REG1		9
 #define RK3026_SUSPEND_PHY_REG264	10
-#define RK3026_SUSPEND_TABLE_WORDS	11
+/* the CRU's clock setup the routine changes while it sleeps */
+#define RK3026_SUSPEND_MODE_CON		11
+#define RK3026_SUSPEND_CLKSEL0		12
+#define RK3026_SUSPEND_CLKSEL1		13
+#define RK3026_SUSPEND_CLKSEL10		14
+/* the PLLs it put into slow mode and powered down: BIT(PLL index) */
+#define RK3026_SUSPEND_PLLS		15
+#define RK3026_SUSPEND_TABLE_WORDS	16
 
 /* the stack, at the top of the section */
 #define RK3026_SUSPEND_STACK_SIZE	256
@@ -51,6 +58,9 @@
 #define RK3026_SUSPEND_R_TRAIN		0x27	/* the training did not end */
 #define RK3026_SUSPEND_R_REFRESH	0x28	/* a refresh was not taken */
 #define RK3026_SUSPEND_R_TRAIN_GO	0x29	/* no Access after the training */
+#define RK3026_SUSPEND_R_APLL		0x2a	/* a PLL did not lock: 0x2a + */
+#define RK3026_SUSPEND_R_CPLL		0x2c	/* its index (APLL 0, DPLL 1, */
+#define RK3026_SUSPEND_R_GPLL		0x2d	/* CPLL 2, GPLL 3) */
 
 #ifndef __ASSEMBLY__
 u32 rk3026_suspend_sram(void);

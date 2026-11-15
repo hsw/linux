@@ -301,9 +301,11 @@ static const struct rockchip_pm_data rk3288_pm_data __initconst = {
  * self-refresh are all the CRU's and the DDR controller's business. CPU0
  * enters and leaves the sleep through a routine in the internal SRAM
  * (rk3026-suspend.S), which puts the DRAM into self-refresh, stops the
- * DDR PHY and its PLL and waits in wfi for a wake-up interrupt, so no
+ * DDR PHY and its PLL, runs the CPU from the 24 MHz oscillator with the
+ * other PLLs powered down and waits in wfi for a wake-up interrupt, so no
  * resume path through the BootROM is needed and cpu_suspend() always
- * returns through its finisher.
+ * returns through its finisher. The routine gives the CRU back the clock
+ * setup it found, so the clock framework never sees the change.
  */
 #define RK3026_GRF_SOC_CON0		0x140
 #define RK3026_GRF_IMEM_REMAP		BIT(12)

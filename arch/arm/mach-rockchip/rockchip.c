@@ -53,6 +53,7 @@ static void __init rockchip_dt_init(void)
 
 static const char * const rockchip_board_dt_compat[] = {
 	"rockchip,rk2928",
+	"rockchip,rk3026",
 	"rockchip,rk3066a",
 	"rockchip,rk3066b",
 	"rockchip,rk3188",

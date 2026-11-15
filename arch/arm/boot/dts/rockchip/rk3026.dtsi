@@ -326,6 +326,11 @@
 				       <256000000>, <256000000>;
 	};
 
+	dmc: memory-controller@20004000 {
+		compatible = "rockchip,rk3026-dmc";
+		reg = <0x20004000 0x1000>, <0x2000a000 0x1000>;
+	};
+
 	grf: syscon@20008000 {
 		compatible = "rockchip,rk3026-grf", "syscon", "simple-mfd";
 		reg = <0x20008000 0x1000>;

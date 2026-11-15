@@ -9,21 +9,40 @@
 /*
  * The routine's table, in words. pm.c fills it in the SRAM copy at boot.
  * The first RK3026_SUSPEND_BASES words are the virtual bases of every
- * region the routine reads or writes: the finisher touches each of them
- * before the call, so no access from the SRAM needs a page table walk.
+ * region the routine reads or writes: the routine touches each of them
+ * before it changes anything, so no access from the SRAM needs a page
+ * table walk while the DRAM is in self-refresh.
  */
 #define RK3026_SUSPEND_SRAM		0	/* the SRAM section */
 #define RK3026_SUSPEND_CRU		1
 #define RK3026_SUSPEND_GRF		2
-#define RK3026_SUSPEND_BASES		3
-#define RK3026_SUSPEND_STACK_TOP	3	/* the section's end */
-#define RK3026_SUSPEND_TABLE_WORDS	4
+#define RK3026_SUSPEND_PCTL		3	/* the DDR controller */
+#define RK3026_SUSPEND_BASES		4
+#define RK3026_SUSPEND_STACK_TOP	4	/* the section's end */
+/* the routine saves these three here and leaves them as it found them */
+#define RK3026_SUSPEND_MCFG		5
+#define RK3026_SUSPEND_MCFG1		6
+#define RK3026_SUSPEND_SOC_CON2		7
+#define RK3026_SUSPEND_TABLE_WORDS	8
 
 /* the stack, at the top of the section */
 #define RK3026_SUSPEND_STACK_SIZE	256
 
-/* step codes the routine returns; 0 means it never ran */
-#define RK3026_SUSPEND_DONE		1
+/*
+ * Step codes the routine returns; 0 means it never ran. An E_* code: an
+ * entry step failed and the DRAM was brought back, so the sleep fails.
+ * The R_* codes are never returned: the DRAM may be unusable, and the
+ * routine resets the SoC instead.
+ */
+#define RK3026_SUSPEND_DONE		0x01
+#define RK3026_SUSPEND_E_STATE		0x11	/* the PCTL was not in Access */
+#define RK3026_SUSPEND_E_CONFIG		0x12	/* no Config */
+#define RK3026_SUSPEND_E_ACCESS		0x13	/* no Access from Config */
+#define RK3026_SUSPEND_E_SLEEP		0x14	/* no Low_power (self-refresh) */
+#define RK3026_SUSPEND_R_WAKEUP		0x21	/* no Access after the wake-up */
+#define RK3026_SUSPEND_R_BACK_OUT	0x22	/* a back-out found no Access */
+#define RK3026_SUSPEND_R_CONFIG		0x23	/* no Config to restore MCFG */
+#define RK3026_SUSPEND_R_ACCESS		0x24	/* no Access after that */
 
 #ifndef __ASSEMBLY__
 u32 rk3026_suspend_sram(void);

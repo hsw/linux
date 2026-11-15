@@ -300,9 +300,9 @@ static const struct rockchip_pm_data rk3288_pm_data __initconst = {
  * their power in system sleep, and the CPU clock, the PLLs and DDR
  * self-refresh are all the CRU's and the DDR controller's business. CPU0
  * enters and leaves the sleep through a routine in the internal SRAM
- * (rk3026-suspend.S), which waits in wfi for a wake-up interrupt, so no
- * resume path through the BootROM is needed and cpu_suspend() always
- * returns through its finisher.
+ * (rk3026-suspend.S), which puts the DRAM into self-refresh and waits in
+ * wfi for a wake-up interrupt, so no resume path through the BootROM is
+ * needed and cpu_suspend() always returns through its finisher.
  */
 #define RK3026_GRF_SOC_CON0		0x140
 #define RK3026_GRF_IMEM_REMAP		BIT(12)
@@ -313,25 +313,8 @@ static u32 (*rk3026_sram_fn)(void);
 static u32 rk3026_pm_step;
 static bool rk3026_pm_slept;
 
-/*
- * Load a TLB entry for every page the SRAM routine accesses: once DDR is
- * in self-refresh a page table walk would read DDR, and with the L2 cache
- * off nothing holds the tables.
- */
-static void rk3026_pm_pretouch(void)
-{
-	u32 sram = rk3026_sram_table[RK3026_SUSPEND_SRAM];
-	int i;
-
-	for (i = 0; i < RK3026_SUSPEND_BASES; i++)
-		readl_relaxed((void __iomem *)rk3026_sram_table[i]);
-	readl_relaxed((void __iomem *)(sram + rk3026_suspend_sram_sz - 4));
-	readl_relaxed((void __iomem *)(rk3026_sram_table[RK3026_SUSPEND_STACK_TOP] - 4));
-}
-
 static int rk3026_pm_finish(unsigned long arg)
 {
-	rk3026_pm_pretouch();
 	/*
 	 * cpu_suspend() returns 1 for a finisher that returns, whatever it
 	 * returns: the routine's step code goes through a global instead.
@@ -361,7 +344,7 @@ static int rk3026_suspend_enter(suspend_state_t state)
 	local_fiq_enable();
 
 	if (rk3026_pm_step != RK3026_SUSPEND_DONE) {
-		pr_err("%s: the SRAM routine stopped at step %u\n", __func__,
+		pr_err("%s: the SRAM routine stopped at step %#x\n", __func__,
 		       rk3026_pm_step);
 		return -EIO;
 	}
@@ -408,8 +391,8 @@ static void __iomem * __init rk3026_suspend_iomap(const char *compatible)
 
 static int __init rk3026_suspend_init(struct device_node *np)
 {
-	struct device_node *sram_np;
-	void __iomem *cru, *sram;
+	struct device_node *sram_np, *dmc_np;
+	void __iomem *cru, *pctl, *sram;
 	struct resource res;
 	int ret;
 
@@ -425,17 +408,29 @@ static int __init rk3026_suspend_init(struct device_node *np)
 		goto err_grf;
 	}
 
+	pctl = NULL;
+	dmc_np = of_find_compatible_node(NULL, NULL, "rockchip,rk3026-dmc");
+	if (dmc_np) {
+		pctl = of_iomap(dmc_np, 0);
+		of_node_put(dmc_np);
+	}
+	if (!pctl) {
+		pr_err("%s: could not map the DDR controller\n", __func__);
+		ret = -ENODEV;
+		goto err_dmc;
+	}
+
 	sram_np = of_find_compatible_node(NULL, NULL,
 					  "rockchip,rk3026-suspend-sram");
 	if (!sram_np) {
 		pr_err("%s: no suspend SRAM section\n", __func__);
 		ret = -ENODEV;
-		goto err_cru;
+		goto err_dmc;
 	}
 	ret = of_address_to_resource(sram_np, 0, &res);
 	of_node_put(sram_np);
 	if (ret)
-		goto err_cru;
+		goto err_dmc;
 
 	if (resource_size(&res) <
 	    rk3026_suspend_sram_sz + RK3026_SUSPEND_STACK_SIZE) {
@@ -443,7 +438,7 @@ static int __init rk3026_suspend_init(struct device_node *np)
 		       __func__, (u64)resource_size(&res),
 		       rk3026_suspend_sram_sz + RK3026_SUSPEND_STACK_SIZE);
 		ret = -EINVAL;
-		goto err_cru;
+		goto err_dmc;
 	}
 
 	/*
@@ -453,7 +448,7 @@ static int __init rk3026_suspend_init(struct device_node *np)
 	sram = __arm_ioremap_exec(res.start, resource_size(&res), false);
 	if (!sram) {
 		ret = -ENOMEM;
-		goto err_cru;
+		goto err_dmc;
 	}
 
 	rk3026_sram_fn = (void *)fncpy((void __force *)sram,
@@ -464,12 +459,15 @@ static int __init rk3026_suspend_init(struct device_node *np)
 	rk3026_sram_table[RK3026_SUSPEND_SRAM] = (u32)sram;
 	rk3026_sram_table[RK3026_SUSPEND_CRU] = (u32)cru;
 	rk3026_sram_table[RK3026_SUSPEND_GRF] = (u32)rk3026_grf;
+	rk3026_sram_table[RK3026_SUSPEND_PCTL] = (u32)pctl;
 	rk3026_sram_table[RK3026_SUSPEND_STACK_TOP] =
 		(u32)sram + resource_size(&res);
 
 	return 0;
 
-err_cru:
+err_dmc:
+	if (pctl)
+		iounmap(pctl);
 	iounmap(cru);
 err_grf:
 	iounmap(rk3026_grf);

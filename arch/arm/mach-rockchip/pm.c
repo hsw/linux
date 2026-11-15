@@ -343,10 +343,16 @@ static int rk3026_pm_finish(unsigned long arg)
 
 static int rk3026_suspend_enter(suspend_state_t state)
 {
+	int ret;
+
 	/* CPU1 is offline: the SRAM must not be mapped at address 0 */
 	if (num_online_cpus() > 1 ||
 	    readl_relaxed(rk3026_grf + RK3026_GRF_SOC_CON0) & RK3026_GRF_IMEM_REMAP)
 		return -EBUSY;
+
+	ret = rk3026_pm_debug_begin();
+	if (ret)
+		return ret;
 
 	local_fiq_disable();
 
@@ -356,11 +362,17 @@ static int rk3026_suspend_enter(suspend_state_t state)
 
 	cpu_suspend(0, rk3026_pm_finish);
 
+	rk3026_pm_debug_woke(rk3026_pm_step);
+
 	outer_resume();
 
 	local_fiq_enable();
 
-	if (rk3026_pm_step != RK3026_SUSPEND_DONE) {
+	rk3026_pm_debug_disarm();
+
+	ret = rk3026_pm_step == RK3026_SUSPEND_DONE ? 0 : -EIO;
+	rk3026_pm_debug_end(ret);
+	if (ret) {
 		pr_err("%s: the SRAM routine stopped at step %u\n", __func__,
 		       rk3026_pm_step);
 		return -EIO;
@@ -388,6 +400,8 @@ static bool rk3026_suspend_again(void)
 	if (again)
 		pm_pr_dbg("RK3026: woken by no wake-up source, sleeping again\n");
 
+	rk3026_pm_debug_again(again);
+
 	return again;
 }
 
@@ -405,6 +419,9 @@ static void __iomem * __init rk3026_suspend_iomap(const char *compatible)
 
 	return base;
 }
+
+/* debug layer: the ops go to rk3026_pm_debug_init() */
+static const struct platform_suspend_ops rk3026_suspend_ops;
 
 static int __init rk3026_suspend_init(struct device_node *np)
 {
@@ -467,6 +484,8 @@ static int __init rk3026_suspend_init(struct device_node *np)
 	rk3026_sram_table[RK3026_SUSPEND_STACK_TOP] =
 		(u32)sram + resource_size(&res);
 
+	rk3026_pm_debug_init(rk3026_sram_table, &rk3026_suspend_ops);
+
 	return 0;
 
 err_cru:
@@ -523,6 +542,10 @@ void __init rockchip_suspend_init(void)
 			goto out_put;
 		}
 	}
+
+	/* debug layer: registered when rk3026_pm/enable is written */
+	if (pm_data->ops == &rk3026_suspend_ops)
+		goto out_put;
 
 	suspend_set_ops(pm_data->ops);
 

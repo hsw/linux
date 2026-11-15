@@ -342,9 +342,11 @@ static void rk3026_pm_gate(void)
 	for (i = 0; i < RK3026_SUSPEND_GATE_REGS; i++) {
 		con = rk3026_cru + RK3026_CRU_CLKGATE_CON(i);
 		rk3026_pm_gates[i] = readl_relaxed(con);
-		close = (u16)~rk3026_pm_hold[i];
+		/* debug layer: more held below depth 4 and under the guard */
+		close = (u16)~(rk3026_pm_hold[i] | rk3026_pm_debug_hold(i));
 		writel_relaxed(close << 16 | close, con);
 	}
+	rk3026_pm_debug_gated();
 }
 
 static void rk3026_pm_ungate(void)
@@ -372,10 +374,16 @@ static int rk3026_pm_finish(unsigned long arg)
 
 static int rk3026_suspend_enter(suspend_state_t state)
 {
+	int ret;
+
 	/* CPU1 is offline: the SRAM must not be mapped at address 0 */
 	if (num_online_cpus() > 1 ||
 	    readl_relaxed(rk3026_grf + RK3026_GRF_SOC_CON0) & RK3026_GRF_IMEM_REMAP)
 		return -EBUSY;
+
+	ret = rk3026_pm_debug_begin();
+	if (ret)
+		return ret;
 
 	local_fiq_disable();
 
@@ -387,11 +395,17 @@ static int rk3026_suspend_enter(suspend_state_t state)
 	cpu_suspend(0, rk3026_pm_finish);
 
 	rk3026_pm_ungate();
+	rk3026_pm_debug_woke(rk3026_pm_step);
+
 	outer_resume();
 
 	local_fiq_enable();
 
-	if (rk3026_pm_step != RK3026_SUSPEND_DONE) {
+	rk3026_pm_debug_disarm();
+
+	ret = rk3026_pm_step == RK3026_SUSPEND_DONE ? 0 : -EIO;
+	rk3026_pm_debug_end(ret);
+	if (ret) {
 		pr_err("%s: the SRAM routine stopped at step %#x\n", __func__,
 		       rk3026_pm_step);
 		return -EIO;
@@ -418,6 +432,8 @@ static bool rk3026_suspend_again(void)
 	rk3026_pm_slept = false;
 	if (again)
 		pm_pr_dbg("RK3026: woken by no wake-up source, sleeping again\n");
+
+	rk3026_pm_debug_again(again);
 
 	return again;
 }
@@ -452,12 +468,14 @@ static int rk3026_pm_notify(struct notifier_block *nb, unsigned long event,
 		if (ret < 0)
 			break;
 		cpufreq_update_policy(0);
+		rk3026_pm_debug_cpu(RK3026_PM_CPU_NOTIFY);
 		break;
 	case PM_POST_SUSPEND:
 		if (!freq_qos_request_active(&rk3026_pm_qos))
 			break;
 		freq_qos_remove_request(&rk3026_pm_qos);
 		cpufreq_update_policy(0);
+		rk3026_pm_debug_cpu(RK3026_PM_CPU_POST);
 		break;
 	}
 
@@ -490,6 +508,9 @@ static void __iomem * __init rk3026_suspend_iomap(const char *compatible)
 
 	return base;
 }
+
+/* debug layer: the ops go to rk3026_pm_debug_init() */
+static const struct platform_suspend_ops rk3026_suspend_ops;
 
 static int __init rk3026_suspend_init(struct device_node *np)
 {
@@ -569,6 +590,7 @@ static int __init rk3026_suspend_init(struct device_node *np)
 		(u32)sram + resource_size(&res);
 
 	rk3026_pm_qos_init();
+	rk3026_pm_debug_init(rk3026_sram_table, &rk3026_suspend_ops);
 
 	return 0;
 
@@ -586,6 +608,7 @@ err_grf:
 }
 
 static const struct platform_suspend_ops rk3026_suspend_ops = {
+	.prepare	= rk3026_pm_debug_prepare,	/* debug layer */
 	.enter		= rk3026_suspend_enter,
 	.suspend_again	= rk3026_suspend_again,
 	.valid		= suspend_valid_only_mem,
@@ -631,6 +654,10 @@ void __init rockchip_suspend_init(void)
 			goto out_put;
 		}
 	}
+
+	/* debug layer: registered when rk3026_pm/enable is written */
+	if (pm_data->ops == &rk3026_suspend_ops)
+		goto out_put;
 
 	suspend_set_ops(pm_data->ops);
 

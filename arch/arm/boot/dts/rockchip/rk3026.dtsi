@@ -219,6 +219,16 @@
 			compatible = "rockchip,rk3026-restart-sram";
 			reg = <0x1000 0x200>;
 		};
+
+		/*
+		 * Suspend to RAM runs its last steps here, while DDR may be
+		 * in self-refresh (mach-rockchip pm.c, rk3026-suspend.S):
+		 * the routine, its table and its stack.
+		 */
+		suspend-sram@1200 {
+			compatible = "rockchip,rk3026-suspend-sram";
+			reg = <0x1200 0xe00>;
+		};
 	};
 
 	scu@1013c000 {

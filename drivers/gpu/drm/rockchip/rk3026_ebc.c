@@ -3988,9 +3988,10 @@ static int ebc_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, -EINVAL,
 				     "panel-timing too long for a display mode\n");
 	/*
-	 * One panel's worth of DU-changed pixels spends the budget; a part
-	 * that changes half the panel takes the cleanup FULL then, and any
-	 * part does at four panels' worth (rk3026_ebc_du_cleanup()).
+	 * One panel's worth of pixels changed by DU, A2 or PART plane parts
+	 * spends the budget; a part that changes half the panel takes the
+	 * cleanup FULL then, and any part does at four panels' worth
+	 * (rk3026_ebc_du_cleanup()).
 	 */
 	ebc->du_cleanup_area = ebc->width * ebc->height;
 	ebc->du_cleanup_big_area = ebc->du_cleanup_area / 2;

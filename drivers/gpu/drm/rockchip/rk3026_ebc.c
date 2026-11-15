@@ -4278,6 +4278,40 @@ static const struct dev_pm_ops ebc_pm_ops = {
 	.restore	= pm_sleep_ptr(ebc_restore),
 };
 
+/*
+ * sysfs "refresh", write-only: any write queues one whole-panel FULL of
+ * the image on the glass, the refresh button of an e-reader UI. It is the
+ * idle cleanup's update (EBC_SOURCE_IDLE, rk3026_ebc_idle_tick()) queued
+ * at once: no budget, no delay, never skipped as identical, and it writes
+ * no pixel. With the CRTC off there is nothing to redraw: -EAGAIN.
+ */
+static ssize_t refresh_store(struct device *dev, struct device_attribute *attr,
+			     const char *buf, size_t count)
+{
+	struct rk3026_ebc *ebc = dev_get_drvdata(dev);
+	struct rk3026_ebc_update upd = {
+		.clip	= DRM_RECT_INIT(0, 0, ebc->width, ebc->height),
+		.mode	= EBC_MODE_FULL,
+		.source	= EBC_SOURCE_IDLE,
+	};
+	ssize_t ret = count;
+
+	mutex_lock(&ebc->image_lock);
+	if (ebc->crtc_on)
+		rk3026_ebc_add_update(ebc, &upd);
+	else
+		ret = -EAGAIN;
+	mutex_unlock(&ebc->image_lock);
+	return ret;
+}
+static DEVICE_ATTR_WO(refresh);
+
+static struct attribute *ebc_attrs[] = {
+	&dev_attr_refresh.attr,
+	NULL
+};
+ATTRIBUTE_GROUPS(ebc);
+
 static const struct of_device_id ebc_of_match[] = {
 	{ .compatible = "rockchip,rk3026-ebc" },
 	{ }
@@ -4292,6 +4326,7 @@ static struct platform_driver ebc_driver = {
 		.name		= DRIVER_NAME,
 		.of_match_table	= ebc_of_match,
 		.pm		= pm_sleep_ptr(&ebc_pm_ops),
+		.dev_groups	= ebc_groups,
 	},
 };
 module_platform_driver(ebc_driver);

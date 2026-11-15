@@ -75,9 +75,13 @@
 
 #define HYM8563_TMR_CNT		0x0f
 
+/* Longest alarm the countdown timer takes, in seconds (1 Hz source) */
+#define HYM8563_TMR_MAX_SECS	255
+
 struct hym8563 {
 	struct i2c_client	*client;
 	struct rtc_device	*rtc;
+	bool			timer_alarm;
 #ifdef CONFIG_COMMON_CLK
 	struct clk_hw		clkout_hw;
 #endif
@@ -158,22 +162,47 @@ static int hym8563_rtc_set_time(struct device *dev, struct rtc_time *tm)
 	return 0;
 }
 
+/*
+ * Alarms up to HYM8563_TMR_MAX_SECS ahead run on the countdown timer, which
+ * counts seconds; later ones on the alarm registers, which match minutes.
+ * The timer reloads and counts again when it reaches zero, so it is stopped
+ * whenever it is not in use, at its slowest source as the datasheet asks.
+ */
+static int hym8563_timer_stop(struct i2c_client *client)
+{
+	return i2c_smbus_write_byte_data(client, HYM8563_TMR_CTL,
+					 HYM8563_TMR_CTL_1_60);
+}
+
 static int hym8563_rtc_alarm_irq_enable(struct device *dev,
 					unsigned int enabled)
 {
 	struct i2c_client *client = to_i2c_client(dev);
-	int data;
+	struct hym8563 *hym8563 = i2c_get_clientdata(client);
+	int ie = hym8563->timer_alarm ? HYM8563_CTL2_TIE : HYM8563_CTL2_AIE;
+	int data, ret;
 
 	data = i2c_smbus_read_byte_data(client, HYM8563_CTL2);
 	if (data < 0)
 		return data;
 
-	if (enabled)
-		data |= HYM8563_CTL2_AIE;
-	else
-		data &= ~HYM8563_CTL2_AIE;
+	/*
+	 * A write ANDs AF and TF with the flags, so writing them as 1 leaves
+	 * them alone: a flag raised after the read, such as TF of a timer
+	 * that is already counting, is not cleared and its interrupt lost.
+	 */
+	data |= HYM8563_CTL2_AF | HYM8563_CTL2_TF;
 
-	return i2c_smbus_write_byte_data(client, HYM8563_CTL2, data);
+	if (enabled)
+		data |= ie;
+	else
+		data &= ~ie;
+
+	ret = i2c_smbus_write_byte_data(client, HYM8563_CTL2, data);
+	if (ret < 0 || enabled || !hym8563->timer_alarm)
+		return ret;
+
+	return hym8563_timer_stop(client);
 };
 
 static int hym8563_rtc_read_alarm(struct device *dev, struct rtc_wkalrm *alm)
@@ -213,23 +242,77 @@ static int hym8563_rtc_read_alarm(struct device *dev, struct rtc_wkalrm *alm)
 	return 0;
 }
 
+static int hym8563_rtc_set_timer(struct device *dev, u8 secs)
+{
+	struct i2c_client *client = to_i2c_client(dev);
+	struct hym8563 *hym8563 = i2c_get_clientdata(client);
+	int ret;
+
+	ret = i2c_smbus_write_byte_data(client, HYM8563_TMR_CNT, secs);
+	if (ret < 0)
+		return ret;
+
+	ret = i2c_smbus_write_byte_data(client, HYM8563_TMR_CTL,
+					HYM8563_TMR_CTL_ENABLE |
+					HYM8563_TMR_CTL_1);
+	if (ret < 0)
+		return ret;
+
+	hym8563->timer_alarm = true;
+
+	return hym8563_rtc_alarm_irq_enable(dev, 1);
+}
+
 static int hym8563_rtc_set_alarm(struct device *dev, struct rtc_wkalrm *alm)
 {
 	struct i2c_client *client = to_i2c_client(dev);
+	struct hym8563 *hym8563 = i2c_get_clientdata(client);
 	struct rtc_time *alm_tm = &alm->time;
+	struct rtc_time tm;
+	time64_t secs;
 	u8 buf[4];
 	int ret;
+
+	/*
+	 * Disarm both, and drop a flag of an earlier alarm: the new one
+	 * must not take it for its own. Stop the timer first, so that it
+	 * cannot set TF again once the flags are clear.
+	 */
+	ret = hym8563_timer_stop(client);
+	if (ret < 0)
+		return ret;
+
+	hym8563->timer_alarm = false;
 
 	ret = i2c_smbus_read_byte_data(client, HYM8563_CTL2);
 	if (ret < 0)
 		return ret;
 
-	ret &= ~HYM8563_CTL2_AIE;
+	ret &= ~(HYM8563_CTL2_AIE | HYM8563_CTL2_TIE |
+		 HYM8563_CTL2_AF | HYM8563_CTL2_TF);
 
 	ret = i2c_smbus_write_byte_data(client, HYM8563_CTL2, ret);
 	if (ret < 0)
 		return ret;
 
+	ret = hym8563_rtc_read_time(dev, &tm);
+	if (ret)
+		return ret;
+
+	/*
+	 * At 1 Hz the timer fires after secs ticks, the first one within a
+	 * second. An alarm that is due already gets one tick.
+	 */
+	secs = rtc_tm_to_time64(alm_tm) - rtc_tm_to_time64(&tm);
+	if (alm->enabled && secs <= HYM8563_TMR_MAX_SECS)
+		return hym8563_rtc_set_timer(dev, max_t(time64_t, secs, 1));
+
+	/*
+	 * The alarm registers have no seconds: a later alarm fires at the
+	 * start of its minute, early but never late. The core then finds
+	 * its timer not yet due and sets the alarm again for the seconds
+	 * left, which the countdown timer takes.
+	 */
 	buf[0] = (alm_tm->tm_min < 60 && alm_tm->tm_min >= 0) ?
 			bin2bcd(alm_tm->tm_min) : HYM8563_ALM_BIT_DISABLE;
 
@@ -406,10 +489,9 @@ static struct clk *hym8563_clkout_register_clk(struct hym8563 *hym8563)
 #endif
 
 /*
- * The alarm interrupt is implemented as a level-low interrupt in the
- * hym8563, while the timer interrupt uses a falling edge.
- * We don't use the timer at all, so the interrupt is requested to
- * use the level-low trigger.
+ * The alarm and the countdown timer share the INT pin. With TI_TP clear
+ * both hold it low while their flag and their interrupt enable are set,
+ * so the interrupt is requested to use the level-low trigger.
  */
 static irqreturn_t hym8563_irq(int irq, void *dev_id)
 {
@@ -419,8 +501,6 @@ static irqreturn_t hym8563_irq(int irq, void *dev_id)
 
 	rtc_lock(hym8563->rtc);
 
-	/* Clear the alarm flag */
-
 	data = i2c_smbus_read_byte_data(client, HYM8563_CTL2);
 	if (data < 0) {
 		dev_err(&client->dev, "%s: error reading i2c data %d\n",
@@ -428,13 +508,28 @@ static irqreturn_t hym8563_irq(int irq, void *dev_id)
 		goto out;
 	}
 
-	data &= ~HYM8563_CTL2_AF;
+	/*
+	 * A countdown alarm is one-shot: stop the timer reloading, before
+	 * TF is cleared, so that it cannot count down again in between and
+	 * leave a stale TF behind.
+	 */
+	if (data & HYM8563_CTL2_TF) {
+		ret = hym8563_timer_stop(client);
+		if (ret < 0)
+			dev_err(&client->dev, "%s: error stopping timer %d\n",
+				__func__, ret);
+	}
 
-	ret = i2c_smbus_write_byte_data(client, HYM8563_CTL2, data);
+	/* Clear the alarm and timer flags; only one of them is armed */
+	ret = i2c_smbus_write_byte_data(client, HYM8563_CTL2,
+					data & ~(HYM8563_CTL2_AF |
+						 HYM8563_CTL2_TF));
 	if (ret < 0) {
 		dev_err(&client->dev, "%s: error writing i2c data %d\n",
 			__func__, ret);
 	}
+
+	rtc_update_irq(hym8563->rtc, 1, RTC_IRQF | RTC_AF);
 
 out:
 	rtc_unlock(hym8563->rtc);
@@ -467,7 +562,11 @@ static int hym8563_init_device(struct i2c_client *client)
 
 	ret &= ~HYM8563_CTL2_TI_TP;
 
-	return i2c_smbus_write_byte_data(client, HYM8563_CTL2, ret);
+	ret = i2c_smbus_write_byte_data(client, HYM8563_CTL2, ret);
+	if (ret < 0)
+		return ret;
+
+	return hym8563_timer_stop(client);
 }
 
 #ifdef CONFIG_PM_SLEEP
@@ -553,7 +652,6 @@ static int hym8563_probe(struct i2c_client *client)
 		(ret & HYM8563_SEC_VL) ? "invalid" : "valid");
 
 	hym8563->rtc->ops = &hym8563_rtc_ops;
-	set_bit(RTC_FEATURE_ALARM_RES_MINUTE, hym8563->rtc->features);
 	clear_bit(RTC_FEATURE_UPDATE_INTERRUPT, hym8563->rtc->features);
 
 #ifdef CONFIG_COMMON_CLK

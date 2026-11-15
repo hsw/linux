@@ -145,6 +145,41 @@
 #define SLEEP_DDR_PHY		1	/* the DDR PHY and the DPLL */
 #define SLEEP_PLLS		2	/* APLL, CPLL and GPLL */
 
+	/* debug layer: the point reached, to GRF_OS_REG6 (r2 = the table) */
+	.macro	crumb, point
+	ldr	r3, [r2, #RK3026_SUSPEND_GRF * 4]
+	movw	r0, #\point
+	movt	r0, #(RK3026_PM_CRUMB_SRAM >> 16)
+	str	r0, [r3, #RK3026_GRF_OS_REG6]
+	dsb
+	.endm
+
+	/* debug layer: back out at this point when fail_at names it */
+	.macro	fail_at, point
+	ldr	r0, [r2, #RK3026_SUSPEND_FAIL_AT * 4]
+	cmp	r0, #\point
+	moveq	r0, #(RK3026_SUSPEND_ABORT | \point)
+	beq	.Lback_out
+	.endm
+
+	/* debug layer: reset after this exit step when fail_at names it */
+	.macro	fail_step, code
+	ldr	r0, [r2, #RK3026_SUSPEND_FAIL_AT * 4]
+	cmp	r0, #\code
+	moveq	r0, #\code
+	beq	.Lreset
+	.endm
+
+	/* debug layer: r0 | the tag to GRF_OS_REG6; uses r3 */
+	.macro	crumb_r0, flag
+	ldr	r3, [r2, #RK3026_SUSPEND_GRF * 4]
+	orr	r0, r0, #\flag
+	orr	r0, r0, #(RK3026_PM_CRUMB_SRAM & 0xff000000)
+	orr	r0, r0, #(RK3026_PM_CRUMB_SRAM & 0x00ff0000)
+	str	r0, [r3, #RK3026_GRF_OS_REG6]
+	dsb
+	.endm
+
 	.arch	armv7-a
 	.arm
 	.text
@@ -202,6 +237,20 @@ ENTRY(rk3026_suspend_sram)
 	tst	r0, #CRU_DPLL_MODE_NORMAL
 	movne	r10, #(SLEEP_DDR_PHY | SLEEP_PLLS)
 1:
+	crumb	RK3026_PM_SRAM_ENTRY
+	fail_at	RK3026_PM_SRAM_ENTRY
+
+	/*
+	 * debug: depth 2 leaves APLL, CPLL and GPLL running, depth 1 also the
+	 * PHY and the DPLL, depth 0 also the DRAM active
+	 */
+	ldr	r0, [r2, #RK3026_SUSPEND_DEPTH * 4]
+	cmp	r0, #3
+	biclo	r10, r10, #SLEEP_PLLS
+	cmp	r0, #2
+	movlo	r10, #0
+	cmp	r0, #0
+	beq	.Lsleep
 
 	/*
 	 * Only a controller in Access goes to sleep; nothing changed yet. As
@@ -249,6 +298,18 @@ ENTRY(rk3026_suspend_sram)
 	bl	.Lmove
 	cmp	r0, #0
 	bne	.Lback_out
+	crumb	RK3026_PM_SRAM_SR
+
+.Lsleep:
+	/* debug guard: restart the watchdog with its sleep timeout */
+	ldr	r0, [r2, #RK3026_SUSPEND_WDT_TORR * 4]
+	cmp	r0, #0
+	ldrne	r3, [r2, #RK3026_SUSPEND_WDT * 4]
+	strne	r0, [r3, #DW_WDT_TORR]
+	movne	r0, #DW_WDT_CRR_KICK
+	strne	r0, [r3, #DW_WDT_CRR]
+	crumb	RK3026_PM_SRAM_WFI
+	fail_at	RK3026_PM_SRAM_WFI
 
 	cmp	r10, #0
 	beq	.Lwfi
@@ -282,6 +343,7 @@ ENTRY(rk3026_suspend_sram)
 	dsb
 	mov	r0, #1
 	bl	.Ldelay
+	crumb	RK3026_PM_SRAM_PHY_OFF
 
 	/*
 	 * The CPU, its buses and the other PLLs, as the vendor's
@@ -317,16 +379,53 @@ ENTRY(rk3026_suspend_sram)
 	mov	r1, #PLL_GPLL
 	bl	.Lpll_slow
 	str	r6, [r2, #RK3026_SUSPEND_PLLS * 4]
+	/*
+	 * debug guard: with GPLL in slow mode pclk_peri runs at 1/32 of its
+	 * rate, so the sleep timeout takes TOP 10 instead of 15; read back
+	 * before a power-down may stop the clock under a write in flight
+	 */
+	ldr	r0, [r2, #RK3026_SUSPEND_WDT_TORR * 4]
+	cmp	r0, #0
+	tstne	r6, #(1 << PLL_GPLL)
+	beq	1f
+	ldr	r3, [r2, #RK3026_SUSPEND_WDT * 4]
+	ldr	r0, [r2, #RK3026_SUSPEND_WDT_TORR_SLOW * 4]
+	str	r0, [r3, #DW_WDT_TORR]
+	mov	r0, #DW_WDT_CRR_KICK
+	str	r0, [r3, #DW_WDT_CRR]
+	ldr	r0, [r3, #DW_WDT_TORR]
+	dsb
+1:	crumb	RK3026_PM_SRAM_PLL_SLOW
+	/* debug: power down only the PLLs the pd knob names */
+	ldr	r0, [r2, #RK3026_SUSPEND_PD_MASK * 4]
+	and	r6, r6, r0
 	mov	r1, #PLL_APLL
 	bl	.Lpll_down
 	mov	r1, #PLL_CPLL
 	bl	.Lpll_down
 	mov	r1, #PLL_GPLL
 	bl	.Lpll_down
+	crumb	RK3026_PM_SRAM_PLL_OFF
 
 .Lwfi:
 	dsb
 	wfi
+
+	/*
+	 * debug: the point, with the interrupt that ended the wfi in bits
+	 * 15:8 (the low byte of GICC_HPPIR's ID; 0xff when none is pending);
+	 * r7 keeps those bits for the points after this one
+	 */
+	ldr	r3, [r2, #RK3026_SUSPEND_GICC * 4]
+	ldr	r1, [r3, #RK3026_GICC_HPPIR]
+	and	r1, r1, #0xff
+	lsl	r7, r1, #8
+	mov	r0, r7
+	crumb_r0 RK3026_PM_SRAM_WOKE
+	ldr	r0, [r2, #RK3026_SUSPEND_DEPTH * 4]
+	cmp	r0, #0
+	moveq	r0, #RK3026_SUSPEND_DONE
+	beq	.Lreturn
 
 	tst	r10, #SLEEP_PLLS
 	beq	1f
@@ -343,7 +442,20 @@ ENTRY(rk3026_suspend_sram)
 	movt	r0, #0xffff
 	str	r0, [r9, #RK3026_CRU_CLKSEL_CON(10)]
 	bl	.Lpll_mode
-	mov	r1, #PLL_CPLL
+	/* debug guard: pclk_peri at its rate again, TOP 15 */
+	ldr	r0, [r2, #RK3026_SUSPEND_WDT_TORR * 4]
+	cmp	r0, #0
+	beq	2f
+	ldr	r3, [r2, #RK3026_SUSPEND_PLLS * 4]
+	tst	r3, #(1 << PLL_GPLL)
+	beq	2f
+	ldr	r3, [r2, #RK3026_SUSPEND_WDT * 4]
+	str	r0, [r3, #DW_WDT_TORR]
+	mov	r0, #DW_WDT_CRR_KICK
+	str	r0, [r3, #DW_WDT_CRR]
+	ldr	r0, [r3, #DW_WDT_TORR]
+	dsb
+2:	mov	r1, #PLL_CPLL
 	bl	.Lpll_up
 	bl	.Lpll_mode
 	mov	r1, #PLL_APLL
@@ -356,6 +468,8 @@ ENTRY(rk3026_suspend_sram)
 	str	r0, [r9, #RK3026_CRU_CLKSEL_CON(0)]
 	dsb
 	bl	.Lpll_mode
+	orr	r0, r7, #RK3026_PM_SRAM_PLL_ON
+	crumb_r0 0
 1:
 	cmp	r10, #0
 	beq	.Lwakeup
@@ -373,7 +487,8 @@ ENTRY(rk3026_suspend_sram)
 	bne	1b
 	mov	r0, #RK3026_SUSPEND_R_DPLL
 	b	.Lreset
-2:	movw	r0, #CRU_DPLL_MODE_NORMAL
+2:	fail_step RK3026_SUSPEND_R_DPLL
+	movw	r0, #CRU_DPLL_MODE_NORMAL
 	movt	r0, #CRU_DPLL_MODE_NORMAL
 	str	r0, [r9, #RK3026_CRU_MODE_CON]
 	dsb
@@ -390,6 +505,8 @@ ENTRY(rk3026_suspend_sram)
 	dsb
 	mov	r0, #PHY_SETTLE_US
 	bl	.Ldelay
+	orr	r0, r7, #RK3026_PM_SRAM_PHY_ON
+	crumb_r0 0
 
 	/*
 	 * Low_power -> Access. If that fails the DRAM state is unknown and
@@ -419,6 +536,10 @@ ENTRY(rk3026_suspend_sram)
 	ldr	r6, [r4, #PCTL_TREFI]
 	mov	r0, #0
 	str	r0, [r4, #PCTL_TREFI]
+	/* debug: the global timer at the auto refresh's stop */
+	ldr	r3, [r2, #RK3026_SUSPEND_GICC * 4]
+	ldr	r0, [r3, #RK3026_GICC_GT_COUNT]
+	str	r0, [r2, #RK3026_SUSPEND_GT_REFOFF * 4]
 	/*
 	 * Done bits that read set before the start may be the last
 	 * training's until the calibration clears them: then wait as the
@@ -426,6 +547,7 @@ ENTRY(rk3026_suspend_sram)
 	 * this calibration, so poll at once.
 	 */
 	ldr	r1, [r8, #PHY_REG62]
+	str	r1, [r2, #RK3026_SUSPEND_REG62_PRE * 4]
 	ldr	r0, [r8, #PHY_REG2]
 	bic	r0, r0, #PHY_REG2_CAL_MASK
 	orr	r0, r0, #PHY_REG2_CAL_START
@@ -443,7 +565,8 @@ ENTRY(rk3026_suspend_sram)
 	bne	1b
 	mov	r0, #RK3026_SUSPEND_R_TRAIN
 	b	.Lreset
-2:	ldr	r0, [r8, #PHY_REG2]
+2:	fail_step RK3026_SUSPEND_R_TRAIN
+	ldr	r0, [r8, #PHY_REG2]
 	bic	r0, r0, #PHY_REG2_CAL_MASK
 	str	r0, [r8, #PHY_REG2]
 	dsb
@@ -466,7 +589,25 @@ ENTRY(rk3026_suspend_sram)
 	b	.Lreset
 5:	subs	r1, r1, #1
 	bne	3b
+	fail_step RK3026_SUSPEND_R_REFRESH
 	str	r6, [r4, #PCTL_TREFI]
+	/*
+	 * debug: the global timer ticks the auto refresh was off, and of one
+	 * .Ldelay(1)
+	 */
+	ldr	r3, [r2, #RK3026_SUSPEND_GICC * 4]
+	ldr	r0, [r3, #RK3026_GICC_GT_COUNT]
+	ldr	r1, [r2, #RK3026_SUSPEND_GT_REFOFF * 4]
+	sub	r0, r0, r1
+	str	r0, [r2, #RK3026_SUSPEND_GT_REFOFF * 4]
+	ldr	r1, [r3, #RK3026_GICC_GT_COUNT]
+	mov	r0, #1
+	bl	.Ldelay
+	ldr	r0, [r3, #RK3026_GICC_GT_COUNT]
+	sub	r0, r0, r1
+	str	r0, [r2, #RK3026_SUSPEND_GT_DELAY * 4]
+	orr	r0, r7, #RK3026_PM_SRAM_TRAINED
+	crumb_r0 0
 	mov	r0, #PCTL_GO_STATE
 	mov	r1, #PCTL_ACCESS
 	mov	r3, #RK3026_SUSPEND_R_TRAIN_GO
@@ -507,6 +648,14 @@ ENTRY(rk3026_suspend_sram)
 	bne	.Lreset
 .Lrestored:
 	bl	.Lsoc_con2
+	/*
+	 * debug: the point with the interrupt after a wake-up, the code with
+	 * the back-out flag after a back-out, to OS_REG6
+	 */
+	cmp	r6, #RK3026_SUSPEND_DONE
+	orreq	r0, r7, #RK3026_PM_SRAM_BACK
+	orrne	r0, r6, #RK3026_SUSPEND_ABORT
+	crumb_r0 0
 	mov	r0, r6
 .Lreturn:
 	pop	{r1, r4-r10, lr}
@@ -573,7 +722,12 @@ ENTRY(rk3026_suspend_sram)
 	bne	1b
 	mov	r0, r3
 	bx	lr
-2:	mov	r0, #0
+	/* debug: fail_at names this step: fail as if STAT never got there */
+2:	ldr	r0, [r2, #RK3026_SUSPEND_FAIL_AT * 4]
+	cmp	r0, r3
+	moveq	r0, r3
+	bxeq	lr
+	mov	r0, #0
 	bx	lr
 
 	/* wait at least r0 microseconds; uses r0, r12 and the flags */
@@ -643,11 +797,18 @@ ENTRY(rk3026_suspend_sram)
 	bl	.Ldelay
 	ldr	r0, [r3, #CRU_PLL_CON1]
 	tst	r0, #CRU_PLL_LOCK
-	popne	{pc}
+	bne	2f
 	subs	r6, r6, #1
 	bne	1b
 	add	r0, r1, #RK3026_SUSPEND_R_APLL
 	b	.Lreset
+	/* debug: fail_at names this PLL's lock: reset as if it never came */
+2:	ldr	r0, [r2, #RK3026_SUSPEND_FAIL_AT * 4]
+	sub	r0, r0, #RK3026_SUSPEND_R_APLL
+	cmp	r0, r1
+	addeq	r0, r1, #RK3026_SUSPEND_R_APLL
+	beq	.Lreset
+	pop	{pc}
 
 	/*
 	 * Give the PLL r1 the mode it had back, if the routine changed it.
@@ -685,6 +846,9 @@ ENTRY(rk3026_suspend_sram)
 	 * boot loader left there first.
 	 */
 .Lreset:
+	/* debug: the code with the reset flag to OS_REG6 */
+	and	r0, r0, #0xff
+	crumb_r0 RK3026_PM_SRAM_RESET
 	bl	.Lsoc_con2
 	ldr	r1, [r2, #RK3026_SUSPEND_CRU * 4]
 	ldr	r4, [r2, #RK3026_SUSPEND_GRF * 4]

@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/memory-controllers/rockchip,rk3026-dmc.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Rockchip RK3026 DDR memory controller
+
+maintainers:
+  - Sergei Khomenkov <shomenkow@gmail.com>
+
+description:
+  The DDR3 memory controller of the RK3026, a protocol controller (PCTL)
+  with its DDR PHY. The boot loader programs and trains both; the
+  operating system only moves the DRAM into self-refresh and back across
+  system suspend.
+
+properties:
+  compatible:
+    const: rockchip,rk3026-dmc
+
+  reg:
+    items:
+      - description: protocol controller (PCTL) registers
+      - description: DDR PHY registers
+
+required:
+  - compatible
+  - reg
+
+additionalProperties: false
+
+examples:
+  - |
+    memory-controller@20004000 {
+        compatible = "rockchip,rk3026-dmc";
+        reg = <0x20004000 0x1000>, <0x2000a000 0x1000>;
+    };

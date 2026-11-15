@@ -76,6 +76,9 @@
  *                    (rk3026_ebc_palette_show())
  *   rows             text, the rows where each image may differ from
  *                    another (rk3026_ebc_rows_show())
+ *   qos              TEST ONLY: the NoC QoS generators of the ports that
+ *                    compete with the scan fetch, read-write text
+ *                    (rk3026_ebc_qos_show(), rk3026_ebc_qos_write())
  *
  * flip_held and flip_late are counters, yet files of their own next to
  * flip_timeout_ms rather than lines of "state" (struct rk3026_ebc_stats):
@@ -100,11 +103,17 @@
  * most for one snapshot to be built.
  */
 
+#include <linux/clk.h>
 #include <linux/debugfs.h>
+#include <linux/device.h>
 #include <linux/err.h>
 #include <linux/fs.h>
 #include <linux/hex.h>
+#include <linux/io.h>
 #include <linux/mm.h>
+#include <linux/mutex.h>
+#include <linux/of.h>
+#include <linux/of_platform.h>
 #include <linux/overflow.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
@@ -523,6 +532,198 @@ VISIBLE_IF_KUNIT int rk3026_ebc_rows_show(struct seq_file *m, void *unused)
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_rows_show);
 DEFINE_SHOW_ATTRIBUTE(rk3026_ebc_rows);
 
+/*
+ * TEST ONLY, not for upstream: "qos", the RK3026 NoC QoS generators of the
+ * ports that compete with the EBC's scan fetch, to test whether a port above
+ * the EBC's starves a scan (no under-run flag exists, so only the glass
+ * shows it).
+ *
+ * Window 0x10128000, one generator per master port: PRIORITY at +0x08
+ * ((level under budget) << 2 | (level over budget)), MODE at +0x0c (0 none,
+ * 1 fixed, 2 limiter, 3 regulator), BANDWIDTH at +0x10.
+ *
+ * A port's generator answers only while the port's AXI clock runs; an access
+ * with it gated hangs the bus. So each access holds that clock: ACLK_GPU (the
+ * GPU node's "bus" clock) for the GPU port, the EBC's "aclk" (ACLK_LCDC1, the
+ * VIO1 NIU) for the LCDC1 and EBC ports. The CPU and PERI ports are always
+ * clocked. The GPU port is touched only while lima is bound.
+ *
+ * Read: one line per port, "name prio 0x.. mode . bw 0x..", or "name skipped".
+ * Write: "<port> <prio>" (hex, 0..f) or "<port>.mode <0..3>", for the gpu,
+ * lcdc1 and ebc ports only.
+ */
+#define QOS_WIN_BASE		0x10128000
+#define QOS_WIN_SIZE		0x8000
+#define QOS_PRIORITY		0x08
+#define QOS_MODE		0x0c
+#define QOS_BANDWIDTH		0x10
+
+enum qos_clk { QOS_CLK_NONE, QOS_CLK_GPU, QOS_CLK_VIO1 };
+
+struct rk3026_ebc_qos_port {
+	const char	*name;
+	u32		base;
+	enum qos_clk	clk;
+	bool		writable;
+};
+
+static const struct rk3026_ebc_qos_port rk3026_ebc_qos_ports[] = {
+	{ "cpu0",	0x2000, QOS_CLK_NONE, false },
+	{ "cpu1w",	0x2080, QOS_CLK_NONE, false },
+	{ "cpu1r",	0x2100, QOS_CLK_NONE, false },
+	{ "peri",	0x4000, QOS_CLK_NONE, false },
+	{ "gpu",	0x5000, QOS_CLK_GPU,  true },
+	{ "lcdc1",	0x7000, QOS_CLK_VIO1, true },
+	{ "ebc",	0x7080, QOS_CLK_VIO1, true },
+};
+
+static void __iomem *rk3026_ebc_qos_win;
+static DEFINE_MUTEX(rk3026_ebc_qos_lock);
+
+/* The GPU's bus clock, enabled, while lima is bound; else NULL. */
+static struct clk *rk3026_ebc_qos_gpu_clk_get(void)
+{
+	struct platform_device *pdev;
+	struct device_node *np;
+	struct clk *clk = NULL;
+
+	np = of_find_compatible_node(NULL, NULL, "rockchip,rk3026-mali");
+	if (!np)
+		return NULL;
+	pdev = of_find_device_by_node(np);
+	if (pdev) {
+		device_lock(&pdev->dev);
+		if (device_is_bound(&pdev->dev)) {
+			clk = of_clk_get_by_name(np, "bus");
+			if (IS_ERR(clk) || clk_prepare_enable(clk)) {
+				if (!IS_ERR(clk))
+					clk_put(clk);
+				clk = NULL;
+			}
+		}
+		device_unlock(&pdev->dev);
+		put_device(&pdev->dev);
+	}
+	of_node_put(np);
+	return clk;
+}
+
+static void rk3026_ebc_qos_gpu_clk_put(struct clk *clk)
+{
+	clk_disable_unprepare(clk);
+	clk_put(clk);
+}
+
+/*
+ * Hold @port's clock: returns 0 with it held (*gpu set for the GPU port),
+ * -ENODEV when it cannot be held.
+ */
+static int rk3026_ebc_qos_hold(struct rk3026_ebc *ebc,
+			       const struct rk3026_ebc_qos_port *port,
+			       struct clk **gpu)
+{
+	*gpu = NULL;
+	switch (port->clk) {
+	case QOS_CLK_GPU:
+		*gpu = rk3026_ebc_qos_gpu_clk_get();
+		return *gpu ? 0 : -ENODEV;
+	case QOS_CLK_VIO1:
+		return clk_prepare_enable(ebc->aclk) ? -ENODEV : 0;
+	default:
+		return 0;
+	}
+}
+
+static void rk3026_ebc_qos_release(struct rk3026_ebc *ebc,
+				   const struct rk3026_ebc_qos_port *port,
+				   struct clk *gpu)
+{
+	if (port->clk == QOS_CLK_GPU)
+		rk3026_ebc_qos_gpu_clk_put(gpu);
+	else if (port->clk == QOS_CLK_VIO1)
+		clk_disable_unprepare(ebc->aclk);
+}
+
+static int rk3026_ebc_qos_show(struct seq_file *m, void *unused)
+{
+	struct rk3026_ebc *ebc = m->private;
+	unsigned int i;
+
+	if (!rk3026_ebc_qos_win)
+		return -ENODEV;
+	mutex_lock(&rk3026_ebc_qos_lock);
+	for (i = 0; i < ARRAY_SIZE(rk3026_ebc_qos_ports); i++) {
+		const struct rk3026_ebc_qos_port *port =
+			&rk3026_ebc_qos_ports[i];
+		void __iomem *base = rk3026_ebc_qos_win + port->base;
+		u32 prio, mode, bw;
+		struct clk *gpu;
+
+		if (rk3026_ebc_qos_hold(ebc, port, &gpu)) {
+			seq_printf(m, "%s skipped\n", port->name);
+			continue;
+		}
+		prio = readl(base + QOS_PRIORITY);
+		mode = readl(base + QOS_MODE);
+		bw = readl(base + QOS_BANDWIDTH);
+		rk3026_ebc_qos_release(ebc, port, gpu);
+		seq_printf(m, "%s prio 0x%x mode %u bw 0x%x\n", port->name,
+			   prio, mode, bw);
+	}
+	mutex_unlock(&rk3026_ebc_qos_lock);
+	return 0;
+}
+
+static ssize_t rk3026_ebc_qos_write(struct file *file, const char __user *ubuf,
+				    size_t count, loff_t *ppos)
+{
+	struct rk3026_ebc *ebc = ((struct seq_file *)file->private_data)->private;
+	const struct rk3026_ebc_qos_port *port = NULL;
+	char buf[32], name[16], *dot;
+	unsigned int i, val, reg = QOS_PRIORITY, max = 0xf;
+	struct clk *gpu;
+	int ret;
+
+	if (!rk3026_ebc_qos_win)
+		return -ENODEV;
+	if (count >= sizeof(buf))
+		return -EINVAL;
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+	buf[count] = '\0';
+	if (sscanf(buf, "%15s %x", name, &val) != 2)
+		return -EINVAL;
+	dot = strchr(name, '.');
+	if (dot) {
+		if (strcmp(dot, ".mode"))
+			return -EINVAL;
+		*dot = '\0';
+		reg = QOS_MODE;
+		max = 3;
+	}
+	if (val > max)
+		return -EINVAL;
+	for (i = 0; i < ARRAY_SIZE(rk3026_ebc_qos_ports); i++)
+		if (!strcmp(name, rk3026_ebc_qos_ports[i].name))
+			port = &rk3026_ebc_qos_ports[i];
+	if (!port || !port->writable)
+		return -EINVAL;
+
+	mutex_lock(&rk3026_ebc_qos_lock);
+	ret = rk3026_ebc_qos_hold(ebc, port, &gpu);
+	if (!ret) {
+		writel(val, rk3026_ebc_qos_win + port->base + reg);
+		rk3026_ebc_qos_release(ebc, port, gpu);
+	}
+	mutex_unlock(&rk3026_ebc_qos_lock);
+	if (ret)
+		return ret;
+	dev_info(ebc->dev, "qos test: %s %s 0x%x\n", port->name,
+		 reg == QOS_MODE ? "mode" : "prio", val);
+	return count;
+}
+DEFINE_SHOW_STORE_ATTRIBUTE(rk3026_ebc_qos);
+
 void rk3026_ebc_debugfs_init(struct rk3026_ebc *ebc)
 {
 	struct dentry *dir = debugfs_create_dir("rk3026-ebc", NULL);
@@ -562,10 +763,15 @@ void rk3026_ebc_debugfs_init(struct rk3026_ebc *ebc)
 	debugfs_create_u32("rails_off_ms", 0644, dir, &ebc->rails_off_ms);
 	debugfs_create_file("palette", 0444, dir, ebc, &rk3026_ebc_palette_fops);
 	debugfs_create_file("rows", 0444, dir, ebc, &rk3026_ebc_rows_fops);
+	rk3026_ebc_qos_win = ioremap(QOS_WIN_BASE, QOS_WIN_SIZE);
+	debugfs_create_file("qos", 0644, dir, ebc, &rk3026_ebc_qos_fops);
 }
 
 void rk3026_ebc_debugfs_fini(struct rk3026_ebc *ebc)
 {
 	debugfs_remove(ebc->debugfs);
 	ebc->debugfs = NULL;
+	if (rk3026_ebc_qos_win)
+		iounmap(rk3026_ebc_qos_win);
+	rk3026_ebc_qos_win = NULL;
 }

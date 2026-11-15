@@ -1103,9 +1103,9 @@ struct rk3026_ebc {
 
 	/*
 	 * The DU cleanup budget (rk3026_ebc_du_account()). @du_area counts the
-	 * pixels plane parts changed in DU or A2 since the glass was last
-	 * cleared; the refresh thread alone writes it, under @image_lock;
-	 * PART parts leave it. Once it reaches @du_cleanup_area (spent), or
+	 * pixels plane parts changed in DU, A2 or PART since the glass was
+	 * last cleared; the refresh thread alone writes it, under
+	 * @image_lock. Once it reaches @du_cleanup_area (spent), or
 	 * would reach it with the part, an auto plane part, two-level or
 	 * grey, that changes at least @du_cleanup_big_area pixels is driven
 	 * FULL instead of DU, A2 or PART; once it reaches

@@ -25,6 +25,9 @@ properties:
     oneOf:
       # for Rockchip RK2928 and before RK3288
       - const: rockchip,rk2928-dw-mshc
+      - items:
+          - const: rockchip,rk3026-dw-mshc
+          - const: rockchip,rk2928-dw-mshc
       # for Rockchip RK3288
       - const: rockchip,rk3288-dw-mshc
       - items:

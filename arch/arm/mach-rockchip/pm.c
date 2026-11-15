@@ -300,9 +300,10 @@ static const struct rockchip_pm_data rk3288_pm_data __initconst = {
  * their power in system sleep, and the CPU clock, the PLLs and DDR
  * self-refresh are all the CRU's and the DDR controller's business. CPU0
  * enters and leaves the sleep through a routine in the internal SRAM
- * (rk3026-suspend.S), which puts the DRAM into self-refresh and waits in
- * wfi for a wake-up interrupt, so no resume path through the BootROM is
- * needed and cpu_suspend() always returns through its finisher.
+ * (rk3026-suspend.S), which puts the DRAM into self-refresh, stops the
+ * DDR PHY and its PLL and waits in wfi for a wake-up interrupt, so no
+ * resume path through the BootROM is needed and cpu_suspend() always
+ * returns through its finisher.
  */
 #define RK3026_GRF_SOC_CON0		0x140
 #define RK3026_GRF_IMEM_REMAP		BIT(12)
@@ -392,7 +393,7 @@ static void __iomem * __init rk3026_suspend_iomap(const char *compatible)
 static int __init rk3026_suspend_init(struct device_node *np)
 {
 	struct device_node *sram_np, *dmc_np;
-	void __iomem *cru, *pctl, *sram;
+	void __iomem *cru, *pctl, *phy, *sram;
 	struct resource res;
 	int ret;
 
@@ -409,12 +410,14 @@ static int __init rk3026_suspend_init(struct device_node *np)
 	}
 
 	pctl = NULL;
+	phy = NULL;
 	dmc_np = of_find_compatible_node(NULL, NULL, "rockchip,rk3026-dmc");
 	if (dmc_np) {
 		pctl = of_iomap(dmc_np, 0);
+		phy = of_iomap(dmc_np, 1);
 		of_node_put(dmc_np);
 	}
-	if (!pctl) {
+	if (!pctl || !phy) {
 		pr_err("%s: could not map the DDR controller\n", __func__);
 		ret = -ENODEV;
 		goto err_dmc;
@@ -460,12 +463,15 @@ static int __init rk3026_suspend_init(struct device_node *np)
 	rk3026_sram_table[RK3026_SUSPEND_CRU] = (u32)cru;
 	rk3026_sram_table[RK3026_SUSPEND_GRF] = (u32)rk3026_grf;
 	rk3026_sram_table[RK3026_SUSPEND_PCTL] = (u32)pctl;
+	rk3026_sram_table[RK3026_SUSPEND_PHY] = (u32)phy;
 	rk3026_sram_table[RK3026_SUSPEND_STACK_TOP] =
 		(u32)sram + resource_size(&res);
 
 	return 0;
 
 err_dmc:
+	if (phy)
+		iounmap(phy);
 	if (pctl)
 		iounmap(pctl);
 	iounmap(cru);

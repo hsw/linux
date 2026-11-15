@@ -17,13 +17,16 @@
 #define RK3026_SUSPEND_CRU		1
 #define RK3026_SUSPEND_GRF		2
 #define RK3026_SUSPEND_PCTL		3	/* the DDR controller */
-#define RK3026_SUSPEND_BASES		4
-#define RK3026_SUSPEND_STACK_TOP	4	/* the section's end */
-/* the routine saves these three here and leaves them as it found them */
-#define RK3026_SUSPEND_MCFG		5
-#define RK3026_SUSPEND_MCFG1		6
-#define RK3026_SUSPEND_SOC_CON2		7
-#define RK3026_SUSPEND_TABLE_WORDS	8
+#define RK3026_SUSPEND_PHY		4	/* the DDR PHY */
+#define RK3026_SUSPEND_BASES		5
+#define RK3026_SUSPEND_STACK_TOP	5	/* the section's end */
+/* the routine saves these here and leaves them as it found them */
+#define RK3026_SUSPEND_MCFG		6
+#define RK3026_SUSPEND_MCFG1		7
+#define RK3026_SUSPEND_SOC_CON2		8
+#define RK3026_SUSPEND_PHY_REG1		9
+#define RK3026_SUSPEND_PHY_REG264	10
+#define RK3026_SUSPEND_TABLE_WORDS	11
 
 /* the stack, at the top of the section */
 #define RK3026_SUSPEND_STACK_SIZE	256
@@ -43,6 +46,11 @@
 #define RK3026_SUSPEND_R_BACK_OUT	0x22	/* a back-out found no Access */
 #define RK3026_SUSPEND_R_CONFIG		0x23	/* no Config to restore MCFG */
 #define RK3026_SUSPEND_R_ACCESS		0x24	/* no Access after that */
+#define RK3026_SUSPEND_R_DPLL		0x25	/* the DDR PLL did not lock */
+#define RK3026_SUSPEND_R_TRAIN_CFG	0x26	/* no Config for the training */
+#define RK3026_SUSPEND_R_TRAIN		0x27	/* the training did not end */
+#define RK3026_SUSPEND_R_REFRESH	0x28	/* a refresh was not taken */
+#define RK3026_SUSPEND_R_TRAIN_GO	0x29	/* no Access after the training */
 
 #ifndef __ASSEMBLY__
 u32 rk3026_suspend_sram(void);

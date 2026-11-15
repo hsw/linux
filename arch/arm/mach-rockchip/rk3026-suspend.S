@@ -64,6 +64,33 @@
  */
 #define PCTL_POLLS		0x10000
 
+	/* debug layer: the point reached, to GRF_OS_REG6 (r2 = the table) */
+	.macro	crumb, point
+	ldr	r3, [r2, #RK3026_SUSPEND_GRF * 4]
+	movw	r0, #\point
+	movt	r0, #(RK3026_PM_CRUMB_SRAM >> 16)
+	str	r0, [r3, #RK3026_GRF_OS_REG6]
+	dsb
+	.endm
+
+	/* debug layer: back out at this point when fail_at names it */
+	.macro	fail_at, point
+	ldr	r0, [r2, #RK3026_SUSPEND_FAIL_AT * 4]
+	cmp	r0, #\point
+	moveq	r0, #(RK3026_SUSPEND_ABORT | \point)
+	beq	.Lback_out
+	.endm
+
+	/* debug layer: r0 | the tag to GRF_OS_REG6; uses r3 */
+	.macro	crumb_r0, flag
+	ldr	r3, [r2, #RK3026_SUSPEND_GRF * 4]
+	orr	r0, r0, #\flag
+	orr	r0, r0, #(RK3026_PM_CRUMB_SRAM & 0xff000000)
+	orr	r0, r0, #(RK3026_PM_CRUMB_SRAM & 0x00ff0000)
+	str	r0, [r3, #RK3026_GRF_OS_REG6]
+	dsb
+	.endm
+
 	.arch	armv7-a
 	.arm
 	.text
@@ -73,7 +100,7 @@ ENTRY(rk3026_suspend_sram)
 	adrl	r2, rk3026_suspend_sram_table
 	mov	r1, sp
 	ldr	sp, [r2, #RK3026_SUSPEND_STACK_TOP * 4]
-	push	{r1, r4-r6, lr}
+	push	{r1, r4-r7, lr}
 
 	/*
 	 * Load a TLB entry for every page the routine reaches, with one read
@@ -100,6 +127,13 @@ ENTRY(rk3026_suspend_sram)
 	str	r0, [r2, #RK3026_SUSPEND_MCFG1 * 4]
 	ldr	r0, [r5, #RK3026_GRF_SOC_CON2]
 	str	r0, [r2, #RK3026_SUSPEND_SOC_CON2 * 4]
+	crumb	RK3026_PM_SRAM_ENTRY
+	fail_at	RK3026_PM_SRAM_ENTRY
+
+	/* debug: depth 0 leaves the DRAM active */
+	ldr	r0, [r2, #RK3026_SUSPEND_DEPTH * 4]
+	cmp	r0, #0
+	beq	.Lsleep
 
 	/*
 	 * Only a controller in Access goes to sleep; nothing changed yet. As
@@ -147,9 +181,37 @@ ENTRY(rk3026_suspend_sram)
 	bl	.Lmove
 	cmp	r0, #0
 	bne	.Lback_out
+	crumb	RK3026_PM_SRAM_SR
+
+.Lsleep:
+	/* debug guard: restart the watchdog with its sleep timeout */
+	ldr	r0, [r2, #RK3026_SUSPEND_WDT_TORR * 4]
+	cmp	r0, #0
+	ldrne	r3, [r2, #RK3026_SUSPEND_WDT * 4]
+	strne	r0, [r3, #DW_WDT_TORR]
+	movne	r0, #DW_WDT_CRR_KICK
+	strne	r0, [r3, #DW_WDT_CRR]
+	crumb	RK3026_PM_SRAM_WFI
+	fail_at	RK3026_PM_SRAM_WFI
 
 	dsb
 	wfi
+
+	/*
+	 * debug: the point, with the interrupt that ended the wfi in bits
+	 * 15:8 (the low byte of GICC_HPPIR's ID; 0xff when none is pending);
+	 * r7 keeps those bits for the points after this one
+	 */
+	ldr	r3, [r2, #RK3026_SUSPEND_GICC * 4]
+	ldr	r1, [r3, #RK3026_GICC_HPPIR]
+	and	r1, r1, #0xff
+	lsl	r7, r1, #8
+	mov	r0, r7
+	crumb_r0 RK3026_PM_SRAM_WOKE
+	ldr	r0, [r2, #RK3026_SUSPEND_DEPTH * 4]
+	cmp	r0, #0
+	moveq	r0, #RK3026_SUSPEND_DONE
+	beq	.Lreturn
 
 	/*
 	 * Low_power -> Access. If that fails the DRAM state is unknown and
@@ -194,9 +256,17 @@ ENTRY(rk3026_suspend_sram)
 	bne	.Lreset
 .Lrestored:
 	bl	.Lsoc_con2
+	/*
+	 * debug: the point with the interrupt after a wake-up, the code with
+	 * the back-out flag after a back-out, to OS_REG6
+	 */
+	cmp	r6, #RK3026_SUSPEND_DONE
+	orreq	r0, r7, #RK3026_PM_SRAM_BACK
+	orrne	r0, r6, #RK3026_SUSPEND_ABORT
+	crumb_r0 0
 	mov	r0, r6
 .Lreturn:
-	pop	{r1, r4-r6, lr}
+	pop	{r1, r4-r7, lr}
 	mov	sp, r1
 	bx	lr
 
@@ -260,7 +330,12 @@ ENTRY(rk3026_suspend_sram)
 	bne	1b
 	mov	r0, r3
 	bx	lr
-2:	mov	r0, #0
+	/* debug: fail_at names this step: fail as if STAT never got there */
+2:	ldr	r0, [r2, #RK3026_SUSPEND_FAIL_AT * 4]
+	cmp	r0, r3
+	moveq	r0, r3
+	bxeq	lr
+	mov	r0, #0
 	bx	lr
 
 	/* GRF_SOC_CON2 bit 0 back to its saved value; uses r0 */
@@ -279,6 +354,9 @@ ENTRY(rk3026_suspend_sram)
 	 * so the system boots again.
 	 */
 .Lreset:
+	/* debug: the code with the reset flag to OS_REG6 */
+	and	r0, r0, #0xff
+	crumb_r0 RK3026_PM_SRAM_RESET
 	ldr	r1, [r2, #RK3026_SUSPEND_CRU * 4]
 	ldr	r4, [r2, #RK3026_SUSPEND_GRF * 4]
 	rk3026_core_reset 0

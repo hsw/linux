@@ -95,6 +95,7 @@ patternProperties:
             - qcom,pil-reloc-info
             - renesas,smp-sram
             - rockchip,rk3026-restart-sram
+            - rockchip,rk3026-suspend-sram
             - rockchip,rk3066-smp-sram
             - samsung,exynos4210-sysram
             - samsung,exynos4210-sysram-ns

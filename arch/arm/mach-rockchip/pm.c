@@ -304,17 +304,59 @@ static const struct rockchip_pm_data rk3288_pm_data __initconst = {
  * DDR PHY and its PLL, runs the CPU from the 24 MHz oscillator with the
  * other PLLs powered down and waits in wfi for a wake-up interrupt, so no
  * resume path through the BootROM is needed and cpu_suspend() always
- * returns through its finisher. The routine gives the CRU back the clock
- * setup it found, so the clock framework never sees the change.
+ * returns through its finisher. Before it runs, every clock gate the
+ * sleep does not need is closed (the vendor's first stage of gating). The
+ * CRU gets back the clock setup and the gates it had, so the clock
+ * framework never sees the change.
  */
 #define RK3026_GRF_SOC_CON0		0x140
 #define RK3026_GRF_IMEM_REMAP		BIT(12)
+#define RK3026_CRU_CLKGATE_CON(x)	(0xd0 + (x) * 4)
+
+static const u16 rk3026_pm_hold[RK3026_SUSPEND_GATE_REGS] = {
+	RK3026_SUSPEND_HOLD0, RK3026_SUSPEND_HOLD1, RK3026_SUSPEND_HOLD2,
+	RK3026_SUSPEND_HOLD3, RK3026_SUSPEND_HOLD4, RK3026_SUSPEND_HOLD5,
+	RK3026_SUSPEND_HOLD6, RK3026_SUSPEND_HOLD7, RK3026_SUSPEND_HOLD8,
+	RK3026_SUSPEND_HOLD9,
+};
 
 static void __iomem *rk3026_grf;
+static void __iomem *rk3026_cru;
+static u32 rk3026_pm_gates[RK3026_SUSPEND_GATE_REGS];
 static u32 *rk3026_sram_table;
 static u32 (*rk3026_sram_fn)(void);
 static u32 rk3026_pm_step;
 static bool rk3026_pm_slept;
+
+/*
+ * Close every gate but the held ones. From here to rk3026_pm_ungate()
+ * nothing may print: a console's UART may have lost its clock.
+ */
+static void rk3026_pm_gate(void)
+{
+	void __iomem *con;
+	u32 close;
+	int i;
+
+	for (i = 0; i < RK3026_SUSPEND_GATE_REGS; i++) {
+		con = rk3026_cru + RK3026_CRU_CLKGATE_CON(i);
+		rk3026_pm_gates[i] = readl_relaxed(con);
+		close = (u16)~rk3026_pm_hold[i];
+		writel_relaxed(close << 16 | close, con);
+	}
+}
+
+static void rk3026_pm_ungate(void)
+{
+	int i;
+
+	for (i = 0; i < RK3026_SUSPEND_GATE_REGS; i++)
+		writel_relaxed(0xffff0000 | rk3026_pm_gates[i],
+			       rk3026_cru + RK3026_CRU_CLKGATE_CON(i));
+	/* every gate open again before a driver reaches its block */
+	readl_relaxed(rk3026_cru + RK3026_CRU_CLKGATE_CON(0));
+	dsb();
+}
 
 static int rk3026_pm_finish(unsigned long arg)
 {
@@ -336,12 +378,14 @@ static int rk3026_suspend_enter(suspend_state_t state)
 
 	local_fiq_disable();
 
+	rk3026_pm_gate();
 	rk3026_pm_step = 0;
 	flush_cache_all();
 	outer_disable();
 
 	cpu_suspend(0, rk3026_pm_finish);
 
+	rk3026_pm_ungate();
 	outer_resume();
 
 	local_fiq_enable();
@@ -395,7 +439,7 @@ static void __iomem * __init rk3026_suspend_iomap(const char *compatible)
 static int __init rk3026_suspend_init(struct device_node *np)
 {
 	struct device_node *sram_np, *dmc_np;
-	void __iomem *cru, *pctl, *phy, *sram;
+	void __iomem *pctl, *phy, *sram;
 	struct resource res;
 	int ret;
 
@@ -404,8 +448,8 @@ static int __init rk3026_suspend_init(struct device_node *np)
 	if (!rk3026_grf)
 		return -ENOMEM;
 
-	cru = rk3026_suspend_iomap("rockchip,rk3026-cru");
-	if (!cru) {
+	rk3026_cru = rk3026_suspend_iomap("rockchip,rk3026-cru");
+	if (!rk3026_cru) {
 		pr_err("%s: could not map the CRU\n", __func__);
 		ret = -ENODEV;
 		goto err_grf;
@@ -462,7 +506,7 @@ static int __init rk3026_suspend_init(struct device_node *np)
 
 	rk3026_sram_table = (u32 __force *)(sram + rk3026_suspend_sram_table_off);
 	rk3026_sram_table[RK3026_SUSPEND_SRAM] = (u32)sram;
-	rk3026_sram_table[RK3026_SUSPEND_CRU] = (u32)cru;
+	rk3026_sram_table[RK3026_SUSPEND_CRU] = (u32)rk3026_cru;
 	rk3026_sram_table[RK3026_SUSPEND_GRF] = (u32)rk3026_grf;
 	rk3026_sram_table[RK3026_SUSPEND_PCTL] = (u32)pctl;
 	rk3026_sram_table[RK3026_SUSPEND_PHY] = (u32)phy;
@@ -476,7 +520,8 @@ err_dmc:
 		iounmap(phy);
 	if (pctl)
 		iounmap(pctl);
-	iounmap(cru);
+	iounmap(rk3026_cru);
+	rk3026_cru = NULL;
 err_grf:
 	iounmap(rk3026_grf);
 	rk3026_grf = NULL;

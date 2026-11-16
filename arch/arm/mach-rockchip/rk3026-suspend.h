@@ -33,10 +33,44 @@
 #define RK3026_SUSPEND_CLKSEL10		14
 /* the PLLs it put into slow mode and powered down: BIT(PLL index) */
 #define RK3026_SUSPEND_PLLS		15
-#define RK3026_SUSPEND_TABLE_WORDS	16
+/* CLKGATE_CON0 before the routine closed the GPLL inputs of the CPU's muxes */
+#define RK3026_SUSPEND_GATE0		16
+#define RK3026_SUSPEND_TABLE_WORDS	17
 
 /* the stack, at the top of the section */
 #define RK3026_SUSPEND_STACK_SIZE	256
+
+/*
+ * The clock gates the sleep leaves as it finds them, by CLKGATE_CON
+ * register (bit n: gate n; the names are clk-rk3026.c's). pm.c closes
+ * every other gate of CLKGATE_CON0..9 before the routine runs and writes
+ * all ten back as they were once it returns. Held: what the CPU, the
+ * routine and the DRAM run on, and what wakes the system:
+ * 0: core_peri, gpll_cpu, dpll_ddr, aclk_cpu, hclk_cpu, pclk_cpu,
+ *    gpll_armclk, aclk_core_pre, gpll_ddr; the routine closes the three
+ *    GPLL inputs itself once the CPU and the DDR run from other PLLs;
+ * 1: sclk_otgphy0/1, and the DDR, GPU and core DLL gates (bits 7, 14,
+ *    15, which the clock driver does not describe);
+ * 2: aclk_peri_src, aclk_peri, hclk_peri, pclk_peri: the GPIO banks'
+ *    clock and the USB controllers' bus;
+ * 4: the peripheral AXI matrix and the CPU's bridge to it (bits 0-3, not
+ *    in the clock driver), aclk_strc_sys, aclk_intmem (the SRAM);
+ * 5: pclk_grf, pclk_ddrupctl, hclk_otg;
+ * 7: hclk_host, pclk_pwm (a PWM may set a supply voltage);
+ * 8: pclk_gpio0-3;
+ * 9: clk_l2c, hclk_usb_peri, hclk_peri_arbi, aclk_peri_niu.
+ */
+#define RK3026_SUSPEND_GATE_REGS	10
+#define RK3026_SUSPEND_HOLD0		0x01ff
+#define RK3026_SUSPEND_HOLD1		0xc0e0
+#define RK3026_SUSPEND_HOLD2		0x000f
+#define RK3026_SUSPEND_HOLD3		0x0000
+#define RK3026_SUSPEND_HOLD4		0x140f
+#define RK3026_SUSPEND_HOLD5		0x2090
+#define RK3026_SUSPEND_HOLD6		0x0000
+#define RK3026_SUSPEND_HOLD7		0x0408
+#define RK3026_SUSPEND_HOLD8		0x1e00
+#define RK3026_SUSPEND_HOLD9		0xe010
 
 /*
  * Step codes the routine returns; 0 means it never ran. An E_* code: an

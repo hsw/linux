@@ -10,9 +10,10 @@
  * stack into the SRAM, touches every page it reaches, puts the DRAM into
  * self-refresh, puts the DDR PHY into reset and stops its clock and the
  * DDR PLL, runs the CPU and its buses from the 24 MHz oscillator with the
- * other PLLs powered down, waits for a wake-up interrupt and brings it all
- * back, with a new data training of the PHY. Position independent: it
- * reaches its table PC-relative.
+ * other PLLs powered down, closes the GPLL inputs of the CPU's clock muxes
+ * and divides the core clock by 32, waits for a wake-up interrupt and
+ * brings it all back, with a new data training of the PHY. Position
+ * independent: it reaches its table PC-relative.
  *
  * The DDR controller and PHY sequences follow Rockchip's RK2928/RK3026
  * vendor kernel (arch/arm/mach-rk2928/ddr.c, GPL-2.0, Copyright (C) 2012
@@ -20,7 +21,9 @@
  * controller's and the PHY's configuration given back exactly as they
  * were found. The PLL sequence follows the same vendor's RK3026 kernel
  * (arch/arm/mach-rk3026/pm.c, rk_pm_soc_pll_suspend() and _resume(),
- * GPL-2.0, same copyright), with the clock setup given back the same way.
+ * GPL-2.0, same copyright), with the clock setup given back the same way,
+ * and so do the last clock gates and the core divider
+ * (rk_pm_soc_sram_clk_gating() and rk_pm_soc_sram_sys_clk_suspend()).
  *
  * Returns a step code: RK3026_SUSPEND_DONE after a normal wake-up, or the
  * RK3026_SUSPEND_E_* code of the entry step that failed, after the DRAM
@@ -99,6 +102,17 @@
 #define CRU_CLKSEL0_SLEEP	0x3f1f0000
 #define CRU_CLKSEL1_SLEEP	0x737f0000
 
+/*
+ * Then the core at /32 (CLKSEL_CON0 bits 4:0, back to the /1 above after
+ * the wfi), and CLKGATE_CON0's gpll_cpu, gpll_armclk and gpll_ddr closed:
+ * the GPLL inputs of the CPU bus mux, the core mux and the DDR clock mux,
+ * none of which selects GPLL by then (the core mux, CLKSEL_CON0 bit 7, is
+ * on APLL once cpufreq has finished its last rate change, as the PLL
+ * steps above assume as well).
+ */
+#define CRU_CORE_DIV_MASK	0x001f
+#define CRU_GATE0_SLEEP		0x0142
+
 /* GRF_OS_REG1, the boot loader's DRAM description: bit 11 set, two ranks */
 #define RK3026_GRF_OS_REG1	0x1cc
 #define GRF_DDR_TWO_RANKS	0x0800
@@ -134,6 +148,7 @@
  * the other PLLs has no time limit); APLL, CPLL and GPLL lock with the
  * CPU on the oscillator, where a 1 us wait lasts some hundred times
  * longer, so a PLL that never locks resets the SoC within a second or so.
+ * No wait and no poll runs with the core at /32.
  */
 #define DELAY_1US		1024
 #define PLL_LOCK_US		1000
@@ -326,12 +341,37 @@ ENTRY(rk3026_suspend_sram)
 	mov	r1, #PLL_GPLL
 	bl	.Lpll_down
 
+	/*
+	 * The clocks are on the oscillator now, and pm.c has closed every
+	 * gate the sleep does not need, as the vendor's first stage of
+	 * gating: close the GPLL inputs of the CPU's muxes and slow the core
+	 * down to /32, as the vendor's rk_pm_soc_sram_clk_gating() and
+	 * rk_pm_soc_sram_sys_clk_suspend().
+	 */
+	ldr	r0, [r9, #RK3026_CRU_CLKGATE_CON(0)]
+	str	r0, [r2, #RK3026_SUSPEND_GATE0 * 4]
+	movw	r0, #CRU_GATE0_SLEEP
+	orr	r0, r0, r0, lsl #16
+	str	r0, [r9, #RK3026_CRU_CLKGATE_CON(0)]
+	movw	r0, #CRU_CORE_DIV_MASK
+	movt	r0, #CRU_CORE_DIV_MASK
+	str	r0, [r9, #RK3026_CRU_CLKSEL_CON(0)]
+
 .Lwfi:
 	dsb
 	wfi
 
 	tst	r10, #SLEEP_PLLS
 	beq	1f
+	/* the core back at /1 first, then the gates as they were */
+	mov	r0, #(CRU_CORE_DIV_MASK << 16)
+	str	r0, [r9, #RK3026_CRU_CLKSEL_CON(0)]
+	movw	r1, #CRU_GATE0_SLEEP
+	ldr	r0, [r2, #RK3026_SUSPEND_GATE0 * 4]
+	and	r0, r0, r1
+	orr	r0, r0, r1, lsl #16
+	str	r0, [r9, #RK3026_CRU_CLKGATE_CON(0)]
+	dsb
 	/*
 	 * The PLLs first, so the DDR and its training come back at full
 	 * speed; as the vendor's rk_pm_soc_pll_resume(): GPLL, CPLL, APLL,

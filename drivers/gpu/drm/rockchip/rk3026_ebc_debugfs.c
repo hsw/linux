@@ -119,6 +119,8 @@
 
 #include <kunit/visibility.h>
 
+#include <dt-bindings/clock/rk3026-cru.h>
+
 #include "rk3026_ebc.h"
 
 struct ebc_snapshot {
@@ -515,9 +517,14 @@ DEFINE_SHOW_ATTRIBUTE(rk3026_ebc_rows);
  *
  * A port's generator answers only while the port's AXI clock runs; an access
  * with it gated hangs the bus. So each access holds that clock: ACLK_GPU (the
- * GPU node's "bus" clock) for the GPU port, the EBC's "aclk" (ACLK_LCDC1, the
- * VIO1 NIU) for the LCDC1 and EBC ports. The CPU and PERI ports are always
- * clocked. The GPU port is touched only while lima is bound.
+ * GPU node's "bus" clock) for the GPU port; for the LCDC1 and EBC ports both
+ * video NIUs, the EBC's "aclk" (ACLK_LCDC1, under the VIO1 NIU) and ACLK_LCDC0
+ * (under the VIO0 NIU). The window at 0x1012f000 holds the ports of both NIUs,
+ * and a first read with only VIO1 held hung the book after clk_disable_unused
+ * had gated the unused VIO0 NIU (stock gates it too, and its reads of that
+ * window hang). The CPU and PERI ports are always clocked. The GPU port is
+ * touched only while lima is bound. Every access is logged first, so a hang
+ * names its port in the console.
  *
  * Read: one line per port, "name prio 0x.. mode . bw 0x..", or "name skipped".
  * Write: "<port> <prio>" (hex, 0..f) or "<port>.mode <0..3>", for the gpu,
@@ -585,9 +592,29 @@ static void rk3026_ebc_qos_gpu_clk_put(struct clk *clk)
 	clk_put(clk);
 }
 
+/* ACLK_LCDC0, enabled: it holds the VIO0 NIU and its source on. */
+static struct clk *rk3026_ebc_qos_vio0_clk_get(void)
+{
+	struct of_phandle_args args = { .args_count = 1, .args = { ACLK_LCDC0 } };
+	struct clk *clk;
+
+	args.np = of_find_compatible_node(NULL, NULL, "rockchip,rk3026-cru");
+	if (!args.np)
+		return NULL;
+	clk = of_clk_get_from_provider(&args);
+	of_node_put(args.np);
+	if (IS_ERR(clk))
+		return NULL;
+	if (clk_prepare_enable(clk)) {
+		clk_put(clk);
+		return NULL;
+	}
+	return clk;
+}
+
 /*
- * Hold @port's clock: returns 0 with it held (*gpu set for the GPU port),
- * -ENODEV when it cannot be held.
+ * Hold @port's clocks: returns 0 with them held (*extra set for the GPU and
+ * the VIO ports), -ENODEV when they cannot be held.
  */
 static int rk3026_ebc_qos_hold(struct rk3026_ebc *ebc,
 			       const struct rk3026_ebc_qos_port *port,
@@ -599,7 +626,15 @@ static int rk3026_ebc_qos_hold(struct rk3026_ebc *ebc,
 		*gpu = rk3026_ebc_qos_gpu_clk_get();
 		return *gpu ? 0 : -ENODEV;
 	case QOS_CLK_VIO1:
-		return clk_prepare_enable(ebc->aclk) ? -ENODEV : 0;
+		*gpu = rk3026_ebc_qos_vio0_clk_get();
+		if (!*gpu)
+			return -ENODEV;
+		if (clk_prepare_enable(ebc->aclk)) {
+			rk3026_ebc_qos_gpu_clk_put(*gpu);
+			*gpu = NULL;
+			return -ENODEV;
+		}
+		return 0;
 	default:
 		return 0;
 	}
@@ -609,10 +644,12 @@ static void rk3026_ebc_qos_release(struct rk3026_ebc *ebc,
 				   const struct rk3026_ebc_qos_port *port,
 				   struct clk *gpu)
 {
-	if (port->clk == QOS_CLK_GPU)
+	if (port->clk == QOS_CLK_GPU) {
 		rk3026_ebc_qos_gpu_clk_put(gpu);
-	else if (port->clk == QOS_CLK_VIO1)
+	} else if (port->clk == QOS_CLK_VIO1) {
 		clk_disable_unprepare(ebc->aclk);
+		rk3026_ebc_qos_gpu_clk_put(gpu);
+	}
 }
 
 static int rk3026_ebc_qos_show(struct seq_file *m, void *unused)
@@ -634,6 +671,7 @@ static int rk3026_ebc_qos_show(struct seq_file *m, void *unused)
 			seq_printf(m, "%s skipped\n", port->name);
 			continue;
 		}
+		dev_info(ebc->dev, "qos test: reading %s\n", port->name);
 		prio = readl(base + QOS_PRIORITY);
 		mode = readl(base + QOS_MODE);
 		bw = readl(base + QOS_BANDWIDTH);
@@ -683,6 +721,7 @@ static ssize_t rk3026_ebc_qos_write(struct file *file, const char __user *ubuf,
 	mutex_lock(&rk3026_ebc_qos_lock);
 	ret = rk3026_ebc_qos_hold(ebc, port, &gpu);
 	if (!ret) {
+		dev_info(ebc->dev, "qos test: writing %s\n", port->name);
 		writel(val, rk3026_ebc_qos_win + port->base + reg);
 		rk3026_ebc_qos_release(ebc, port, gpu);
 	}

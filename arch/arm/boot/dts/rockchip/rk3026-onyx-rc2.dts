@@ -440,14 +440,15 @@
  * the stock clock tree; CPLL is in slow mode when the loader hands over, so
  * its rate is set here first. No dclk-parent: dclk_ebc is parented to CPLL
  * by assigned-clock-parents, and the driver then only sets the rate it already
- * has. Only the pads the board routes to the EBC: GPIO2_B2 (SDOE) and B4
- * (SDCE2) are board GPIOs here, and GPIO2_C0 (EBC_VCOM) is the TPS65185
- * VCOM_CTRL line.
+ * has. "qos-gpu" and "qos-vio0" are the SoC's (rk3026.dtsi), listed again
+ * because this list replaces the SoC's. Only the pads the board routes to the
+ * EBC: GPIO2_B2 (SDOE) and B4 (SDCE2) are board GPIOs here, and GPIO2_C0
+ * (EBC_VCOM) is the TPS65185 VCOM_CTRL line.
  */
 &ebc {
 	clocks = <&cru HCLK_EBC>, <&cru DCLK_EBC>, <&cru ACLK_LCDC1>,
-		 <&cru ACLK_EBC>;
-	clock-names = "hclk", "dclk", "aclk", "mclk";
+		 <&cru ACLK_EBC>, <&cru ACLK_GPU>, <&cru ACLK_LCDC0>;
+	clock-names = "hclk", "dclk", "aclk", "mclk", "qos-gpu", "qos-vio0";
 	assigned-clocks = <&cru PLL_CPLL>, <&cru DCLK_EBC>;
 	assigned-clock-parents = <0>, <&cru PLL_CPLL>;
 	assigned-clock-rates = <640000000>, <160000000>;

@@ -815,10 +815,18 @@
 		 * because CCF already believed dclk was on GPLL while the mux bit
 		 * said CPLL. GPLL is 132 MHz, so 66 MHz is the reachable maximum
 		 * (vendor runs 80, which needs CPLL at 560 -- docs/BLOCKERS.md).
+		 *
+		 * "qos-gpu" (ACLK_GPU) and "qos-vio0" (ACLK_LCDC0, which holds
+		 * the VIO0 NIU) are only held while the driver writes the NoC
+		 * QoS priorities of the GPU and EBC ports (&qos): a generator
+		 * whose clock is gated hangs the bus. Optional; without them
+		 * the driver leaves the priorities alone.
 		 */
 		clocks = <&cru HCLK_EBC>, <&cru DCLK_EBC>, <&cru ACLK_LCDC1>,
-			 <&cru ACLK_EBC>, <&cru PLL_GPLL>;
-		clock-names = "hclk", "dclk", "aclk", "mclk", "dclk-parent";
+			 <&cru ACLK_EBC>, <&cru PLL_GPLL>,
+			 <&cru ACLK_GPU>, <&cru ACLK_LCDC0>;
+		clock-names = "hclk", "dclk", "aclk", "mclk", "dclk-parent",
+			      "qos-gpu", "qos-vio0";
 		/* SOFTRST_CON7 b11 / b12; the driver resets only a wedged scan. */
 		resets = <&cru SRST_EBC_AXI>, <&cru SRST_EBC_AHB>;
 		reset-names = "axi", "ahb";
@@ -826,6 +834,24 @@
 		pinctrl-0 = <&ebc_pins>;
 		rockchip,grf = <&grf>;
 		status = "disabled";
+	};
+
+	/*
+	 * The NoC QoS generators, one per master port, PRIORITY at +0x08 of
+	 * each port base (vendor mach-rk3026/include/mach/cpu_axi.h): CPU0
+	 * +0x2000, CPU1W +0x2080, CPU1R +0x2100, PERI +0x4000, GPU +0x5000,
+	 * LCDC1 +0x7000, EBC +0x7080, LCDC0 +0x7180. One node for the whole
+	 * window: nothing on rk3026 consumes a single port.
+	 *
+	 * A generator answers only while its port is clocked, and an access
+	 * to one that is not hangs the bus: the GPU port needs ACLK_GPU, the
+	 * ports at +0x7000 need both video NIUs (VIO0 and VIO1). Whoever
+	 * touches the window holds those clocks; the EBC driver, which sets
+	 * the GPU and EBC priorities, has them as "qos-gpu" and "qos-vio0".
+	 */
+	qos: qos@10128000 {
+		compatible = "rockchip,rk3026-qos", "syscon";
+		reg = <0x10128000 0x8000>;
 	};
 
 	pinctrl: pinctrl {

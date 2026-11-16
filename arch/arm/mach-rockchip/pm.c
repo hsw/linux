@@ -4,6 +4,7 @@
  * Author: Tony Xie <tony.xie@rock-chips.com>
  */
 
+#include <linux/cpufreq.h>
 #include <linux/init.h>
 #include <linux/io.h>
 #include <linux/kernel.h>
@@ -421,6 +422,60 @@ static bool rk3026_suspend_again(void)
 	return again;
 }
 
+#ifdef CONFIG_CPU_FREQ
+/*
+ * Sleep at the lowest CPU rate, and so at the lowest voltage the
+ * operating points give it: before the system sleep, s2idle included,
+ * cap CPU0's policy at its lowest rate, and drop the cap after it. The
+ * policy is refreshed at once, while the governor still runs, and
+ * cpufreq_suspend() later clamps its suspend frequency to the cap. A
+ * reboot or power-off does not pass here and keeps the suspend frequency
+ * of the operating points, which a boot loader may need after a reset.
+ */
+static struct freq_qos_request rk3026_pm_qos;
+
+static int rk3026_pm_notify(struct notifier_block *nb, unsigned long event,
+			    void *unused)
+{
+	struct cpufreq_policy *policy;
+	int ret;
+
+	switch (event) {
+	case PM_SUSPEND_PREPARE:
+		policy = cpufreq_cpu_get(0);
+		if (!policy)
+			break;
+		ret = freq_qos_add_request(&policy->constraints, &rk3026_pm_qos,
+					   FREQ_QOS_MAX,
+					   policy->cpuinfo.min_freq);
+		cpufreq_cpu_put(policy);
+		if (ret < 0)
+			break;
+		cpufreq_update_policy(0);
+		break;
+	case PM_POST_SUSPEND:
+		if (!freq_qos_request_active(&rk3026_pm_qos))
+			break;
+		freq_qos_remove_request(&rk3026_pm_qos);
+		cpufreq_update_policy(0);
+		break;
+	}
+
+	return NOTIFY_OK;
+}
+
+static struct notifier_block rk3026_pm_nb = {
+	.notifier_call = rk3026_pm_notify,
+};
+
+static void __init rk3026_pm_qos_init(void)
+{
+	register_pm_notifier(&rk3026_pm_nb);
+}
+#else
+static inline void rk3026_pm_qos_init(void) { }
+#endif
+
 static void __iomem * __init rk3026_suspend_iomap(const char *compatible)
 {
 	struct device_node *np;
@@ -512,6 +567,8 @@ static int __init rk3026_suspend_init(struct device_node *np)
 	rk3026_sram_table[RK3026_SUSPEND_PHY] = (u32)phy;
 	rk3026_sram_table[RK3026_SUSPEND_STACK_TOP] =
 		(u32)sram + resource_size(&res);
+
+	rk3026_pm_qos_init();
 
 	return 0;
 

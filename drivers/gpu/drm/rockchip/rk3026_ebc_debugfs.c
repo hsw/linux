@@ -44,6 +44,9 @@
  *                    N commits at once. Probe sets Y.
  *   timing           text, the blit and snapshot times of the last part and
  *                    the last driven one (rk3026_ebc_timing_show())
+ *   noc_qos          text, the NoC QoS priorities of the GPU and EBC ports
+ *                    as read back, and how many scans wrote them
+ *                    (rk3026_ebc_noc_qos_show()), read-only
  *   flip_timeout_ms  how long a commit event is held at most before the
  *                    watchdog sends it (rk3026_ebc_flip_hold()), read-write;
  *                    used up to EBC_FLIP_TIMEOUT_MAX_MS, 0: at the
@@ -368,6 +371,33 @@ static int rk3026_ebc_timing_show(struct seq_file *m, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(rk3026_ebc_timing);
 
+/*
+ * "noc_qos": one "<port> 0x<priority>" line per row of
+ * rk3026_ebc_noc_qos_ports[], read with the ports' clocks held, or "absent"
+ * without the window and its clocks; then "writes <n>", the scans that wrote
+ * the table. A read alone shows whether something reset the window since the
+ * last scan.
+ */
+static int rk3026_ebc_noc_qos_show(struct seq_file *m, void *unused)
+{
+	struct rk3026_ebc *ebc = m->private;
+	u32 prio[RK3026_EBC_NOC_QOS_PORTS];
+	unsigned int i;
+	int ret;
+
+	ret = rk3026_ebc_noc_qos_read(ebc, prio);
+	if (ret && ret != -ENODEV)
+		return ret;
+	if (ret)
+		seq_puts(m, "absent\n");
+	for (i = 0; !ret && i < RK3026_EBC_NOC_QOS_PORTS; i++)
+		seq_printf(m, "%s 0x%x\n", rk3026_ebc_noc_qos_ports[i].name,
+			   prio[i]);
+	seq_printf(m, "writes %d\n", atomic_read(&ebc->noc_qos_writes));
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(rk3026_ebc_noc_qos);
+
 static int rk3026_ebc_flip_release_show(struct seq_file *m, void *data)
 {
 	struct rk3026_ebc *ebc = m->private;
@@ -519,6 +549,8 @@ void rk3026_ebc_debugfs_init(struct rk3026_ebc *ebc)
 			    &ebc->fbdev_console_lock);
 	debugfs_create_bool("fbdev_pace", 0644, dir, &ebc->fbdev_pace);
 	debugfs_create_file("timing", 0444, dir, ebc, &rk3026_ebc_timing_fops);
+	debugfs_create_file("noc_qos", 0444, dir, ebc,
+			    &rk3026_ebc_noc_qos_fops);
 	debugfs_create_u32("flip_timeout_ms", 0644, dir, &ebc->flip_timeout_ms);
 	debugfs_create_u32("flip_held", 0444, dir, &ebc->flip_held);
 	debugfs_create_u32("flip_late", 0444, dir, &ebc->flip_late);

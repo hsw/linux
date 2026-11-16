@@ -18381,6 +18381,125 @@ static struct kunit_suite rk3026_ebc_conv_test_suite = {
 
 kunit_test_suite(rk3026_ebc_conv_test_suite);
 
+/* --- the NoC QoS priorities written before every scan --- */
+
+/*
+ * The window as the device tree maps it (rk3026.dtsi, qos@10128000), and the
+ * table as ABSOLUTE addresses with each priority's two levels written out:
+ * the level while the port is under its bandwidth budget, then the one while
+ * it is over. The driver's offsets are relative to the window, so a port base
+ * taken wrong cannot pass this.
+ *
+ * GPU (2, 1) = 0x9 is the vendor kernel's cpu_axi_init() value
+ * (arch/arm/mach-rk3026/common.c; reset 0xd). EBC (3, 3) = 0xf is the top
+ * level in both states, where the vendor leaves the port at its reset 0x8.
+ */
+#define T_NOC_QOS_BASE		0x10128000
+#define T_NOC_QOS_SIZE		0x8000
+
+static const struct {
+	const char	*name;
+	u32		addr;
+	u32		high;
+	u32		low;
+} t_noc_qos_ports[] = {
+	{ "gpu", 0x1012d008, 2, 1 },
+	{ "ebc", 0x1012f088, 3, 3 },
+};
+
+/* Exactly the two ports, each at its address with its value, in order. */
+static void ebc_test_noc_qos_table(struct kunit *test)
+{
+	size_t i;
+
+	KUNIT_ASSERT_EQ(test, ARRAY_SIZE(t_noc_qos_ports),
+			RK3026_EBC_NOC_QOS_PORTS);
+	for (i = 0; i < ARRAY_SIZE(t_noc_qos_ports); i++) {
+		const struct rk3026_ebc_noc_qos_port *p =
+			&rk3026_ebc_noc_qos_ports[i];
+
+		KUNIT_EXPECT_STREQ(test, p->name, t_noc_qos_ports[i].name);
+		KUNIT_EXPECT_EQ(test, T_NOC_QOS_BASE + p->off,
+				t_noc_qos_ports[i].addr);
+		KUNIT_EXPECT_EQ(test, p->val,
+				t_noc_qos_ports[i].high << 2 |
+				t_noc_qos_ports[i].low);
+	}
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_noc_qos_ports[0].val, 0x9);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_noc_qos_ports[1].val, 0xf);
+}
+
+/*
+ * The shape of every row: PRIORITY (+0x08) of a port base, which sit at a
+ * stride of 0x80; inside the window, word-aligned for the regmap, no port
+ * twice; a 4-bit value whose level over budget is not above the one under it
+ * (else going over the budget would promote the port).
+ */
+static void ebc_test_noc_qos_shape(struct kunit *test)
+{
+	size_t i, j;
+
+	for (i = 0; i < RK3026_EBC_NOC_QOS_PORTS; i++) {
+		const struct rk3026_ebc_noc_qos_port *p =
+			&rk3026_ebc_noc_qos_ports[i];
+
+		KUNIT_EXPECT_EQ(test, p->off % 0x80, 0x08);
+		KUNIT_EXPECT_EQ(test, p->off % 4, 0);
+		KUNIT_EXPECT_LT(test, p->off, T_NOC_QOS_SIZE);
+		KUNIT_EXPECT_LE(test, p->val, 0xf);
+		KUNIT_EXPECT_LE(test, p->val & 3, (p->val >> 2) & 3);
+		for (j = 0; j < i; j++)
+			KUNIT_EXPECT_NE(test, rk3026_ebc_noc_qos_ports[j].off,
+					p->off);
+	}
+}
+
+/*
+ * The point of the table: the EBC's fetch outranks the GPU's in both
+ * regulator states, so a GPU over its budget cannot hold the scan off.
+ */
+static void ebc_test_noc_qos_rank(struct kunit *test)
+{
+	u32 gpu = rk3026_ebc_noc_qos_ports[0].val;
+	u32 ebc = rk3026_ebc_noc_qos_ports[1].val;
+
+	KUNIT_EXPECT_GT(test, (ebc >> 2) & 3, (gpu >> 2) & 3);
+	KUNIT_EXPECT_GT(test, ebc & 3, gpu & 3);
+}
+
+/*
+ * Without the window and its clocks nothing touches the window: a scan's
+ * write is a no-op that counts nothing, and a read says there is none.
+ */
+static void ebc_test_noc_qos_absent(struct kunit *test)
+{
+	struct rk3026_ebc *ebc = kunit_kzalloc(test, sizeof(*ebc), GFP_KERNEL);
+	u32 prio[RK3026_EBC_NOC_QOS_PORTS] = { 0x5a, 0x5a };
+
+	KUNIT_ASSERT_NOT_NULL(test, ebc);
+	rk3026_ebc_noc_qos_apply(ebc);
+	rk3026_ebc_noc_qos_apply(ebc);
+	KUNIT_EXPECT_EQ(test, atomic_read(&ebc->noc_qos_writes), 0);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_noc_qos_read(ebc, prio), -ENODEV);
+	KUNIT_EXPECT_EQ(test, prio[0], 0x5a);
+	KUNIT_EXPECT_EQ(test, prio[1], 0x5a);
+}
+
+static struct kunit_case rk3026_ebc_noc_qos_test_cases[] = {
+	KUNIT_CASE(ebc_test_noc_qos_table),
+	KUNIT_CASE(ebc_test_noc_qos_shape),
+	KUNIT_CASE(ebc_test_noc_qos_rank),
+	KUNIT_CASE(ebc_test_noc_qos_absent),
+	{}
+};
+
+static struct kunit_suite rk3026_ebc_noc_qos_test_suite = {
+	.name = "rk3026_ebc_noc_qos",
+	.test_cases = rk3026_ebc_noc_qos_test_cases,
+};
+
+kunit_test_suite(rk3026_ebc_noc_qos_test_suite);
+
 MODULE_DESCRIPTION("KUnit tests for the RK3026 EBC driver");
 MODULE_LICENSE("GPL");
 MODULE_IMPORT_NS("EXPORTED_FOR_KUNIT_TESTING");

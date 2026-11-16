@@ -1002,6 +1002,16 @@ struct rk3026_ebc {
 	struct regulator	*vcom_supply;
 	struct regulator	*v3p3_supply;
 	struct regmap		*grf;
+	/*
+	 * The NoC QoS window and the clocks its GPU and EBC ports sit behind
+	 * (rk3026_ebc_noc_qos.c): all three set, or @noc_qos NULL and the
+	 * window never touched. @noc_qos_writes counts the scans that wrote
+	 * the priorities.
+	 */
+	struct regmap		*noc_qos;
+	struct clk		*noc_qos_gpu_clk;
+	struct clk		*noc_qos_vio0_clk;
+	atomic_t		noc_qos_writes;
 	struct thermal_zone_device *tzd;
 	int			irq;
 
@@ -1578,6 +1588,24 @@ int rk3026_ebc_rkf_decode(const s16 *left, const s16 *right, int root,
 			  u8 *dst, size_t dst_len, size_t n, const u8 *src,
 			  size_t len);
 #endif
+
+/* rk3026_ebc_noc_qos.c */
+#define RK3026_EBC_NOC_QOS_PORTS	2
+
+/* A PRIORITY register of the QoS window, and the value written to it. */
+struct rk3026_ebc_noc_qos_port {
+	const char	*name;
+	u32		off;
+	u32		val;
+};
+
+extern const struct rk3026_ebc_noc_qos_port
+rk3026_ebc_noc_qos_ports[RK3026_EBC_NOC_QOS_PORTS];
+
+int rk3026_ebc_noc_qos_init(struct rk3026_ebc *ebc);
+void rk3026_ebc_noc_qos_apply(struct rk3026_ebc *ebc);
+int rk3026_ebc_noc_qos_read(struct rk3026_ebc *ebc,
+			    u32 prio[RK3026_EBC_NOC_QOS_PORTS]);
 
 /* rk3026_ebc_debugfs.c */
 #if IS_ENABLED(CONFIG_DEBUG_FS)

@@ -784,6 +784,15 @@ VISIBLE_IF_KUNIT int rk3026_ebc_drive(struct rk3026_ebc *ebc, const u8 *lut,
 	last->lut_mode = lut_mode;
 	last->frames = frames;
 
+	/*
+	 * The EBC's DRAM fetch above the GPU's before the first frame starts:
+	 * a GPU under load otherwise starves it, and nothing but the glass
+	 * shows that (no under-run flag). Every scan, so that no reset or
+	 * re-probe since the last one leaves the window at its resets
+	 * (rk3026_ebc_noc_qos.c).
+	 */
+	rk3026_ebc_noc_qos_apply(ebc);
+
 	ebc_set_dsp_ctrl(ebc, mode);
 	rk3026_ebc_set_image_addr(ebc, 0, 0);
 
@@ -3976,6 +3985,11 @@ static int ebc_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, PTR_ERR(ebc->grf), "bad rockchip,grf\n");
 	if (!ebc->grf)
 		dev_warn(dev, "no rockchip,grf; skipping pad mux\n");
+
+	/* Optional: the GPU and EBC priorities written before each scan. */
+	ret = rk3026_ebc_noc_qos_init(ebc);
+	if (ret)
+		return ret;
 
 	ret = of_get_display_timing(dev->of_node, "panel-timing", &ebc->timing);
 	if (ret)

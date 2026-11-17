@@ -820,8 +820,8 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_du_at_ceiling);
  * @changed_px: the pixels the part's snapshot changes
  *	(rk3026_ebc_build_snapshot())
  * @added_px: the pixels the part adds to the budget when it is driven as
- *	its content asks: @changed_px if two-level (DU or A2), else 0 (PART
- *	adds nothing; rk3026_ebc_du_account())
+ *	its content asks (rk3026_ebc_du_account()): @changed_px for a plane
+ *	part, DU, A2 or PART alike
  * @reason: returns which cleanup, if one is due; left alone if not
  *
  * The budget is spent once @budget->area reaches @budget->limit. A spent
@@ -919,8 +919,9 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_du_cleanup);
  * was thresholded. A part of mxcfb sends alone keeps @scan_mode, its
  * client's default.
  *
- * DU leaves the ghosts of what it draws over, and @budget counts them. An
- * auto part with a plane update in it, two-level or grey, keeps
+ * DU and PART leave the ghosts of what they draw over, and @budget counts
+ * them, a PART's as a DU's. An auto part with a plane update in it,
+ * two-level or grey, keeps
  * @scan_mode, FULL, which clears the glass, when rk3026_ebc_du_cleanup()
  * says a cleanup is due: a big part (by its changed pixels) once the
  * budget is spent or when it would spend it, any part at its ceiling. A
@@ -968,8 +969,7 @@ u32 rk3026_ebc_resolve_mode(const struct rk3026_ebc_set *part, u32 scan_mode,
 	if (!part->auto_ok)
 		return scan_mode;
 	if (part->has_plane &&
-	    rk3026_ebc_du_cleanup(budget, changed_px,
-				  two_level ? changed_px : 0, reason))
+	    rk3026_ebc_du_cleanup(budget, changed_px, changed_px, reason))
 		return scan_mode;
 	if (two_level) {
 		if (part->has_plane && a2->max_area &&
@@ -1249,8 +1249,8 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_gap_timeout);
 
 /**
  * rk3026_ebc_du_account - the DU cleanup budget after one part
- * @du_area: the pixels plane parts changed in DU or A2 since the glass was
- *	cleared
+ * @du_area: the pixels plane parts changed in DU, A2 or PART since the
+ *	glass was cleared
  * @part: the part, as rk3026_ebc_pending_take() gave it
  * @mode: the mode it was driven in (force_mode included)
  * @changed_px: the pixels its snapshot changed (rk3026_ebc_build_snapshot())
@@ -1267,9 +1267,12 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_gap_timeout);
  * - a FULL part clears it, whoever sent it, the idle cleanup too: the
  *   controller scans the whole frame, and GC16 drives every pixel,
  *   unchanged ones too;
- * - a PART part leaves it, a grey plane part too: it drives only the pixels
- *   that change, to all 16 levels, so it adds no DU ghost and clears none
- *   of the others;
+ * - a PART part with a plane update in it adds @changed_px too: it drives
+ *   only the pixels that change, to all 16 levels, and a partial waveform
+ *   leaves a ghost of what it draws over as well (a grey drawn over black
+ *   by a partial lands dark on this panel). It clears none of the others.
+ *   Without this, a client whose frames always hold a grey (anti-aliased
+ *   text) would never reach a cleanup;
  * - a RESET part clears it whatever its outcome: one that was not driven
  *   leaves the glass unknown, and the next draw repairs it first;
  * - a repair RESET that ran to its end clears it too, whatever became of
@@ -1304,7 +1307,8 @@ u32 rk3026_ebc_du_account(u32 du_area, const struct rk3026_ebc_set *part,
 
 	if (mode == EBC_MODE_FULL)
 		return 0;
-	if (!ebc_mode_two_level(mode) || !part->has_plane)
+	if ((!ebc_mode_two_level(mode) && mode != EBC_MODE_PART) ||
+	    !part->has_plane)
 		return du_area;
 	if (check_add_overflow(du_area, changed_px, &du_area))
 		return U32_MAX;

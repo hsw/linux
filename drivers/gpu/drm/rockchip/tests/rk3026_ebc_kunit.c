@@ -2263,16 +2263,18 @@ static const struct t_resolve t_resolve_cases[] = {
 	{ "plane two-level near small", T_PLANE, false, true, T_DU_MODE,
 	  T_AUTO_DU, T_NEAR_SMALL },
 	/*
-	 * A big two-level part that would spend the budget takes the
-	 * cleanup now, rather than DU and the cleanup after it. A grey one
-	 * is PART, which adds nothing to the budget.
+	 * A big part that would spend the budget takes the cleanup now,
+	 * rather than DU or PART and the cleanup after it: a grey one adds
+	 * its pixels to the budget as a two-level one does.
 	 */
 	{ "plane two-level near big", T_PLANE, false, true, EBC_MODE_FULL,
 	  T_BIG, T_NEAR_BIG },
 	{ "plane and auto part two-level near big", T_PLANE_AUTO_PART, false,
 	  true, EBC_MODE_FULL, T_BIG, T_NEAR_BIG },
-	{ "plane grey near big", T_PLANE, false, false, EBC_MODE_PART,
-	  T_AUTO_GREY, T_NEAR_BIG },
+	{ "plane grey near big", T_PLANE, false, false, EBC_MODE_FULL,
+	  T_BIG, T_NEAR_BIG },
+	{ "plane and auto part grey near big", T_PLANE_AUTO_PART, false,
+	  false, EBC_MODE_FULL, T_BIG, T_NEAR_BIG },
 	{ "plane repair two-level near big", T_PLANE, true, true,
 	  EBC_MODE_FULL, T_EXPL, T_NEAR_BIG },
 	/*
@@ -3408,8 +3410,8 @@ static u32 t_du(u32 area, const struct rk3026_ebc_set *part, u32 mode,
 }
 
 /*
- * A driven plane DU or A2 part grows the budget, a FULL of anyone's clears
- * it.
+ * A driven plane DU, A2 or PART part grows the budget, a FULL of anyone's
+ * clears it.
  */
 static void ebc_test_du_account_driven(struct kunit *test)
 {
@@ -3447,14 +3449,18 @@ static void ebc_test_du_account_driven(struct kunit *test)
 			KUNIT_EXPECT_EQ(test,
 					t_du(100, &mxcfb, EBC_MODE_FULL, 28, o,
 					     r), 0);
+			/* A plane PART leaves a ghost too; mxcfb's not. */
+			KUNIT_EXPECT_EQ(test,
+					t_du(100, &plane, EBC_MODE_PART, 28, o,
+					     r), left + 28);
+			KUNIT_EXPECT_EQ(test,
+					t_du(100, &mxcfb, EBC_MODE_PART, 28, o,
+					     r), left);
 			/*
 			 * Other modes neither count nor clear; GL16 full
 			 * (OED_PART) is full class, but leaves white over
 			 * white alone, so it clears no ghost.
 			 */
-			KUNIT_EXPECT_EQ(test,
-					t_du(100, &plane, EBC_MODE_PART, 28, o,
-					     r), left);
 			/* A2 leaves a ghost too: it counts as DU does. */
 			KUNIT_EXPECT_EQ(test,
 					t_du(100, &plane, EBC_MODE_A2, 28, o,
@@ -3485,30 +3491,58 @@ static void ebc_test_du_account_driven(struct kunit *test)
 
 /*
  * A grey plane part resolved PART (rk3026_ebc_resolve_mode()) drives only
- * its changed pixels, with a 16-level waveform: it adds no DU ghost and
- * clears none of the others, so the budget stays as it was, spent or not,
- * whatever its waveform's outcome.
+ * its changed pixels, with a 16-level waveform, and leaves a ghost of what
+ * it draws over: it grows the budget as DU does, saturating, whatever its
+ * waveform's outcome, so a client that always draws greys still reaches a
+ * cleanup. A run of PART frames spends a fresh budget. An mxcfb PART send
+ * alone never counts: such a client runs its own fulls.
  */
 static void ebc_test_du_account_part(struct kunit *test)
 {
-	static const u32 areas[] = { 0, 100, T_W * T_H, U32_MAX };
+	static const u32 areas[] = { 0, 100, T_W * T_H };
 	static const enum t_kind kinds[] = { T_PLANE, T_PLANE_AUTO_PART };
-	struct rk3026_ebc_set part;
+	struct rk3026_ebc_du_budget b = { .limit = 100, .big_area = 50,
+					   .ceiling = 400 };
+	struct rk3026_ebc_set part, mxcfb;
 	unsigned int i, j, k;
 
+	t_kind_part(T_AUTO_PART, &mxcfb);
+	KUNIT_ASSERT_FALSE(test, mxcfb.has_plane);
 	for (k = 0; k < ARRAY_SIZE(kinds); k++) {
 		t_kind_part(kinds[k], &part);
 		KUNIT_ASSERT_TRUE(test, part.has_plane);
 		KUNIT_ASSERT_TRUE(test, part.auto_ok);
-		for (i = 0; i < ARRAY_SIZE(t_waveform_outcomes); i++)
-			for (j = 0; j < ARRAY_SIZE(areas); j++)
+		for (i = 0; i < ARRAY_SIZE(t_waveform_outcomes); i++) {
+			enum rk3026_ebc_outcome o = t_waveform_outcomes[i];
+
+			for (j = 0; j < ARRAY_SIZE(areas); j++) {
 				KUNIT_EXPECT_EQ(test,
 						t_du(areas[j], &part,
-						     EBC_MODE_PART, 28,
-						     t_waveform_outcomes[i],
+						     EBC_MODE_PART, 28, o,
+						     EBC_REPAIR_NONE),
+						areas[j] + 28);
+				KUNIT_EXPECT_EQ(test,
+						t_du(areas[j], &mxcfb,
+						     EBC_MODE_PART, 28, o,
 						     EBC_REPAIR_NONE),
 						areas[j]);
+			}
+			KUNIT_EXPECT_EQ(test,
+					t_du(U32_MAX - 5, &part, EBC_MODE_PART,
+					     10, o, EBC_REPAIR_NONE),
+					U32_MAX);
+		}
 	}
+
+	/* Four PART frames of 28 pixels spend a budget of 100. */
+	t_kind_part(T_PLANE, &part);
+	for (i = 0; i < 4; i++) {
+		KUNIT_EXPECT_FALSE(test, rk3026_ebc_du_spent(&b));
+		b.area = t_du(b.area, &part, EBC_MODE_PART, 28,
+			      EBC_OUTCOME_DRIVEN, EBC_REPAIR_NONE);
+	}
+	KUNIT_EXPECT_EQ(test, b.area, 112);
+	KUNIT_EXPECT_TRUE(test, rk3026_ebc_du_spent(&b));
 }
 
 /*
@@ -5566,6 +5600,12 @@ static void ebc_test_glue_auto_grey(struct kunit *test)
 	u32 *grey = t_plane_fb(test, 0x808080);
 	struct rk3026_ebc_last last;
 
+	/*
+	 * A grey part over the whole panel would spend a budget of one panel
+	 * and take the cleanup (ebc_test_glue_part_driven()); two panels keep
+	 * it PART.
+	 */
+	ebc->du_cleanup_area = 2 * T_W * T_H;
 	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, grey, &t_panel));
 	rk3026_ebc_do_refresh(ebc, &last);
 	KUNIT_EXPECT_EQ(test, last.asked_mode, EBC_MODE_FULL);
@@ -6004,9 +6044,11 @@ static void ebc_test_glue_du_driven(struct kunit *test)
 }
 
 /*
- * A grey box of 4 x 2 pixels on the white glass is driven PART and leaves
- * the budget as it was; with the budget spent, a grey plane update over the
- * whole panel, a big part, is driven FULL for the cleanup and clears it.
+ * A grey box of 4 x 2 pixels on the white glass is driven PART and adds its
+ * 8 pixels to the budget, as DU would; with the budget spent, a grey plane
+ * update over the whole panel, a big part, is driven FULL for the cleanup
+ * and clears it. On a fresh budget of one panel that whole-panel grey part
+ * would spend it, so it takes the cleanup too.
  */
 static void ebc_test_glue_part_driven(struct kunit *test)
 {
@@ -6026,7 +6068,7 @@ static void ebc_test_glue_part_driven(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_PART);
 	KUNIT_EXPECT_EQ(test, last.lut_mode, EBC_MODE_PART);
 	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_AUTO_PART);
-	KUNIT_EXPECT_EQ(test, ebc->du_area, 50);
+	KUNIT_EXPECT_EQ(test, ebc->du_area, 58);
 	KUNIT_EXPECT_EQ(test, t_px(ebc->shadows.prev, 4, 2), 8);
 	KUNIT_EXPECT_EQ(test, t_px(ebc->shadows.prev, 3, 2), 15);
 
@@ -6038,16 +6080,24 @@ static void ebc_test_glue_part_driven(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_CLEANUP_BIG);
 	KUNIT_EXPECT_EQ(test, ebc->du_area, 0);
 
-	KUNIT_EXPECT_EQ(test, d.n, 2);
+	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, box, &t_panel));
+	rk3026_ebc_do_refresh(ebc, &last);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_FULL);
+	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_CLEANUP_BIG);
+	KUNIT_EXPECT_EQ(test, ebc->du_area, 0);
+
+	KUNIT_EXPECT_EQ(test, d.n, 3);
 	KUNIT_EXPECT_EQ(test, d.mode[0], EBC_MODE_PART);
 	KUNIT_EXPECT_EQ(test, d.mode[1], EBC_MODE_FULL);
+	KUNIT_EXPECT_EQ(test, d.mode[2], EBC_MODE_FULL);
 }
 
 /*
  * The budget spent, the cleanup waits for a big part. A black box of
  * 4 x 2 pixels on the white glass is small: driven DU, it adds its 8
  * pixels. A grey box of 2 x 2 beside it is small too: driven PART, it
- * leaves the budget. A grey plane update over the whole panel changes
+ * adds its 4. A grey plane update over the whole panel changes
  * every pixel, at least half of it: driven FULL for the cleanup, reason
  * cleanup_big, and the budget is cleared. Spent again, a change of one
  * pixel in a damage box of the whole panel, a far pointer jump, is small:
@@ -6085,7 +6135,7 @@ static void ebc_test_glue_du_big(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
 	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_PART);
 	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_AUTO_PART);
-	KUNIT_EXPECT_EQ(test, ebc->du_area, ebc->du_cleanup_area + 8);
+	KUNIT_EXPECT_EQ(test, ebc->du_area, ebc->du_cleanup_area + 12);
 
 	KUNIT_ASSERT_TRUE(test, t_plane_xrgb(ebc, grey, &t_panel));
 	rk3026_ebc_do_refresh(ebc, &last);
@@ -6390,7 +6440,7 @@ static void t_a2_draw(struct kunit *test, struct rk3026_ebc *ebc, u32 *fb,
  *  - a black box of 8 pixels on white is driven A2, with the A2 table (2
  *    frames), reason auto_a2, and adds its 8 pixels to the budget;
  *  - one of 9 pixels is one over: DU;
- *  - a grey box of 4 pixels is driven PART, and leaves the budget;
+ *  - a grey box of 4 pixels is driven PART, and adds its 4 pixels;
  *  - the same 4 pixels made black are over a grey: DU, though small.
  */
 static void ebc_test_glue_a2_driven(struct kunit *test)
@@ -6421,13 +6471,13 @@ static void ebc_test_glue_a2_driven(struct kunit *test)
 	t_a2_draw(test, ebc, fb, 12, 4, 14, 6, &last);
 	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_PART);
 	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_AUTO_PART);
-	KUNIT_EXPECT_EQ(test, ebc->du_area, 17);
+	KUNIT_EXPECT_EQ(test, ebc->du_area, 21);
 
 	t_fb_box(fb, 12, 4, 14, 6, 0);
 	t_a2_draw(test, ebc, fb, 12, 4, 14, 6, &last);
 	KUNIT_EXPECT_EQ(test, last.mode, EBC_MODE_BLACK_WHITE);
 	KUNIT_EXPECT_EQ(test, last.reason, EBC_REASON_AUTO_DU);
-	KUNIT_EXPECT_EQ(test, ebc->du_area, 21);
+	KUNIT_EXPECT_EQ(test, ebc->du_area, 25);
 	KUNIT_EXPECT_EQ(test, t_px(ebc->shadows.prev, 13, 5), 0);
 
 	KUNIT_EXPECT_EQ(test, d.n, 4);

@@ -8,6 +8,7 @@
 #include <linux/init.h>
 #include <linux/io.h>
 #include <linux/kernel.h>
+#include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/regmap.h>
@@ -447,33 +448,80 @@ static bool rk3026_suspend_again(void)
  * cpufreq_suspend() later clamps its suspend frequency to the cap. A
  * reboot or power-off does not pass here and keeps the suspend frequency
  * of the operating points, which a boot loader may need after a reset.
+ *
+ * The request lives as long as the policy: added, at no cap, when the
+ * policy is created and removed before it is freed, so a cpufreq driver
+ * unbound while a sleep starts or ends (an rmmod before the freezer or
+ * after the thaw) takes the request with it. The lock keeps the policy
+ * from being freed while the cap changes.
  */
 static struct freq_qos_request rk3026_pm_qos;
+static struct cpufreq_policy *rk3026_pm_policy;
+static DEFINE_MUTEX(rk3026_pm_qos_lock);
+
+static int rk3026_pm_policy_notify(struct notifier_block *nb,
+				   unsigned long event, void *data)
+{
+	struct cpufreq_policy *policy = data;
+
+	if (!cpumask_test_cpu(0, policy->related_cpus))
+		return NOTIFY_DONE;
+
+	mutex_lock(&rk3026_pm_qos_lock);
+	switch (event) {
+	case CPUFREQ_CREATE_POLICY:
+		if (freq_qos_add_request(&policy->constraints, &rk3026_pm_qos,
+					 FREQ_QOS_MAX,
+					 FREQ_QOS_MAX_DEFAULT_VALUE) >= 0)
+			rk3026_pm_policy = policy;
+		break;
+	case CPUFREQ_REMOVE_POLICY:
+		if (rk3026_pm_policy != policy)
+			break;
+		freq_qos_remove_request(&rk3026_pm_qos);
+		rk3026_pm_policy = NULL;
+		break;
+	}
+	mutex_unlock(&rk3026_pm_qos_lock);
+
+	return NOTIFY_OK;
+}
+
+static struct notifier_block rk3026_pm_policy_nb = {
+	.notifier_call = rk3026_pm_policy_notify,
+};
+
+/* the policy itself is refreshed by the caller, without the lock */
+static int rk3026_pm_qos_cap(bool cap)
+{
+	int ret = -ENODEV;
+
+	mutex_lock(&rk3026_pm_qos_lock);
+	if (rk3026_pm_policy)
+		ret = freq_qos_update_request(&rk3026_pm_qos, cap ?
+					      rk3026_pm_policy->cpuinfo.min_freq :
+					      FREQ_QOS_MAX_DEFAULT_VALUE);
+	mutex_unlock(&rk3026_pm_qos_lock);
+
+	return ret;
+}
 
 static int rk3026_pm_notify(struct notifier_block *nb, unsigned long event,
 			    void *unused)
 {
-	struct cpufreq_policy *policy;
 	int ret;
 
 	switch (event) {
 	case PM_SUSPEND_PREPARE:
-		policy = cpufreq_cpu_get(0);
-		if (!policy)
-			break;
-		ret = freq_qos_add_request(&policy->constraints, &rk3026_pm_qos,
-					   FREQ_QOS_MAX,
-					   policy->cpuinfo.min_freq);
-		cpufreq_cpu_put(policy);
+		ret = rk3026_pm_qos_cap(true);
 		if (ret < 0)
 			break;
 		cpufreq_update_policy(0);
 		rk3026_pm_debug_cpu(RK3026_PM_CPU_NOTIFY);
 		break;
 	case PM_POST_SUSPEND:
-		if (!freq_qos_request_active(&rk3026_pm_qos))
+		if (rk3026_pm_qos_cap(false) < 0)
 			break;
-		freq_qos_remove_request(&rk3026_pm_qos);
 		cpufreq_update_policy(0);
 		rk3026_pm_debug_cpu(RK3026_PM_CPU_POST);
 		break;
@@ -486,8 +534,12 @@ static struct notifier_block rk3026_pm_nb = {
 	.notifier_call = rk3026_pm_notify,
 };
 
+/* before the cpufreq driver probes, so CPU0's policy is seen created */
 static void __init rk3026_pm_qos_init(void)
 {
+	if (cpufreq_register_notifier(&rk3026_pm_policy_nb,
+				      CPUFREQ_POLICY_NOTIFIER))
+		return;
 	register_pm_notifier(&rk3026_pm_nb);
 }
 #else

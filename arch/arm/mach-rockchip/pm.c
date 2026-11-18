@@ -332,7 +332,10 @@ static bool rk3026_pm_slept;
 
 /*
  * Close every gate but the held ones. From here to rk3026_pm_ungate()
- * nothing may print: a console's UART may have lost its clock.
+ * nothing may print, so nothing here does: a console's UART may have lost
+ * its clocks, and with no_console_suspend a printk (a WARN as well) would
+ * write to it anyway; a read from a gated APB slave stalls the bus, so it
+ * would hang rather than print.
  */
 static void rk3026_pm_gate(void)
 {

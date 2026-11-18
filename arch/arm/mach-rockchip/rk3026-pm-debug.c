@@ -9,7 +9,8 @@
  *            mem_sleep_default= on the cmdline), so writing enable is the
  *            opt-in. It also keeps the consoles running through the sleep,
  *            so the ramoops console records the suspend path
- *            (no_console_suspend). One way.
+ *            (no_console_suspend); at depth 4 a UART whose pclk is open
+ *            keeps its gates, so a console on it stays writable. One way.
  *   depth    how far the sleep goes: 0 = wfi from SRAM with the DRAM
  *            active, 1 = the DRAM in self-refresh (PCTL Low_power), 2 =
  *            also the DDR PHY in reset with its clock gated and the DPLL
@@ -116,6 +117,10 @@
 /* pclk_wdt: CLKGATE_CON7 bit 15 (clk-rk3026.c) */
 #define RK3026_CRU_CLKGATE_CON7		0xec
 #define RK3026_CRU_PCLK_WDT		BIT(15)
+/* pclk_uart0-2: CLKGATE_CON8 bits 0-2; uartN_src/_frac: CON1 bits 8+2N/9+2N */
+#define RK3026_CRU_CLKGATE_CON8		0xf0
+#define RK3026_CRU_PCLK_UARTS		GENMASK(2, 0)
+#define RK3026_CRU_SCLK_UART(n)		(0x3 << (8 + 2 * (n)))
 
 #define DW_WDT_CR			0x00
 #define DW_WDT_CR_EN			BIT(0)
@@ -212,6 +217,8 @@ static u32 rk3026_pm_cycles, rk3026_pm_done, rk3026_pm_failed;
 static u32 rk3026_pm_refused;
 static u32 rk3026_pm_again;
 static bool rk3026_pm_guarded;
+/* BIT(n): UART n's pclk was open as the sleep started */
+static u16 rk3026_pm_uarts;
 static u32 rk3026_pm_gate7;
 
 /* the A9 global timer's rate, for the routine's tick counts */
@@ -268,14 +275,27 @@ static void rk3026_pm_debug_crumb(u32 point, u32 code)
 /*
  * pm.c's first stage of gating: below depth 4 it closes nothing, and
  * under the guard pclk_wdt stays open (its parents are in the hold set).
+ * The consoles stay on in the sleep (no_console_suspend), so a UART whose
+ * pclk is still open, a console's among them, keeps its pclk and its
+ * sclk gates: a printk or a WARN between pm.c's gating and ungating then
+ * reaches the UART instead of stalling the bus on a gated APB slave.
  */
 u16 rk3026_pm_debug_hold(int reg)
 {
+	u16 hold = 0;
+	int n;
+
 	if (rk3026_pm_depth < 4)
 		return 0xffff;
 	if (reg == 7 && rk3026_pm_guarded)
-		return RK3026_CRU_PCLK_WDT;
-	return 0;
+		hold |= RK3026_CRU_PCLK_WDT;
+	if (reg == 8)
+		hold |= rk3026_pm_uarts;
+	if (reg == 1)
+		for (n = 0; n < 3; n++)
+			if (rk3026_pm_uarts & BIT(n))
+				hold |= RK3026_CRU_SCLK_UART(n);
+	return hold;
 }
 
 void rk3026_pm_debug_gated(void)
@@ -360,6 +380,8 @@ int rk3026_pm_debug_begin(void)
 	 */
 	rk3026_pm_table[RK3026_SUSPEND_WDT] = (u32)rk3026_pm_grf;
 	rk3026_pm_guarded = false;
+	rk3026_pm_uarts = RK3026_CRU_PCLK_UARTS &
+		~readl_relaxed(rk3026_pm_cru + RK3026_CRU_CLKGATE_CON8);
 
 	if (rk3026_pm_depth > RK3026_PM_DEPTH_MAX) {
 		rk3026_pm_refused++;

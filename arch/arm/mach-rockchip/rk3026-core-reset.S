@@ -180,14 +180,18 @@
 	/*
 	 * { CRU offset, reset bits }: the blocks that master the AXI or AHB
 	 * bus, and so may still be transferring, or be stuck halfway, when
-	 * the cores go down. Never the GPIO banks (a board's PMIC power hold
-	 * may be a GPIO), the GRF, the internal SRAM, the DDR controller and
-	 * PHY (DDR keeps its content), nor the bus fabric.
+	 * the cores go down; and the DesignWare watchdog, which masters
+	 * nothing but survives the core reset still counting: nothing in the
+	 * BootROM or the loader feeds it, and when it expires there its
+	 * global reset drops a GPIO power hold. Never the GPIO banks (a
+	 * board's PMIC power hold may be a GPIO), the GRF, the internal SRAM,
+	 * the DDR controller and PHY (DDR keeps its content), nor the bus
+	 * fabric.
 	 */
 .Lresets\@:
 	.word	RK3026_CRU_SOFTRST_CON(3), 0x0020	/* CRYPTO */
 	.word	RK3026_CRU_SOFTRST_CON(4), 0x05b1	/* DMA2 NANDC USBOTG0 OTGC0 USBOTG1 OTGC1 */
-	.word	RK3026_CRU_SOFTRST_CON(5), 0x000e	/* MMC0 SDIO EMMC */
+	.word	RK3026_CRU_SOFTRST_CON(5), 0x004e	/* MMC0 SDIO EMMC WDT */
 	.word	RK3026_CRU_SOFTRST_CON(6), 0x7c70	/* LCDC0, IEP, RGA, CIF0 */
 	.word	RK3026_CRU_SOFTRST_CON(7), 0x19e3	/* VCODEC, LCDC1, GPU, EBC */
 .Lresets_end\@:

@@ -3028,13 +3028,18 @@ static void ebc_test_thread_woken(struct kunit *test)
  * One pass of the refresh thread (rk3026_ebc_thread_step()), times in
  * jiffies, the retry in ns after the pass's clock: the rails go off at
  * their deadline (time_after_eq(), across a wrap too), on every pass, but
- * not while a gap is open; the idle cleanup is looked at, at its deadline,
+ * not while a gap is open, nor while the wait's condition holds until
+ * @rails_hold past the deadline (time_before(), across a wrap too): then
+ * the part is looked at, and after the hold the rails go off all the same;
+ * with no hold (@rails_hold 0) they go off at the deadline. The idle
+ * cleanup is looked at, at its deadline,
  * but not while a gap is open; the next part is looked at while a gap is
  * open or the wait's condition holds; else the wait times out at the
  * earliest deadline, at least a jiffy ahead: the retry's converted from the
  * clock and rounded up (@timeout_us, usecs_to_jiffies() of it), or none.
  * While the system suspends (@suspended) the rails still go off at their
- * deadline, an open gap does not hold them, and nothing else is looked at:
+ * deadline, neither an open gap nor a pending part holds them, and nothing
+ * else is looked at:
  * the wait has the rails' deadline alone.
  */
 struct t_step {
@@ -3052,6 +3057,7 @@ struct t_step {
 	long			timeout;
 	u32			timeout_us;
 	bool			suspended;
+	unsigned long		rails_hold;
 };
 
 static const struct t_step t_step_cases[] = {
@@ -3064,8 +3070,8 @@ static const struct t_step t_step_cases[] = {
 	  false, false, EBC_STEP_WAIT, 1 },
 	{ "rails due, gap open: held, look", 1000, true, 1000, false, 0, false,
 	  0, true, false, EBC_STEP_LOOK },
-	{ "rails due, part pending: off first", 1000, true, 1000, false, 0,
-	  false, 0, false, true, EBC_STEP_RAILS_OFF },
+	{ "rails due, part pending, no hold: off first", 1000, true, 1000,
+	  false, 0, false, 0, false, true, EBC_STEP_RAILS_OFF },
 	{ "rails down: none", 1000, false, 900, false, 0, false, 0,
 	  false, false, EBC_STEP_WAIT, MAX_SCHEDULE_TIMEOUT },
 	{ "rails due across a wrap: off", 5, true, ULONG_MAX - 5, false, 0,
@@ -3127,6 +3133,52 @@ static const struct t_step t_step_cases[] = {
 	  .idle_armed = true, .idle_at = 1010, .retry_armed = true,
 	  .retry_ns = 1000000, .suspended = true, .step = EBC_STEP_WAIT,
 	  .timeout = 200 },
+	{ .desc = "rails due, part pending: held, look", .now = 1000,
+	  .rails_on = true, .rails_off_at = 1000, .rails_hold = 20,
+	  .woken = true, .step = EBC_STEP_LOOK },
+	{ .desc = "rails a jiffy past, part pending: held, look", .now = 1001,
+	  .rails_on = true, .rails_off_at = 1000, .rails_hold = 20,
+	  .woken = true, .step = EBC_STEP_LOOK },
+	{ .desc = "rails past, part pending, last held jiffy: look",
+	  .now = 1019, .rails_on = true, .rails_off_at = 1000,
+	  .rails_hold = 20, .woken = true, .step = EBC_STEP_LOOK },
+	{ .desc = "rails past the hold, part pending: off", .now = 1020,
+	  .rails_on = true, .rails_off_at = 1000, .rails_hold = 20,
+	  .woken = true, .step = EBC_STEP_RAILS_OFF },
+	{ .desc = "rails well past the hold, part pending: off", .now = 1500,
+	  .rails_on = true, .rails_off_at = 1000, .rails_hold = 20,
+	  .woken = true, .step = EBC_STEP_RAILS_OFF },
+	{ .desc = "rails due, hold, nothing pending: off", .now = 1001,
+	  .rails_on = true, .rails_off_at = 1000, .rails_hold = 20,
+	  .step = EBC_STEP_RAILS_OFF },
+	{ .desc = "rails due, retry due: held, look", .now = 1005,
+	  .rails_on = true, .rails_off_at = 1000, .rails_hold = 20,
+	  .retry_armed = true, .retry_ns = -1, .woken = true,
+	  .step = EBC_STEP_LOOK },
+	{ .desc = "rails held, idle due: idle first", .now = 2005,
+	  .rails_on = true, .rails_off_at = 2000, .rails_hold = 20,
+	  .idle_armed = true, .idle_at = 2000, .woken = true,
+	  .step = EBC_STEP_IDLE },
+	{ .desc = "rails past the hold, gap open: held, look", .now = 1500,
+	  .rails_on = true, .rails_off_at = 1000, .rails_hold = 20,
+	  .gap_open = true, .step = EBC_STEP_LOOK },
+	{ .desc = "suspended, rails due, part pending, hold: off",
+	  .now = 1001, .rails_on = true, .rails_off_at = 1000,
+	  .rails_hold = 20, .woken = true, .suspended = true,
+	  .step = EBC_STEP_RAILS_OFF },
+	{ .desc = "rails down, part pending, hold: look", .now = 1500,
+	  .rails_off_at = 1000, .rails_hold = 20, .woken = true,
+	  .step = EBC_STEP_LOOK },
+	/* The deadline and its hold across a jiffies wrap. */
+	{ .desc = "rails held across a wrap: look", .now = 5,
+	  .rails_on = true, .rails_off_at = ULONG_MAX - 5, .rails_hold = 20,
+	  .woken = true, .step = EBC_STEP_LOOK },
+	{ .desc = "rails past the hold across a wrap: off", .now = 14,
+	  .rails_on = true, .rails_off_at = ULONG_MAX - 5, .rails_hold = 20,
+	  .woken = true, .step = EBC_STEP_RAILS_OFF },
+	{ .desc = "rails due before a wrap, hold across it: look",
+	  .now = ULONG_MAX, .rails_on = true, .rails_off_at = ULONG_MAX - 5,
+	  .rails_hold = 20, .woken = true, .step = EBC_STEP_LOOK },
 };
 
 KUNIT_ARRAY_PARAM_DESC(t_step, t_step_cases, desc);
@@ -3138,6 +3190,7 @@ static void ebc_test_thread_step(struct kunit *test)
 	const struct rk3026_ebc_pass pass = {
 		.now		= c->now,
 		.rails_off_at	= c->rails_off_at,
+		.rails_hold	= c->rails_hold,
 		.idle_at	= c->idle_at,
 		.clock		= clock,
 		.retry_at	= ktime_add_ns(clock, c->retry_ns),
@@ -8035,7 +8088,9 @@ static struct rk3026_ebc *t_gap_ebc(struct kunit *test, struct t_drives *d)
  * ebc_refresh_thread() runs it: a pass (rk3026_ebc_thread_pass(),
  * rk3026_ebc_thread_step()) that looks at the part (rk3026_ebc_take_ready()),
  * with the rails and the idle cleanup held while the gap is open, past
- * their deadlines too; and while the gap is open, ebc_gap_wait(): a wait
+ * their deadlines too, and the rails held at their deadline by the part
+ * pending (one @rails_off_ms, the pass's @rails_hold); and while the gap
+ * is open, ebc_gap_wait(): a wait
  * that sleeps for the time rk3026_ebc_gap_timeout() gives, ending at the
  * gap's end or at the next send, and none at all if the end has passed
  * (the rails' ramp outlasted the gap): the next look must take then.
@@ -8062,6 +8117,16 @@ static unsigned int t_gap_run(struct kunit *test, struct rk3026_ebc *ebc,
 		rk3026_ebc_thread_pass(ebc, jiffies, &pass);
 		KUNIT_EXPECT_EQ(test, rk3026_ebc_thread_step(&pass, &timeout),
 				EBC_STEP_LOOK);
+		KUNIT_EXPECT_TRUE(test, pass.woken);
+		KUNIT_EXPECT_EQ(test, pass.rails_hold,
+				msecs_to_jiffies(ebc->rails_off_ms));
+		if (!ebc->gap.open) {
+			pass.rails_on = true;
+			pass.rails_off_at = pass.now;
+			KUNIT_EXPECT_EQ(test,
+					rk3026_ebc_thread_step(&pass, &timeout),
+					EBC_STEP_LOOK);
+		}
 		if (ebc->gap.open) {
 			pass.rails_off_at = pass.now;
 			pass.idle_armed = true;

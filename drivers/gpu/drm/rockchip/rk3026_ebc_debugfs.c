@@ -63,8 +63,9 @@
  *                    it times out and the abort path runs, read-write;
  *                    counts down to 0, as probe sets it. A test knob.
  *   rails_off_ms     how long the panel rails stay up after the last
- *                    waveform, read-write; 0: off at the thread's next
- *                    look. Probe sets EBC_RAILS_OFF_MS.
+ *                    waveform, read-write, and how much longer at most a
+ *                    part pending then holds them; 0: off at the
+ *                    thread's next look. Probe sets EBC_RAILS_OFF_MS.
  *   flip_release     where a held commit event is sent, read-write text:
  *                    "done" at the finish of its part (the frame is on the
  *                    glass, or its out-fence has an error), "take" at the

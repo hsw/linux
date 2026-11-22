@@ -467,15 +467,17 @@ struct rk3026_ebc_gap {
 /*
  * One pass of the refresh thread, as it read it without the lock
  * (rk3026_ebc_thread_pass()): @now in jiffies and @clock
- * (rk3026_ebc_clock()) of the same pass; the rails up (@rails_on) and their
- * off deadline; the idle cleanup armed and its deadline; the carry's retry
- * armed and its time, on @clock; the take's gap open; the system
- * suspending (@suspended); and the wait's condition (@woken:
+ * (rk3026_ebc_clock()) of the same pass; the rails up (@rails_on), their
+ * off deadline and how long past it at most a pending part holds them
+ * (@rails_hold, in jiffies); the idle cleanup armed and its deadline; the
+ * carry's retry armed and its time, on @clock; the take's gap open; the
+ * system suspending (@suspended); and the wait's condition (@woken:
  * rk3026_ebc_thread_woken()).
  */
 struct rk3026_ebc_pass {
 	unsigned long	now;
 	unsigned long	rails_off_at;
+	unsigned long	rails_hold;
 	unsigned long	idle_at;
 	ktime_t		clock;
 	ktime_t		retry_at;

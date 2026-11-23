@@ -155,12 +155,15 @@ TRACE_EVENT(rk3026_ebc_update_queue,
  * rk3026_ebc_setup_us()), the time the take waited for a quiet gap, the
  * retries of a carried part and the take's own time (taken_us, the
  * monotonic clock in microseconds, as the trace_clock "mono" stamps the
- * events: a commit event sent at the take is not before it).
+ * events: a commit event sent at the take is not before it). Last, the
+ * time the waveform waited after @setup_us for the rails to settle
+ * (settle_us, ebc_rails_settle(), 0 for none): the event is emitted after
+ * that wait, right before the first frame.
  */
 TRACE_EVENT(rk3026_ebc_scan_start,
 	TP_PROTO(const struct rk3026_ebc_last *last, u32 mode, u32 lut_mode,
-		 u32 frames, bool repair, u32 setup_us),
-	TP_ARGS(last, mode, lut_mode, frames, repair, setup_us),
+		 u32 frames, bool repair, u32 setup_us, u32 settle_us),
+	TP_ARGS(last, mode, lut_mode, frames, repair, setup_us, settle_us),
 	TP_STRUCT__entry(
 		__field(u32, mode)
 		__field(u32, lut_mode)
@@ -181,6 +184,7 @@ TRACE_EVENT(rk3026_ebc_scan_start,
 		__field(u32, gap_us)
 		__field(u32, tries)
 		__field(s64, taken_us)
+		__field(u32, settle_us)
 	),
 	TP_fast_assign(
 		__entry->mode = mode;
@@ -202,8 +206,9 @@ TRACE_EVENT(rk3026_ebc_scan_start,
 		__entry->gap_us = last->gap_us;
 		__entry->tries = last->tries;
 		__entry->taken_us = ktime_to_us(last->taken);
+		__entry->settle_us = settle_us;
 	),
-	TP_printk("mode=%u(%s) lut_mode=%u(%s) temp=%d frames=%u marker=%u merged=%u repair=%d reason=%s seq=%u box=%d,%d-%d,%d changed_px=%u du_area=%u setup_us=%u gap_us=%u tries=%u taken_us=%lld",
+	TP_printk("mode=%u(%s) lut_mode=%u(%s) temp=%d frames=%u marker=%u merged=%u repair=%d reason=%s seq=%u box=%d,%d-%d,%d changed_px=%u du_area=%u setup_us=%u gap_us=%u tries=%u taken_us=%lld settle_us=%u",
 		  __entry->mode, ebc_trace_mode(__entry->mode),
 		  __entry->lut_mode, ebc_trace_mode(__entry->lut_mode),
 		  __entry->temp, __entry->frames, __entry->marker,
@@ -211,7 +216,8 @@ TRACE_EVENT(rk3026_ebc_scan_start,
 		  ebc_trace_reason(__entry->reason), __entry->seq,
 		  __entry->x1, __entry->y1, __entry->x2, __entry->y2,
 		  __entry->changed_px, __entry->du_area, __entry->setup_us,
-		  __entry->gap_us, __entry->tries, __entry->taken_us)
+		  __entry->gap_us, __entry->tries, __entry->taken_us,
+		  __entry->settle_us)
 );
 
 /* A waveform ends; @seq is its part's (a repair RESET's too). */

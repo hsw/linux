@@ -83,6 +83,47 @@ u32 rk3026_ebc_us_between(ktime_t start, ktime_t end)
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_us_between);
 
+/**
+ * rk3026_ebc_settle_wait_us - how long a waveform waits for the rails to settle
+ * @up_at: when the panel rails last came up
+ * @now: the time of the waveform's start, on the same clock
+ * @settle_ms: how long the rails must have been up by its first frame
+ *
+ * The time from @now to @up_at + @settle_ms. A waveform that starts soon
+ * after the rails came up waits for the rest of @settle_ms; one that starts
+ * later, or after rails that were up already, does not wait. The setup of
+ * the part after the rails came up (snapshot, repair, LUT) counts toward
+ * the settle, so does the take's quiet gap when they came up for it.
+ *
+ * @settle_ms is capped at EBC_RAILS_SETTLE_MAX_MS: a debugfs write cannot
+ * park the refresh thread with a part in flight for longer. A @now before
+ * @up_at (a clock seen going backwards) waits the whole (capped)
+ * @settle_ms, never more: the wait errs to the side of the panel.
+ *
+ * Return: microseconds, rounded up, so that a wait still due is never 0;
+ * 0 when @settle_ms is 0 or @up_at + @settle_ms has come.
+ */
+u32 rk3026_ebc_settle_wait_us(ktime_t up_at, ktime_t now, u32 settle_ms)
+{
+	u64 settle_ns, up_ns = 0;
+
+	settle_ms = min_t(u32, settle_ms, EBC_RAILS_SETTLE_MAX_MS);
+	if (!settle_ms)
+		return 0;
+	settle_ns = (u64)settle_ms * NSEC_PER_MSEC;
+	/*
+	 * Up for no time at all when the clock went backwards. Otherwise the
+	 * difference in u64, which holds that of any two ktime_t values
+	 * without the overflow a signed one could hit.
+	 */
+	if (!ktime_before(now, up_at))
+		up_ns = (u64)ktime_to_ns(now) - (u64)ktime_to_ns(up_at);
+	if (up_ns >= settle_ns)
+		return 0;
+	return DIV_ROUND_UP_ULL(settle_ns - up_ns, NSEC_PER_USEC);
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_settle_wait_us);
+
 /*
  * How strongly a mode drives, for merging updates into one scan: the merged
  * scan runs the strongest of their modes, so none of them is drawn weaker

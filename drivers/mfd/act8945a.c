@@ -34,9 +34,11 @@ static const struct regmap_config act8945a_regmap_config = {
 };
 
 /*
- * ACT8931A: only the VSET and CTRL registers of the seven outputs can be
- * written. The chip has no 0x0B and no *_SUS registers, and its SYS and
- * APCH (charger) settings are left as the board has set them.
+ * ACT8931A: only the VSET and CTRL registers of the seven outputs and the
+ * charger's APCH_CFG (0x71) can be written. The chip has no 0x0B and no
+ * *_SUS registers, and its SYS settings and charger interrupt registers are
+ * left as the board has set them. The charger driver writes only the
+ * SUSCHG bit of 0x71, and only on a request from user space.
  */
 static const struct mfd_cell act8931a_devs[] = {
 	{
@@ -55,6 +57,7 @@ static const struct regmap_range act8931a_wr_ranges[] = {
 	regmap_reg_range(0x54, 0x55),	/* LDO2 VSET, CTRL */
 	regmap_reg_range(0x60, 0x61),	/* LDO3 VSET, CTRL */
 	regmap_reg_range(0x64, 0x65),	/* LDO4 VSET, CTRL */
+	regmap_reg_range(0x71, 0x71),	/* APCH_CFG: SUSCHG */
 };
 
 static const struct regmap_access_table act8931a_wr_table = {

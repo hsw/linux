@@ -121,7 +121,9 @@
  * commits cannot keep the rails up longer than the hold; nor do the rails
  * come up for a part the look finds will not be driven. Stock
  * powers off right after each update; leaving the rails and VCOM up between
- * updates holds a DC bias on the panel.
+ * updates holds a DC bias on the panel. A waveform that starts soon after
+ * they came up first waits for them to have been up @rails_settle_ms
+ * (ebc_rails_settle()).
  *
  * This sets the deadline @rails_off_ms from now. Under @rails_lock or on
  * the thread.
@@ -725,6 +727,45 @@ static void ebc_stop_scan(struct rk3026_ebc *ebc)
 }
 
 /*
+ * Let the rails settle before a waveform's first frame: sleep until they
+ * have been up for @rails_settle_ms (rk3026_ebc_settle_wait_us()), counted
+ * from when ebc_rails_on() last brought one of them up. A short waveform
+ * started right after the rails came up was seen under-driven on the
+ * glass, with the image it drove right; the knob is there to find the time
+ * a panel's rails need. Rails that were up already, a part whose setup
+ * took that long, or a knob of 0 do not wait.
+ *
+ * The refresh thread calls it from rk3026_ebc_drive(), between the take
+ * and the finish of a part: it holds no lock there. @image_lock is free,
+ * so senders add updates and commits go on meanwhile, and @rails_lock is
+ * taken only to read the time and dropped before the sleep, so a CRTC
+ * disable that gives up waiting for the part may still take the rails
+ * down under it (the chunk loop finds them down and abandons the
+ * waveform). The part is @in_flight, which a suspend and a paced fbdev
+ * damage commit wait for: they wait EBC_RAILS_SETTLE_MAX_MS longer at
+ * most. Sleeps on an hrtimer, so the wait does not round up to whole
+ * jiffies as msleep() would at a low HZ.
+ *
+ * Returns the time slept in microseconds, 0 for none, for the scan_start
+ * event.
+ */
+static u32 ebc_rails_settle(struct rk3026_ebc *ebc)
+{
+	ktime_t up_at;
+	u32 us;
+
+	mutex_lock(&ebc->rails_lock);
+	up_at = ebc->rails_up_at;
+	mutex_unlock(&ebc->rails_lock);
+
+	us = rk3026_ebc_settle_wait_us(up_at, ktime_get(),
+				       READ_ONCE(ebc->rails_settle_ms));
+	if (us)
+		usleep_range(us, us + 100);
+	return us;
+}
+
+/*
  * The time from the take of @last's part to now (rk3026_ebc_clock()), for
  * the scan_start event of each of its waveforms: the snapshot, and a repair
  * RESET in front of the part.
@@ -750,6 +791,11 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_setup_us);
  * so the caller must not drive anything else for this update. -EIO if the
  * rails were found down before a chunk.
  *
+ * Before the first frame the rails get the rest of @rails_settle_ms since
+ * they came up (ebc_rails_settle()); the scan_start event follows that
+ * wait, with its time (settle_us) after the part's setup_us, and the
+ * waveform's time (@last->scan_ms) counts from its end.
+ *
  * @shadows.prev_unknown is set here and cleared in exactly ONE place of this
  * function -- the successful exit below. rk3026_ebc_scan_finish() records the
  * part's outcome afterwards and never clears what this left set.
@@ -771,17 +817,22 @@ VISIBLE_IF_KUNIT int rk3026_ebc_drive(struct rk3026_ebc *ebc, const u8 *lut,
 				      struct rk3026_ebc_last *last)
 {
 	bool unknown = READ_ONCE(ebc->shadows.prev_unknown);
-	u32 done = 0, chunk = 0;
-	ktime_t start = ktime_get();
+	u32 done = 0, chunk = 0, setup_us, settle_us;
+	ktime_t start;
 	int ret = 0;
 
 	KUNIT_STATIC_STUB_REDIRECT(rk3026_ebc_drive, ebc, lut, frames, mode,
 				   lut_mode, last);
 
+	/* The setup counts toward the settle; the settle is not setup. */
+	setup_us = rk3026_ebc_setup_us(ebc, last);
+	settle_us = ebc_rails_settle(ebc);
+	start = ktime_get();
+
 	/* A repair is the first waveform of an update that has repaired set. */
 	trace_rk3026_ebc_scan_start(last, mode, lut_mode, frames,
 				    last->repaired && !last->scans,
-				    rk3026_ebc_setup_us(ebc, last));
+				    setup_us, settle_us);
 
 	WRITE_ONCE(ebc->shadows.prev_unknown, true);
 	last->scans++;
@@ -950,8 +1001,11 @@ static int ebc_rails_on(struct rk3026_ebc *ebc)
 	}
 	/* dev_dbg only: a console line would itself queue a refresh. */
 	dev_dbg(ebc->dev, "rails on\n");
-	if (changed)
+	if (changed) {
+		/* The settle before a waveform runs from here (ebc_rails_settle()). */
+		ebc->rails_up_at = ktime_get();
 		trace_rk3026_ebc_rails(true, ebc->epd_on, ebc->vcom_on, 0);
+	}
 	return 0;
 }
 
@@ -4038,6 +4092,8 @@ static int ebc_probe(struct platform_device *pdev)
 	ebc->force_mode = -1;
 	/* The rails stay up this long after a waveform. */
 	ebc->rails_off_ms = EBC_RAILS_OFF_MS;
+	/* And are up this long before a waveform's first frame. */
+	ebc->rails_settle_ms = EBC_RAILS_SETTLE_MS;
 
 	/* E Ink GDCK_STA / LGONL; no display-timing binding covers them. */
 	if (of_property_read_u32(dev->of_node, "rockchip,gdck-sta",

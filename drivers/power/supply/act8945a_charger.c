@@ -9,6 +9,7 @@
 #include <linux/devm-helpers.h>
 #include <linux/interrupt.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/of_irq.h>
 #include <linux/platform_device.h>
@@ -79,6 +80,12 @@ static const char *act8945a_charger_manufacturer = "Active-semi";
  * and 0x7A, and a change of the bits they are made of raises a change event.
  */
 #define ACT8931A_POLL_MS		5000
+/*
+ * After a SUSCHG write the change event waits a little, so that its
+ * properties show the charger's new state rather than the old one.
+ */
+#define ACT8945A_SUSCHG_EVENT_MS	100
+
 #define ACT8931A_STATUS_WATCH		(APCH_STATUS_CHGDAT | APCH_STATUS_INDAT | \
 					 APCH_STATUS_TEMPDAT | APCH_STATUS_TIMRDAT)
 
@@ -88,6 +95,7 @@ enum act8945a_type {
 };
 
 struct act8945a_charger {
+	struct device *dev;
 	struct power_supply *psy;
 	struct power_supply_desc desc;
 	struct regmap *regmap;
@@ -98,6 +106,12 @@ struct act8945a_charger {
 	bool init_done;
 	struct gpio_desc *lbo_gpio;
 	struct gpio_desc *chglev_gpio;
+
+	/* SUSCHG writes: charge_behaviour, unbind and shutdown */
+	struct mutex lock;
+	struct delayed_work changed;
+	bool suschg_written;
+	bool suschg_locked;
 };
 
 static int act8945a_get_charger_state(struct regmap *regmap, int *val)
@@ -359,6 +373,152 @@ static int act8945a_get_current_max(struct act8945a_charger *charger,
 	return 0;
 }
 
+static int act8945a_get_charge_behaviour(struct regmap *regmap, int *val)
+{
+	unsigned int config;
+	int ret;
+
+	ret = regmap_read(regmap, ACT8945A_APCH_CFG, &config);
+	if (ret < 0)
+		return ret;
+
+	if (config & APCH_CFG_SUSCHG)
+		*val = POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE;
+	else
+		*val = POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO;
+
+	return 0;
+}
+
+/*
+ * Set or clear SUSCHG and read it back. Only that bit changes: the safety
+ * timers and the input over-voltage threshold keep what the board or the
+ * probe has set. The caller holds charger->lock.
+ */
+static int act8945a_write_suschg(struct act8945a_charger *charger,
+				 bool suspend)
+{
+	unsigned int want = suspend ? APCH_CFG_SUSCHG : 0;
+	unsigned int config;
+	int ret;
+
+	lockdep_assert_held(&charger->lock);
+
+	charger->suschg_written = true;
+
+	ret = regmap_update_bits(charger->regmap, ACT8945A_APCH_CFG,
+				 APCH_CFG_SUSCHG, want);
+	if (ret)
+		return ret;
+
+	ret = regmap_read(charger->regmap, ACT8945A_APCH_CFG, &config);
+	if (ret)
+		return ret;
+
+	return (config & APCH_CFG_SUSCHG) == want ? 0 : -EIO;
+}
+
+static int act8945a_set_charge_behaviour(struct act8945a_charger *charger,
+					 int behaviour)
+{
+	bool suspend;
+	int ret;
+
+	switch (behaviour) {
+	case POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO:
+		suspend = false;
+		break;
+	case POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE:
+		suspend = true;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	guard(mutex)(&charger->lock);
+
+	if (charger->suschg_locked)
+		return -ESHUTDOWN;
+
+	ret = act8945a_write_suschg(charger, suspend);
+	if (ret)
+		return ret;
+
+	mod_delayed_work(system_power_efficient_wq, &charger->changed,
+			 msecs_to_jiffies(ACT8945A_SUSCHG_EVENT_MS));
+
+	return 0;
+}
+
+static void act8945a_suschg_changed(struct work_struct *work)
+{
+	struct act8945a_charger *charger =
+		container_of(to_delayed_work(work), struct act8945a_charger,
+			     changed);
+
+	power_supply_changed(charger->psy);
+}
+
+/* runs before the power supply is unregistered: no event after it */
+static void act8945a_suschg_changed_cancel(void *data)
+{
+	struct act8945a_charger *charger = data;
+
+	scoped_guard(mutex, &charger->lock)
+		charger->suschg_locked = true;
+
+	cancel_delayed_work_sync(&charger->changed);
+}
+
+/*
+ * Charging stays enabled after the driver: on unbind and at shutdown or
+ * reboot SUSCHG is cleared if charge_behaviour was written. A SUSCHG that
+ * was set before the probe and never written stays as it was found.
+ */
+static void act8945a_restore_charging(struct act8945a_charger *charger)
+{
+	int ret;
+
+	guard(mutex)(&charger->lock);
+
+	charger->suschg_locked = true;
+	if (!charger->suschg_written)
+		return;
+
+	ret = act8945a_write_suschg(charger, false);
+	if (ret)
+		dev_warn(charger->dev, "failed to resume charging: %d\n", ret);
+}
+
+static void act8945a_restore_charging_action(void *data)
+{
+	act8945a_restore_charging(data);
+}
+
+static int act8945a_charger_set_property(struct power_supply *psy,
+					 enum power_supply_property prop,
+					 const union power_supply_propval *val)
+{
+	struct act8945a_charger *charger = power_supply_get_drvdata(psy);
+
+	switch (prop) {
+	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
+		return act8945a_set_charge_behaviour(charger, val->intval);
+	default:
+		return -EINVAL;
+	}
+}
+
+static int act8945a_charger_property_is_writeable(struct power_supply *psy,
+						  enum power_supply_property prop)
+{
+	return prop == POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR;
+}
+
+#define ACT8945A_CHARGE_BEHAVIOURS \
+	(BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO) | \
+	 BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE))
+
 static enum power_supply_property act8945a_charger_props[] = {
 	POWER_SUPPLY_PROP_STATUS,
 	POWER_SUPPLY_PROP_CHARGE_TYPE,
@@ -366,6 +526,7 @@ static enum power_supply_property act8945a_charger_props[] = {
 	POWER_SUPPLY_PROP_HEALTH,
 	POWER_SUPPLY_PROP_CAPACITY_LEVEL,
 	POWER_SUPPLY_PROP_CURRENT_MAX,
+	POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR,
 	POWER_SUPPLY_PROP_MODEL_NAME,
 	POWER_SUPPLY_PROP_MANUFACTURER
 };
@@ -381,6 +542,7 @@ static const enum power_supply_property act8931a_charger_props[] = {
 	POWER_SUPPLY_PROP_CHARGE_TYPE,
 	POWER_SUPPLY_PROP_TECHNOLOGY,
 	POWER_SUPPLY_PROP_HEALTH,
+	POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR,
 	POWER_SUPPLY_PROP_MODEL_NAME,
 	POWER_SUPPLY_PROP_MANUFACTURER
 };
@@ -413,6 +575,9 @@ static int act8945a_charger_get_property(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_CURRENT_MAX:
 		ret = act8945a_get_current_max(charger,
 					       regmap, &val->intval);
+		break;
+	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
+		ret = act8945a_get_charge_behaviour(regmap, &val->intval);
 		break;
 	case POWER_SUPPLY_PROP_MODEL_NAME:
 		val->strval = act8945a_charger_model;
@@ -644,6 +809,23 @@ static int act8945a_charger_config(struct device *dev,
 	return regmap_write(regmap, ACT8945A_APCH_CFG, value);
 }
 
+/*
+ * charge_behaviour: auto or inhibit-charge (SUSCHG), written only on a
+ * request from user space; the probe keeps the SUSCHG it finds.
+ */
+static int act8945a_charge_behaviour_init(struct device *dev,
+					  struct act8945a_charger *charger)
+{
+	charger->desc.charge_behaviours = ACT8945A_CHARGE_BEHAVIOURS;
+	charger->desc.set_property = act8945a_charger_set_property;
+	charger->desc.property_is_writeable =
+		act8945a_charger_property_is_writeable;
+
+	/* runs after the power supply is unregistered */
+	return devm_add_action_or_reset(dev, act8945a_restore_charging_action,
+					charger);
+}
+
 static int act8931a_poll_state(struct regmap *regmap, unsigned int *val)
 {
 	unsigned int status, state;
@@ -692,18 +874,30 @@ static int act8931a_charger_probe(struct platform_device *pdev,
 				  struct act8945a_charger *charger)
 {
 	struct power_supply_config psy_cfg = {};
-	int ret;
+	int behaviour, ret;
 
 	ret = act8931a_poll_state(charger->regmap, &charger->poll_state);
 	if (ret)
 		return dev_err_probe(&pdev->dev, ret,
 				     "failed to read the charger state\n");
 
+	ret = act8945a_get_charge_behaviour(charger->regmap, &behaviour);
+	if (ret)
+		return dev_err_probe(&pdev->dev, ret,
+				     "failed to read the charger config\n");
+
+	if (behaviour == POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE)
+		dev_info(&pdev->dev, "charging suspended (SUSCHG) at probe\n");
+
 	charger->desc.name = "act8931a-charger";
 	charger->desc.type = POWER_SUPPLY_TYPE_USB;
 	charger->desc.get_property = act8931a_charger_get_property;
 	charger->desc.properties = act8931a_charger_props;
 	charger->desc.num_properties = ARRAY_SIZE(act8931a_charger_props);
+
+	ret = act8945a_charge_behaviour_init(&pdev->dev, charger);
+	if (ret)
+		return ret;
 
 	/* the PMIC node: a fuel gauge can name the charger in power-supplies */
 	psy_cfg.fwnode = dev_fwnode(pdev->dev.parent);
@@ -714,6 +908,11 @@ static int act8931a_charger_probe(struct platform_device *pdev,
 	if (IS_ERR(charger->psy))
 		return dev_err_probe(&pdev->dev, PTR_ERR(charger->psy),
 				     "failed to register power supply\n");
+
+	ret = devm_add_action_or_reset(&pdev->dev,
+				       act8945a_suschg_changed_cancel, charger);
+	if (ret)
+		return ret;
 
 	ret = devm_delayed_work_autocancel(&pdev->dev, &charger->poll,
 					   act8931a_poll);
@@ -746,9 +945,15 @@ static int act8945a_charger_probe(struct platform_device *pdev)
 		return -EINVAL;
 	}
 
+	charger->dev = &pdev->dev;
+	ret = devm_mutex_init(&pdev->dev, &charger->lock);
+	if (ret)
+		return ret;
+
 	platform_set_drvdata(pdev, charger);
 
 	INIT_WORK(&charger->work, act8945a_work);
+	INIT_DELAYED_WORK(&charger->changed, act8945a_suschg_changed);
 
 	if (id->driver_data == ACT8931A)
 		return act8931a_charger_probe(pdev, charger);
@@ -768,6 +973,10 @@ static int act8945a_charger_probe(struct platform_device *pdev)
 	charger->desc.properties = act8945a_charger_props;
 	charger->desc.num_properties = ARRAY_SIZE(act8945a_charger_props);
 
+	ret = act8945a_charge_behaviour_init(&pdev->dev, charger);
+	if (ret)
+		return ret;
+
 	ret = act8945a_set_supply_type(charger, &charger->desc.type);
 	if (ret)
 		return -EINVAL;
@@ -782,6 +991,11 @@ static int act8945a_charger_probe(struct platform_device *pdev)
 		dev_err(&pdev->dev, "failed to register power supply\n");
 		return PTR_ERR(charger->psy);
 	}
+
+	ret = devm_add_action_or_reset(&pdev->dev,
+				       act8945a_suschg_changed_cancel, charger);
+	if (ret)
+		return ret;
 
 	ret = devm_request_irq(&pdev->dev, irq, act8945a_status_changed,
 			       IRQF_TRIGGER_FALLING, "act8945a_interrupt",
@@ -808,6 +1022,14 @@ static void act8945a_charger_remove(struct platform_device *pdev)
 	cancel_work_sync(&charger->work);
 }
 
+static void act8945a_charger_shutdown(struct platform_device *pdev)
+{
+	struct act8945a_charger *charger = platform_get_drvdata(pdev);
+
+	act8945a_restore_charging(charger);
+	cancel_delayed_work_sync(&charger->changed);
+}
+
 static const struct platform_device_id act8945a_charger_id[] = {
 	{ "act8931a-charger", ACT8931A },
 	{ "act8945a-charger", ACT8945A },
@@ -821,6 +1043,7 @@ static struct platform_driver act8945a_charger_driver = {
 	},
 	.probe	= act8945a_charger_probe,
 	.remove	= act8945a_charger_remove,
+	.shutdown = act8945a_charger_shutdown,
 	.id_table = act8945a_charger_id,
 };
 module_platform_driver(act8945a_charger_driver);

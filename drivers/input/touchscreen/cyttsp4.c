@@ -249,6 +249,7 @@ struct cyttsp4 {
 	bool input_ready;
 	bool suspended;
 	bool stopped;
+	bool restart_cancelled;		/* by the suspend, before it ran */
 
 	struct work_struct startup_work;
 	struct delayed_work watchdog_work;
@@ -1107,7 +1108,13 @@ static int cyttsp4_suspend(struct device *dev)
 	ts->suspended = true;
 	mutex_unlock(&ts->system_lock);
 
-	cancel_work_sync(&ts->startup_work);
+	/* a restart that has not started yet runs after the resume */
+	if (cancel_work_sync(&ts->startup_work)) {
+		mutex_lock(&ts->system_lock);
+		ts->startup_state = STARTUP_NONE;
+		ts->restart_cancelled = true;
+		mutex_unlock(&ts->system_lock);
+	}
 
 	mutex_lock(&ts->ctrl_lock);
 	cyttsp4_stop_wd(ts);
@@ -1131,6 +1138,13 @@ static int cyttsp4_resume(struct device *dev)
 	mutex_lock(&ts->ctrl_lock);
 	error = cyttsp4_wake_locked(ts);
 	mutex_unlock(&ts->ctrl_lock);
+
+	mutex_lock(&ts->system_lock);
+	if (ts->restart_cancelled) {
+		ts->restart_cancelled = false;
+		cyttsp4_queue_startup(ts);
+	}
+	mutex_unlock(&ts->system_lock);
 
 	return error;
 }

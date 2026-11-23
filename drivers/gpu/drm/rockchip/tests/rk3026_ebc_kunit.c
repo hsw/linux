@@ -279,6 +279,75 @@ static void ebc_test_us_between(struct kunit *test)
 			U32_MAX - 1);
 }
 
+/*
+ * The wait for the rails to settle: none with the knob at 0 or once they
+ * have been up long enough, the rest of it rounded up to a microsecond
+ * otherwise; the knob capped; a clock seen going backwards waits the whole
+ * (capped) knob, and a distance too large for s64 counts as settled.
+ */
+static void ebc_test_settle_wait_us(struct kunit *test)
+{
+	ktime_t up = ms_to_ktime(10000);
+
+	/* The knob at 0: never a wait, whenever the rails came up. */
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_settle_wait_us(up, up, 0), 0);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_settle_wait_us(up, up - 1, 0), 0);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_settle_wait_us(0, KTIME_MAX, 0), 0);
+
+	/* Up just now: the whole settle. */
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_settle_wait_us(up, up, 50), 50000);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_settle_wait_us(up, up, 1), 1000);
+
+	/* Partly settled: the rest, rounded up. */
+	KUNIT_EXPECT_EQ(test,
+			rk3026_ebc_settle_wait_us(up, up + ms_to_ktime(30), 50),
+			20000);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_settle_wait_us(up, up + 1, 50), 50000);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_settle_wait_us(up, up + 1000, 50),
+			49999);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_settle_wait_us(up, up + 999, 50),
+			50000);
+	KUNIT_EXPECT_EQ(test,
+			rk3026_ebc_settle_wait_us(up, up + 50 * NSEC_PER_MSEC - 1,
+						  50),
+			1);
+
+	/* Settled exactly at the mark, and long after it: no wait. */
+	KUNIT_EXPECT_EQ(test,
+			rk3026_ebc_settle_wait_us(up, up + ms_to_ktime(50), 50),
+			0);
+	KUNIT_EXPECT_EQ(test,
+			rk3026_ebc_settle_wait_us(up, up + ms_to_ktime(5000), 50),
+			0);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_settle_wait_us(up, KTIME_MAX, 50), 0);
+	/* Never up since probe (0): long settled at any real time. */
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_settle_wait_us(0, up, 50), 0);
+	/* A distance beyond S64_MAX: settled, not an overflowed wait. */
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_settle_wait_us(KTIME_MIN, KTIME_MAX, 50),
+			0);
+
+	/* The clock went backwards: the whole settle, never more. */
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_settle_wait_us(up, up - 1, 50), 50000);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_settle_wait_us(KTIME_MAX, 0, 50),
+			50000);
+
+	/* The knob is capped, whatever the debugfs write. */
+	KUNIT_EXPECT_EQ(test,
+			rk3026_ebc_settle_wait_us(up, up, EBC_RAILS_SETTLE_MAX_MS),
+			EBC_RAILS_SETTLE_MAX_MS * USEC_PER_MSEC);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_settle_wait_us(up, up, U32_MAX),
+			EBC_RAILS_SETTLE_MAX_MS * USEC_PER_MSEC);
+	KUNIT_EXPECT_EQ(test,
+			rk3026_ebc_settle_wait_us(up, up + ms_to_ktime(400),
+						  U32_MAX),
+			(EBC_RAILS_SETTLE_MAX_MS - 400) * USEC_PER_MSEC);
+	KUNIT_EXPECT_EQ(test,
+			rk3026_ebc_settle_wait_us(up,
+						  up + ms_to_ktime(EBC_RAILS_SETTLE_MAX_MS),
+						  U32_MAX),
+			0);
+}
+
 static void ebc_test_rank_order(struct kunit *test)
 {
 	unsigned int a2 = rk3026_ebc_mode_rank(EBC_MODE_A2);
@@ -3879,6 +3948,7 @@ static struct kunit_case rk3026_ebc_core_test_cases[] = {
 	KUNIT_CASE(ebc_test_dsp_ctrl_mode),
 	KUNIT_CASE(ebc_test_sdck),
 	KUNIT_CASE(ebc_test_us_between),
+	KUNIT_CASE(ebc_test_settle_wait_us),
 	KUNIT_CASE(ebc_test_rank_order),
 	KUNIT_CASE(ebc_test_rank_unknown),
 	KUNIT_CASE(ebc_test_rank_merge),

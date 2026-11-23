@@ -66,6 +66,12 @@
  *                    waveform, read-write, and how much longer at most a
  *                    part pending then holds them; 0: off at the
  *                    thread's next look. Probe sets EBC_RAILS_OFF_MS.
+ *   rails_settle_ms  how long the panel rails must have been up before
+ *                    a waveform's first frame, read-write; a waveform
+ *                    that starts sooner waits for the rest (settle_us in
+ *                    the scan_start event). 0: no wait; capped at
+ *                    EBC_RAILS_SETTLE_MAX_MS. Probe sets
+ *                    EBC_RAILS_SETTLE_MS. A test knob.
  *   flip_release     where a held commit event is sent, read-write text:
  *                    "done" at the finish of its part (the frame is on the
  *                    glass, or its out-fence has an error), "take" at the
@@ -561,6 +567,7 @@ void rk3026_ebc_debugfs_init(struct rk3026_ebc *ebc)
 				   &rk3026_ebc_force_mode_fops);
 	debugfs_create_atomic_t("debug_timeout", 0644, dir, &ebc->debug_timeout);
 	debugfs_create_u32("rails_off_ms", 0644, dir, &ebc->rails_off_ms);
+	debugfs_create_u32("rails_settle_ms", 0644, dir, &ebc->rails_settle_ms);
 	debugfs_create_file("palette", 0444, dir, ebc, &rk3026_ebc_palette_fops);
 	debugfs_create_file("rows", 0444, dir, ebc, &rk3026_ebc_rows_fops);
 }

@@ -331,6 +331,20 @@ struct rk3026_ebc_du_budget {
 #define EBC_RAILS_OFF_MS	200
 
 /*
+ * How long the panel rails must have been up before the first frame of a
+ * waveform, as probe sets it (@rails_settle_ms in struct rk3026_ebc; debugfs
+ * rails_settle_ms changes it): a short waveform started right after the
+ * rails came up was seen under-driven on the glass, while the image it
+ * drove was right. 0 waits for nothing. The value is a test knob until a
+ * sweep on a panel finds the time its rails need.
+ * EBC_RAILS_SETTLE_MAX_MS bounds what a debugfs write can make the refresh
+ * thread sleep before one waveform, with a part in flight
+ * (rk3026_ebc_settle_wait_us()).
+ */
+#define EBC_RAILS_SETTLE_MS	0
+#define EBC_RAILS_SETTLE_MAX_MS	1000
+
+/*
  * What rk3026_ebc_resolve_mode() needs to drive a two-level auto plane part
  * in A2 rather than DU:
  *
@@ -1249,6 +1263,15 @@ struct rk3026_ebc {
 	 */
 	u32			rails_off_ms;
 	/*
+	 * When the rails last came up (ktime_get()): the moment ebc_rails_on()
+	 * enabled one of the two that was off, under @rails_lock.
+	 * rk3026_ebc_drive() lets them settle from it for @rails_settle_ms
+	 * before a waveform's first frame (EBC_RAILS_SETTLE_MS at probe,
+	 * debugfs may change it, read with READ_ONCE()).
+	 */
+	ktime_t			rails_up_at;
+	u32			rails_settle_ms;
+	/*
 	 * The CRTC is enabled, so a part may drive the panel. Under
 	 * @image_lock: the thread samples it in the section that takes a
 	 * part, and a sender checks it in the section that adds its update.
@@ -1502,6 +1525,7 @@ static inline u8 rk3026_ebc_grey_level(u8 g)
 u32 rk3026_ebc_dsp_ctrl_mode(u32 mode);
 u32 rk3026_ebc_sdck(u32 width);
 u32 rk3026_ebc_us_between(ktime_t start, ktime_t end);
+u32 rk3026_ebc_settle_wait_us(ktime_t up_at, ktime_t now, u32 settle_ms);
 bool rk3026_ebc_pending_add(struct rk3026_ebc_pending *p,
 			    const struct rk3026_ebc_update *upd, u32 *seq);
 bool rk3026_ebc_pending_peek(const struct rk3026_ebc_pending *p,

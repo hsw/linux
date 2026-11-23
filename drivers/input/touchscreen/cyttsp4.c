@@ -135,6 +135,7 @@ enum cyttsp4_sleep_state {
 	SS_SLEEP_ON,
 	SS_SLEEPING,
 	SS_WAKING,
+	SS_POWER_OFF,		/* supply off, reset asserted, IRQ disabled */
 };
 
 enum cyttsp4_startup_state {
@@ -234,6 +235,8 @@ struct cyttsp4 {
 	struct input_dev *input;
 	struct touchscreen_properties prop;
 	struct gpio_desc *reset_gpio;
+	struct regulator *vdd;
+	bool vdd_on;
 	int irq;
 	bool level_irq;
 
@@ -249,6 +252,7 @@ struct cyttsp4 {
 	bool input_ready;
 	bool suspended;
 	bool stopped;
+	bool restart_cancelled;		/* by the suspend, before it ran */
 
 	struct work_struct startup_work;
 	struct delayed_work watchdog_work;
@@ -1095,9 +1099,81 @@ static int cyttsp4_wake_locked(struct cyttsp4 *ts)
 }
 
 /*
+ * Called with ctrl_lock held. The IRQ stays disabled until the power-up:
+ * the line may fall with the supply.
+ */
+static void cyttsp4_power_off_locked(struct cyttsp4 *ts)
+{
+	int error;
+
+	mutex_lock(&ts->system_lock);
+	if (ts->sleep_state == SS_POWER_OFF) {
+		mutex_unlock(&ts->system_lock);
+		return;
+	}
+	ts->sleep_state = SS_POWER_OFF;
+	mutex_unlock(&ts->system_lock);
+
+	/* also waits for a running IRQ thread */
+	disable_irq(ts->irq);
+
+	mutex_lock(&ts->system_lock);
+	ts->mode = CY_MODE_UNKNOWN;
+	mutex_unlock(&ts->system_lock);
+
+	/* no contact stays down while the controller is off */
+	cyttsp4_lift_all(ts);
+
+	/* no current into the unpowered controller through its reset input */
+	if (ts->reset_gpio)
+		gpiod_set_value_cansleep(ts->reset_gpio, 1);
+
+	error = regulator_disable(ts->vdd);
+	if (error)
+		dev_err(ts->dev, "supply off failed: %d\n", error);
+	else
+		ts->vdd_on = false;
+}
+
+/*
+ * Called with ctrl_lock held. A power cycle loses the controller's state,
+ * so there is no wake-up to wait for: restart it in the background. A
+ * supply that does not come on leaves the controller off, in reset and
+ * with the IRQ disabled; the next resume tries again.
+ */
+static int cyttsp4_power_on_locked(struct cyttsp4 *ts)
+{
+	int error;
+
+	if (!ts->vdd_on) {
+		error = regulator_enable(ts->vdd);
+		if (error) {
+			dev_err(ts->dev, "supply on failed: %d\n", error);
+			return error;
+		}
+		ts->vdd_on = true;
+		msleep(CY_POWER_ON_DELAY_MS);
+	}
+
+	if (ts->reset_gpio)
+		gpiod_set_value_cansleep(ts->reset_gpio, 0);
+
+	enable_irq(ts->irq);
+
+	mutex_lock(&ts->system_lock);
+	ts->sleep_state = SS_SLEEP_OFF;
+	ts->restart_cancelled = false;
+	cyttsp4_queue_startup(ts);
+	mutex_unlock(&ts->system_lock);
+
+	return 0;
+}
+
+/*
  * No restart and no watchdog while the system sleeps: both talk to the bus.
- * A controller that cannot enter deep sleep stays awake, and the system
- * suspend goes on.
+ * Unless it is a wake-up source, a controller with its own supply is
+ * switched off, one without is put into deep sleep. A controller that
+ * cannot enter deep sleep stays awake, and the system suspend goes on.
  */
 static int cyttsp4_suspend(struct device *dev)
 {
@@ -1107,13 +1183,23 @@ static int cyttsp4_suspend(struct device *dev)
 	ts->suspended = true;
 	mutex_unlock(&ts->system_lock);
 
-	cancel_work_sync(&ts->startup_work);
+	/* a restart that has not started yet runs after the resume */
+	if (cancel_work_sync(&ts->startup_work)) {
+		mutex_lock(&ts->system_lock);
+		ts->startup_state = STARTUP_NONE;
+		ts->restart_cancelled = true;
+		mutex_unlock(&ts->system_lock);
+	}
 
 	mutex_lock(&ts->ctrl_lock);
 	cyttsp4_stop_wd(ts);
 	/* a wake-up source keeps scanning; the PM core arms its IRQ */
-	if (!device_may_wakeup(dev))
-		cyttsp4_sleep_locked(ts);
+	if (!device_may_wakeup(dev)) {
+		if (ts->vdd)
+			cyttsp4_power_off_locked(ts);
+		else
+			cyttsp4_sleep_locked(ts);
+	}
 	mutex_unlock(&ts->ctrl_lock);
 
 	return 0;
@@ -1129,8 +1215,19 @@ static int cyttsp4_resume(struct device *dev)
 	mutex_unlock(&ts->system_lock);
 
 	mutex_lock(&ts->ctrl_lock);
-	error = cyttsp4_wake_locked(ts);
+	if (ts->sleep_state == SS_POWER_OFF)
+		error = cyttsp4_power_on_locked(ts);
+	else
+		error = cyttsp4_wake_locked(ts);
 	mutex_unlock(&ts->ctrl_lock);
+
+	/* never restart a controller that is still off */
+	mutex_lock(&ts->system_lock);
+	if (ts->restart_cancelled && ts->sleep_state != SS_POWER_OFF) {
+		ts->restart_cancelled = false;
+		cyttsp4_queue_startup(ts);
+	}
+	mutex_unlock(&ts->system_lock);
 
 	return error;
 }
@@ -1191,6 +1288,14 @@ static void cyttsp4_stop(void *data)
 	cancel_delayed_work_sync(&ts->watchdog_work);
 }
 
+static void cyttsp4_power_down(void *data)
+{
+	struct cyttsp4 *ts = data;
+
+	if (ts->vdd_on)
+		regulator_disable(ts->vdd);
+}
+
 static int cyttsp4_probe(struct i2c_client *client)
 {
 	struct device *dev = &client->dev;
@@ -1218,11 +1323,24 @@ static int cyttsp4_probe(struct i2c_client *client)
 	INIT_WORK(&ts->startup_work, cyttsp4_startup_work);
 	INIT_DELAYED_WORK(&ts->watchdog_work, cyttsp4_watchdog_work);
 
-	error = devm_regulator_get_enable_optional(dev, "vdd");
-	if (error && error != -ENODEV)
-		return dev_err_probe(dev, error, "vdd supply\n");
-	if (!error)
+	ts->vdd = devm_regulator_get_optional(dev, "vdd");
+	if (IS_ERR(ts->vdd)) {
+		error = PTR_ERR(ts->vdd);
+		if (error != -ENODEV)
+			return dev_err_probe(dev, error, "vdd supply\n");
+		ts->vdd = NULL;
+	} else {
+		error = regulator_enable(ts->vdd);
+		if (error)
+			return dev_err_probe(dev, error, "vdd enable\n");
+		ts->vdd_on = true;
+
+		error = devm_add_action_or_reset(dev, cyttsp4_power_down, ts);
+		if (error)
+			return error;
+
 		msleep(CY_POWER_ON_DELAY_MS);
+	}
 
 	ts->reset_gpio = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_LOW);
 	if (IS_ERR(ts->reset_gpio))

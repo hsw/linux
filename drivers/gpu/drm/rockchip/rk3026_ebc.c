@@ -766,6 +766,30 @@ static u32 ebc_rails_settle(struct rk3026_ebc *ebc)
 }
 
 /*
+ * The panel supply's error flags for a scan event, and the counters
+ * (rk3026_ebc_pmic_err()). A TPS65185 latches its faults until they are
+ * read, so a read right after the settle shows those since the previous
+ * read, the rails coming up among them, and one after the waveform those
+ * during it. An I2C read: the refresh thread calls it from
+ * rk3026_ebc_drive() with no lock held, @image_lock and @rails_lock
+ * included; the regulator's own lock orders it against the rails' enable
+ * and disable, so a CRTC disable may take the rails down around it.
+ */
+static u32 ebc_pmic_err(struct rk3026_ebc *ebc)
+{
+	unsigned int flags = 0;
+	u32 err;
+
+	err = rk3026_ebc_pmic_err(regulator_get_error_flags(ebc->epd_supply,
+							    &flags), flags);
+	if (err & EBC_PMIC_ERR_FAILED)
+		atomic_inc(&ebc->pmic_read_errors);
+	else if (err)
+		atomic_inc(&ebc->pmic_faults);
+	return err;
+}
+
+/*
  * The time from the take of @last's part to now (rk3026_ebc_clock()), for
  * the scan_start event of each of its waveforms: the snapshot, and a repair
  * RESET in front of the part.
@@ -794,7 +818,9 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_setup_us);
  * Before the first frame the rails get the rest of @rails_settle_ms since
  * they came up (ebc_rails_settle()); the scan_start event follows that
  * wait, with its time (settle_us) after the part's setup_us, and the
- * waveform's time (@last->scan_ms) counts from its end.
+ * waveform's time (@last->scan_ms) counts from its end. Both scan events
+ * carry the panel supply's error flags, read right before each
+ * (ebc_pmic_err()), outside the waveform's time.
  *
  * @shadows.prev_unknown is set here and cleared in exactly ONE place of this
  * function -- the successful exit below. rk3026_ebc_scan_finish() records the
@@ -817,7 +843,7 @@ VISIBLE_IF_KUNIT int rk3026_ebc_drive(struct rk3026_ebc *ebc, const u8 *lut,
 				      struct rk3026_ebc_last *last)
 {
 	bool unknown = READ_ONCE(ebc->shadows.prev_unknown);
-	u32 done = 0, chunk = 0, setup_us, settle_us;
+	u32 done = 0, chunk = 0, setup_us, settle_us, pmic_err;
 	ktime_t start;
 	int ret = 0;
 
@@ -827,12 +853,13 @@ VISIBLE_IF_KUNIT int rk3026_ebc_drive(struct rk3026_ebc *ebc, const u8 *lut,
 	/* The setup counts toward the settle; the settle is not setup. */
 	setup_us = rk3026_ebc_setup_us(ebc, last);
 	settle_us = ebc_rails_settle(ebc);
+	pmic_err = ebc_pmic_err(ebc);
 	start = ktime_get();
 
 	/* A repair is the first waveform of an update that has repaired set. */
 	trace_rk3026_ebc_scan_start(last, mode, lut_mode, frames,
 				    last->repaired && !last->scans,
-				    setup_us, settle_us);
+				    setup_us, settle_us, pmic_err);
 
 	WRITE_ONCE(ebc->shadows.prev_unknown, true);
 	last->scans++;
@@ -897,8 +924,9 @@ VISIBLE_IF_KUNIT int rk3026_ebc_drive(struct rk3026_ebc *ebc, const u8 *lut,
 out:
 	last->driven = done;
 	last->scan_ms = ktime_ms_delta(ktime_get(), start);
+	pmic_err = ebc_pmic_err(ebc);
 	trace_rk3026_ebc_scan_end(mode, frames, done, last->scan_ms, ret,
-				  last->seq);
+				  last->seq, pmic_err);
 	return ret;
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_drive);

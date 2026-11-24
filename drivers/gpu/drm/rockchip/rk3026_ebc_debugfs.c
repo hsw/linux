@@ -259,6 +259,9 @@ static void ebc_show_last(struct seq_file *m, const char *p,
  * in flight, or a carry waits for its retry (a send not finished yet).
  * carry_failed counts the carried parts given up after their retries
  * (rk3026_ebc_retry_next()), or at once, and the RESETs not driven.
+ * pmic_faults counts the reads of the panel supply's error flags, two per
+ * waveform, that found one set, pmic_read_errors those that failed (the
+ * scan events' pmic_err, EBC_PMIC_ERR_FAILED).
  * Clips are x1 y1 x2 y2, x2/y2 exclusive. Modes are the EBC work modes
  * (EBC_MODE_*). Times in ms.
  */
@@ -302,6 +305,9 @@ static int rk3026_ebc_state_show(struct seq_file *m, void *unused)
 	seq_printf(m, "timeouts %llu\n", st.timeouts);
 	seq_printf(m, "abandoned %llu\n", st.abandoned);
 	seq_printf(m, "carry_failed %llu\n", st.carry_failed);
+	seq_printf(m, "pmic_faults %d\n", atomic_read(&ebc->pmic_faults));
+	seq_printf(m, "pmic_read_errors %d\n",
+		   atomic_read(&ebc->pmic_read_errors));
 	ebc_show_last(m, "last_", &last);
 	ebc_show_last(m, "scan_", &scan);
 	return 0;

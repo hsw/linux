@@ -29,6 +29,7 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/prandom.h>
+#include <linux/regulator/consumer.h>
 #include <linux/seq_file.h>
 #include <linux/string.h>
 #include <linux/uaccess.h>
@@ -346,6 +347,43 @@ static void ebc_test_settle_wait_us(struct kunit *test)
 						  up + ms_to_ktime(EBC_RAILS_SETTLE_MAX_MS),
 						  U32_MAX),
 			0);
+}
+
+/*
+ * The scan events' pmic_err: the flags of a read that worked, unchanged; a
+ * failed read marked by EBC_PMIC_ERR_FAILED with its errno, whatever the
+ * flags held, and never mistaken for one that worked, nor the other way
+ * round.
+ */
+static void ebc_test_pmic_err(struct kunit *test)
+{
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_pmic_err(0, 0), 0);
+	KUNIT_EXPECT_EQ(test,
+			rk3026_ebc_pmic_err(0, REGULATOR_ERROR_UNDER_VOLTAGE),
+			REGULATOR_ERROR_UNDER_VOLTAGE);
+	KUNIT_EXPECT_EQ(test,
+			rk3026_ebc_pmic_err(0, REGULATOR_ERROR_FAIL |
+					    REGULATOR_ERROR_REGULATION_OUT |
+					    REGULATOR_ERROR_OVER_TEMP_WARN),
+			REGULATOR_ERROR_FAIL | REGULATOR_ERROR_REGULATION_OUT |
+			REGULATOR_ERROR_OVER_TEMP_WARN);
+	/* A flag as high as the mark is not taken for a failed read. */
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_pmic_err(0, EBC_PMIC_ERR_FAILED), 0);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_pmic_err(0, U32_MAX),
+			U32_MAX & ~EBC_PMIC_ERR_FAILED);
+
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_pmic_err(-EIO, 0), 0x80000005);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_pmic_err(-EINVAL, 0), 0x80000016);
+	/* What a failed read left in the flags does not leak through. */
+	KUNIT_EXPECT_EQ(test,
+			rk3026_ebc_pmic_err(-ETIMEDOUT,
+					    REGULATOR_ERROR_UNDER_VOLTAGE),
+			EBC_PMIC_ERR_FAILED | ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_pmic_err(-MAX_ERRNO, U32_MAX),
+			EBC_PMIC_ERR_FAILED | MAX_ERRNO);
+	/* Nothing past the errno field, whatever is passed in. */
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_pmic_err(INT_MIN + 1, 0),
+			EBC_PMIC_ERR_FAILED | EBC_PMIC_ERR_ERRNO);
 }
 
 static void ebc_test_rank_order(struct kunit *test)
@@ -3949,6 +3987,7 @@ static struct kunit_case rk3026_ebc_core_test_cases[] = {
 	KUNIT_CASE(ebc_test_sdck),
 	KUNIT_CASE(ebc_test_us_between),
 	KUNIT_CASE(ebc_test_settle_wait_us),
+	KUNIT_CASE(ebc_test_pmic_err),
 	KUNIT_CASE(ebc_test_rank_order),
 	KUNIT_CASE(ebc_test_rank_unknown),
 	KUNIT_CASE(ebc_test_rank_merge),

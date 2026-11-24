@@ -158,12 +158,16 @@ TRACE_EVENT(rk3026_ebc_update_queue,
  * events: a commit event sent at the take is not before it). Last, the
  * time the waveform waited after @setup_us for the rails to settle
  * (settle_us, ebc_rails_settle(), 0 for none): the event is emitted after
- * that wait, right before the first frame.
+ * that wait, right before the first frame. Last of all pmic_err, the panel
+ * supply's REGULATOR_ERROR_* flags read after the settle: 0 for none, or
+ * 0x8000xxxx when the read failed, xxxx the errno (EBC_PMIC_ERR_FAILED).
  */
 TRACE_EVENT(rk3026_ebc_scan_start,
 	TP_PROTO(const struct rk3026_ebc_last *last, u32 mode, u32 lut_mode,
-		 u32 frames, bool repair, u32 setup_us, u32 settle_us),
-	TP_ARGS(last, mode, lut_mode, frames, repair, setup_us, settle_us),
+		 u32 frames, bool repair, u32 setup_us, u32 settle_us,
+		 u32 pmic_err),
+	TP_ARGS(last, mode, lut_mode, frames, repair, setup_us, settle_us,
+		pmic_err),
 	TP_STRUCT__entry(
 		__field(u32, mode)
 		__field(u32, lut_mode)
@@ -185,6 +189,7 @@ TRACE_EVENT(rk3026_ebc_scan_start,
 		__field(u32, tries)
 		__field(s64, taken_us)
 		__field(u32, settle_us)
+		__field(u32, pmic_err)
 	),
 	TP_fast_assign(
 		__entry->mode = mode;
@@ -207,8 +212,9 @@ TRACE_EVENT(rk3026_ebc_scan_start,
 		__entry->tries = last->tries;
 		__entry->taken_us = ktime_to_us(last->taken);
 		__entry->settle_us = settle_us;
+		__entry->pmic_err = pmic_err;
 	),
-	TP_printk("mode=%u(%s) lut_mode=%u(%s) temp=%d frames=%u marker=%u merged=%u repair=%d reason=%s seq=%u box=%d,%d-%d,%d changed_px=%u du_area=%u setup_us=%u gap_us=%u tries=%u taken_us=%lld settle_us=%u",
+	TP_printk("mode=%u(%s) lut_mode=%u(%s) temp=%d frames=%u marker=%u merged=%u repair=%d reason=%s seq=%u box=%d,%d-%d,%d changed_px=%u du_area=%u setup_us=%u gap_us=%u tries=%u taken_us=%lld settle_us=%u pmic_err=0x%x",
 		  __entry->mode, ebc_trace_mode(__entry->mode),
 		  __entry->lut_mode, ebc_trace_mode(__entry->lut_mode),
 		  __entry->temp, __entry->frames, __entry->marker,
@@ -217,13 +223,17 @@ TRACE_EVENT(rk3026_ebc_scan_start,
 		  __entry->x1, __entry->y1, __entry->x2, __entry->y2,
 		  __entry->changed_px, __entry->du_area, __entry->setup_us,
 		  __entry->gap_us, __entry->tries, __entry->taken_us,
-		  __entry->settle_us)
+		  __entry->settle_us, __entry->pmic_err)
 );
 
-/* A waveform ends; @seq is its part's (a repair RESET's too). */
+/*
+ * A waveform ends; @seq is its part's (a repair RESET's too). Last,
+ * pmic_err as in rk3026_ebc_scan_start, read after the last frame.
+ */
 TRACE_EVENT(rk3026_ebc_scan_end,
-	TP_PROTO(u32 mode, u32 frames, u32 driven, s64 ms, int ret, u32 seq),
-	TP_ARGS(mode, frames, driven, ms, ret, seq),
+	TP_PROTO(u32 mode, u32 frames, u32 driven, s64 ms, int ret, u32 seq,
+		 u32 pmic_err),
+	TP_ARGS(mode, frames, driven, ms, ret, seq, pmic_err),
 	TP_STRUCT__entry(
 		__field(u32, mode)
 		__field(u32, frames)
@@ -231,6 +241,7 @@ TRACE_EVENT(rk3026_ebc_scan_end,
 		__field(s64, ms)
 		__field(int, ret)
 		__field(u32, seq)
+		__field(u32, pmic_err)
 	),
 	TP_fast_assign(
 		__entry->mode = mode;
@@ -239,11 +250,12 @@ TRACE_EVENT(rk3026_ebc_scan_end,
 		__entry->ms = ms;
 		__entry->ret = ret;
 		__entry->seq = seq;
+		__entry->pmic_err = pmic_err;
 	),
-	TP_printk("mode=%u(%s) driven=%u/%u ms=%lld ret=%d seq=%u",
+	TP_printk("mode=%u(%s) driven=%u/%u ms=%lld ret=%d seq=%u pmic_err=0x%x",
 		  __entry->mode, ebc_trace_mode(__entry->mode),
 		  __entry->driven, __entry->frames, __entry->ms, __entry->ret,
-		  __entry->seq)
+		  __entry->seq, __entry->pmic_err)
 );
 
 /*

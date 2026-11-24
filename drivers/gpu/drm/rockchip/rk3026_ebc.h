@@ -335,13 +335,15 @@ struct rk3026_ebc_du_budget {
  * waveform, as probe sets it (@rails_settle_ms in struct rk3026_ebc; debugfs
  * rails_settle_ms changes it): a short waveform started right after the
  * rails came up was seen under-driven on the glass, while the image it
- * drove was right. 0 waits for nothing. The value is a test knob until a
- * sweep on a panel finds the time its rails need.
+ * drove was right. On the ED060KD1C2 the misses fell as the wait grew
+ * and none was seen at 200 ms, so that is the default: it costs the first
+ * update after an idle pause (the rails off) up to that much, and nothing
+ * while the rails stay up. 0 waits for nothing.
  * EBC_RAILS_SETTLE_MAX_MS bounds what a debugfs write can make the refresh
  * thread sleep before one waveform, with a part in flight
  * (rk3026_ebc_settle_wait_us()).
  */
-#define EBC_RAILS_SETTLE_MS	0
+#define EBC_RAILS_SETTLE_MS	200
 #define EBC_RAILS_SETTLE_MAX_MS	1000
 
 /*

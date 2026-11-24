@@ -1215,19 +1215,20 @@ static int cyttsp4_resume(struct device *dev)
 	mutex_unlock(&ts->system_lock);
 
 	mutex_lock(&ts->ctrl_lock);
-	if (ts->sleep_state == SS_POWER_OFF)
+	if (ts->sleep_state == SS_POWER_OFF) {
+		/* queues the restart itself, or leaves the controller off */
 		error = cyttsp4_power_on_locked(ts);
-	else
+	} else {
 		error = cyttsp4_wake_locked(ts);
-	mutex_unlock(&ts->ctrl_lock);
 
-	/* never restart a controller that is still off */
-	mutex_lock(&ts->system_lock);
-	if (ts->restart_cancelled && ts->sleep_state != SS_POWER_OFF) {
-		ts->restart_cancelled = false;
-		cyttsp4_queue_startup(ts);
+		mutex_lock(&ts->system_lock);
+		if (ts->restart_cancelled) {
+			ts->restart_cancelled = false;
+			cyttsp4_queue_startup(ts);
+		}
+		mutex_unlock(&ts->system_lock);
 	}
-	mutex_unlock(&ts->system_lock);
+	mutex_unlock(&ts->ctrl_lock);
 
 	return error;
 }

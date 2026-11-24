@@ -71,7 +71,7 @@
  *                    that starts sooner waits for the rest (settle_us in
  *                    the scan_start event). 0: no wait; capped at
  *                    EBC_RAILS_SETTLE_MAX_MS. Probe sets
- *                    EBC_RAILS_SETTLE_MS. A test knob.
+ *                    EBC_RAILS_SETTLE_MS.
  *   flip_release     where a held commit event is sent, read-write text:
  *                    "done" at the finish of its part (the frame is on the
  *                    glass, or its out-fence has an error), "take" at the

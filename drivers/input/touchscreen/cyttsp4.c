@@ -1152,7 +1152,7 @@ static int cyttsp4_power_on_locked(struct cyttsp4 *ts)
 			return error;
 		}
 		ts->vdd_on = true;
-		msleep(CY_POWER_ON_DELAY_MS);
+		fsleep(CY_POWER_ON_DELAY_MS * USEC_PER_MSEC);
 	}
 
 	if (ts->reset_gpio)
@@ -1339,7 +1339,7 @@ static int cyttsp4_probe(struct i2c_client *client)
 		if (error)
 			return error;
 
-		msleep(CY_POWER_ON_DELAY_MS);
+		fsleep(CY_POWER_ON_DELAY_MS * USEC_PER_MSEC);
 	}
 
 	ts->reset_gpio = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_LOW);

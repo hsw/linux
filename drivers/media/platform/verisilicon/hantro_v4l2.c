@@ -394,6 +394,9 @@ static int hantro_try_fmt(const struct hantro_ctx *ctx,
 		 */
 		pix_mp->plane_fmt[0].sizeimage = fmt->header_size +
 			pix_mp->width * pix_mp->height * fmt->max_depth;
+	} else {
+		pix_mp->plane_fmt[0].sizeimage =
+			max(pix_mp->plane_fmt[0].sizeimage, fmt->min_size);
 	}
 
 	return 0;

@@ -83,6 +83,7 @@ static const struct hantro_fmt stm32mp25_venc_fmts[] = {
 		.codec_mode = HANTRO_MODE_JPEG_ENC,
 		.max_depth = 2,
 		.header_size = JPEG_HEADER_SIZE,
+		.min_size = JPEG_HEADER_SIZE + 64,	/* header + one burst */
 		.frmsize = {
 			.min_width = 96,
 			.max_width = FMT_4K_WIDTH,

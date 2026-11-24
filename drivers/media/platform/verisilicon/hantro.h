@@ -286,6 +286,7 @@ struct hantro_ctx {
  * @codec_mode:	Codec mode related to this format. See
  *		enum hantro_codec_mode.
  * @header_size: Optional header size. Currently used by JPEG encoder.
+ * @min_size:	Optional minimum sizeimage, for bitstream formats.
  * @max_depth:	Maximum depth, for bitstream formats
  * @enc_fmt:	Format identifier for encoder registers.
  * @frmsize:	Supported range of frame sizes (only for bitstream formats).
@@ -297,6 +298,7 @@ struct hantro_fmt {
 	u32 fourcc;
 	enum hantro_codec_mode codec_mode;
 	int header_size;
+	u32 min_size;
 	int max_depth;
 	enum hantro_enc_fmt enc_fmt;
 	struct v4l2_frmsize_stepwise frmsize;

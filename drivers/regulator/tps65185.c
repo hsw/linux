@@ -38,6 +38,23 @@
 #define TPS65185_PG_ALL 0xfa
 #define TPS65185_REG_REVID 0x10
 
+/* INT1, SLVSAQ8G Table 10 */
+#define TPS65185_INT1_TSD BIT(6)
+#define TPS65185_INT1_HOT BIT(5)
+#define TPS65185_INT1_UVLO BIT(2)
+/* INT2, SLVSAQ8G Table 11 */
+#define TPS65185_INT2_VB_UV BIT(7)
+#define TPS65185_INT2_VDDH_UV BIT(6)
+#define TPS65185_INT2_VN_UV BIT(5)
+#define TPS65185_INT2_VPOS_UV BIT(4)
+#define TPS65185_INT2_VEE_UV BIT(3)
+#define TPS65185_INT2_VCOMF BIT(2)
+#define TPS65185_INT2_VNEG_UV BIT(1)
+#define TPS65185_INT2_EOC BIT(0)
+#define TPS65185_INT2_UV (TPS65185_INT2_VB_UV | TPS65185_INT2_VDDH_UV | \
+			  TPS65185_INT2_VN_UV | TPS65185_INT2_VPOS_UV | \
+			  TPS65185_INT2_VEE_UV | TPS65185_INT2_VNEG_UV)
+
 #define TPS65185_READ_THERM BIT(7)
 #define TPS65185_CONV_END BIT(5)
 
@@ -65,6 +82,8 @@ struct tps65185_data {
 	struct completion pgood_completion;
 	int pgood_irq;
 	struct completion tmst_completion;
+	/* vposneg enabled by the core, for its error flags; under its lock */
+	bool vposneg_on;
 	/* board values from DT, restored whenever the chip leaves SLEEP */
 	bool has_vadj, has_upseq, has_dwnseq;
 	u8 vadj;
@@ -285,6 +304,7 @@ static int tps65185_vposneg_enable(struct regulator_dev *rdev)
 		return -ETIMEDOUT;
 	}
 
+	data->vposneg_on = true;
 	return 0;
 }
 
@@ -305,8 +325,81 @@ static int tps65185_vposneg_disable(struct regulator_dev *rdev)
 					 TPS65185_ENABLE_ACTIVE |
 					 TPS65185_ENABLE_STANDBY,
 					 TPS65185_ENABLE_STANDBY);
+	if (!ret)
+		data->vposneg_on = false;
 
 	return ret;
+}
+
+/*
+ * Faults as REGULATOR_ERROR_* flags, from INT1, INT2 and PG as read. Any
+ * rail's undervoltage, and VIN below UVLO, which shuts every rail down, are
+ * UNDER_VOLTAGE; thermal shutdown is OVER_TEMP, its early warning HOT is
+ * OVER_TEMP_WARN; a VCOM fault, which drops all rails at once, is FAIL.
+ * PG short of all rails in regulation is REGULATION_OUT, but only while
+ * the rails are meant to be on: off, PG reads 0 by design.
+ */
+static unsigned int tps65185_error_flags(unsigned int int1, unsigned int int2,
+					 unsigned int pg, bool enabled)
+{
+	unsigned int flags = 0;
+
+	if ((int1 & TPS65185_INT1_UVLO) || (int2 & TPS65185_INT2_UV))
+		flags |= REGULATOR_ERROR_UNDER_VOLTAGE;
+	if (int1 & TPS65185_INT1_TSD)
+		flags |= REGULATOR_ERROR_OVER_TEMP;
+	if (int1 & TPS65185_INT1_HOT)
+		flags |= REGULATOR_ERROR_OVER_TEMP_WARN;
+	if (int2 & TPS65185_INT2_VCOMF)
+		flags |= REGULATOR_ERROR_FAIL;
+	if (enabled && (pg & TPS65185_PG_ALL) != TPS65185_PG_ALL)
+		flags |= REGULATOR_ERROR_REGULATION_OUT;
+
+	return flags;
+}
+
+/*
+ * INT1 and INT2 clear when read (SLVSAQ8G 8.3.10), so the flags are the
+ * faults latched since the last read of them by anyone -- this, the sysfs
+ * error attributes, which come here too, or the nINT thread -- and PG as it
+ * is now. A board without nINT has nothing else reading them; a rail shut
+ * down by a fault cannot be enabled again until they are read (8.3.8).
+ *
+ * The end of a temperature conversion is in INT2 as well: complete it here
+ * as the nINT thread would, or a temperature read waiting for it on a
+ * board with nINT would wait out its timeout instead.
+ *
+ * Only vposneg has this: VCOM's fault is in the same read, and a second
+ * regulator reading INT1/INT2 would take faults away from this one.
+ */
+static int tps65185_vposneg_get_error_flags(struct regulator_dev *rdev,
+					    unsigned int *flags)
+{
+	struct tps65185_data *data = rdev_get_drvdata(rdev);
+	unsigned int int1, int2, pg;
+	int ret;
+
+	ret = regmap_read(data->regmap, TPS65185_REG_INT1, &int1);
+	if (ret)
+		return ret;
+
+	ret = regmap_read(data->regmap, TPS65185_REG_INT2, &int2);
+	if (ret)
+		return ret;
+
+	if (int2 & TPS65185_INT2_EOC)
+		complete(&data->tmst_completion);
+
+	ret = regmap_read(data->regmap, TPS65185_REG_PG, &pg);
+	if (ret)
+		return ret;
+
+	dev_dbg(data->dev, "error flags: INT1 %02x INT2 %02x PG %02x\n",
+		int1, int2, pg);
+
+	*flags = tps65185_error_flags(int1, int2, pg, data->vposneg_on);
+
+	return 0;
 }
 
 static int tps65185_vcom_set_voltage_sel(struct regulator_dev *rdev, unsigned int selector)
@@ -356,6 +449,7 @@ static const struct regulator_ops tps65185_vposneg_ops = {
 	.is_enabled = tps65185_check_powergood,
 	.set_voltage_sel = tps65185_vposneg_set_voltage_sel,
 	.get_voltage_sel = tps65185_vposneg_get_voltage_sel,
+	.get_error_flags = tps65185_vposneg_get_error_flags,
 };
 
 static const struct regulator_desc regulators[] = {
@@ -417,7 +511,7 @@ static irqreturn_t tps65185_irq_thread(int irq, void *dev_id)
 	if (ret)
 		return IRQ_NONE;
 
-	if (int_status_2 & BIT(0))
+	if (int_status_2 & TPS65185_INT2_EOC)
 		complete(&data->tmst_completion);
 
 	dev_dbg(data->dev, "irq status %02x %02x\n", int_status_1, int_status_2);

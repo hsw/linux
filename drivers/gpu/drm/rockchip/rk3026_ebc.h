@@ -347,6 +347,17 @@ struct rk3026_ebc_du_budget {
 #define EBC_RAILS_SETTLE_MAX_MS	1000
 
 /*
+ * The pmic_err field of the scan events (rk3026_ebc_pmic_err()): the panel
+ * supply's REGULATOR_ERROR_* flags as read, 0 for none; or, when the read
+ * failed, EBC_PMIC_ERR_FAILED with the errno, positive, in
+ * EBC_PMIC_ERR_ERRNO (0x80000005: -EIO; 0x80000016: -EINVAL, a supply
+ * that cannot report its errors). No flag is that high, so the two never
+ * meet.
+ */
+#define EBC_PMIC_ERR_FAILED	BIT(31)
+#define EBC_PMIC_ERR_ERRNO	GENMASK(15, 0)
+
+/*
  * What rk3026_ebc_resolve_mode() needs to drive a two-level auto plane part
  * in A2 rather than DU:
  *
@@ -1274,6 +1285,13 @@ struct rk3026_ebc {
 	ktime_t			rails_up_at;
 	u32			rails_settle_ms;
 	/*
+	 * rk3026_ebc_drive() reads @epd_supply's error flags before and after
+	 * each waveform, for the scan events (EBC_PMIC_ERR_FAILED): the reads
+	 * that found a flag set, and those that failed. Since probe.
+	 */
+	atomic_t		pmic_faults;
+	atomic_t		pmic_read_errors;
+	/*
 	 * The CRTC is enabled, so a part may drive the panel. Under
 	 * @image_lock: the thread samples it in the section that takes a
 	 * part, and a sender checks it in the section that adds its update.
@@ -1528,6 +1546,7 @@ u32 rk3026_ebc_dsp_ctrl_mode(u32 mode);
 u32 rk3026_ebc_sdck(u32 width);
 u32 rk3026_ebc_us_between(ktime_t start, ktime_t end);
 u32 rk3026_ebc_settle_wait_us(ktime_t up_at, ktime_t now, u32 settle_ms);
+u32 rk3026_ebc_pmic_err(int ret, unsigned int flags);
 bool rk3026_ebc_pending_add(struct rk3026_ebc_pending *p,
 			    const struct rk3026_ebc_update *upd, u32 *seq);
 bool rk3026_ebc_pending_peek(const struct rk3026_ebc_pending *p,

@@ -124,6 +124,23 @@ u32 rk3026_ebc_settle_wait_us(ktime_t up_at, ktime_t now, u32 settle_ms)
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_settle_wait_us);
 
+/**
+ * rk3026_ebc_pmic_err - the scan events' word for one read of the error flags
+ * @ret: regulator_get_error_flags()'s return
+ * @flags: the flags it gave, looked at only when @ret is 0
+ *
+ * Return: @flags for a read that succeeded, less EBC_PMIC_ERR_FAILED should
+ * a flag ever be that high; EBC_PMIC_ERR_FAILED with -@ret in
+ * EBC_PMIC_ERR_ERRNO for one that failed.
+ */
+u32 rk3026_ebc_pmic_err(int ret, unsigned int flags)
+{
+	if (ret < 0)
+		return EBC_PMIC_ERR_FAILED | (-(u32)ret & EBC_PMIC_ERR_ERRNO);
+	return flags & ~EBC_PMIC_ERR_FAILED;
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_pmic_err);
+
 /*
  * How strongly a mode drives, for merging updates into one scan: the merged
  * scan runs the strongest of their modes, so none of them is drawn weaker

@@ -165,15 +165,18 @@ TRACE_EVENT(rk3026_ebc_update_queue,
  * taken before @setup_us ends: -1 each with the knob off. Last, warmup:
  * the frames of the scan that drove nothing after the settle and before
  * this waveform (debugfs rails_warmup_frames, the rk3026_ebc_warmup
- * event), 0 for none or for one that did not end.
+ * event), 0 for none or for one that did not end. Then vcom_pin, GPIO2_C0's
+ * function as the GRF reads it right before the first frame (0 GPIO,
+ * 2 EBC_VCOM, -1 with the debugfs vcom_pin_ebc knob unused), and vcom_us,
+ * the time since ebc_rails_on() muxed it to the EBC (-1 when it is not).
  */
 TRACE_EVENT(rk3026_ebc_scan_start,
 	TP_PROTO(const struct rk3026_ebc_last *last, u32 mode, u32 lut_mode,
 		 u32 frames, bool repair, u32 setup_us, u32 settle_us,
 		 u32 pmic_err, const struct rk3026_ebc_verify *verify,
-		 u32 warmup),
+		 u32 warmup, int vcom_pin, s64 vcom_pin_us),
 	TP_ARGS(last, mode, lut_mode, frames, repair, setup_us, settle_us,
-		pmic_err, verify, warmup),
+		pmic_err, verify, warmup, vcom_pin, vcom_pin_us),
 	TP_STRUCT__entry(
 		__field(u32, mode)
 		__field(u32, lut_mode)
@@ -200,6 +203,8 @@ TRACE_EVENT(rk3026_ebc_scan_start,
 		__field(s32, hw_next_bad)
 		__field(s32, hw_prev_bad)
 		__field(u32, warmup)
+		__field(int, vcom_pin)
+		__field(s64, vcom_pin_us)
 	),
 	TP_fast_assign(
 		__entry->mode = mode;
@@ -227,8 +232,10 @@ TRACE_EVENT(rk3026_ebc_scan_start,
 		__entry->hw_next_bad = verify->hw_next_bad;
 		__entry->hw_prev_bad = verify->hw_prev_bad;
 		__entry->warmup = warmup;
+		__entry->vcom_pin = vcom_pin;
+		__entry->vcom_pin_us = vcom_pin_us;
 	),
-	TP_printk("mode=%u(%s) lut_mode=%u(%s) temp=%d frames=%u marker=%u merged=%u repair=%d reason=%s seq=%u box=%d,%d-%d,%d changed_px=%u du_area=%u setup_us=%u gap_us=%u tries=%u taken_us=%lld settle_us=%u pmic_err=0x%x hw_diff=%d hw_next_bad=%d hw_prev_bad=%d warmup=%u",
+	TP_printk("mode=%u(%s) lut_mode=%u(%s) temp=%d frames=%u marker=%u merged=%u repair=%d reason=%s seq=%u box=%d,%d-%d,%d changed_px=%u du_area=%u setup_us=%u gap_us=%u tries=%u taken_us=%lld settle_us=%u pmic_err=0x%x hw_diff=%d hw_next_bad=%d hw_prev_bad=%d warmup=%u vcom_pin=%d vcom_us=%lld",
 		  __entry->mode, ebc_trace_mode(__entry->mode),
 		  __entry->lut_mode, ebc_trace_mode(__entry->lut_mode),
 		  __entry->temp, __entry->frames, __entry->marker,
@@ -238,7 +245,8 @@ TRACE_EVENT(rk3026_ebc_scan_start,
 		  __entry->changed_px, __entry->du_area, __entry->setup_us,
 		  __entry->gap_us, __entry->tries, __entry->taken_us,
 		  __entry->settle_us, __entry->pmic_err, __entry->hw_diff,
-		  __entry->hw_next_bad, __entry->hw_prev_bad, __entry->warmup)
+		  __entry->hw_next_bad, __entry->hw_prev_bad, __entry->warmup,
+		  __entry->vcom_pin, __entry->vcom_pin_us)
 );
 
 /*

@@ -86,6 +86,12 @@
  *                    event, mst_ok of scan_end; struct rk3026_ebc_verify).
  *                    Read-write, 0 as probe sets it; reads up to both
  *                    images, uncached, per waveform. A test knob.
+ *   vcom_pin_ebc     1: GPIO2_C0 (the TPS65185 VCOM_CTRL line on the RC2)
+ *                    is muxed to the EBC's VCOM output while the rails
+ *                    are on, from the next rails-on, and back to the
+ *                    GPIO before VCOM goes off (vcom_pin and vcom_us in
+ *                    the scan_start event). Read-write, 0 as probe sets
+ *                    it. A test knob, for boards that wire the pin so.
  *   flip_release     where a held commit event is sent, read-write text:
  *                    "done" at the finish of its part (the frame is on the
  *                    glass, or its out-fence has an error), "take" at the
@@ -591,6 +597,7 @@ void rk3026_ebc_debugfs_init(struct rk3026_ebc *ebc)
 	debugfs_create_u32("rails_warmup_frames", 0644, dir,
 			   &ebc->rails_warmup_frames);
 	debugfs_create_bool("scan_verify", 0644, dir, &ebc->scan_verify);
+	debugfs_create_bool("vcom_pin_ebc", 0644, dir, &ebc->vcom_pin_ebc);
 	debugfs_create_file("palette", 0444, dir, ebc, &rk3026_ebc_palette_fops);
 	debugfs_create_file("rows", 0444, dir, ebc, &rk3026_ebc_rows_fops);
 }

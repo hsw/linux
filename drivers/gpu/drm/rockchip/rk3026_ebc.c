@@ -679,6 +679,49 @@ u32 rk3026_ebc_blit(struct rk3026_ebc *ebc, const void *src,
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_blit);
 
 static void ebc_program_regs(struct rk3026_ebc *ebc);
+/*
+ * debugfs vcom_pin_ebc: GPIO2_C0 to the EBC's VCOM output (@ebc_fn) or back
+ * to the GPIO, by the GRF directly. The pin stays requested by the vcom
+ * supply's enable GPIO, which still drives the level once it is a GPIO
+ * again; pinctrl's own records do not see the change. Under @rails_lock.
+ */
+static void ebc_vcom_pin_mux(struct rk3026_ebc *ebc, bool ebc_fn)
+{
+	int ret;
+
+	ret = regmap_write(ebc->grf, GRF_GPIO2C_IOMUX_REG,
+			   FIELD_PREP_WM16(GRF_GPIO2C0_SEL,
+					   ebc_fn ? GRF_GPIO2C0_EBC_VCOM :
+						    GRF_GPIO2C0_GPIO));
+	if (ret) {
+		dev_err_ratelimited(ebc->dev, "failed to mux the VCOM pin: %d\n",
+				    ret);
+		return;
+	}
+	ebc->vcom_pin_muxed = ebc_fn;
+	if (ebc_fn)
+		ebc->vcom_pin_at = ktime_get();
+}
+
+/*
+ * GPIO2_C0's function as the GRF reads it, for the scan events: 0 GPIO,
+ * 2 EBC_VCOM, -1 without a GRF or on a failed read. Without the debugfs
+ * vcom_pin_ebc knob in use, -1 too, so the read costs nothing then. Under
+ * @rails_lock.
+ */
+static int ebc_vcom_pin_func(struct rk3026_ebc *ebc)
+{
+	unsigned int val;
+
+	lockdep_assert_held(&ebc->rails_lock);
+
+	if (!ebc->grf || (!READ_ONCE(ebc->vcom_pin_ebc) && !ebc->vcom_pin_muxed))
+		return -1;
+	if (regmap_read(ebc->grf, GRF_GPIO2C_IOMUX_REG, &val))
+		return -1;
+	return FIELD_GET(GRF_GPIO2C0_SEL, val);
+}
+
 static int ebc_rails_off(struct rk3026_ebc *ebc);
 
 /*
@@ -992,6 +1035,8 @@ VISIBLE_IF_KUNIT int rk3026_ebc_drive(struct rk3026_ebc *ebc, const u8 *lut,
 	bool unknown = READ_ONCE(ebc->shadows.prev_unknown);
 	u32 done = 0, chunk = 0, setup_us, settle_us, warmup, pmic_err;
 	struct rk3026_ebc_verify verify;
+	s64 vcom_pin_us = -1;
+	int vcom_pin;
 	ktime_t start;
 	bool check;
 	int ret = 0;
@@ -1007,13 +1052,18 @@ VISIBLE_IF_KUNIT int rk3026_ebc_drive(struct rk3026_ebc *ebc, const u8 *lut,
 	settle_us = ebc_rails_settle(ebc);
 	warmup = ebc_rails_warmup(ebc, mode, last->seq);
 	pmic_err = ebc_pmic_err(ebc);
+	mutex_lock(&ebc->rails_lock);
+	vcom_pin = ebc_vcom_pin_func(ebc);
 	start = ktime_get();
+	if (ebc->vcom_pin_muxed)
+		vcom_pin_us = ktime_us_delta(start, ebc->vcom_pin_at);
+	mutex_unlock(&ebc->rails_lock);
 
 	/* A repair is the first waveform of an update that has repaired set. */
 	trace_rk3026_ebc_scan_start(last, mode, lut_mode, frames,
 				    last->repaired && !last->scans,
 				    setup_us, settle_us, pmic_err, &verify,
-				    warmup);
+				    warmup, vcom_pin, vcom_pin_us);
 
 	WRITE_ONCE(ebc->shadows.prev_unknown, true);
 	last->scans++;
@@ -1181,6 +1231,8 @@ static int ebc_rails_on(struct rk3026_ebc *ebc)
 		WRITE_ONCE(ebc->vcom_on, true);
 		changed = true;
 	}
+	if (READ_ONCE(ebc->vcom_pin_ebc) && !ebc->vcom_pin_muxed && ebc->grf)
+		ebc_vcom_pin_mux(ebc, true);
 	/* dev_dbg only: a console line would itself queue a refresh. */
 	dev_dbg(ebc->dev, "rails on\n");
 	if (changed) {
@@ -1209,6 +1261,9 @@ static int ebc_rails_off(struct rk3026_ebc *ebc)
 	int ret;
 
 	lockdep_assert_held(&ebc->rails_lock);
+	/* The GPIO is still high here: VCOM goes off with the disable below. */
+	if (ebc->vcom_pin_muxed)
+		ebc_vcom_pin_mux(ebc, false);
 	if (ebc->vcom_on) {
 		ret = regulator_disable(ebc->vcom_supply);
 		if (ret)

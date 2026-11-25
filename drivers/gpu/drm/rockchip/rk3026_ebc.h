@@ -135,6 +135,17 @@
 #define GRF_LVDS_OUT_SEL_BIT	BIT(9)
 
 /*
+ * GRF_GPIO2C_IOMUX: GPIO2_C0's function in bits 1:0, 0 GPIO, 2 EBC_VCOM (the
+ * RK2928-type layout, 2 bits a pin from 0xa8). Only debugfs vcom_pin_ebc, a
+ * test knob, writes it: on a board that wires the pin to the TPS65185
+ * VCOM_CTRL input, the EBC then decides when VCOM is on.
+ */
+#define GRF_GPIO2C_IOMUX_REG	0xd0
+#define GRF_GPIO2C0_SEL		GENMASK(1, 0)
+#define GRF_GPIO2C0_GPIO	0
+#define GRF_GPIO2C0_EBC_VCOM	2
+
+/*
  * Source-driver clock: 306 x 769 x 85 Hz = 20 MHz, which is the figure the
  * panel table carries and what DRM's mode->clock describes.
  *
@@ -1339,6 +1350,18 @@ struct rk3026_ebc {
 	 * rk3026_ebc_verify). Read with READ_ONCE(), once per waveform.
 	 */
 	bool			scan_verify;
+	/*
+	 * debugfs vcom_pin_ebc, a test knob, 0 at probe and read with
+	 * READ_ONCE(): ebc_rails_on() muxes GPIO2_C0 (the TPS65185 VCOM_CTRL
+	 * line on the RC2, otherwise @vcom_supply's enable GPIO) to the EBC's
+	 * VCOM output once VCOM is on, and ebc_rails_off() muxes it back to
+	 * the GPIO, still high, before VCOM goes off. @vcom_pin_muxed says it
+	 * is muxed, @vcom_pin_at since when (ktime_get()), both under
+	 * @rails_lock.
+	 */
+	bool			vcom_pin_ebc;
+	bool			vcom_pin_muxed;
+	ktime_t			vcom_pin_at;
 	/*
 	 * The CRTC is enabled, so a part may drive the panel. Under
 	 * @image_lock: the thread samples it in the section that takes a

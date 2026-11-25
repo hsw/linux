@@ -72,6 +72,13 @@
  *                    the scan_start event). 0: no wait; capped at
  *                    EBC_RAILS_SETTLE_MAX_MS. Probe sets
  *                    EBC_RAILS_SETTLE_MS.
+ *   rails_warmup_frames
+ *                    the frames of a scan that drives nothing, run after
+ *                    the settle in front of the first waveform after the
+ *                    rails came up (the rk3026_ebc_warmup event, warmup
+ *                    in the scan_start event), read-write. A test knob:
+ *                    0, as probe sets it, runs none; capped at
+ *                    EBC_RAILS_WARMUP_MAX_FRAMES.
  *   scan_verify      1: before each waveform the two scanned images are
  *                    compared, inside the part's clip, with the snapshot
  *                    and the image on the glass, and the WIN_MST0/1 pair is
@@ -581,6 +588,8 @@ void rk3026_ebc_debugfs_init(struct rk3026_ebc *ebc)
 	debugfs_create_atomic_t("debug_timeout", 0644, dir, &ebc->debug_timeout);
 	debugfs_create_u32("rails_off_ms", 0644, dir, &ebc->rails_off_ms);
 	debugfs_create_u32("rails_settle_ms", 0644, dir, &ebc->rails_settle_ms);
+	debugfs_create_u32("rails_warmup_frames", 0644, dir,
+			   &ebc->rails_warmup_frames);
 	debugfs_create_bool("scan_verify", 0644, dir, &ebc->scan_verify);
 	debugfs_create_file("palette", 0444, dir, ebc, &rk3026_ebc_palette_fops);
 	debugfs_create_file("rows", 0444, dir, ebc, &rk3026_ebc_rows_fops);

@@ -350,6 +350,47 @@ static void ebc_test_settle_wait_us(struct kunit *test)
 }
 
 /*
+ * rk3026_ebc_warmup_frames(): only a waveform that finds the mark set is
+ * warmed up, by the knob capped at EBC_RAILS_WARMUP_MAX_FRAMES, and every
+ * waveform clears it, a knob of 0 too: the next one is not warmed up
+ * until the rails come up again.
+ */
+static void ebc_test_warmup_frames(struct kunit *test)
+{
+	bool due = false;
+
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_warmup_frames(&due, 4), 0);
+	KUNIT_EXPECT_FALSE(test, due);
+
+	due = true;
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_warmup_frames(&due, 4), 4);
+	KUNIT_EXPECT_FALSE(test, due);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_warmup_frames(&due, 4), 0);
+
+	due = true;
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_warmup_frames(&due, 0), 0);
+	KUNIT_EXPECT_FALSE(test, due);
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_warmup_frames(&due, 4), 0);
+
+	due = true;
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_warmup_frames(&due, 1), 1);
+	due = true;
+	KUNIT_EXPECT_EQ(test,
+			rk3026_ebc_warmup_frames(&due,
+						 EBC_RAILS_WARMUP_MAX_FRAMES),
+			EBC_RAILS_WARMUP_MAX_FRAMES);
+	due = true;
+	KUNIT_EXPECT_EQ(test,
+			rk3026_ebc_warmup_frames(&due,
+						 EBC_RAILS_WARMUP_MAX_FRAMES + 1),
+			EBC_RAILS_WARMUP_MAX_FRAMES);
+	due = true;
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_warmup_frames(&due, U32_MAX),
+			EBC_RAILS_WARMUP_MAX_FRAMES);
+	KUNIT_EXPECT_FALSE(test, due);
+}
+
+/*
  * debugfs scan_verify's compare: pixels, not bytes, inside the clip widened
  * to whole bytes, a short tail included; the next half against the prev
  * half, the next half against the snapshot, the prev half against the
@@ -4064,6 +4105,7 @@ static struct kunit_case rk3026_ebc_core_test_cases[] = {
 	KUNIT_CASE(ebc_test_sdck),
 	KUNIT_CASE(ebc_test_us_between),
 	KUNIT_CASE(ebc_test_settle_wait_us),
+	KUNIT_CASE(ebc_test_warmup_frames),
 	KUNIT_CASE(ebc_test_pmic_err),
 	KUNIT_CASE(ebc_test_verify_halves),
 	KUNIT_CASE(ebc_test_rank_order),
@@ -7962,6 +8004,9 @@ struct t_kicks {
 	unsigned int	n;
 	u32		mst[4][2];
 	u32		chunk[4];
+	const u8	*lut[4];
+	u32		frames[4];
+	bool		last[4];
 };
 
 /* An address of neither half, left in WIN_MST0/1 by each kick (t_kick()). */
@@ -7981,6 +8026,9 @@ static void t_kick(struct rk3026_ebc *ebc, const u8 *lut, u32 chunk,
 	if (k->n < ARRAY_SIZE(k->mst)) {
 		t_mst_get(ebc, k->mst[k->n]);
 		k->chunk[k->n] = chunk;
+		k->lut[k->n] = lut;
+		k->frames[k->n] = frames;
+		k->last[k->n] = last;
 	}
 	k->n++;
 	t_mst_set(ebc, T_MST_KICKED, T_MST_KICKED);
@@ -8039,6 +8087,83 @@ static void ebc_test_glue_drive_pair(struct kunit *test)
 	t_mst_get(ebc, mst);
 	KUNIT_EXPECT_EQ(test, mst[0], T_MST_KICKED);
 	KUNIT_EXPECT_EQ(test, mst[1], T_MST_KICKED);
+}
+
+/*
+ * The real rk3026_ebc_drive(), its kicks stubbed (t_kick()), with debugfs
+ * rails_warmup_frames set: the first drive after the rails came up kicks
+ * the warm-up first, the knob's frames of an all-zero LUT that is not the
+ * waveform's, as a last chunk, from the waveform's pair; then the
+ * waveform from its first chunk, the pair written again before it. The
+ * record counts the waveform alone. The next drive is not warmed up, nor
+ * one that finds the rails down, whose warm-up is skipped and the mark
+ * taken all the same.
+ */
+static void ebc_test_glue_drive_warmup(struct kunit *test)
+{
+	struct rk3026_ebc *ebc = t_ebc_alloc(test);
+	u32 frames = EBC_LUT_MAX_FRAMES + 2, warm = 3;
+	struct rk3026_ebc_last last = {};
+	struct t_kicks k = {};
+	unsigned int i;
+	u8 *lut;
+
+	lut = kunit_kzalloc(test, frames * EBC_LUT_FRAME_BYTES, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, lut);
+	init_completion(&ebc->frame_done);
+	ebc->epd_on = true;
+	ebc->vcom_on = true;
+	ebc->rails_warmup_frames = warm;
+	ebc->rails_warmup_due = true;
+	test->priv = &k;
+	kunit_activate_static_stub(test, rk3026_ebc_frame_kick, t_kick);
+
+	ebc->roles = (struct rk3026_ebc_roles){ EBC_HALF_HIGH, EBC_HALF_LOW };
+	t_mst_set(ebc, 0, 0);
+	KUNIT_ASSERT_EQ(test, rk3026_ebc_drive(ebc, lut, frames, EBC_MODE_FULL,
+					       EBC_MODE_FULL, &last), 0);
+	KUNIT_EXPECT_FALSE(test, ebc->rails_warmup_due);
+	KUNIT_EXPECT_EQ(test, last.outcome, EBC_OUTCOME_DRIVEN);
+	KUNIT_EXPECT_EQ(test, last.driven, frames);
+	KUNIT_EXPECT_EQ(test, last.frames, frames);
+	KUNIT_EXPECT_EQ(test, last.scans, 1);
+	KUNIT_ASSERT_EQ(test, k.n, 3);
+
+	/* The warm-up: its own LUT, all code 0, one last chunk. */
+	KUNIT_EXPECT_PTR_NE(test, k.lut[0], (const u8 *)lut);
+	KUNIT_EXPECT_EQ(test, k.chunk[0], 0);
+	KUNIT_EXPECT_EQ(test, k.frames[0], warm);
+	KUNIT_EXPECT_TRUE(test, k.last[0]);
+	KUNIT_EXPECT_TRUE(test, mem_is_zero(k.lut[0],
+					    warm * EBC_LUT_FRAME_BYTES));
+	t_expect_mst(test, ebc, k.mst[0], EBC_HALF_HIGH, EBC_HALF_LOW);
+
+	/* The waveform after it, the pair written again before its first. */
+	for (i = 1; i < 3; i++) {
+		KUNIT_EXPECT_PTR_EQ(test, k.lut[i], (const u8 *)lut);
+		KUNIT_EXPECT_EQ(test, k.chunk[i], i - 1);
+	}
+	KUNIT_EXPECT_EQ(test, k.frames[1], EBC_LUT_MAX_FRAMES);
+	KUNIT_EXPECT_FALSE(test, k.last[1]);
+	KUNIT_EXPECT_EQ(test, k.frames[2], 2);
+	KUNIT_EXPECT_TRUE(test, k.last[2]);
+	t_expect_mst(test, ebc, k.mst[1], EBC_HALF_HIGH, EBC_HALF_LOW);
+	KUNIT_EXPECT_EQ(test, k.mst[2][0], T_MST_KICKED);
+
+	/* The next drive, the rails still up: the waveform alone. */
+	KUNIT_ASSERT_EQ(test, rk3026_ebc_drive(ebc, lut, 1, EBC_MODE_FULL,
+					       EBC_MODE_FULL, &last), 0);
+	KUNIT_ASSERT_EQ(test, k.n, 4);
+	KUNIT_EXPECT_PTR_EQ(test, k.lut[3], (const u8 *)lut);
+	KUNIT_EXPECT_EQ(test, k.frames[3], 1);
+
+	/* The rails came up and went down again: no kick, the mark taken. */
+	ebc->rails_warmup_due = true;
+	ebc->vcom_on = false;
+	KUNIT_EXPECT_EQ(test, rk3026_ebc_drive(ebc, lut, 1, EBC_MODE_FULL,
+					       EBC_MODE_FULL, &last), -EIO);
+	KUNIT_EXPECT_EQ(test, k.n, 4);
+	KUNIT_EXPECT_FALSE(test, ebc->rails_warmup_due);
 }
 
 /*
@@ -14569,6 +14694,7 @@ static struct kunit_case rk3026_ebc_glue_test_cases[] = {
 	KUNIT_CASE(ebc_test_glue_add_update),
 	KUNIT_CASE(ebc_test_glue_crtc_off),
 	KUNIT_CASE(ebc_test_glue_drive_pair),
+	KUNIT_CASE(ebc_test_glue_drive_warmup),
 	KUNIT_CASE(ebc_test_glue_no_waveform),
 	KUNIT_CASE(ebc_test_glue_skipped),
 	KUNIT_CASE(ebc_test_glue_reset_keeps_pre),

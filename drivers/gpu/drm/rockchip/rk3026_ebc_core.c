@@ -126,6 +126,27 @@ u32 rk3026_ebc_settle_wait_us(ktime_t up_at, ktime_t now, u32 settle_ms)
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_settle_wait_us);
 
 /**
+ * rk3026_ebc_warmup_frames - the frames of the warm-up scan before a waveform
+ * @due: set when the panel rails came up, cleared here
+ * @frames: debugfs rails_warmup_frames
+ *
+ * Only the first waveform after the rails came up is warmed up, and it
+ * takes the mark whatever @frames is: a knob written while the rails are
+ * up does not warm up a later waveform.
+ *
+ * Return: @frames, capped at EBC_RAILS_WARMUP_MAX_FRAMES, if @due was set;
+ * 0 otherwise.
+ */
+u32 rk3026_ebc_warmup_frames(bool *due, u32 frames)
+{
+	bool was = *due;
+
+	*due = false;
+	return was ? min_t(u32, frames, EBC_RAILS_WARMUP_MAX_FRAMES) : 0;
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_warmup_frames);
+
+/**
  * rk3026_ebc_pmic_err - the scan events' word for one read of the error flags
  * @ret: regulator_get_error_flags()'s return
  * @flags: the flags it gave, looked at only when @ret is 0

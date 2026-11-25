@@ -72,6 +72,13 @@
  *                    the scan_start event). 0: no wait; capped at
  *                    EBC_RAILS_SETTLE_MAX_MS. Probe sets
  *                    EBC_RAILS_SETTLE_MS.
+ *   scan_verify      1: before each waveform the two scanned images are
+ *                    compared, inside the part's clip, with the snapshot
+ *                    and the image on the glass, and the WIN_MST0/1 pair is
+ *                    read back after it (the hw_* fields of the scan_start
+ *                    event, mst_ok of scan_end; struct rk3026_ebc_verify).
+ *                    Read-write, 0 as probe sets it; reads up to both
+ *                    images, uncached, per waveform. A test knob.
  *   flip_release     where a held commit event is sent, read-write text:
  *                    "done" at the finish of its part (the frame is on the
  *                    glass, or its out-fence has an error), "take" at the
@@ -574,6 +581,7 @@ void rk3026_ebc_debugfs_init(struct rk3026_ebc *ebc)
 	debugfs_create_atomic_t("debug_timeout", 0644, dir, &ebc->debug_timeout);
 	debugfs_create_u32("rails_off_ms", 0644, dir, &ebc->rails_off_ms);
 	debugfs_create_u32("rails_settle_ms", 0644, dir, &ebc->rails_settle_ms);
+	debugfs_create_bool("scan_verify", 0644, dir, &ebc->scan_verify);
 	debugfs_create_file("palette", 0444, dir, ebc, &rk3026_ebc_palette_fops);
 	debugfs_create_file("rows", 0444, dir, ebc, &rk3026_ebc_rows_fops);
 }

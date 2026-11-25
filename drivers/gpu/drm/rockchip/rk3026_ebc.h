@@ -358,6 +358,30 @@ struct rk3026_ebc_du_budget {
 #define EBC_PMIC_ERR_ERRNO	GENMASK(15, 0)
 
 /*
+ * The debugfs scan_verify fields of the scan_start event, in pixels inside
+ * the part's clip (rk3026_ebc_verify_halves()); -1 each when the knob is
+ * off:
+ *
+ * @hw_diff: where the half the scan reads as next differs from the one it
+ *	reads as prev, the pixels the controller's (prev, next) lookup can
+ *	move at all;
+ * @hw_next_bad: where the next half differs from the snapshot the driver
+ *	means to drive (&rk3026_ebc_shadows.scan);
+ * @hw_prev_bad: where the prev half differs from what the driver takes to
+ *	be on the glass (&rk3026_ebc_shadows.prev; white for the part's own
+ *	scan after a repair RESET, ebc_recover_panel()).
+ */
+struct rk3026_ebc_verify {
+	s32	hw_diff;
+	s32	hw_next_bad;
+	s32	hw_prev_bad;
+};
+
+#define EBC_VERIFY_OFF \
+	((struct rk3026_ebc_verify){ .hw_diff = -1, .hw_next_bad = -1, \
+				      .hw_prev_bad = -1 })
+
+/*
  * What rk3026_ebc_resolve_mode() needs to drive a two-level auto plane part
  * in A2 rather than DU:
  *
@@ -1292,6 +1316,13 @@ struct rk3026_ebc {
 	atomic_t		pmic_faults;
 	atomic_t		pmic_read_errors;
 	/*
+	 * debugfs scan_verify, a test knob: rk3026_ebc_drive() compares the
+	 * scanned images with the CPU-side ones before each waveform and reads
+	 * the WIN_MST0/1 pair back after it, for the scan events (struct
+	 * rk3026_ebc_verify). Read with READ_ONCE(), once per waveform.
+	 */
+	bool			scan_verify;
+	/*
 	 * The CRTC is enabled, so a part may drive the panel. Under
 	 * @image_lock: the thread samples it in the section that takes a
 	 * part, and a sender checks it in the section that adds its update.
@@ -1547,6 +1578,10 @@ u32 rk3026_ebc_sdck(u32 width);
 u32 rk3026_ebc_us_between(ktime_t start, ktime_t end);
 u32 rk3026_ebc_settle_wait_us(ktime_t up_at, ktime_t now, u32 settle_ms);
 u32 rk3026_ebc_pmic_err(int ret, unsigned int flags);
+void rk3026_ebc_verify_halves(const u8 *hw_prev, const u8 *hw_next,
+			      const u8 *prev, const u8 *scan, u32 pitch,
+			      u32 height, const struct drm_rect *clip, u8 *row,
+			      struct rk3026_ebc_verify *v);
 bool rk3026_ebc_pending_add(struct rk3026_ebc_pending *p,
 			    const struct rk3026_ebc_update *upd, u32 *seq);
 bool rk3026_ebc_pending_peek(const struct rk3026_ebc_pending *p,

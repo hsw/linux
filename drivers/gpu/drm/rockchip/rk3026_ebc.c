@@ -36,6 +36,7 @@
 #include <linux/regmap.h>
 #include <linux/regulator/consumer.h>
 #include <linux/reset.h>
+#include <linux/slab.h>
 #include <linux/thermal.h>
 #include <linux/workqueue.h>
 
@@ -790,6 +791,67 @@ static u32 ebc_pmic_err(struct rk3026_ebc *ebc)
 }
 
 /*
+ * debugfs scan_verify: the halves the waveform reads, @roles, against
+ * what the driver means them to hold, inside the part's clip (struct
+ * rk3026_ebc_verify); -1 each when @on is false. The refresh thread calls
+ * it from rk3026_ebc_drive() with no lock held: it alone writes the halves
+ * and the shadows, and nothing writes either between the copies of the
+ * part and its frames, a repair's white fill included (that comes before
+ * the part's own waveform). The pair written right after this,
+ * rk3026_ebc_set_image_addr(), is @roles too.
+ *
+ * The halves are write-combined (ebc_setup_buffers()): Normal
+ * non-cacheable on ARMv7, mapped so by the DMA API with no cacheable alias
+ * (the lowmem pages of a CMA pool are remapped, a no-map pool has no
+ * linear map), so a CPU load reads the memory the controller fetches. The
+ * barrier first drains the write buffers of the copies into it, the
+ * outer cache's included, as the writel() of FRAME_START does for the
+ * controller.
+ *
+ * The prev half holds white for the part's own scan after a repair RESET
+ * (ebc_recover_panel()), @shadows.prev for every other.
+ */
+static void ebc_scan_verify(struct rk3026_ebc *ebc,
+			    const struct rk3026_ebc_last *last, bool on,
+			    struct rk3026_ebc_verify *v)
+{
+	const struct rk3026_ebc_shadows *sh = &ebc->shadows;
+	u8 *row;
+
+	*v = EBC_VERIFY_OFF;
+	if (!on)
+		return;
+	row = kmalloc(2 * sh->pitch, GFP_KERNEL);
+	if (!row)
+		return;
+
+	/* The copies' stores reach memory before the loads below. */
+	mb();
+	rk3026_ebc_verify_halves(ebc->half_virt[ebc->roles.prev],
+				 ebc->half_virt[ebc->roles.next],
+				 last->repaired && last->scans ? NULL : sh->prev,
+				 sh->scan, sh->pitch, sh->height, &last->clip,
+				 row, v);
+	kfree(row);
+}
+
+/*
+ * debugfs scan_verify: 1 if WIN_MST0/1 hold the pair rk3026_ebc_drive()
+ * wrote for the waveform, the window at the origin, else 0; -1 when @on
+ * is false. Read after the waveform, the pair its last FRAME_START
+ * latched; a stop that reset the block (ebc_stop_scan()) reads 0/0.
+ */
+static int ebc_mst_ok(struct rk3026_ebc *ebc, bool on)
+{
+	if (!on)
+		return -1;
+	return ebc_read(ebc, EBC_WIN_MST0) ==
+		lower_32_bits(ebc->half_phys[ebc->roles.prev]) &&
+	       ebc_read(ebc, EBC_WIN_MST1) ==
+		lower_32_bits(ebc->half_phys[ebc->roles.next]);
+}
+
+/*
  * The time from the take of @last's part to now (rk3026_ebc_clock()), for
  * the scan_start event of each of its waveforms: the snapshot, and a repair
  * RESET in front of the part.
@@ -820,7 +882,10 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_setup_us);
  * wait, with its time (settle_us) after the part's setup_us, and the
  * waveform's time (@last->scan_ms) counts from its end. Both scan events
  * carry the panel supply's error flags, read right before each
- * (ebc_pmic_err()), outside the waveform's time.
+ * (ebc_pmic_err()), outside the waveform's time. With debugfs scan_verify
+ * on, the halves are compared first (ebc_scan_verify()), inside @setup_us,
+ * so that the compare shortens the settle rather than delays the first
+ * frame, and the pair is read back after the last (ebc_mst_ok()).
  *
  * @shadows.prev_unknown is set here and cleared in exactly ONE place of this
  * function -- the successful exit below. rk3026_ebc_scan_finish() records the
@@ -844,11 +909,16 @@ VISIBLE_IF_KUNIT int rk3026_ebc_drive(struct rk3026_ebc *ebc, const u8 *lut,
 {
 	bool unknown = READ_ONCE(ebc->shadows.prev_unknown);
 	u32 done = 0, chunk = 0, setup_us, settle_us, pmic_err;
+	struct rk3026_ebc_verify verify;
 	ktime_t start;
+	bool check;
 	int ret = 0;
 
 	KUNIT_STATIC_STUB_REDIRECT(rk3026_ebc_drive, ebc, lut, frames, mode,
 				   lut_mode, last);
+
+	check = READ_ONCE(ebc->scan_verify);
+	ebc_scan_verify(ebc, last, check, &verify);
 
 	/* The setup counts toward the settle; the settle is not setup. */
 	setup_us = rk3026_ebc_setup_us(ebc, last);
@@ -859,7 +929,7 @@ VISIBLE_IF_KUNIT int rk3026_ebc_drive(struct rk3026_ebc *ebc, const u8 *lut,
 	/* A repair is the first waveform of an update that has repaired set. */
 	trace_rk3026_ebc_scan_start(last, mode, lut_mode, frames,
 				    last->repaired && !last->scans,
-				    setup_us, settle_us, pmic_err);
+				    setup_us, settle_us, pmic_err, &verify);
 
 	WRITE_ONCE(ebc->shadows.prev_unknown, true);
 	last->scans++;
@@ -926,7 +996,7 @@ out:
 	last->scan_ms = ktime_ms_delta(ktime_get(), start);
 	pmic_err = ebc_pmic_err(ebc);
 	trace_rk3026_ebc_scan_end(mode, frames, done, last->scan_ms, ret,
-				  last->seq, pmic_err);
+				  last->seq, pmic_err, ebc_mst_ok(ebc, check));
 	return ret;
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_drive);

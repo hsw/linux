@@ -350,6 +350,83 @@ static void ebc_test_settle_wait_us(struct kunit *test)
 }
 
 /*
+ * debugfs scan_verify's compare: pixels, not bytes, inside the clip widened
+ * to whole bytes, a short tail included; the next half against the prev
+ * half, the next half against the snapshot, the prev half against the
+ * glass or, NULL, white.
+ */
+static void ebc_test_verify_halves(struct kunit *test)
+{
+	enum { W = 20, H = 4, P = W / 2, SZ = P * H };
+	u8 *hp = kunit_kzalloc(test, SZ, GFP_KERNEL);
+	u8 *hn = kunit_kzalloc(test, SZ, GFP_KERNEL);
+	u8 *prev = kunit_kzalloc(test, SZ, GFP_KERNEL);
+	u8 *scan = kunit_kzalloc(test, SZ, GFP_KERNEL);
+	u8 *row = kunit_kzalloc(test, 2 * P, GFP_KERNEL);
+	struct drm_rect all = DRM_RECT_INIT(0, 0, W, H);
+	struct drm_rect r;
+	struct rk3026_ebc_verify v;
+
+	KUNIT_ASSERT_NOT_NULL(test, hp);
+	KUNIT_ASSERT_NOT_NULL(test, hn);
+	KUNIT_ASSERT_NOT_NULL(test, prev);
+	KUNIT_ASSERT_NOT_NULL(test, scan);
+	KUNIT_ASSERT_NOT_NULL(test, row);
+	memset(hp, 0xff, SZ);
+	memset(hn, 0xff, SZ);
+	memset(prev, 0xff, SZ);
+	memset(scan, 0xff, SZ);
+
+	rk3026_ebc_verify_halves(hp, hn, prev, scan, P, H, &all, row, &v);
+	KUNIT_EXPECT_EQ(test, v.hw_diff, 0);
+	KUNIT_EXPECT_EQ(test, v.hw_next_bad, 0);
+	KUNIT_EXPECT_EQ(test, v.hw_prev_bad, 0);
+
+	/* A DU over white: both pixels of byte 2 and the high one of the tail. */
+	scan[P + 2] = 0x00;
+	scan[P + 9] = 0x0f;
+	hn[P + 2] = 0x00;
+	hn[P + 9] = 0x0f;
+	rk3026_ebc_verify_halves(hp, hn, prev, scan, P, H, &all, row, &v);
+	KUNIT_EXPECT_EQ(test, v.hw_diff, 3);
+	KUNIT_EXPECT_EQ(test, v.hw_next_bad, 0);
+	KUNIT_EXPECT_EQ(test, v.hw_prev_bad, 0);
+
+	/* x 5..6 widens to 4..6, byte 2; the tail is outside. */
+	r = DRM_RECT_INIT(5, 1, 1, 1);
+	rk3026_ebc_verify_halves(hp, hn, prev, scan, P, H, &r, row, &v);
+	KUNIT_EXPECT_EQ(test, v.hw_diff, 2);
+	r = DRM_RECT_INIT(0, 2, W, 2);
+	rk3026_ebc_verify_halves(hp, hn, prev, scan, P, H, &r, row, &v);
+	KUNIT_EXPECT_EQ(test, v.hw_diff, 0);
+
+	/* The next half missed the change: no pixel moves, all of it is bad. */
+	hn[P + 2] = 0xff;
+	hn[P + 9] = 0xff;
+	rk3026_ebc_verify_halves(hp, hn, prev, scan, P, H, &all, row, &v);
+	KUNIT_EXPECT_EQ(test, v.hw_diff, 0);
+	KUNIT_EXPECT_EQ(test, v.hw_next_bad, 3);
+	KUNIT_EXPECT_EQ(test, v.hw_prev_bad, 0);
+
+	/* A stale prev half: wrong against the glass, and against white. */
+	hp[3 * P] = 0xf0;
+	prev[0] = 0x00;
+	rk3026_ebc_verify_halves(hp, hn, prev, scan, P, H, &all, row, &v);
+	KUNIT_EXPECT_EQ(test, v.hw_diff, 1);
+	KUNIT_EXPECT_EQ(test, v.hw_next_bad, 3);
+	KUNIT_EXPECT_EQ(test, v.hw_prev_bad, 3);
+	rk3026_ebc_verify_halves(hp, hn, NULL, scan, P, H, &all, row, &v);
+	KUNIT_EXPECT_EQ(test, v.hw_prev_bad, 1);
+
+	/* Nothing of the clip in the image. */
+	r = DRM_RECT_INIT(W, 0, 4, H);
+	rk3026_ebc_verify_halves(hp, hn, prev, scan, P, H, &r, row, &v);
+	KUNIT_EXPECT_EQ(test, v.hw_diff, 0);
+	KUNIT_EXPECT_EQ(test, v.hw_next_bad, 0);
+	KUNIT_EXPECT_EQ(test, v.hw_prev_bad, 0);
+}
+
+/*
  * The scan events' pmic_err: the flags of a read that worked, unchanged; a
  * failed read marked by EBC_PMIC_ERR_FAILED with its errno, whatever the
  * flags held, and never mistaken for one that worked, nor the other way
@@ -3988,6 +4065,7 @@ static struct kunit_case rk3026_ebc_core_test_cases[] = {
 	KUNIT_CASE(ebc_test_us_between),
 	KUNIT_CASE(ebc_test_settle_wait_us),
 	KUNIT_CASE(ebc_test_pmic_err),
+	KUNIT_CASE(ebc_test_verify_halves),
 	KUNIT_CASE(ebc_test_rank_order),
 	KUNIT_CASE(ebc_test_rank_unknown),
 	KUNIT_CASE(ebc_test_rank_merge),

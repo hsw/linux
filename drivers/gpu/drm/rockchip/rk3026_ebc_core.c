@@ -8,6 +8,7 @@
  * structs below, and rk3026_ebc_kunit.c tests them as they are.
  */
 
+#include <linux/bitops.h>
 #include <linux/compiler.h>
 #include <linux/export.h>
 #include <linux/jiffies.h>
@@ -140,6 +141,73 @@ u32 rk3026_ebc_pmic_err(int ret, unsigned int flags)
 	return flags & ~EBC_PMIC_ERR_FAILED;
 }
 EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_pmic_err);
+
+/*
+ * The pixels where @a and @b differ, of @n bytes at two pixels a byte;
+ * a NULL @b is white. Per word as in ebc_snap_word(): one bit per nibble
+ * that differs, then counted.
+ */
+static u32 ebc_px_diff(const u8 *a, const u8 *b, u32 n)
+{
+	u32 count = 0, d;
+
+	for (; n >= 4; n -= 4, a += 4) {
+		d = get_unaligned_le32(a) ^ (b ? get_unaligned_le32(b) : ~0u);
+		count += hweight32((d | d >> 1 | d >> 2 | d >> 3) & 0x11111111);
+		if (b)
+			b += 4;
+	}
+	for (; n; n--, a++) {
+		d = *a ^ (b ? *b++ : 0xff);
+		count += hweight32((d | d >> 1 | d >> 2 | d >> 3) & 0x11);
+	}
+	return count;
+}
+
+/**
+ * rk3026_ebc_verify_halves - the scanned images against the CPU-side ones
+ * @hw_prev: the image a scan reads as prev (WIN_MST0)
+ * @hw_next: the image it reads as next (WIN_MST1)
+ * @prev: what @hw_prev is meant to hold, laid out like it; NULL for white
+ * @scan: what @hw_next is meant to hold
+ * @pitch: bytes per row of each image
+ * @height: rows of each image
+ * @clip: the part's clip, in pixels; widened to whole bytes as the
+ *	snapshot's box is (rk3026_ebc_widen_clip())
+ * @row: scratch of 2 * @pitch bytes
+ * @v: returns the pixels that differ (struct rk3026_ebc_verify), 0 each
+ *	for a clip outside the image
+ *
+ * The scanned images are write-combined, uncached on the CPU side: each
+ * row of the clip is read from them once, by memcpy() into @row, and
+ * compared there.
+ */
+void rk3026_ebc_verify_halves(const u8 *hw_prev, const u8 *hw_next,
+			      const u8 *prev, const u8 *scan, u32 pitch,
+			      u32 height, const struct drm_rect *clip, u8 *row,
+			      struct rk3026_ebc_verify *v)
+{
+	struct drm_rect r = *clip;
+	u8 *rp = row, *rn = row + pitch;
+	u32 nb;
+	int y;
+
+	*v = (struct rk3026_ebc_verify){ 0 };
+	if (!rk3026_ebc_widen_clip(&r, pitch * 2, height))
+		return;
+
+	nb = (r.x2 - r.x1) / 2;
+	for (y = r.y1; y < r.y2; y++) {
+		size_t off = (size_t)y * pitch + r.x1 / 2;
+
+		memcpy(rp, hw_prev + off, nb);
+		memcpy(rn, hw_next + off, nb);
+		v->hw_diff += ebc_px_diff(rn, rp, nb);
+		v->hw_next_bad += ebc_px_diff(rn, scan + off, nb);
+		v->hw_prev_bad += ebc_px_diff(rp, prev ? prev + off : NULL, nb);
+	}
+}
+EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_verify_halves);
 
 /*
  * How strongly a mode drives, for merging updates into one scan: the merged

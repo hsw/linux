@@ -124,7 +124,9 @@
  * powers off right after each update; leaving the rails and VCOM up between
  * updates holds a DC bias on the panel. A waveform that starts soon after
  * they came up first waits for them to have been up @rails_settle_ms
- * (ebc_rails_settle()).
+ * (ebc_rails_settle()); with debugfs rails_warmup_frames the first one
+ * after they came up runs a scan that drives nothing next
+ * (ebc_rails_warmup()).
  *
  * This sets the deadline @rails_off_ms from now. Under @rails_lock or on
  * the thread.
@@ -767,6 +769,83 @@ static u32 ebc_rails_settle(struct rk3026_ebc *ebc)
 }
 
 /*
+ * The warm-up's LUT: every 2-bit code 0. Each LUT frame is 16 words, one
+ * per old grey, holding 2 bits per new grey; code 0 drives the pixel
+ * neither way (1 drives it toward black, 2 toward white), so no pixel of
+ * the panel moves, whatever the two images hold.
+ */
+static const u8 ebc_warmup_lut[EBC_RAILS_WARMUP_MAX_FRAMES *
+			       EBC_LUT_FRAME_BYTES] __aligned(4);
+
+static_assert(EBC_RAILS_WARMUP_MAX_FRAMES <= EBC_LUT_MAX_FRAMES);
+
+/*
+ * debugfs rails_warmup_frames, a test knob: the first waveform after the
+ * rails came up, right after its settle, is preceded by a scan of that
+ * many frames that drives nothing (@ebc_warmup_lut). A short waveform
+ * started right after the rails came up was seen to leave all its pixels
+ * undrawn now and then, the scanned images right: should the panel's
+ * drivers or the controller's output lose the first scan after power-up
+ * as a whole, the loss falls on frames that move nothing.
+ * rk3026_ebc_warmup_frames() decides, from the mark ebc_rails_on() set.
+ *
+ * The scan covers the whole window, in the waveform's mode, from the
+ * waveform's pair in WIN_MST0/1 (@ebc->roles). rk3026_ebc_drive() writes
+ * the same pair again before its own first frame, so the latch at
+ * FRAME_START, ebc_take_roles()'s read-back at the next take and
+ * ebc_mst_ok() see that pair as without the warm-up. The one chunk ends
+ * with VCOM_MODE clear, as a waveform's last does: the waveform starts
+ * from the state a waveform after a waveform starts from. No image, shadow
+ * or record of the part changes.
+ *
+ * A chunk that does not end within its budget stops the controller
+ * (ebc_stop_scan()) and the waveform still runs: its kick programs what
+ * the stop reset. Rails found down: no scan, and the waveform's own check
+ * abandons it.
+ *
+ * Returns the frames driven, for the scan_start event; the
+ * rk3026_ebc_warmup event, emitted for every warm-up asked for, has its
+ * time and outcome.
+ */
+static u32 ebc_rails_warmup(struct rk3026_ebc *ebc, u32 mode, u32 seq)
+{
+	u32 frames, driven = 0;
+	unsigned long budget;
+	ktime_t start;
+	int ret = 0;
+
+	mutex_lock(&ebc->rails_lock);
+	frames = rk3026_ebc_warmup_frames(&ebc->rails_warmup_due,
+					  READ_ONCE(ebc->rails_warmup_frames));
+	mutex_unlock(&ebc->rails_lock);
+	if (!frames)
+		return 0;
+
+	start = ktime_get();
+	if (!ebc_rails_up(ebc)) {
+		ret = -EIO;
+		goto out;
+	}
+
+	ebc_set_dsp_ctrl(ebc, mode);
+	rk3026_ebc_set_image_addr(ebc, 0, 0);
+	budget = msecs_to_jiffies(rk3026_ebc_chunk_timeout_ms(ebc, frames));
+	reinit_completion(&ebc->frame_done);
+	rk3026_ebc_frame_kick(ebc, ebc_warmup_lut, 0, frames, true);
+	if (!wait_for_completion_timeout(&ebc->frame_done, budget)) {
+		dev_warn_ratelimited(ebc->dev, "warm-up frame timeout\n");
+		ebc_stop_scan(ebc);
+		ret = -ETIMEDOUT;
+		goto out;
+	}
+	driven = frames;
+out:
+	trace_rk3026_ebc_warmup(seq, frames, driven,
+				rk3026_ebc_us_between(start, ktime_get()), ret);
+	return driven;
+}
+
+/*
  * The panel supply's error flags for a scan event, and the counters
  * (rk3026_ebc_pmic_err()). A TPS65185 latches its faults until they are
  * read, so a read right after the settle shows those since the previous
@@ -878,9 +957,12 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_setup_us);
  * rails were found down before a chunk.
  *
  * Before the first frame the rails get the rest of @rails_settle_ms since
- * they came up (ebc_rails_settle()); the scan_start event follows that
- * wait, with its time (settle_us) after the part's setup_us, and the
- * waveform's time (@last->scan_ms) counts from its end. Both scan events
+ * they came up (ebc_rails_settle()), then the first waveform after they
+ * came up gets a scan that drives nothing with debugfs rails_warmup_frames
+ * (ebc_rails_warmup()); the scan_start event follows both, with the
+ * wait's time (settle_us) after the part's setup_us and the warm-up's
+ * frames (warmup) last, and the waveform's time (@last->scan_ms) counts
+ * from its end, the warm-up's outside it. Both scan events
  * carry the panel supply's error flags, read right before each
  * (ebc_pmic_err()), outside the waveform's time. With debugfs scan_verify
  * on, the halves are compared first (ebc_scan_verify()), inside @setup_us,
@@ -908,7 +990,7 @@ VISIBLE_IF_KUNIT int rk3026_ebc_drive(struct rk3026_ebc *ebc, const u8 *lut,
 				      struct rk3026_ebc_last *last)
 {
 	bool unknown = READ_ONCE(ebc->shadows.prev_unknown);
-	u32 done = 0, chunk = 0, setup_us, settle_us, pmic_err;
+	u32 done = 0, chunk = 0, setup_us, settle_us, warmup, pmic_err;
 	struct rk3026_ebc_verify verify;
 	ktime_t start;
 	bool check;
@@ -923,13 +1005,15 @@ VISIBLE_IF_KUNIT int rk3026_ebc_drive(struct rk3026_ebc *ebc, const u8 *lut,
 	/* The setup counts toward the settle; the settle is not setup. */
 	setup_us = rk3026_ebc_setup_us(ebc, last);
 	settle_us = ebc_rails_settle(ebc);
+	warmup = ebc_rails_warmup(ebc, mode, last->seq);
 	pmic_err = ebc_pmic_err(ebc);
 	start = ktime_get();
 
 	/* A repair is the first waveform of an update that has repaired set. */
 	trace_rk3026_ebc_scan_start(last, mode, lut_mode, frames,
 				    last->repaired && !last->scans,
-				    setup_us, settle_us, pmic_err, &verify);
+				    setup_us, settle_us, pmic_err, &verify,
+				    warmup);
 
 	WRITE_ONCE(ebc->shadows.prev_unknown, true);
 	last->scans++;
@@ -1100,8 +1184,13 @@ static int ebc_rails_on(struct rk3026_ebc *ebc)
 	/* dev_dbg only: a console line would itself queue a refresh. */
 	dev_dbg(ebc->dev, "rails on\n");
 	if (changed) {
-		/* The settle before a waveform runs from here (ebc_rails_settle()). */
+		/*
+		 * The settle before a waveform runs from here
+		 * (ebc_rails_settle()), and the next one is warmed up
+		 * (ebc_rails_warmup()).
+		 */
 		ebc->rails_up_at = ktime_get();
+		ebc->rails_warmup_due = true;
 		trace_rk3026_ebc_rails(true, ebc->epd_on, ebc->vcom_on, 0);
 	}
 	return 0;

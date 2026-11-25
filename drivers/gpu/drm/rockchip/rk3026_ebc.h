@@ -347,6 +347,13 @@ struct rk3026_ebc_du_budget {
 #define EBC_RAILS_SETTLE_MAX_MS	1000
 
 /*
+ * debugfs rails_warmup_frames, a test knob, is capped at this many frames
+ * (rk3026_ebc_warmup_frames()): the scan that drives nothing in front of
+ * the first waveform after the rails came up is one chunk.
+ */
+#define EBC_RAILS_WARMUP_MAX_FRAMES	16
+
+/*
  * The pmic_err field of the scan events (rk3026_ebc_pmic_err()): the panel
  * supply's REGULATOR_ERROR_* flags as read, 0 for none; or, when the read
  * failed, EBC_PMIC_ERR_FAILED with the errno, positive, in
@@ -1309,6 +1316,16 @@ struct rk3026_ebc {
 	ktime_t			rails_up_at;
 	u32			rails_settle_ms;
 	/*
+	 * debugfs rails_warmup_frames, a test knob, 0 at probe and read with
+	 * READ_ONCE(): the first rk3026_ebc_drive() after ebc_rails_on()
+	 * brought a rail up runs a scan of that many frames that drives
+	 * nothing before its waveform (ebc_rails_warmup()). ebc_rails_on()
+	 * sets @rails_warmup_due with @rails_up_at, and that drive takes it,
+	 * both under @rails_lock.
+	 */
+	bool			rails_warmup_due;
+	u32			rails_warmup_frames;
+	/*
 	 * rk3026_ebc_drive() reads @epd_supply's error flags before and after
 	 * each waveform, for the scan events (EBC_PMIC_ERR_FAILED): the reads
 	 * that found a flag set, and those that failed. Since probe.
@@ -1577,6 +1594,7 @@ u32 rk3026_ebc_dsp_ctrl_mode(u32 mode);
 u32 rk3026_ebc_sdck(u32 width);
 u32 rk3026_ebc_us_between(ktime_t start, ktime_t end);
 u32 rk3026_ebc_settle_wait_us(ktime_t up_at, ktime_t now, u32 settle_ms);
+u32 rk3026_ebc_warmup_frames(bool *due, u32 frames);
 u32 rk3026_ebc_pmic_err(int ret, unsigned int flags);
 void rk3026_ebc_verify_halves(const u8 *hw_prev, const u8 *hw_next,
 			      const u8 *prev, const u8 *scan, u32 pitch,

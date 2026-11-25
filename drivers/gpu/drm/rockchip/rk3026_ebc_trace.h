@@ -162,14 +162,18 @@ TRACE_EVENT(rk3026_ebc_update_queue,
  * supply's REGULATOR_ERROR_* flags read after the settle: 0 for none, or
  * 0x8000xxxx when the read failed, xxxx the errno (EBC_PMIC_ERR_FAILED).
  * After it the debugfs scan_verify counts (struct rk3026_ebc_verify),
- * taken before @setup_us ends: -1 each with the knob off.
+ * taken before @setup_us ends: -1 each with the knob off. Last, warmup:
+ * the frames of the scan that drove nothing after the settle and before
+ * this waveform (debugfs rails_warmup_frames, the rk3026_ebc_warmup
+ * event), 0 for none or for one that did not end.
  */
 TRACE_EVENT(rk3026_ebc_scan_start,
 	TP_PROTO(const struct rk3026_ebc_last *last, u32 mode, u32 lut_mode,
 		 u32 frames, bool repair, u32 setup_us, u32 settle_us,
-		 u32 pmic_err, const struct rk3026_ebc_verify *verify),
+		 u32 pmic_err, const struct rk3026_ebc_verify *verify,
+		 u32 warmup),
 	TP_ARGS(last, mode, lut_mode, frames, repair, setup_us, settle_us,
-		pmic_err, verify),
+		pmic_err, verify, warmup),
 	TP_STRUCT__entry(
 		__field(u32, mode)
 		__field(u32, lut_mode)
@@ -195,6 +199,7 @@ TRACE_EVENT(rk3026_ebc_scan_start,
 		__field(s32, hw_diff)
 		__field(s32, hw_next_bad)
 		__field(s32, hw_prev_bad)
+		__field(u32, warmup)
 	),
 	TP_fast_assign(
 		__entry->mode = mode;
@@ -221,8 +226,9 @@ TRACE_EVENT(rk3026_ebc_scan_start,
 		__entry->hw_diff = verify->hw_diff;
 		__entry->hw_next_bad = verify->hw_next_bad;
 		__entry->hw_prev_bad = verify->hw_prev_bad;
+		__entry->warmup = warmup;
 	),
-	TP_printk("mode=%u(%s) lut_mode=%u(%s) temp=%d frames=%u marker=%u merged=%u repair=%d reason=%s seq=%u box=%d,%d-%d,%d changed_px=%u du_area=%u setup_us=%u gap_us=%u tries=%u taken_us=%lld settle_us=%u pmic_err=0x%x hw_diff=%d hw_next_bad=%d hw_prev_bad=%d",
+	TP_printk("mode=%u(%s) lut_mode=%u(%s) temp=%d frames=%u marker=%u merged=%u repair=%d reason=%s seq=%u box=%d,%d-%d,%d changed_px=%u du_area=%u setup_us=%u gap_us=%u tries=%u taken_us=%lld settle_us=%u pmic_err=0x%x hw_diff=%d hw_next_bad=%d hw_prev_bad=%d warmup=%u",
 		  __entry->mode, ebc_trace_mode(__entry->mode),
 		  __entry->lut_mode, ebc_trace_mode(__entry->lut_mode),
 		  __entry->temp, __entry->frames, __entry->marker,
@@ -232,7 +238,37 @@ TRACE_EVENT(rk3026_ebc_scan_start,
 		  __entry->changed_px, __entry->du_area, __entry->setup_us,
 		  __entry->gap_us, __entry->tries, __entry->taken_us,
 		  __entry->settle_us, __entry->pmic_err, __entry->hw_diff,
-		  __entry->hw_next_bad, __entry->hw_prev_bad)
+		  __entry->hw_next_bad, __entry->hw_prev_bad, __entry->warmup)
+);
+
+/*
+ * The scan that drives nothing in front of the first waveform after the
+ * rails came up (debugfs rails_warmup_frames, ebc_rails_warmup()), after
+ * the settle and before that waveform's scan_start: @seq is its part's,
+ * then the frames asked for, those that ended (0 on a timeout or with the
+ * rails down), its time in microseconds and its outcome: 0, -ETIMEDOUT or
+ * -EIO.
+ */
+TRACE_EVENT(rk3026_ebc_warmup,
+	TP_PROTO(u32 seq, u32 frames, u32 driven, u32 us, int ret),
+	TP_ARGS(seq, frames, driven, us, ret),
+	TP_STRUCT__entry(
+		__field(u32, seq)
+		__field(u32, frames)
+		__field(u32, driven)
+		__field(u32, us)
+		__field(int, ret)
+	),
+	TP_fast_assign(
+		__entry->seq = seq;
+		__entry->frames = frames;
+		__entry->driven = driven;
+		__entry->us = us;
+		__entry->ret = ret;
+	),
+	TP_printk("seq=%u frames=%u driven=%u us=%u ret=%d",
+		  __entry->seq, __entry->frames, __entry->driven, __entry->us,
+		  __entry->ret)
 );
 
 /*

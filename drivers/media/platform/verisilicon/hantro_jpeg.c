@@ -243,3 +243,26 @@ void hantro_jpeg_header_assemble(struct hantro_jpeg_ctx *ctx)
 
 	jpeg_set_quality(ctx);
 }
+
+/*
+ * Worst case for the quality set at the time of S_FMT, with the header
+ * above: 4:2:0, the Annex K Huffman tables and the quantizers of
+ * jpeg_set_quality(). A larger request is clamped to it.
+ */
+u32 hantro_jpeg_enc_sizeimage(const struct hantro_fmt *fmt, int quality,
+			      u32 width, u32 height, u32 sizeimage)
+{
+	u32 max_size;
+	u32 bytes;
+
+	if (quality >= 95)
+		bytes = 5;
+	else if (quality >= 84)
+		bytes = 3;
+	else
+		bytes = 2;
+
+	max_size = fmt->header_size + width * height * bytes;
+
+	return sizeimage ? clamp(sizeimage, fmt->min_size, max_size) : max_size;
+}

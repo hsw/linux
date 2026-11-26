@@ -26,6 +26,7 @@
 
 #include "hantro.h"
 #include "hantro_hw.h"
+#include "hantro_jpeg.h"
 #include "hantro_v4l2.h"
 
 #define  HANTRO_DEFAULT_BIT_DEPTH 8
@@ -386,6 +387,11 @@ static int hantro_try_fmt(const struct hantro_ctx *ctx,
 			pix_mp->plane_fmt[0].sizeimage +=
 				hantro_av1_mv_size(pix_mp->width,
 						   pix_mp->height);
+	} else if (fmt->codec_mode == HANTRO_MODE_JPEG_ENC) {
+		pix_mp->plane_fmt[0].sizeimage =
+			hantro_jpeg_enc_sizeimage(fmt, ctx->jpeg_quality,
+						  pix_mp->width, pix_mp->height,
+						  pix_mp->plane_fmt[0].sizeimage);
 	} else if (!pix_mp->plane_fmt[0].sizeimage) {
 		/*
 		 * For coded formats the application can specify

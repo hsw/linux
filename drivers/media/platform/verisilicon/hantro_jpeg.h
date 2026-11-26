@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0+ */
 
+struct hantro_fmt;
+
 #define JPEG_HEADER_SIZE	624
 #define JPEG_QUANT_SIZE		64
 
@@ -13,3 +15,5 @@ struct hantro_jpeg_ctx {
 };
 
 void hantro_jpeg_header_assemble(struct hantro_jpeg_ctx *ctx);
+u32 hantro_jpeg_enc_sizeimage(const struct hantro_fmt *fmt, int quality,
+			      u32 width, u32 height, u32 sizeimage);

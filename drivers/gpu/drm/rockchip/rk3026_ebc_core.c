@@ -1108,8 +1108,16 @@ static unsigned long ebc_retry_jiffies(unsigned long now, ktime_t clock,
  *   when the wait times out: a steady stream of skipped updates keeps the
  *   thread busy and must not keep the rails up. Not while the take's gap is
  *   open: the part taken after it will be driven (a gap opens only for
- *   such a part), and the gap's cap bounds the hold; but while the system
- *   suspends (@s->suspended) nothing is taken, so the gap holds nothing;
+ *   such a part), and the gap's cap bounds the hold. Nor while a part is
+ *   pending or the carry's retry is due (@s->woken), until @s->rails_hold
+ *   past the deadline: the wait for it ends a jiffy or so late, and a part
+ *   sent in that time is looked at with the rails up rather than after an
+ *   off and on cycle. A part that is driven moves the deadline; one that is
+ *   skipped does not, so the next pass finds the rails due again and they
+ *   go off once nothing is pending or the hold has passed: a stream of
+ *   skipped updates holds them @s->rails_hold past it at most. While the
+ *   system suspends (@s->suspended) nothing is taken, so neither holds
+ *   anything;
  * - while the system suspends, nothing else: no look at the idle cleanup,
  *   the next part or the carry's retry, which all wait for the resume, and
  *   the wait has the rails' deadline alone;
@@ -1121,8 +1129,9 @@ static unsigned long ebc_retry_jiffies(unsigned long now, ktime_t clock,
  * - else the thread waits until the earliest of the rails-off, idle and
  *   retry deadlines (rk3026_ebc_thread_deadline(),
  *   ebc_retry_jiffies()). Each is at least a jiffy ahead then (the
- *   two that are due were acted on above, and a gap is closed), so no
- *   pass spins.
+ *   two that are due were acted on above, a gap is closed and nothing is
+ *   pending, so nothing held the rails), so no pass spins; nor does a
+ *   held look, which takes the part pending or opens the gap for it.
  *
  * Return: the step (enum rk3026_ebc_step).
  */
@@ -1130,9 +1139,12 @@ enum rk3026_ebc_step rk3026_ebc_thread_step(const struct rk3026_ebc_pass *s,
 					    long *timeout)
 {
 	unsigned long deadline, retry_at = 0;
+	bool hold;
 
 	*timeout = MAX_SCHEDULE_TIMEOUT;
-	if (s->rails_on && (!s->gap_open || s->suspended) &&
+	hold = s->gap_open ||
+	       (s->woken && time_before(s->now, s->rails_off_at + s->rails_hold));
+	if (s->rails_on && (!hold || s->suspended) &&
 	    time_after_eq(s->now, s->rails_off_at))
 		return EBC_STEP_RAILS_OFF;
 	if (s->suspended) {

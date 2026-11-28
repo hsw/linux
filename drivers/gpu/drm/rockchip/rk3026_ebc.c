@@ -109,13 +109,17 @@
  * (rk3026_ebc_do_refresh()) or when the take's quiet gap opens for it
  * (rk3026_ebc_take_ready()), and off @rails_off_ms after the last
  * waveform ended (or after they came up, if none was driven; probe sets
- * EBC_RAILS_OFF_MS, debugfs rails_off_ms overrides it); while a gap is open
- * they are held past the deadline (rk3026_ebc_thread_step()), at most the
- * gap's cap. A short delay keeps a burst of updates (typing, a scrolling
- * console) from cycling the PMIC per update. Only a driven waveform moves
- * the deadline: an update that is skipped (identical image) or has no LUT
- * does not, so a stream of no-op commits cannot keep the rails up; nor do
- * the rails come up for a part the look finds will not be driven. Stock
+ * EBC_RAILS_OFF_MS, debugfs rails_off_ms overrides it). They are held past
+ * the deadline (rk3026_ebc_thread_step()) while a gap is open, at most the
+ * gap's cap, and while a part is already pending when it passes, at most
+ * one more @rails_off_ms: the thread's wait for the deadline ends a jiffy
+ * or so late, and an update sent in that time would otherwise find the
+ * rails going off and wait for them to come up again. A short delay keeps
+ * a burst of updates (typing, a scrolling console) from cycling the PMIC
+ * per update. Only a driven waveform moves the deadline: an update that is
+ * skipped (identical image) or has no LUT does not, so a stream of no-op
+ * commits cannot keep the rails up longer than the hold; nor do the rails
+ * come up for a part the look finds will not be driven. Stock
  * powers off right after each update; leaving the rails and VCOM up between
  * updates holds a DC bias on the panel.
  *
@@ -1879,9 +1883,12 @@ EXPORT_SYMBOL_IF_KUNIT(rk3026_ebc_do_refresh);
 
 /*
  * Idle power-off: @rails_off_ms passed since the last waveform. Only this
- * thread drives the panel and it is here, so no waveform is in flight. Queued
- * work does not hold the rails up: an update that needs them brings them up
- * again, and one that is skipped never needed them.
+ * thread drives the panel and it is here, so no waveform is in flight. A
+ * part already pending when the deadline passed held the rails for its look
+ * instead (rk3026_ebc_thread_step()), for one more @rails_off_ms at most:
+ * so here nothing is pending, or the parts looked at in that time were all
+ * skipped. An update sent after this brings the rails up again if it needs
+ * them.
  */
 static void ebc_idle_rails_off(struct rk3026_ebc *ebc)
 {
@@ -2124,10 +2131,10 @@ static void ebc_gap_wait(struct rk3026_ebc *ebc)
  * @now: the pass's time, in jiffies
  * @s: returns it, for rk3026_ebc_thread_step()
  *
- * Without @image_lock: the rails and their deadline, the idle cleanup's
- * (ebc_idle_at()), the carry's retry, the take's gap, whether the system
- * suspends and the wait's condition (rk3026_ebc_thread_woken()), at one
- * rk3026_ebc_clock() read.
+ * Without @image_lock: the rails, their deadline and the hold past it
+ * (one @rails_off_ms), the idle cleanup's (ebc_idle_at()), the carry's
+ * retry, the take's gap, whether the system suspends and the wait's
+ * condition (rk3026_ebc_thread_woken()), at one rk3026_ebc_clock() read.
  * The retry and the gap are this thread's own, so they hold still while
  * the pass runs.
  */
@@ -2142,6 +2149,7 @@ VISIBLE_IF_KUNIT void rk3026_ebc_thread_pass(struct rk3026_ebc *ebc,
 	*s = (struct rk3026_ebc_pass) {
 		.now		= now,
 		.rails_off_at	= READ_ONCE(ebc->rails_off_at),
+		.rails_hold	= msecs_to_jiffies(READ_ONCE(ebc->rails_off_ms)),
 		.clock		= clock,
 		.retry_at	= READ_ONCE(r->at),
 		.rails_on	= READ_ONCE(ebc->rails_on),
